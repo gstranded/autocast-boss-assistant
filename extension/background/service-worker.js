@@ -103,7 +103,21 @@ async function getActiveBossTab({ allowInactiveBossTab = false } = {}) {
   return all.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0] || null;
 }
 
-async function sendToBoss(type, payload = {}, { retries = 1 } = {}) {
+async function forceInjectContent(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content/content-main.js"],
+      injectImmediately: true
+    });
+    await sleep(120);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function sendToBoss(type, payload = {}, { retries = 1, forceInject = false } = {}) {
   const tab = await getActiveBossTab({ allowInactiveBossTab: false });
   if (!tab?.id) {
     const active = (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
@@ -113,7 +127,6 @@ async function sendToBoss(type, payload = {}, { retries = 1 } = {}) {
       message: bossUrlGuardMessage(active?.url || "")
     };
   }
-  // 注入前再次校验 URL，防止标签在异步过程中导航到非 BOSS 页
   if (!isBossUrl(tab.url || "")) {
     return {
       ok: false,
@@ -121,17 +134,37 @@ async function sendToBoss(type, payload = {}, { retries = 1 } = {}) {
       message: bossUrlGuardMessage(tab.url || "")
     };
   }
+
+  // 关键操作前强制注入最新 content，避免扩展重载后仍跑旧脚本
+  const critical = [
+    MSG.START_CHAT,
+    MSG.SEND_TEXT,
+    MSG.SEND_IMAGE,
+    MSG.SCAN_JOBS,
+    MSG.RETURN_TO_LIST,
+    MSG.CLOSE_CHAT,
+    MSG.ENSURE_JOB_LIST
+  ];
+  if (forceInject || critical.includes(type)) {
+    await forceInjectContent(tab.id);
+  }
+
   try {
     try {
       return await chrome.tabs.sendMessage(tab.id, { type, payload });
     } catch (err0) {
-      const msg0 = String(err0?.message || err0 || '');
+      const msg0 = String(err0?.message || err0 || "");
+      // 注入后再试
+      await forceInjectContent(tab.id);
       if (retries > 0 && /message channel closed|Receiving end does not exist|asynchronous response/i.test(msg0)) {
-        // channel closed retry
-        await sleep(700);
-        return sendToBoss(type, payload, { retries: retries - 1 });
+        await sleep(500);
+        return sendToBoss(type, payload, { retries: retries - 1, forceInject: true });
       }
-      throw err0;
+      try {
+        return await chrome.tabs.sendMessage(tab.id, { type, payload });
+      } catch (err1) {
+        throw err1;
+      }
     }
   } catch (err) {
     try {
@@ -143,11 +176,7 @@ async function sendToBoss(type, payload = {}, { retries = 1 } = {}) {
           message: bossUrlGuardMessage(latest?.url || "")
         };
       }
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ["content/content-main.js"],
-        injectImmediately: true
-      });
+      await forceInjectContent(tab.id);
       await sleep(200);
       return await chrome.tabs.sendMessage(tab.id, { type, payload });
     } catch (e2) {

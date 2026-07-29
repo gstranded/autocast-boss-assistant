@@ -14,7 +14,15 @@
     DIAGNOSE: "BHT_DIAGNOSE"
   };
 
-  if (window.__BHT_CONTENT_LOADED__) return;
+  const BHT_CONTENT_VERSION = "1.2.4";
+  // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
+  if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
+    return;
+  }
+  if (window.__BHT_ON_MESSAGE__) {
+    try { chrome.runtime.onMessage.removeListener(window.__BHT_ON_MESSAGE__); } catch (_) {}
+  }
+  window.__BHT_CONTENT_VERSION__ = BHT_CONTENT_VERSION;
   window.__BHT_CONTENT_LOADED__ = true;
 
   function isBossHost(hostname) {
@@ -1249,7 +1257,7 @@ async function setInputText(input, text) {
     return { ok: true, count: cards.length };
   }
 
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  const onBhtMessage = (message, _sender, sendResponse) => {
     const { type, payload } = message || {};
     (async () => {
       try {
@@ -1288,7 +1296,9 @@ async function setInputText(input, text) {
       }
     })().then(sendResponse);
     return true;
-  });
+  };
+  window.__BHT_ON_MESSAGE__ = onBhtMessage;
+  chrome.runtime.onMessage.addListener(onBhtMessage);
 
-  log("content script ready", location.href, "cards=", getJobCards().length);
+  log("content script ready v" + BHT_CONTENT_VERSION, location.href, "cards=", getJobCards().length);
 })();
