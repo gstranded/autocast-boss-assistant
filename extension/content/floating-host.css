@@ -10,7 +10,7 @@
 #bht-float-root .bht-panel,
 #bht-float-root .bht-panel-header,
 #bht-float-root .bht-icon-btn,
-#bht-float-root .bht-frame { pointer-events: auto; }
+#bht-float-root .bht-frame { pointer-events: auto !important; pointer-events: auto; }
 
 #bht-float-root .bht-fab {
   position: fixed;

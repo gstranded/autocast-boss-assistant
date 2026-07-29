@@ -983,6 +983,8 @@ function forceEnableControls() {
     el.removeAttribute('disabled');
     el.style.pointerEvents = 'auto';
     el.style.opacity = '1';
+    el.style.cursor = 'pointer';
+    el.tabIndex = 0;
   });
 }
 
@@ -1041,7 +1043,7 @@ function wireControlButtons() {
   });
 }
 
-// 捕获阶段解除 disabled，避免“点了没反应”
+// CONTROL_CAPTURE_INVOKE: 捕获阶段解除 disabled，避免“点了没反应”
 document.addEventListener('click', (e) => {
   const btn = e.target?.closest?.('#btnPause, #btnResume, #btnSkip, #btnStop');
   if (!btn) return;

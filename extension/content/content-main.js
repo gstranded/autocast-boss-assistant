@@ -194,18 +194,28 @@
     return h.toString(36);
   }
 
+  function safeDecode(s) {
+    try {
+      if (typeof decodeURIComponent === "function") return decodeURIComponent(s);
+    } catch (_) {}
+    try {
+      return unescape(s);
+    } catch (_) {}
+    return String(s || "");
+  }
+
   function extractJobIdFromHref(href = "") {
     if (!href) return "";
-    const m1 = href.match(/job_detail\/([^~.?\s/]+)/i);
-    if (m1) return decodeURIComponent(m1[1].replace(/\.html$/i, ""));
-    const m2 = href.match(/[?&](?:jobId|jid)=([^&]+)/i);
-    if (m2) return decodeURIComponent(m2[1]);
+    const m1 = String(href).match(/job_detail\/([^~.?\s/]+)/i);
+    if (m1) return safeDecode(m1[1].replace(/\.html$/i, ""));
+    const m2 = String(href).match(/[?&](?:jobId|jid)=([^&]+)/i);
+    if (m2) return safeDecode(m2[1]);
     return "";
   }
 
   function extractSecurityId(href = "") {
     const m = String(href).match(/[?&]securityId=([^&]+)/);
-    return m ? decodeURIComponent(m[1]) : "";
+    return m ? safeDecode(m[1]) : "";
   }
 
   function getJobCards() {
@@ -779,106 +789,177 @@ function dismissCommonDialogs() {
     const wantCompany = normalizeText(inputJob.company || "");
     const wantId = String(inputJob.jobId || "");
     const wantHref = String(inputJob.href || "");
-    const wantHrefId = extractJobIdFromHref(wantHref);
+    const wantHrefId = extractJobIdFromHref(wantHref) || (wantId && !wantId.startsWith("name_") && !wantId.startsWith("dom_") ? wantId : "");
 
     try { await closeChatPanel(); } catch (_) {}
-    await sleep(250);
+    await sleep(200);
 
     const getListScroller = () =>
       firstEl(SELECTORS.listScroller) || document.scrollingElement || document.documentElement;
+
+    const mainListRoot = () =>
+      document.querySelector("ul.rec-job-list") ||
+      document.querySelector(".job-list-container") ||
+      document.querySelector(".job-recommend-result") ||
+      document.querySelector(".search-job-result") ||
+      document.querySelector(".recommend-result-job") ||
+      null;
+
+    const isInMainList = (el) => {
+      if (!el) return false;
+      if (el.closest(".job-detail-box, .job-detail-container, .chat-container, .chat-box, .dialog-chat, #chat-box")) return false;
+      const root = mainListRoot();
+      if (root) return root.contains(el);
+      // 无主列表容器时，至少排除详情/聊天
+      return true;
+    };
+
+    const visibleTitleSamples = () => {
+      const root = mainListRoot() || document;
+      return Array.from(root.querySelectorAll("a.job-name, .job-name"))
+        .filter((el) => isInMainList(el))
+        .map((el) => textOf(el))
+        .filter(Boolean)
+        .slice(0, 6);
+    };
 
     const scoreMatch = (p) => {
       if (!p) return -1;
       let score = 0;
       const t = normalizeText(p.title || "");
-      const tc = typeof coreTitle === 'function' ? coreTitle(p.title || '') : t;
-      const wantCore = typeof coreTitle === 'function' ? coreTitle(inputJob.title || '') : wantTitle;
+      const tc = typeof coreTitle === "function" ? coreTitle(p.title || "") : t;
+      const wantCore = typeof coreTitle === "function" ? coreTitle(inputJob.title || "") : wantTitle;
       const co = normalizeText(p.company || "");
       if (wantId && p.jobId && p.jobId === wantId) score += 100;
-      if (wantHrefId && (p.jobId === wantHrefId || (p.href && p.href.includes(wantHrefId)))) score += 80;
-      if (wantHref && p.href && (p.href === wantHref || p.href.includes(wantHrefId || '___'))) score += 70;
+      if (wantHrefId && (p.jobId === wantHrefId || (p.href && p.href.includes(wantHrefId)))) score += 100;
+      if (wantHref && p.href && (p.href === wantHref || (wantHrefId && p.href.includes(wantHrefId)))) score += 90;
       if (wantTitle && t) {
         if (t === wantTitle || tc === wantCore) score += 50;
-        else if (t.includes(wantTitle) || wantTitle.includes(t) || (wantCore && tc && (tc.includes(wantCore) || wantCore.includes(tc)))) score += 35;
-        else return -1;
+        else if (
+          t.includes(wantTitle) ||
+          wantTitle.includes(t) ||
+          (wantCore && tc && (tc.includes(wantCore) || wantCore.includes(tc)))
+        ) {
+          score += 35;
+        } else if (!(wantId || wantHrefId)) {
+          return -1;
+        }
       } else if (!wantId && !wantHrefId) {
         return -1;
       }
       if (wantCompany && co) {
         if (co === wantCompany) score += 12;
         else if (co.includes(wantCompany) || wantCompany.includes(co)) score += 6;
-        // 公司不匹配不直接否决：推荐流公司字段常是 HR 名
       }
       return score;
     };
 
+    const cardFromNameEl = (el) =>
+      el.closest("li.job-card-box") ||
+      el.closest(".job-card-box") ||
+      el.closest(".job-card-wrap") ||
+      el.closest("li") ||
+      el;
+
+    // 1) 最高优先：按 job_detail href / jobId 直接定位主列表锚点
+    const findByHref = () => {
+      if (!wantHrefId && !wantHref) return null;
+      const anchors = Array.from(document.querySelectorAll("a.job-name[href], a[href*='job_detail']"));
+      for (const el of anchors) {
+        if (!isInMainList(el)) continue;
+        const href = el.href || el.getAttribute("href") || "";
+        const id = extractJobIdFromHref(href);
+        if (wantHrefId && (id === wantHrefId || href.includes(wantHrefId))) {
+          const card = cardFromNameEl(el);
+          const live = parseJobCard(card, 0);
+          return {
+            card,
+            live: { ...live, title: live.title || textOf(el), href: live.href || href },
+            score: 100,
+            via: "href"
+          };
+        }
+        if (wantHref && (href === wantHref || href.endsWith(wantHref) || wantHref.endsWith(href))) {
+          const card = cardFromNameEl(el);
+          const live = parseJobCard(card, 0);
+          return {
+            card,
+            live: { ...live, title: live.title || textOf(el), href: live.href || href },
+            score: 95,
+            via: "href-exact"
+          };
+        }
+      }
+      return null;
+    };
+
     const tryPickVisible = () => {
+      const byHref = findByHref();
+      if (byHref) return byHref;
+
       let best = null;
       let bestScore = 0;
-      const cards = getJobCards();
+      const cards = getJobCards().filter((card) => isInMainList(card));
       for (let i = 0; i < cards.length; i++) {
         const p = parseJobCard(cards[i], i);
         const sc = scoreMatch(p);
         if (sc > bestScore) {
           bestScore = sc;
-          best = { card: cards[i], live: p, score: sc };
+          best = { card: cards[i], live: p, score: sc, via: "card" };
         }
       }
-      const names = Array.from(document.querySelectorAll("a.job-name, .job-name"));
+      const root = mainListRoot() || document;
+      const names = Array.from(root.querySelectorAll("a.job-name, .job-name")).filter((el) => isInMainList(el));
       for (const el of names) {
-        if (el.closest(".job-detail-box, .job-detail-container")) continue;
-        const card =
-          el.closest("li.job-card-box") ||
-          el.closest(".job-card-box") ||
-          el.closest(".job-card-wrap") ||
-          el.closest("li") ||
-          el;
+        const card = cardFromNameEl(el);
         const live = parseJobCard(card, 0);
-        const mergedLive = { ...live, title: live.title || textOf(el) };
+        const mergedLive = { ...live, title: live.title || textOf(el), href: live.href || el.href || "" };
         const sc = scoreMatch(mergedLive);
         if (sc > bestScore) {
           bestScore = sc;
-          best = { card, live: mergedLive, score: sc };
+          best = { card, live: mergedLive, score: sc, via: "name" };
         }
       }
       return bestScore >= 25 ? best : null;
     };
 
+    // 确保主列表在
     if (getJobCards().length === 0) {
       try { await ensureJobList({ maxWaitMs: 6000, scroll: true }); } catch (_) {}
     }
 
-    try { window.scrollTo(0, 0); } catch (_) {}
-    try {
-      const sc = getListScroller();
-      if (sc) sc.scrollTop = 0;
-    } catch (_) {}
-    await sleep(350);
-
+    // 先不滚动直接找（href 命中可立刻点）
     let picked = tryPickVisible();
+
     if (!picked) {
-      for (let round = 0; round < 60 && !picked; round++) {
+      try { window.scrollTo(0, 0); } catch (_) {}
+      try {
+        const sc = getListScroller();
+        if (sc) sc.scrollTop = 0;
+      } catch (_) {}
+      await sleep(300);
+      picked = tryPickVisible();
+    }
+
+    if (!picked) {
+      for (let round = 0; round < 70 && !picked; round++) {
         try {
           const sc = getListScroller();
           if (sc && sc !== document.scrollingElement && sc !== document.documentElement) {
-            sc.scrollTop = (sc.scrollTop || 0) + 360;
+            sc.scrollTop = (sc.scrollTop || 0) + 380;
           } else {
-            window.scrollBy(0, 360);
+            window.scrollBy(0, 380);
           }
         } catch (_) {
-          try { window.scrollBy(0, 360); } catch (__) {}
+          try { window.scrollBy(0, 380); } catch (__) {}
         }
-        await sleep(160);
+        await sleep(150);
         picked = tryPickVisible();
       }
     }
 
     if (!picked) {
-      const titles = Array.from(document.querySelectorAll("a.job-name, .job-name"))
-        .filter((el) => !el.closest(".job-detail-box"))
-        .map((el) => textOf(el))
-        .filter(Boolean)
-        .slice(0, 6);
+      const titles = visibleTitleSamples();
       return {
         ok: false,
         error: "JOB_CARD_NOT_FOUND",
@@ -886,9 +967,13 @@ function dismissCommonDialogs() {
           "列表中找不到该岗位「" +
           (inputJob.title || "") +
           "」。请回到职位列表顶部后重新扫描预览再投" +
-          (titles.length ? "\n当前可见示例：" + titles.join(" / ") : ""),
+          (titles.length ? "\n当前可见示例：" + titles.join(" / ") : "") +
+          "\n页面：" +
+          (location.pathname || ""),
         listCount: getJobCards().length,
-        href: location.href
+        href: location.href,
+        wantHrefId,
+        samples: titles
       };
     }
 
@@ -903,19 +988,25 @@ function dismissCommonDialogs() {
       href: live.href || inputJob.href
     };
 
-    log("startChat matched", merged.title, "score=", picked.score, "jobId=", merged.jobId);
+    log("startChat matched via", picked.via, merged.title, "score=", picked.score, "jobId=", merged.jobId);
 
     const wrap = card.closest?.(".job-card-wrap") || card.closest?.("li.job-card-box") || card;
     try { wrap.scrollIntoView({ block: "center", behavior: "instant" }); } catch (_) {}
-    await sleep(180);
+    await sleep(160);
     preventLinkNavigation(wrap, 1500);
-    clickLikeHuman(wrap);
+
+    // 优先点职位名锚点（BOSS 靠它激活右侧详情），再点卡片
+    const titleEl =
+      wrap.querySelector?.("a.job-name, .job-name") ||
+      card.querySelector?.("a.job-name, .job-name") ||
+      null;
+    if (titleEl) clickLikeHuman(titleEl);
+    else clickLikeHuman(wrap);
     await sleep(500);
 
     if (!firstEl(SELECTORS.detailRoot) && !firstEl(SELECTORS.chatOnDetail)) {
       preventLinkNavigation(wrap, 1000);
-      const titleEl = wrap.querySelector?.("a.job-name, .job-name") || card.querySelector?.("a.job-name, .job-name");
-      clickLikeHuman(titleEl || card);
+      clickLikeHuman(titleEl || card || wrap);
       await sleep(450);
     }
 
@@ -925,7 +1016,7 @@ function dismissCommonDialogs() {
     }
 
     let clicked = { ok: false };
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 12; i++) {
       clicked = await clickChatButton();
       if (clicked.ok) break;
       const cardBtn = Array.from((wrap || card).querySelectorAll("a,button")).find((el) =>
@@ -937,7 +1028,7 @@ function dismissCommonDialogs() {
         clicked = { ok: true, buttonText: textOf(cardBtn), already: /继续沟通/.test(textOf(cardBtn)) };
         break;
       }
-      await sleep(320);
+      await sleep(300);
     }
 
     if (!clicked.ok) {
@@ -979,9 +1070,11 @@ function dismissCommonDialogs() {
       securityId: merged.securityId || "",
       detailSalary: merged.salary || "",
       chatPage: isChatPage(),
-      href: location.href
+      href: location.href,
+      via: picked.via
     };
   }
+
 
 async function setInputText(input, text) {
     input.focus();

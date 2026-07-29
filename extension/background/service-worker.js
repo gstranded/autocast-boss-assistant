@@ -388,7 +388,13 @@ async function processOneJob(task, resultRow, config) {
     task.counters.failed += 1;
     task.consecutiveFails += 1;
     await bumpDailyStat('fail');
-    await log('error', `沟通失败：${item.reasons[0]}`, { jobId: job.jobId });
+    await log('error', `沟通失败：${item.reasons[0]}`, {
+      jobId: job.jobId,
+      error: chatRes?.error,
+      samples: chatRes?.samples,
+      listCount: chatRes?.listCount,
+      page: chatRes?.href
+    });
     if (chatRes?.error === 'LOGIN_REQUIRED') {
       runner.pause = true;
       task.awaitingUserRetry = true;
