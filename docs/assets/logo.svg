@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Boss HaiTou Assistant">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%" stop-color="#3B82F6"/><stop offset="100%" stop-color="#1D4ED8"/>
+  </linearGradient></defs>
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#g)"/>
+  <path d="M120 250 L390 150 L280 260 L360 365 L245 285 Z" fill="#FFFFFF"/>
+  <circle cx="145" cy="330" r="14" fill="#FFD666"/>
+  <circle cx="118" cy="355" r="9" fill="#FFD666" opacity="0.85"/>
+</svg>

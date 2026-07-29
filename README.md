@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/logo.png" alt="Boss 海投助手 Logo" width="120" />
+  <img src="https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/logo.svg" alt="Boss HaiTou Assistant Logo" width="128" />
 </p>
 
 <h1 align="center">Boss 海投助手</h1>
