@@ -11,10 +11,11 @@
     ENSURE_JOB_LIST: "BHT_ENSURE_JOB_LIST",
     RETURN_TO_LIST: "BHT_RETURN_TO_LIST",
     CLOSE_CHAT: "BHT_CLOSE_CHAT",
-    DIAGNOSE: "BHT_DIAGNOSE"
+    DIAGNOSE: "BHT_DIAGNOSE",
+    RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.2.8";
+  const BHT_CONTENT_VERSION = "1.2.9";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -1523,28 +1524,7 @@ async function startChat(job, opts = {}) {
         const { type, payload, reqId } = message || {};
         const run = async () => {
           try {
-            switch (type) {
-              case MSG.START_CHAT:
-                return await startChat(payload?.job || payload, payload || {});
-              case MSG.SEND_TEXT:
-                return await sendText(payload?.text || "");
-              case MSG.SEND_IMAGE:
-                return await sendImageFromDataUrl(payload?.dataUrl, payload?.fileName);
-              case MSG.SCAN_JOBS:
-                return await scanJobs(payload || {});
-              case MSG.ENSURE_JOB_LIST:
-                return await ensureJobList(payload || {});
-              case MSG.RETURN_TO_LIST:
-                return await returnToJobList();
-              case MSG.CLOSE_CHAT:
-                return await closeChatPanel();
-              case MSG.DIAGNOSE:
-                return { ok: true, ...diagnose() };
-              case MSG.PING:
-                return { ok: true, page: pageInfo(), contentVersion: BHT_CONTENT_VERSION };
-              default:
-                return { ok: false, error: "UNKNOWN_TYPE", type };
-            }
+            return await runOpByType(type, payload || {});
           } catch (err) {
             return { ok: false, error: String(err?.message || err) };
           }
