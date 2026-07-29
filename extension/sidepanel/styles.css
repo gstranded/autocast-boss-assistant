@@ -242,12 +242,20 @@ html.float-mode main {
 /* modal */
 .bht-modal {
   position: fixed;
-  inset: 0;
+  /* bht-modal-leave-controls: 顶部控制条可点 */
+  top: 96px;
+  left: 0;
+  right: 0;
+  bottom: 0;
   z-index: 10000;
   background: rgba(2, 6, 23, 0.55);
   display: grid;
   place-items: center;
   padding: 16px;
+}
+.controls, .task-actions, #btnPause, #btnResume, #btnSkip, #btnStop {
+  position: relative;
+  z-index: 10001;
 }
 .bht-modal[hidden] { display: none !important; }
 .bht-modal-card {

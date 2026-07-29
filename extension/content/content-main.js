@@ -14,7 +14,7 @@
     DIAGNOSE: "BHT_DIAGNOSE"
   };
 
-  const BHT_CONTENT_VERSION = "1.2.5";
+  const BHT_CONTENT_VERSION = "1.2.6";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -705,30 +705,41 @@ function dismissCommonDialogs() {
   }
 
   async function closeChatPanel() {
+    // 只关聊天浮层，避免 document ESC 把列表页状态打乱
+    const selectors = [
+      ".chat-conversation .icon-close",
+      ".chat-box .icon-close",
+      ".dialog-chat .icon-close",
+      ".chat-container [class*='close']",
+      "div.chat-conversation button[aria-label*='关闭']",
+      ".boss-dialog .icon-close",
+      ".dialog-wrap .icon-close"
+    ];
+    for (const sel of selectors) {
+      try {
+        const el = document.querySelector(sel);
+        if (el) {
+          clickLikeHuman(el);
+          await sleep(250);
+          break;
+        }
+      } catch (_) {}
+    }
     const closeCandidates = Array.from(
       document.querySelectorAll(
-        "button, a, i, span, div[class*='close'], .icon-close, .chat-close, [aria-label*='关闭']"
+        ".chat-conversation button, .chat-box button, .dialog-chat button, .chat-container button, [class*='chat'] [class*='close']"
       )
     ).filter((el) => {
       const t = textOf(el);
       const aria = el.getAttribute?.("aria-label") || "";
       const cls = String(el.className || "");
-      return (
-        t === "关闭" ||
-        t === "×" ||
-        t === "x" ||
-        /关闭/.test(aria) ||
-        /close|icon-close|chat-close/i.test(cls)
-      );
+      return t === "关闭" || t === "×" || /关闭/.test(aria) || /close|icon-close|chat-close/i.test(cls);
     });
     if (closeCandidates[0]) {
       clickLikeHuman(closeCandidates[0]);
-      await sleep(350);
+      await sleep(250);
     }
-    // ESC 关闭浮层
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }));
-    await sleep(200);
-    return { ok: true };
+    return { ok: true, contentVersion: BHT_CONTENT_VERSION };
   }
 
   async function returnToJobList() {
@@ -795,7 +806,51 @@ function dismissCommonDialogs() {
     return null;
   }
 
-﻿  async function startChat(job, opts = {}) {
+﻿  async function openJobByHrefFallback(href, title) {
+    const wantHref = String(href || "");
+    const wantId = extractJobIdFromHref(wantHref);
+    if (!wantHref && !wantId) return { ok: false };
+
+    // 1) 全页再找一遍（含非主列表）
+    const anchors = Array.from(document.querySelectorAll("a[href*='job_detail'], a.job-name[href], a[href*='jobId=']"));
+    let hit = null;
+    for (const a of anchors) {
+      const h = a.href || a.getAttribute("href") || "";
+      const id = extractJobIdFromHref(h);
+      if ((wantId && (id === wantId || h.includes(wantId))) || (wantHref && (h === wantHref || h.includes(wantId || "___")))) {
+        hit = a;
+        break;
+      }
+    }
+    if (hit) {
+      const card = hit.closest("li.job-card-box, .job-card-box, .job-card-wrap, li") || hit;
+      try { card.scrollIntoView({ block: "center", behavior: "instant" }); } catch (_) {}
+      preventLinkNavigation(card, 1800);
+      clickLikeHuman(hit);
+      await sleep(600);
+      return { ok: true, via: "href-global", card, titleEl: hit };
+    }
+
+    // 2) 合成锚点点击（让 BOSS SPA 自己路由到岗位详情，再找沟通按钮）
+    try {
+      const a = document.createElement("a");
+      a.href = wantHref || (wantId ? location.origin + "/job_detail/" + wantId + ".html" : "#");
+      a.className = "job-name bht-synthetic-job";
+      a.textContent = title || "job";
+      a.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0;pointer-events:auto;";
+      document.body.appendChild(a);
+      a.click();
+      await sleep(900);
+      a.remove();
+      if (firstEl(SELECTORS.detailRoot) || firstEl(SELECTORS.chatOnDetail) || hasUsableChatInput()) {
+        return { ok: true, via: "href-synthetic" };
+      }
+    } catch (_) {}
+
+    return { ok: false };
+  }
+
+  async function startChat(job, opts = {}) {
     const inputJob = (opts && opts.job) || job || {};
     const wantTitle = normalizeText(inputJob.title || "");
     const wantCompany = normalizeText(inputJob.company || "");
@@ -1017,6 +1072,64 @@ function dismissCommonDialogs() {
     }
 
     if (!picked) {
+      // 列表虚拟化/Feed 变化时：按扫描时保存的 href 兜底打开
+      const fb = await openJobByHrefFallback(wantHref || inputJob.href, inputJob.title || "");
+      if (fb.ok) {
+        log("startChat href fallback via", fb.via, inputJob.title);
+        if (fb.card) {
+          picked = {
+            card: fb.card,
+            live: parseJobCard(fb.card, 0),
+            score: 80,
+            via: fb.via
+          };
+        } else {
+          // 无卡片：直接走详情/沟通按钮
+          if (typeof detectLoginModal === "function") {
+            const loginHit = detectLoginModal();
+            if (loginHit.ok) {
+              return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+            }
+          }
+          let clicked = { ok: false };
+          for (let i = 0; i < 16; i++) {
+            clicked = await clickChatButton();
+            if (clicked.ok) break;
+            await sleep(320);
+          }
+          if (!clicked.ok) {
+            return {
+              ok: false,
+              error: "CHAT_BUTTON_NOT_FOUND",
+              message: "已尝试按链接打开岗位，但未找到「立即沟通」按钮。请确认已登录且仍在职位列表页",
+              contentVersion: BHT_CONTENT_VERSION
+            };
+          }
+          await sleep(450);
+          dismissCommonDialogs();
+          const chatReady = await waitForChat(16000);
+          if (!chatReady) {
+            return {
+              ok: false,
+              error: "CHAT_TIMEOUT",
+              message: "聊天输入框未出现。请确认已登录；如有弹窗请先处理",
+              contentVersion: BHT_CONTENT_VERSION
+            };
+          }
+          return {
+            ok: true,
+            already: Boolean(clicked.already),
+            job: inputJob,
+            securityId: inputJob.securityId || "",
+            contentVersion: BHT_CONTENT_VERSION,
+            matchedVia: fb.via,
+            matchScore: 80
+          };
+        }
+      }
+    }
+
+    if (!picked) {
       const titles = visibleTitleSamples();
       return {
         ok: false,
@@ -1024,7 +1137,7 @@ function dismissCommonDialogs() {
         message:
           "列表中找不到该岗位「" +
           (inputJob.title || "") +
-          "」。请回到职位列表顶部后重新扫描预览再投" +
+          "」。当前列表可能已刷新，请重新扫描预览后再投" +
           (titles.length ? "\n当前可见示例：" + titles.join(" / ") : "") +
           "\n页面：" +
           (location.pathname || ""),

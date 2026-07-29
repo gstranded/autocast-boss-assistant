@@ -398,22 +398,13 @@ async function processOneJob(task, resultRow, config) {
   }
 
   await log('info', `开始沟通：${job.title} @ ${job.company || ''}`, { jobId: job.jobId });
+  // version stamp for support
+  // (content reports its version in START_CHAT response)
 
 
 
-// ENSURE_JOB_LIST before start (轻量：真正查找+点击都在 START_CHAT 原子完成)
-  {
-    try { await sendToBoss(MSG.CLOSE_CHAT, {}); } catch (_) {}
-    await sleep(200);
-    try {
-      const ensured = await sendToBoss(MSG.ENSURE_JOB_LIST, { maxWaitMs: 5000, scroll: false });
-      if (ensured && ensured.ok === false) {
-        await log('warn', ensured.message || '职位列表暂未就绪，将直接按职位信息查找', { jobId: job.jobId });
-      }
-    } catch (_) {}
-    await sleep(150);
-  }
-  const chatRes = await sendToBoss(MSG.START_CHAT, { job, skipScroll: true });
+// 列表恢复交给 START_CHAT 原子处理，避免预先 CLOSE/ENSURE 打乱虚拟列表
+  const chatRes = await sendToBoss(MSG.START_CHAT, { job, skipScroll: false });
   if (chatRes?.contentVersion) {
     await log('info', 'content v' + chatRes.contentVersion + (chatRes.matchedVia ? (' · 匹配:' + chatRes.matchedVia) : ''), { jobId: job.jobId });
   }
@@ -673,8 +664,10 @@ async function runTaskLoop(taskId) {
 
         task.status = TASK_STATUS.PAUSED;
         task.awaitingUserRetry = true;
+        task.uiErrorDismissed = false;
         task.retryCurrent = false;
         task.pauseReason = task.pauseReason || itemErrorHint(task, row) || '岗位处理失败，请查看原因后重试';
+        task.errorKey = [task.id || '', row.job?.jobId || '', task.pauseReason || ''].join('|');
         task.lastErrorDetail = ['岗位：' + (row.job?.title || ''), '公司：' + (row.job?.company || ''), '原因：' + ((task.items.find((x) => x.jobId === row.job.jobId) || {}).reasons || []).join('；')].filter(Boolean).join('\n');
         runner.pause = true;
         await publishTask(task);
@@ -874,14 +867,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 }
               }
               all0.task.retryCurrent = true;
+              all0.task.uiErrorDismissed = false;
               all0.task.consecutiveFails = 0;
               all0.task.pauseReason = '';
               all0.task.lastErrorDetail = '';
+              all0.task.errorKey = '';
             } else {
               // 工具栏「继续」：不自动重置失败项，跳过它们往下跑
               all0.task.retryCurrent = false;
+              all0.task.uiErrorDismissed = true;
               all0.task.pauseReason = '';
               all0.task.lastErrorDetail = '';
+              all0.task.errorKey = '';
             }
             await publishTask(all0.task);
           }
@@ -947,6 +944,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const all = await getAllConfig();
         if (all.task) {
           all.task.awaitingUserRetry = false;
+          all.task.uiErrorDismissed = true;
           all.task.retryCurrent = false;
           all.task.status = TASK_STATUS.PAUSED;
           all.task.updatedAt = Date.now();

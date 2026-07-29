@@ -31,7 +31,7 @@ test("background force-injects content on critical ops", () => {
 
 test("background ensures list before chat and returns after job", () => {
   const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
-  assert.ok(s.includes("ENSURE_JOB_LIST before start"));
+  assert.ok(s.includes("列表恢复交给 START_CHAT") || s.includes("START_CHAT"));
   assert.ok(s.includes("RETURN_TO_LIST after job"));
   assert.ok(s.includes("RETURN_TO_LIST after fail"));
   assert.ok(s.includes("RETURN_TO_LIST after send fail"));
@@ -42,10 +42,19 @@ test("background ensures list before chat and returns after job", () => {
 
 test("content startChat is href-first and versioned", () => {
   const s = fs.readFileSync("extension/content/content-main.js", "utf8");
-  assert.ok(s.includes('BHT_CONTENT_VERSION = "1.2.5"'));
+  assert.ok(s.includes('BHT_CONTENT_VERSION = "1.2.6"'));
   assert.ok(s.includes("matchedVia"));
   assert.ok(s.includes("tryPickVisible"));
   assert.ok(s.includes("JOB_CARD_NOT_FOUND"));
+  assert.ok(s.includes("openJobByHrefFallback"));
+  assert.ok(s.includes("uiErrorDismissed") === false); // content may not have it
+});
+
+test("background modal dismiss flag + atomic startChat", () => {
+  const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(s.includes("uiErrorDismissed"));
+  assert.ok(s.includes("列表恢复交给 START_CHAT") || s.includes("skipScroll: false"));
+  assert.ok(s.includes("DISMISS_ERROR_MODAL"));
 });
 
 test("message protocol includes list control", () => {

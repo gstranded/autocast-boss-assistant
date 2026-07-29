@@ -4,7 +4,7 @@ import { reasonText } from '../shared/reason-codes.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
-const BHT_UI_VERSION = "1.2.5";
+const BHT_UI_VERSION = "1.2.6";
 // FLOAT_MODE_FORCE_BOSS: floating host only injects on BOSS pages
 const state = {
   modalDismissed: false,
@@ -503,7 +503,7 @@ async function refresh(options = {}) {
 
   const isBoss = Boolean(res.activeIsBoss || res.activeTab);
   if (isBoss) {
-    setConn(true, '已连接 BOSS 页面');
+    setConn(true, '已连接 BOSS · v' + BHT_UI_VERSION);
     setBossMode(true);
   } else {
     const reason = '当前不是 BOSS 直聘页面，助手仅在 zhipin.com 生效';
@@ -929,12 +929,13 @@ chrome.runtime.onMessage.addListener((msg) => {
       msg.payload?.status === 'paused' &&
       msg.payload?.awaitingUserRetry &&
       msg.payload?.pauseReason &&
+      !msg.payload?.uiErrorDismissed &&
       !state.modalDismissed
     ) {
       const reason = msg.payload.pauseReason;
       const detail = msg.payload?.lastErrorDetail || '';
       const body = reason + (detail ? ('\n\n' + detail) : '');
-      const key = '投递已暂停|' + body;
+      const key = msg.payload?.errorKey || ('投递已暂停|' + body);
       if (state.modalClosedForKey && state.modalClosedForKey === key) return;
       showErrorModal('投递已暂停', body, { showRetry: true, force: false });
     }
@@ -954,9 +955,16 @@ $('bht-modal-close')?.addEventListener('click', async () => {
   const modal = $('bht-modal');
   if (modal) modal.hidden = true;
   try {
-    await api('BHT_DISMISS_ERROR_MODAL', {});
-  } catch (_) {}
+    await api(MSG.DISMISS_ERROR_MODAL, {});
+  } catch (_) {
+    try { await api('BHT_DISMISS_ERROR_MODAL', {}); } catch (__) {}
+  }
+  if (state.config?.task) {
+    state.config.task.awaitingUserRetry = false;
+    state.config.task.uiErrorDismissed = true;
+  }
   toast('已关闭，任务保持暂停，不会自动重试', 'warn', 2800);
+  forceEnableControls();
 });
 
 $('bht-modal-retry')?.addEventListener('click', async () => {
