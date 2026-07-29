@@ -376,11 +376,15 @@
   }
 
   async function openJobDetail(job) {
-    const ensure = await ensureJobList({ maxWaitMs: 6000 });
-    if (!ensure.ok) return { ok: false, error: "LIST_NOT_READY", message: ensure.message };
-
-    const card = findCardByJob(job);
-    if (!card) return { ok: false, error: "JOB_CARD_NOT_FOUND" };
+    await ensureJobList({ maxWaitMs: 5000, scroll: true });
+    let card = findCardByJob(job);
+    if (!card && job?.title) {
+      card = getJobCards().find((c, i) => {
+        const p = parseJobCard(c, i);
+        return p.title && (p.title === job.title || p.title.includes(job.title) || job.title.includes(p.title));
+      }) || null;
+    }
+    if (!card) return { ok: false, error: "JOB_CARD_NOT_FOUND", message: "未找到岗位卡片" };
 
     const wrap = card.closest(".job-card-wrap") || card;
     try {
@@ -472,49 +476,65 @@
     return hasUsableChatInput();
   }
 
-  async function ensureJobList({ maxWaitMs = 8000 } = {}) {
-    if (getJobCards().length > 0) return { ok: true, count: getJobCards().length, restored: false };
-
-    // 若在聊天全页，先返回
-    if (isChatPage()) {
-      try {
-        history.back();
-      } catch (_) {}
-      await sleep(700);
+  async function ensureJobList({ maxWaitMs = 12000, scroll = true } = {}) {
+    const readyCount = () => getJobCards().length;
+    if (readyCount() > 0) {
+      return { ok: true, count: readyCount(), restored: false, href: location.href };
     }
 
-    // 关掉可能遮挡的聊天浮层
+    // 聊天页先返回
+    if (isChatPage()) {
+      try { history.back(); } catch (_) {}
+      await sleep(900);
+    }
     await closeChatPanel();
+    await sleep(300);
+
+    if (scroll) {
+      try { await autoScrollList(6); } catch (_) {}
+    }
 
     const start = Date.now();
+    let navTried = false;
     while (Date.now() - start < maxWaitMs) {
-      if (getJobCards().length > 0) {
-        return { ok: true, count: getJobCards().length, restored: true };
+      if (readyCount() > 0) {
+        return { ok: true, count: readyCount(), restored: true, href: location.href };
       }
-      // 尝试点顶部「职位」导航
+      // 点「职位/推荐」导航
       const jobNav = Array.from(document.querySelectorAll("a,button,span,div")).find((el) => {
         const t = textOf(el);
-        return t === "职位" || t === "推荐" || /职位列表|找工作/.test(t);
+        return t === "职位" || t === "推荐" || t === "首页" || /职位列表|找工作|职位推荐/.test(t);
       });
       if (jobNav) clickLikeHuman(jobNav);
+
+      // 仍无卡片且路径不像列表，尝试进入 jobs（只跳一次，然后继续等）
+      if (!navTried && readyCount() === 0 && /zhipin\.com|bosszhipin\.com/i.test(location.hostname)) {
+        const path = location.pathname || "";
+        const looksList = /geek\/(jobs|job)|rec-job|recommend|search|job_detail/i.test(path + location.href);
+        if (!looksList) {
+          navTried = true;
+          const target = location.origin + "/web/geek/jobs";
+          if (!location.href.startsWith(target)) {
+            location.assign(target);
+            // 给 SPA 时间加载，不立刻判失败
+            await sleep(1500);
+          }
+        }
+      }
+      if (scroll && (Date.now() - start) > 2500) {
+        try { window.scrollBy(0, 600); } catch (_) {}
+      }
       await sleep(400);
     }
 
-    // 最后手段：若当前不在 geek jobs，跳到 jobs（仅 BOSS 域）
-    if (getJobCards().length === 0 && /zhipin\.com|bosszhipin\.com/i.test(location.hostname)) {
-      if (!/\/web\/geek\/jobs|\/web\/geek\/job/.test(location.pathname)) {
-        const target = location.origin + "/web/geek/jobs";
-        if (location.href !== target) {
-          location.href = target;
-          return { ok: false, error: "NAVIGATING_TO_LIST", message: "正在返回职位列表页" };
-        }
-      }
-    }
-
+    const count = readyCount();
     return {
-      ok: getJobCards().length > 0,
-      count: getJobCards().length,
-      message: getJobCards().length ? "" : "未找到职位列表，请打开 BOSS 职位推荐/搜索页"
+      ok: count > 0,
+      count,
+      restored: true,
+      href: location.href,
+      error: count > 0 ? "" : "LIST_NOT_FOUND",
+      message: count > 0 ? "" : "未找到职位列表卡片。请停留在 BOSS 职位推荐/搜索列表页后重试，或重新扫描预览"
     };
   }
 
@@ -559,27 +579,61 @@
   }
 
   async function startChat(job) {
-    const opened = await openJobDetail(job);
-    if (!opened.ok) return opened;
+    // 尽量恢复列表，但不因列表检测失败直接放弃（卡片可能仍在）
+    const ensured = await ensureJobList({ maxWaitMs: 8000, scroll: true });
+    let card = findCardByJob(job);
 
-    // 详情区「立即沟通」优先，避免误点其它按钮
+    // 二次模糊匹配：标题包含关系
+    if (!card && job?.title) {
+      const cards = getJobCards();
+      card = cards.find((c, i) => {
+        const p = parseJobCard(c, i);
+        return p.title && (p.title === job.title || p.title.includes(job.title) || job.title.includes(p.title));
+      }) || null;
+      if (card) {
+        // 同步最新 jobId
+        const parsed = parseJobCard(card, 0);
+        if (parsed.jobId) job.jobId = parsed.jobId;
+      }
+    }
+
+    if (!card) {
+      return {
+        ok: false,
+        error: "JOB_CARD_NOT_FOUND",
+        message: ensured?.ok
+          ? "列表中找不到该岗位，请重新扫描预览后再投递"
+          : (ensured?.message || "职位列表未就绪，请打开职位列表页并重新扫描预览"),
+        listCount: getJobCards().length,
+        href: location.href
+      };
+    }
+
+    const opened = await openJobDetail(job);
+    if (!opened.ok && opened.error !== "LIST_NOT_READY") {
+      // openJobDetail 内部还会 ensure；若仅 list 警告但 card 在，继续
+      if (opened.error === "JOB_CARD_NOT_FOUND") return opened;
+    }
+
+    // 详情区立即沟通
     let clicked = await clickChatButton();
     if (!clicked.ok) {
-      // 再尝试卡片内部按钮
-      const card = findCardByJob(job);
-      const cardBtn = card
-        ? Array.from(card.querySelectorAll("a,button")).find((el) =>
-            /立即沟通|继续沟通|打招呼/.test(textOf(el))
-          )
-        : null;
-      if (!cardBtn) return clicked;
+      const cardBtn = Array.from(card.querySelectorAll("a,button")).find((el) =>
+        /立即沟通|继续沟通|打招呼/.test(textOf(el))
+      );
+      if (!cardBtn) {
+        return {
+          ok: false,
+          error: "CHAT_BUTTON_NOT_FOUND",
+          message: "未找到「立即沟通」按钮，请确认已登录且岗位可沟通"
+        };
+      }
       clickLikeHuman(cardBtn);
       clicked = { ok: true, buttonText: textOf(cardBtn), already: /继续沟通/.test(textOf(cardBtn)) };
     }
 
-    await sleep(400);
+    await sleep(450);
     dismissCommonDialogs();
-
     const chatReady = await waitForChat(14000);
     if (!chatReady) {
       const login = Array.from(document.querySelectorAll("a,button,div")).find((el) =>
@@ -595,16 +649,16 @@
       return {
         ok: false,
         error: "CHAT_TIMEOUT",
-        securityId: opened.securityId,
-        message: "聊天窗口未出现，可能页面结构变化或被弹窗阻挡"
+        message: "聊天窗口未出现，请手动点一次「立即沟通」确认页面是否正常",
+        securityId: opened?.securityId
       };
     }
 
     return {
       ok: true,
       already: Boolean(clicked.already),
-      securityId: opened.securityId,
-      detailSalary: opened.detailSalary,
+      securityId: opened?.securityId,
+      detailSalary: opened?.detailSalary,
       chatPage: isChatPage(),
       href: location.href
     };

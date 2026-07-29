@@ -35,7 +35,8 @@ let runner = {
   running: false,
   abort: false,
   pause: false,
-  skipCurrent: false
+  skipCurrent: false,
+  pauseLogged: false
 };
 
 chrome.runtime.onInstalled.addListener(async () => {
@@ -346,17 +347,24 @@ async function processOneJob(task, resultRow, config) {
   }
 
   await log('info', `开始沟通：${job.title} @ ${job.company || ''}`, { jobId: job.jobId });
-  // ENSURE_JOB_LIST before start
+  // ENSURE_JOB_LIST before start（软检测：失败不直接放弃，交给 START_CHAT 再试）
   {
-    const listReady = await sendToBoss(MSG.ENSURE_JOB_LIST, { maxWaitMs: 10000 });
+    let listReady = await sendToBoss(MSG.ENSURE_JOB_LIST, { maxWaitMs: 8000, scroll: true });
     if (!listReady?.ok) {
-      item.state = 'FAILED';
-      item.reasons = [listReady?.message || '职位列表未就绪'];
-      task.counters.failed += 1;
-      task.consecutiveFails += 1;
-      await bumpDailyStat('fail');
-      await log('error', item.reasons[0], { jobId: job.jobId });
-      return 'failed';
+      await log('warn', listReady?.message || '职位列表暂未就绪，尝试滚动重扫…', { jobId: job.jobId });
+      const rescanned = await sendToBoss(MSG.SCAN_JOBS, { scroll: true, maxRounds: 5 });
+      if (rescanned?.ok && rescanned.jobs?.length) {
+        // 用最新列表刷新当前 job 的 index/jobId（标题匹配）
+        const hit = rescanned.jobs.find((j) => j.jobId === job.jobId || j.title === job.title);
+        if (hit) {
+          Object.assign(job, hit);
+          resultRow.job = job;
+        }
+        listReady = { ok: true, count: rescanned.jobs.length };
+      }
+    }
+    if (!listReady?.ok) {
+      await log('warn', '列表仍未就绪，仍尝试直接沟通该岗位', { jobId: job.jobId });
     }
   }
   const chatRes = await sendToBoss(MSG.START_CHAT, { job });
@@ -533,6 +541,7 @@ async function runTaskLoop(taskId) {
   runner.abort = false;
   runner.pause = false;
   runner.skipCurrent = false;
+  runner.pauseLogged = false;
 
   try {
     let config = await getAllConfig();
@@ -590,7 +599,7 @@ async function runTaskLoop(taskId) {
         task.pauseReason = reasonText(REASON.EXEC_CONSECUTIVE_FAIL);
         runner.pause = true;
         await publishTask(task);
-        await log('error', task.pauseReason);
+        if (!runner.pauseLogged) { runner.pauseLogged = true; await log('error', task.pauseReason); }
         break;
       }
 

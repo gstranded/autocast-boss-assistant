@@ -794,6 +794,31 @@ function bindEvents() {
     state.formDirty = false;
   await refresh({ soft: false });
   });
+  $('btnCopyLogs')?.addEventListener('click', async () => {
+    const logs = state.config?.logs || [];
+    const text = logs
+      .slice()
+      .reverse()
+      .map((l) => {
+        const time = new Date(l.ts || Date.now()).toLocaleTimeString();
+        return `[${time}] ${l.message || ''}`;
+      })
+      .join('\n');
+    try {
+      await navigator.clipboard.writeText(text || '暂无日志');
+      toast('日志已复制');
+    } catch (_) {
+      // fallback
+      const ta = document.createElement('textarea');
+      ta.value = text || '暂无日志';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+      toast('日志已复制');
+    }
+  });
+
   $('btnClearLogs').addEventListener('click', async () => {
     await api(MSG.CLEAR_LOGS);
     state.formDirty = false;

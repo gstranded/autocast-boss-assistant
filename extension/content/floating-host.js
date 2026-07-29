@@ -96,6 +96,79 @@
     } catch (_) {}
   }
 
+  
+  function enableFabDrag(fab) {
+    let dragging = false;
+    let moved = false;
+    let startX = 0, startY = 0, origL = 0, origT = 0;
+    const STORE = "bht_fab_pos_v1";
+
+    try {
+      const raw = localStorage.getItem(STORE);
+      if (raw) {
+        const pos = JSON.parse(raw);
+        if (typeof pos.left === "number" && typeof pos.top === "number") {
+          fab.style.left = pos.left + "px";
+          fab.style.top = pos.top + "px";
+          fab.style.right = "auto";
+          fab.style.bottom = "auto";
+        }
+      }
+    } catch (_) {}
+
+    const onDown = (e) => {
+      dragging = true;
+      moved = false;
+      const point = e.touches ? e.touches[0] : e;
+      startX = point.clientX;
+      startY = point.clientY;
+      const rect = fab.getBoundingClientRect();
+      origL = rect.left;
+      origT = rect.top;
+      fab.style.left = origL + "px";
+      fab.style.top = origT + "px";
+      fab.style.right = "auto";
+      fab.style.bottom = "auto";
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+      document.addEventListener("touchmove", onMove, { passive: false });
+      document.addEventListener("touchend", onUp);
+    };
+    const onMove = (e) => {
+      if (!dragging) return;
+      const point = e.touches ? e.touches[0] : e;
+      const dx = point.clientX - startX;
+      const dy = point.clientY - startY;
+      if (Math.abs(dx) + Math.abs(dy) > 4) moved = true;
+      if (e.cancelable && moved) e.preventDefault();
+      const left = Math.max(0, Math.min(window.innerWidth - 48, origL + dx));
+      const top = Math.max(0, Math.min(window.innerHeight - 48, origT + dy));
+      fab.style.left = left + "px";
+      fab.style.top = top + "px";
+    };
+    const onUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.removeEventListener("touchmove", onMove);
+      document.removeEventListener("touchend", onUp);
+      const rect = fab.getBoundingClientRect();
+      try {
+        localStorage.setItem(STORE, JSON.stringify({ left: rect.left, top: rect.top }));
+      } catch (_) {}
+      // 若发生拖动，阻止紧随其后的 click 打开面板
+      if (moved) {
+        fab.dataset.skipClick = "1";
+        setTimeout(() => {
+          delete fab.dataset.skipClick;
+        }, 80);
+      }
+    };
+    fab.addEventListener("mousedown", onDown);
+    fab.addEventListener("touchstart", onDown, { passive: true });
+  }
+
   function enableDrag(panel, handle) {
     let dragging = false;
     let startX = 0;
@@ -159,7 +232,15 @@
     const btnMin = root.querySelector("#bht-min");
     const btnClose = root.querySelector("#bht-close");
 
-    fab.addEventListener("click", () => setOpen(true));
+    enableFabDrag(fab);
+    fab.addEventListener("click", (e) => {
+      if (fab.dataset.skipClick === "1") {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      setOpen(true);
+    });
     btnMin.addEventListener("click", () => setOpen(false));
     btnClose.addEventListener("click", () => setOpen(false));
     enableDrag(panel, drag);
