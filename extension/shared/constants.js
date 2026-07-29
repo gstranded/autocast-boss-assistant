@@ -47,8 +47,8 @@ export const ITEM_STATE = {
 export const DEFAULT_SETTINGS = {
   messageMode: MESSAGE_MODES.AUTO_DETECT,
   similarityThreshold: 0.85,
-  segmentIntervalMs: [1200, 2500],
-  jobIntervalMs: [2000, 4000],
+  segmentIntervalMs: [1800, 3200],
+  jobIntervalMs: [3500, 6000],
   taskMaxCommunicate: 30,
   dailyMaxCommunicate: 80,
   companyDailyMax: 3,

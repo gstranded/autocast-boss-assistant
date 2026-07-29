@@ -218,3 +218,56 @@ html.float-mode main {
   overflow: auto;
   max-height: calc(100vh - 110px);
 }
+/* toast */
+.bht-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  z-index: 9999;
+  max-width: calc(100% - 24px);
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.94);
+  color: #f8fafc;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: 0 10px 30px rgba(0,0,0,.28);
+  pointer-events: none;
+}
+.bht-toast.success { background: rgba(22, 163, 74, 0.95); }
+.bht-toast.error { background: rgba(220, 38, 38, 0.95); }
+.bht-toast.warn { background: rgba(217, 119, 6, 0.95); }
+
+/* modal */
+.bht-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: rgba(2, 6, 23, 0.55);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+}
+.bht-modal[hidden] { display: none !important; }
+.bht-modal-card {
+  width: min(340px, 100%);
+  background: #111a2e;
+  border: 1px solid #243353;
+  border-radius: 14px;
+  padding: 14px;
+  color: #e8eefc;
+  box-shadow: 0 18px 40px rgba(0,0,0,.35);
+}
+.bht-modal-title { font-size: 15px; font-weight: 800; margin-bottom: 8px; }
+.bht-modal-body {
+  font-size: 13px;
+  color: #cbd5e1;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow: auto;
+  margin-bottom: 12px;
+}
+.bht-modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.bht-modal-actions .btn { min-width: 72px; }

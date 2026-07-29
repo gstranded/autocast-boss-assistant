@@ -103,7 +103,7 @@ async function getActiveBossTab({ allowInactiveBossTab = false } = {}) {
   return all.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0] || null;
 }
 
-async function sendToBoss(type, payload = {}) {
+async function sendToBoss(type, payload = {}, { retries = 1 } = {}) {
   const tab = await getActiveBossTab({ allowInactiveBossTab: false });
   if (!tab?.id) {
     const active = (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
@@ -122,7 +122,17 @@ async function sendToBoss(type, payload = {}) {
     };
   }
   try {
-    return await chrome.tabs.sendMessage(tab.id, { type, payload });
+    try {
+      return await chrome.tabs.sendMessage(tab.id, { type, payload });
+    } catch (err0) {
+      const msg0 = String(err0?.message || err0 || '');
+      if (retries > 0 && /message channel closed|Receiving end does not exist|asynchronous response/i.test(msg0)) {
+        // channel closed retry
+        await sleep(700);
+        return sendToBoss(type, payload, { retries: retries - 1 });
+      }
+      throw err0;
+    }
   } catch (err) {
     try {
       const latest = await chrome.tabs.get(tab.id);
@@ -283,6 +293,12 @@ async function runPreview(payload = {}) {
   return { ok: true, task, summary, warnings };
 }
 
+function itemErrorHint(task, row) {
+  const item = (task.items || []).find((x) => x.jobId === row?.job?.jobId);
+  const reason = (item?.reasons || []).filter(Boolean).join('；');
+  return reason || task.pauseReason || '';
+}
+
 async function waitWhilePaused(task) {
   while (runner.pause && !runner.abort) {
     task.status = TASK_STATUS.PAUSED;
@@ -374,12 +390,15 @@ async function processOneJob(task, resultRow, config) {
     if (chatRes?.error === 'CHAT_TIMEOUT') code = REASON.EXEC_CHAT_TIMEOUT;
     if (chatRes?.error === 'LOGIN_REQUIRED') code = REASON.LIMIT_PLATFORM;
     item.reasons = [reasonText(code, chatRes?.message || chatRes?.error || '')];
+    task.pauseReason = item.reasons[0];
+    task.lastErrorDetail = '岗位：' + (job.title || '') + ' @ ' + (job.company || '');
     task.counters.failed += 1;
     task.consecutiveFails += 1;
     await bumpDailyStat('fail');
     await log('error', `沟通失败：${item.reasons[0]}`, { jobId: job.jobId });
     if (chatRes?.error === 'LOGIN_REQUIRED') {
       runner.pause = true;
+      task.awaitingUserRetry = true;
       task.status = TASK_STATUS.PAUSED;
       task.pauseReason = chatRes.message || '请先登录 BOSS 直聘后再投递';
       await publishTask(task);
@@ -589,6 +608,24 @@ async function runTaskLoop(taskId) {
         await sendToBoss(MSG.RETURN_TO_LIST, {});
         await sleep(500);
       }
+      // awaitingUserRetry on fail
+      if (outcome === 'failed') {
+        task.status = TASK_STATUS.PAUSED;
+        task.awaitingUserRetry = true;
+        task.pauseReason = task.pauseReason || itemErrorHint(task, row) || '岗位处理失败，请查看原因后重试';
+        task.lastErrorDetail = [
+          '岗位：' + (row.job?.title || ''),
+          '公司：' + (row.job?.company || ''),
+          '原因：' + ((task.items.find(x => x.jobId === row.job.jobId) || {}).reasons || []).join('；')
+        ].filter(Boolean).join('\n');
+        runner.pause = true;
+        await publishTask(task);
+        await log('error', task.pauseReason);
+        // 等用户点重试/关闭，不再立刻冲下一个
+        await waitWhilePaused(task);
+        if (runner.abort) break;
+        // 用户点重试后，不增加 processed 重复？已失败计一次
+      }
       task.counters.processed += 1;
       task.updatedAt = Date.now();
       await publishTask(task);
@@ -605,7 +642,12 @@ async function runTaskLoop(taskId) {
         break;
       }
 
-      await sleep(randomBetween(config.settings.jobIntervalMs));
+      // minJobInterval guard
+      {
+        let iv = config.settings.jobIntervalMs || [3500, 6000];
+        if (Array.isArray(iv) && iv[0] < 2500) iv = [3500, 6000];
+        await sleep(randomBetween(iv));
+      }
     }
 
     config = await getAllConfig();
@@ -724,6 +766,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await log('warn', '用户暂停任务');
         return { ok: true };
       case MSG.RESUME_TASK: {
+        if (true) {
+          const all0 = await getAllConfig();
+          if (all0.task) {
+            all0.task.awaitingUserRetry = false;
+            all0.task.pauseReason = '';
+            all0.task.lastErrorDetail = '';
+            await publishTask(all0.task);
+          }
+          runner.pauseLogged = false;
+          // reset FAILED for retry
+          {
+            const all1 = await getAllConfig();
+            if (all1.task?.items) {
+              all1.task.items = all1.task.items.map((it) =>
+                it.state === 'FAILED' ? { ...it, state: 'NOT_STARTED', reasons: [] } : it
+              );
+              all1.task.consecutiveFails = 0;
+              await publishTask(all1.task);
+            }
+          }
+        }
         // RESUME_TASK guard
         {
           const guard = await assertBossContext();

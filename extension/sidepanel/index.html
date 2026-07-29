@@ -253,6 +253,18 @@
         </section>
       </main>
     </div>
+
+    <div id="bht-toast" class="bht-toast" hidden></div>
+    <div id="bht-modal" class="bht-modal" hidden>
+      <div class="bht-modal-card">
+        <div class="bht-modal-title" id="bht-modal-title">提示</div>
+        <div class="bht-modal-body" id="bht-modal-body"></div>
+        <div class="bht-modal-actions">
+          <button type="button" class="btn" id="bht-modal-close">关闭</button>
+          <button type="button" class="btn primary" id="bht-modal-retry" hidden>重试</button>
+        </div>
+      </div>
+    </div>
     <script>if (new URLSearchParams(location.search).get('mode') === 'float') document.documentElement.classList.add('float-mode');</script>
     <script type="module" src="./app.js"></script>
   </body>

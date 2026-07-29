@@ -230,7 +230,7 @@ function renderProfileList() {
       await api(MSG.SAVE_RESUMES, state.config.resumes);
       state.formDirty = false;
   await refresh({ soft: false });
-      toast('已更新默认方案');
+      toast('已更新默认方案', 'success');
     });
   });
 }
@@ -511,8 +511,7 @@ async function saveFilters() {
   await api(MSG.SAVE_SETTINGS, settings);
   state.formDirty = false;
   await refresh({ soft: false });
-  toast('筛选已保存');
-}
+  }
 
 async function saveMessage() {
   const template = readTemplate(state.config.messageTemplate);
@@ -521,16 +520,14 @@ async function saveMessage() {
   await api(MSG.SAVE_SETTINGS, settings);
   state.formDirty = false;
   await refresh({ soft: false });
-  toast('消息模板已保存');
-}
+  }
 
 async function saveSettings() {
   const settings = readSettingsPatch(state.config.settings);
   await api(MSG.SAVE_SETTINGS, settings);
   state.formDirty = false;
   await refresh({ soft: false });
-  toast('设置已保存');
-}
+  }
 
 async function saveResume() {
   const resumes = structuredClone(state.config.resumes);
@@ -566,7 +563,7 @@ async function saveResume() {
   const attach = $('attachFile').files?.[0];
   if (attach) {
     if (attach.size > 4.5 * 1024 * 1024) {
-      toast('附件过大（建议 < 4.5MB）');
+      toast('附件过大（建议 < 4.5MB）', 'success');
     } else {
       profile.attachment = {
         name: attach.name,
@@ -588,8 +585,7 @@ async function saveResume() {
   $('attachFile').value = '';
   state.formDirty = false;
   await refresh({ soft: false });
-  toast('当前方案已保存');
-}
+  }
 
 async function saveBindings() {
   const rules = readBindingsFromDom()
@@ -598,17 +594,46 @@ async function saveBindings() {
   await api(MSG.SAVE_BINDINGS, { rules });
   state.formDirty = false;
   await refresh({ soft: false });
-  toast('绑定规则已保存');
+  }
+
+function toast(msg, type = 'success', ms = 2200) {
+  const el = $('bht-toast') || $('taskWarnings');
+  if (!el) return;
+  if (el.id === 'bht-toast') {
+    el.hidden = false;
+    el.textContent = msg;
+    el.className = 'bht-toast ' + (type || 'success');
+    clearTimeout(toast._timer);
+    toast._timer = setTimeout(() => {
+      el.hidden = true;
+    }, ms);
+  } else {
+    el.textContent = msg;
+    setTimeout(() => {
+      if (el.textContent === msg) {
+        const t = state.config?.task;
+        el.textContent = (t?.warnings || []).join('；');
+      }
+    }, ms);
+  }
 }
 
-function toast(msg) {
-  $('taskWarnings').textContent = msg;
-  setTimeout(() => {
-    if ($('taskWarnings').textContent === msg) {
-      const t = state.config?.task;
-      $('taskWarnings').textContent = (t?.warnings || []).join('；');
-    }
-  }, 2500);
+function showErrorModal(title, body, { showRetry = true } = {}) {
+  const modal = $('bht-modal');
+  if (!modal) {
+    toast(body || title, 'error', 4000);
+    return;
+  }
+  $('bht-modal-title').textContent = title || '投递失败';
+  $('bht-modal-body').textContent = body || '发生未知错误';
+  const retryBtn = $('bht-modal-retry');
+  if (retryBtn) retryBtn.hidden = !showRetry;
+  modal.hidden = false;
+}
+
+function hideErrorModal() {
+  const modal = $('bht-modal');
+  if (modal) modal.hidden = true;
 }
 
 function bindEvents() {
@@ -616,11 +641,46 @@ function bindEvents() {
     btn.addEventListener('click', () => showTab(btn.dataset.tab));
   });
 
-  $('btnSaveFilter').addEventListener('click', saveFilters);
-  $('btnSaveMessage').addEventListener('click', saveMessage);
-  $('btnSaveSettings').addEventListener('click', saveSettings);
-  $('btnSaveResume').addEventListener('click', saveResume);
-  $('btnSaveBindings').addEventListener('click', saveBindings);
+  $('btnSaveFilter').addEventListener('click', async () => {
+    try {
+      await saveFilters();
+      toast('筛选已保存', 'success');
+    } catch (e) {
+      toast(String(e.message || e), 'error');
+    }
+  });
+  $('btnSaveMessage').addEventListener('click', async () => {
+    try {
+      await saveMessage();
+      toast('消息模板已保存', 'success');
+    } catch (e) {
+      toast(String(e.message || e), 'error');
+    }
+  });
+  $('btnSaveSettings').addEventListener('click', async () => {
+    try {
+      await saveSettings();
+      toast('设置已保存', 'success');
+    } catch (e) {
+      toast(String(e.message || e), 'error');
+    }
+  });
+  $('btnSaveResume').addEventListener('click', async () => {
+    try {
+      await saveResume();
+      toast('当前方案已保存', 'success');
+    } catch (e) {
+      toast(String(e.message || e), 'error');
+    }
+  });
+  $('btnSaveBindings').addEventListener('click', async () => {
+    try {
+      await saveBindings();
+      toast('绑定规则已保存', 'success');
+    } catch (e) {
+      toast(String(e.message || e), 'error');
+    }
+  });
 
   $('btnAddSeg').addEventListener('click', () => {
     const template = readTemplate(state.config.messageTemplate);
@@ -630,25 +690,22 @@ function bindEvents() {
       text: ''
     });
     state.config.messageTemplate = template;
+    state.formDirty = true;
     renderSegments(template);
+    toast('已新增消息段', 'success');
   });
 
   $('btnAddProfile')?.addEventListener('click', async () => {
     flushActiveProfileForm();
     const resumes = structuredClone(state.config.resumes);
     const id = uid('profile');
-    resumes.profiles.push({
-      id,
-      name: `方案 ${resumes.profiles.length + 1}`,
-      images: [],
-      attachment: null
-    });
+    resumes.profiles.push({ id, name: `方案 ${resumes.profiles.length + 1}`, images: [], attachment: null });
     if (!resumes.defaultProfileId) resumes.defaultProfileId = id;
     state.activeProfileId = id;
     await api(MSG.SAVE_RESUMES, resumes);
     state.formDirty = false;
-  await refresh({ soft: false });
-    toast('已新建方案');
+    await refresh({ soft: false });
+    toast('已新建方案', 'success');
   });
 
   $('btnSetDefaultProfile')?.addEventListener('click', async () => {
@@ -657,29 +714,26 @@ function bindEvents() {
     resumes.defaultProfileId = state.activeProfileId || resumes.defaultProfileId;
     await api(MSG.SAVE_RESUMES, resumes);
     state.formDirty = false;
-  await refresh({ soft: false });
-    toast('已设为默认方案');
+    await refresh({ soft: false });
+    toast('已设为默认方案', 'success');
   });
 
   $('btnDeleteProfile')?.addEventListener('click', async () => {
     const resumes = structuredClone(state.config.resumes);
     if ((resumes.profiles || []).length <= 1) {
-      toast('至少保留一个方案');
+      toast('至少保留一个方案', 'error');
       return;
     }
     const delId = state.activeProfileId;
     resumes.profiles = resumes.profiles.filter((p) => p.id !== delId);
     if (resumes.defaultProfileId === delId) resumes.defaultProfileId = resumes.profiles[0].id;
     state.activeProfileId = resumes.defaultProfileId;
-    // clean bindings pointing to deleted
-    const bindings = {
-      rules: (state.config.bindings?.rules || []).filter((r) => r.profileId !== delId)
-    };
+    const bindings = { rules: (state.config.bindings?.rules || []).filter((r) => r.profileId !== delId) };
     await api(MSG.SAVE_RESUMES, resumes);
     await api(MSG.SAVE_BINDINGS, bindings);
     state.formDirty = false;
-  await refresh({ soft: false });
-    toast('方案已删除');
+    await refresh({ soft: false });
+    toast('方案已删除', 'success');
   });
 
   $('btnClearImages')?.addEventListener('click', async () => {
@@ -688,8 +742,8 @@ function bindEvents() {
     if (profile) profile.images = [];
     await api(MSG.SAVE_RESUMES, resumes);
     state.formDirty = false;
-  await refresh({ soft: false });
-    toast('已清空图片');
+    await refresh({ soft: false });
+    toast('已清空图片', 'success');
   });
 
   $('btnClearAttach')?.addEventListener('click', async () => {
@@ -698,46 +752,45 @@ function bindEvents() {
     if (profile) profile.attachment = null;
     await api(MSG.SAVE_RESUMES, resumes);
     state.formDirty = false;
-  await refresh({ soft: false });
-    toast('已清除附件');
+    await refresh({ soft: false });
+    toast('已清除附件', 'success');
   });
 
   $('btnAddBinding')?.addEventListener('click', () => {
-    const profileId =
-      state.activeProfileId || state.config.resumes.defaultProfileId || state.config.resumes.profiles[0]?.id;
+    const profileId = state.activeProfileId || state.config.resumes.defaultProfileId || state.config.resumes.profiles[0]?.id;
     state.draftBindings = readBindingsFromDom();
-    state.draftBindings.push({
-      id: uid('rule'),
-      keywords: [],
-      profileId,
-      priority: state.draftBindings.length
-    });
+    state.draftBindings.push({ id: uid('rule'), keywords: [], profileId, priority: state.draftBindings.length });
+    state.formDirty = true;
     renderBindings();
+    toast('已新增绑定规则', 'success');
   });
 
   $('btnPreview').addEventListener('click', async () => {
-    // BOSS_ONLY_GUARD_PREVIEW
-    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用');
+    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
+    toast('开始扫描预览…', 'warn', 1500);
     await saveFilters();
     $('btnPreview').disabled = true;
     $('taskStatus').textContent = '状态：扫描中…';
     const res = await api(MSG.RUN_PREVIEW, { scroll: true });
     if (!res?.ok) {
-      toast(res?.message || res?.error || '扫描失败，请打开职位列表页');
+      toast(res?.message || res?.error || '扫描失败，请打开职位列表页', 'error', 3500);
       setConn(false, '页面未就绪');
+      showErrorModal('扫描失败', res?.message || res?.error || '请打开 BOSS 职位列表页后重试', { showRetry: false });
     } else if (res.summary) {
-      toast(`扫描 ${res.summary.scanned}，通过 ${res.summary.pass}`);
+      toast(`扫描完成：通过 ${res.summary.pass} / 共 ${res.summary.scanned}`, 'success');
+    } else {
+      toast('预览完成', 'success');
     }
-    state.formDirty = false;
-  await refresh({ soft: false });
+    await refresh({ soft: false });
+    $('btnPreview').disabled = false;
   });
 
   $('btnDiagnose')?.addEventListener('click', async () => {
-    // BOSS_ONLY_GUARD_DIAG
-    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用');
+    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
+    toast('正在诊断页面…', 'warn', 1200);
     const res = await api(MSG.DIAGNOSE);
     if (!res?.ok) {
-      toast(res?.message || res?.error || '诊断失败：请先打开 BOSS 职位页');
+      toast(res?.message || res?.error || '诊断失败', 'error');
       return;
     }
     const c = res.counts || {};
@@ -747,53 +800,56 @@ function bindEvents() {
       `卡片: ${c.cardsTotal ?? c.card ?? 0}`,
       `标题节点: ${c.title ?? 0}`,
       `公司节点: ${c.company ?? 0}`,
-      `地点节点: ${c.location ?? 0}`,
-      `沟通按钮: ${c.chat ?? 0}`,
-      sample
-        ? `样例: ${sample.title || ''} @ ${sample.company || ''} / ${sample.location || ''}`
-        : '样例: 无'
+      sample ? `样例: ${sample.title || ''} @ ${sample.company || ''}` : '样例: 无'
     ];
     $('summaryBox').textContent = lines.join('\n');
-    toast(res.ok && (c.cardsTotal || 0) > 0 ? '诊断完成：已识别岗位卡片' : '诊断完成：未识别到岗位卡片');
-    if ((c.cardsTotal || 0) > 0) setConn(true, '页面结构可用');
+    toast((c.cardsTotal || 0) > 0 ? '诊断完成：已识别岗位卡片' : '诊断完成：未识别到岗位卡片', (c.cardsTotal || 0) > 0 ? 'success' : 'warn');
   });
 
   $('btnStart').addEventListener('click', async () => {
-    // BOSS_ONLY_GUARD_START
-    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用');
+    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
     const selectedJobIds = Array.from(state.selected);
     if (!selectedJobIds.length) {
-      toast('请至少选择一个通过岗位');
+      toast('请至少选择一个通过岗位', 'error');
       return;
     }
+    toast('正在启动投递…', 'warn', 1500);
     const res = await api(MSG.CONFIRM_AND_START, { selectedJobIds });
-    if (!res?.ok) toast(res?.error || '启动失败');
-    state.formDirty = false;
-  await refresh({ soft: false });
+    if (!res?.ok) {
+      toast(res?.message || res?.error || '启动失败', 'error', 3500);
+      showErrorModal('启动失败', res?.message || res?.error || '无法开始任务', { showRetry: false });
+    } else {
+      toast('已开始投递', 'success');
+    }
+    await refresh({ soft: true });
   });
 
   $('btnPause').addEventListener('click', async () => {
     await api(MSG.PAUSE_TASK);
-    state.formDirty = false;
-  await refresh({ soft: false });
+    toast('任务已暂停', 'warn');
+    await refresh({ soft: true });
   });
   $('btnResume').addEventListener('click', async () => {
-    // BOSS_ONLY_GUARD_RESUME
-    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用');
-    await api(MSG.RESUME_TASK);
-    state.formDirty = false;
-  await refresh({ soft: false });
+    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
+    hideErrorModal();
+    toast('继续任务…', 'warn', 1500);
+    const res = await api(MSG.RESUME_TASK);
+    if (!res?.ok) toast(res?.message || res?.error || '继续失败', 'error');
+    else toast('已继续投递', 'success');
+    await refresh({ soft: true });
   });
   $('btnStop').addEventListener('click', async () => {
     await api(MSG.STOP_TASK);
-    state.formDirty = false;
-  await refresh({ soft: false });
+    hideErrorModal();
+    toast('任务已停止', 'warn');
+    await refresh({ soft: true });
   });
   $('btnSkip').addEventListener('click', async () => {
     await api(MSG.SKIP_CURRENT);
-    state.formDirty = false;
-  await refresh({ soft: false });
+    toast('已请求跳过当前岗位', 'warn');
+    await refresh({ soft: true });
   });
+
   $('btnCopyLogs')?.addEventListener('click', async () => {
     const logs = state.config?.logs || [];
     const text = logs
@@ -806,23 +862,22 @@ function bindEvents() {
       .join('\n');
     try {
       await navigator.clipboard.writeText(text || '暂无日志');
-      toast('日志已复制');
+      toast('日志已复制', 'success');
     } catch (_) {
-      // fallback
       const ta = document.createElement('textarea');
       ta.value = text || '暂无日志';
       document.body.appendChild(ta);
       ta.select();
       document.execCommand('copy');
       ta.remove();
-      toast('日志已复制');
+      toast('日志已复制', 'success');
     }
   });
 
   $('btnClearLogs').addEventListener('click', async () => {
     await api(MSG.CLEAR_LOGS);
-    state.formDirty = false;
-  await refresh({ soft: false });
+    toast('日志已清空', 'success');
+    await refresh({ soft: true });
   });
 
   $('selectAllPass').addEventListener('change', () => {
@@ -833,11 +888,12 @@ function bindEvents() {
       if (on) state.selected.add(id);
       else state.selected.delete(id);
     });
+    toast(on ? '已全选通过项' : '已取消全选', 'success', 1200);
   });
 
   $('btnExport').addEventListener('click', async () => {
     const res = await api(MSG.EXPORT_CONFIG);
-    if (!res?.ok) return toast('导出失败');
+    if (!res?.ok) return toast('导出失败', 'error');
     const blob = new Blob([JSON.stringify(res.data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -845,6 +901,7 @@ function bindEvents() {
     a.download = `boss-haitou-config-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(url);
+    toast('配置已导出', 'success');
   });
 
   $('importFile').addEventListener('change', async () => {
@@ -856,28 +913,63 @@ function bindEvents() {
       const res = await api(MSG.IMPORT_CONFIG, { data });
       if (!res?.ok) throw new Error(res?.error || '导入失败');
       state.formDirty = false;
-  await refresh({ soft: false });
-      toast('导入成功');
+      await refresh({ soft: false });
+      toast('导入成功', 'success');
     } catch (e) {
-      toast(String(e.message || e));
+      toast(String(e.message || e), 'error');
     } finally {
       $('importFile').value = '';
     }
   });
 }
 
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === MSG.TASK_EVENT) {
     updateTaskUI(msg.payload, state.config?.runner);
     if (msg.payload?.summary) renderPreview(msg.payload);
+    if (msg.payload?.status === 'paused' && msg.payload?.pauseReason) {
+      const reason = msg.payload.pauseReason;
+      // 失败弹窗：给用户看清原因再决定重试
+      if (/失败|登录|找不到|超时|限制|未就绪|错误|channel|LIST|CHAT|JOB/i.test(reason) || msg.payload?.awaitingUserRetry) {
+        showErrorModal('投递已暂停', reason + (msg.payload?.lastErrorDetail ? ('\n\n' + msg.payload.lastErrorDetail) : ''), { showRetry: true });
+      }
+    }
   }
   if (msg?.type === MSG.LOG_EVENT) {
     const logs = [msg.payload, ...(state.config?.logs || [])].slice(0, 100);
     if (state.config) state.config.logs = logs;
     renderLogs(logs);
+    if (msg.payload?.level === 'error' && /登录|失败|找不到|超时/.test(msg.payload?.message || '')) {
+      // 避免每个 error 都弹；仅当任务暂停时弹
+      const st = state.config?.task?.status;
+      if (st === 'paused' || st === 'failed') {
+        showErrorModal('投递失败', msg.payload.message, { showRetry: st === 'paused' });
+      }
+    }
   }
 });
 
+$('bht-modal-close')?.addEventListener('click', () => {
+  hideErrorModal();
+});
+$('bht-modal-retry')?.addEventListener('click', async () => {
+  hideErrorModal();
+  toast('正在重试…', 'warn');
+  const res = await api(MSG.RESUME_TASK);
+  if (!res?.ok) toast(res?.message || res?.error || '重试失败', 'error');
+  await refresh({ soft: true });
+});
+
+$('bht-modal-close')?.addEventListener('click', () => hideErrorModal());
+$('bht-modal-retry')?.addEventListener('click', async () => {
+  hideErrorModal();
+  toast('正在重试…', 'warn');
+  const res = await api(MSG.RESUME_TASK);
+  if (!res?.ok) toast(res?.message || res?.error || '重试失败', 'error');
+  else toast('已继续投递', 'success');
+  await refresh({ soft: true });
+});
 bindEvents();
 refresh();
 setInterval(() => refresh({ soft: true }), 3000);

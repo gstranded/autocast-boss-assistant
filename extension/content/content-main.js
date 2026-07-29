@@ -572,7 +572,7 @@ function dismissCommonDialogs() {
           navTried = true;
           const target = location.origin + "/web/geek/jobs";
           if (!location.href.startsWith(target)) {
-            location.assign(target);
+            /* avoid navigate in msg handler */
             // 给 SPA 时间加载，不立刻判失败
             await sleep(1500);
           }
