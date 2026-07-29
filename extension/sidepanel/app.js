@@ -3,7 +3,11 @@ import { parseKeywords, uid } from '../shared/text-utils.js';
 import { reasonText } from '../shared/reason-codes.js';
 
 const $ = (id) => document.getElementById(id);
+const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
+// FLOAT_MODE_FORCE_BOSS: floating host only injects on BOSS pages
 const state = {
+  modalDismissed: false,
+  modalClosedForKey: '',
   config: null,
   selected: new Set(),
   activeProfileId: null,
@@ -30,17 +34,29 @@ function setConn(ok, text) {
 }
 
 function setBossMode(isBoss, reason = '') {
-  state.isBoss = Boolean(isBoss);
-  state.bossBlockReason = reason || '';
+  // 浮窗只在 BOSS 注入；避免 activeTab 误判导致按钮全灰
+  const effectiveBoss = FLOAT_MODE ? true : Boolean(isBoss);
+  state.isBoss = effectiveBoss;
+  state.bossBlockReason = effectiveBoss ? '' : (reason || '');
   ['btnPreview', 'btnDiagnose', 'btnStart', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
     const el = $(id);
     if (!el) return;
-    el.disabled = !isBoss;
-    el.title = isBoss ? '' : (reason || '仅在 BOSS 直聘页面可用');
+    // 控制按钮在 BOSS/浮窗下始终可点
+    if (['btnPause', 'btnResume', 'btnSkip', 'btnStop'].includes(id)) {
+      el.disabled = false;
+      el.removeAttribute('disabled');
+      el.title = '';
+      el.style.pointerEvents = 'auto';
+      el.style.opacity = '1';
+      return;
+    }
+    el.disabled = !effectiveBoss;
+    el.title = effectiveBoss ? '' : (reason || '仅在 BOSS 直聘页面可用');
+    el.style.opacity = effectiveBoss ? '1' : '0.45';
   });
-  if (!isBoss) {
-    $('taskStatus').textContent = '状态：未在 BOSS 页面（功能已锁定）';
-    if (reason) $('taskWarnings').textContent = reason;
+  if (!effectiveBoss) {
+    if ($('taskStatus')) $('taskStatus').textContent = '状态：未在 BOSS 页面（功能已锁定）';
+    if (reason && $('taskWarnings')) $('taskWarnings').textContent = reason;
   } else {
     updateTaskUI(state.config?.task, state.config?.runner);
   }
@@ -335,18 +351,24 @@ function statusLabel(status) {
 
 function updateTaskUI(task, runner = {}) {
   const status = task?.status || 'idle';
-  $('taskStatus').textContent = `状态：${statusLabel(status)}${task?.pauseReason ? `（${task.pauseReason}）` : ''}`;
+  if ($('taskStatus')) {
+    $('taskStatus').textContent = `状态：${statusLabel(status)}${task?.pauseReason ? `（${task.pauseReason}）` : ''}`;
+  }
   const c = task?.counters || { success: 0, skipped: 0, failed: 0, processed: 0 };
-  $('taskCounters').textContent = `成功 ${c.success || 0} · 跳过 ${c.skipped || 0} · 失败 ${c.failed || 0} · 已处理 ${c.processed || 0}`;
+  if ($('taskCounters')) {
+    $('taskCounters').textContent = `成功 ${c.success || 0} · 跳过 ${c.skipped || 0} · 失败 ${c.failed || 0} · 已处理 ${c.processed || 0}`;
+  }
 
-  const onBoss = state.isBoss !== false;
-  // 暂停/继续/跳过/停止：BOSS 页始终可点
+  const onBoss = FLOAT_MODE || state.isBoss !== false;
+  // 暂停/继续/跳过/停止：始终可点（浮窗/BOSS）
   ['btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
     const el = $(id);
     if (!el) return;
-    el.disabled = !onBoss;
+    el.disabled = false;
     el.removeAttribute('disabled');
-    if (!onBoss) el.disabled = true;
+    el.style.pointerEvents = 'auto';
+    el.style.opacity = '1';
+    el.title = '';
   });
   if ($('btnStart')) $('btnStart').disabled = !(onBoss && status === 'awaiting_confirm');
   if ($('btnPreview')) $('btnPreview').disabled = !(onBoss && status !== 'running');
@@ -616,9 +638,10 @@ function showErrorModal(title, body, { showRetry = true, force = false } = {}) {
     toast(body || title, 'error', 4000);
     return;
   }
-  // 已显示则不重复刷
-  if (!modal.hidden && !force) return;
-  state.lastModalKey = String(title || '') + '|' + String(body || '');
+  const key = String(title || '') + '|' + String(body || '');
+  if (!force && state.modalClosedForKey === key) return;
+  if (!force && !modal.hidden && state.lastModalKey === key) return;
+  state.lastModalKey = key;
   $('bht-modal-title').textContent = title || '投递失败';
   $('bht-modal-body').textContent = body || '发生未知错误';
   const retryBtn = $('bht-modal-retry');
@@ -630,6 +653,7 @@ function hideErrorModal() {
   const modal = $('bht-modal');
   if (modal) modal.hidden = true;
   state.modalDismissed = true;
+  state.modalClosedForKey = state.lastModalKey || state.modalClosedForKey || '';
 }
 
 function bindEvents() {
@@ -820,33 +844,7 @@ function bindEvents() {
     await refresh({ soft: true });
   });
 
-  $('btnPause').addEventListener('click', async () => {
-    const res = await api(MSG.PAUSE_TASK);
-    toast(res?.ok === false ? (res.message || '暂停失败') : '任务已暂停', res?.ok === false ? 'error' : 'warn');
-    await refresh({ soft: true });
-  });
-  $('btnResume').addEventListener('click', async () => {
-    state.modalDismissed = false;
-    const modal = $('bht-modal');
-    if (modal) modal.hidden = true;
-    toast('继续任务…', 'warn', 1200);
-    const res = await api(MSG.RESUME_TASK);
-    toast(res?.ok === false ? (res.message || res.error || '继续失败') : '已继续投递', res?.ok === false ? 'error' : 'success');
-    await refresh({ soft: true });
-  });
-  $('btnStop').addEventListener('click', async () => {
-    state.modalDismissed = true;
-    const modal = $('bht-modal');
-    if (modal) modal.hidden = true;
-    const res = await api(MSG.STOP_TASK);
-    toast(res?.ok === false ? (res.message || '停止失败') : '任务已停止', res?.ok === false ? 'error' : 'warn');
-    await refresh({ soft: true });
-  });
-  $('btnSkip').addEventListener('click', async () => {
-    const res = await api(MSG.SKIP_CURRENT);
-    toast(res?.ok === false ? (res.message || '跳过失败') : '已跳过当前岗位', res?.ok === false ? 'error' : 'warn');
-    await refresh({ soft: true });
-  });
+  // controls wired in wireControlButtons()
 
   $('btnCopyLogs')?.addEventListener('click', async () => {
     const logs = state.config?.logs || [];
@@ -934,7 +932,10 @@ chrome.runtime.onMessage.addListener((msg) => {
     ) {
       const reason = msg.payload.pauseReason;
       const detail = msg.payload?.lastErrorDetail || '';
-      showErrorModal('投递已暂停', reason + (detail ? ('\n\n' + detail) : ''), { showRetry: true, force: false });
+      const body = reason + (detail ? ('\n\n' + detail) : '');
+      const key = '投递已暂停|' + body;
+      if (state.modalClosedForKey && state.modalClosedForKey === key) return;
+      showErrorModal('投递已暂停', body, { showRetry: true, force: false });
     }
   }
   if (msg?.type === MSG.LOG_EVENT) {
@@ -944,12 +945,16 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 });
 
-$('bht-modal-close')?.addEventListener('click', () => {
+$('bht-modal-close')?.addEventListener('click', async () => {
   state.modalDismissed = true;
-  state.lastModalKey = '';
+  const bodyText = $('bht-modal-body')?.textContent || '';
+  state.modalClosedForKey = state.lastModalKey || ('投递已暂停|' + bodyText);
+  state.lastModalKey = state.modalClosedForKey;
   const modal = $('bht-modal');
   if (modal) modal.hidden = true;
-  // 关闭 = 保持暂停，不自动重试
+  try {
+    await api('BHT_DISMISS_ERROR_MODAL', {});
+  } catch (_) {}
   toast('已关闭，任务保持暂停，不会自动重试', 'warn', 2800);
 });
 
@@ -969,16 +974,88 @@ $('bht-modal-retry')?.addEventListener('click', async () => {
   await refresh({ soft: true });
 });
 
-// CONTROL_DELEGATE: 兜底保证按钮可点
-document.addEventListener('click', async (e) => {
-  const btn = e.target?.closest?.('#btnPause, #btnResume, #btnSkip, #btnStop, #bht-modal-close, #bht-modal-retry');
+// 控制按钮强制可点 + 独立绑定（防止 disabled/重复状态导致失灵）
+function forceEnableControls() {
+  ['btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.disabled = false;
+    el.removeAttribute('disabled');
+    el.style.pointerEvents = 'auto';
+    el.style.opacity = '1';
+  });
+}
+
+function wireControlButtons() {
+  const once = (id, handler) => {
+    const el = $(id);
+    if (!el) return;
+    if (el.dataset.bhtWired === '1') return;
+    el.dataset.bhtWired = '1';
+    el.addEventListener('click', async (ev) => {
+      forceEnableControls();
+      try {
+        await handler(ev);
+      } catch (err) {
+        toast(String(err?.message || err), 'error');
+      }
+    });
+  };
+
+  once('btnPause', async () => {
+    const res = await api(MSG.PAUSE_TASK);
+    toast(res?.ok === false ? (res.message || '暂停失败') : '任务已暂停', res?.ok === false ? 'error' : 'warn');
+    await refresh({ soft: true });
+  });
+
+  once('btnResume', async () => {
+    state.modalDismissed = false;
+    state.modalClosedForKey = '';
+    state.lastModalKey = '';
+    const modal = $('bht-modal');
+    if (modal) modal.hidden = true;
+    toast('继续任务…', 'warn', 1200);
+    const res = await api(MSG.RESUME_TASK);
+    toast(res?.ok === false ? (res.message || res.error || '继续失败') : '已继续投递', res?.ok === false ? 'error' : 'success');
+    await refresh({ soft: true });
+  });
+
+  once('btnSkip', async () => {
+    const res = await api(MSG.SKIP_CURRENT);
+    // 暂停等待中也允许跳过：清 pause 继续循环
+    if (state.config?.runner?.pause || state.config?.task?.status === 'paused') {
+      await api(MSG.RESUME_TASK);
+    }
+    toast(res?.ok === false ? (res.message || '跳过失败') : '已请求跳过当前岗位', res?.ok === false ? 'error' : 'warn');
+    await refresh({ soft: true });
+  });
+
+  once('btnStop', async () => {
+    state.modalDismissed = true;
+    state.modalClosedForKey = state.lastModalKey || 'stop';
+    const modal = $('bht-modal');
+    if (modal) modal.hidden = true;
+    const res = await api(MSG.STOP_TASK);
+    toast(res?.ok === false ? (res.message || '停止失败') : '任务已停止', res?.ok === false ? 'error' : 'warn');
+    await refresh({ soft: true });
+  });
+}
+
+// 捕获阶段解除 disabled，避免“点了没反应”
+document.addEventListener('click', (e) => {
+  const btn = e.target?.closest?.('#btnPause, #btnResume, #btnSkip, #btnStop');
   if (!btn) return;
-  // native listeners also fire; this is backup if disabled attribute wrongly set
   if (btn.disabled) {
     btn.disabled = false;
+    btn.removeAttribute('disabled');
   }
 }, true);
 
 bindEvents();
+forceEnableControls();
+wireControlButtons();
 refresh();
-setInterval(() => refresh({ soft: true }), 3000);
+setInterval(() => {
+  forceEnableControls();
+  refresh({ soft: true });
+}, 3000);

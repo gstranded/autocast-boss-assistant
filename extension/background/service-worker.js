@@ -300,17 +300,10 @@ function itemErrorHint(task, row) {
 }
 
 async function waitWhilePaused(task) {
-  // 进入暂停时只发布一次，避免侧栏弹窗被反复刷出
-  if (runner.pause && task && !runner.pausePublished) {
-    runner.pausePublished = true;
-    task.status = TASK_STATUS.PAUSED;
-    task.updatedAt = Date.now();
-    await publishTask(task);
-  }
+  // 不在此处重复 publish，避免弹窗被 TASK_EVENT 反复触发
   while (runner.pause && !runner.abort) {
-    await sleep(400);
+    await sleep(350);
   }
-  runner.pausePublished = false;
 }
 
 async function processOneJob(task, resultRow, config) {
@@ -638,8 +631,7 @@ async function runTaskLoop(taskId) {
         ].filter(Boolean).join('\n');
         runner.pause = true;
         await publishTask(task);
-        await log('error', task.pauseReason);
-        // 等用户点重试/关闭，不再立刻冲下一个
+        // 等用户点重试/关闭；不再重复 log pauseReason（processOneJob 已记录）
         await waitWhilePaused(task);
         if (runner.abort) break;
         // 用户点重试后，不增加 processed 重复？已失败计一次
@@ -836,10 +828,43 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         await log('warn', '用户停止任务');
         return { ok: true };
-      case MSG.SKIP_CURRENT:
+      case MSG.SKIP_CURRENT: {
         runner.skipCurrent = true;
+        // 若在等待用户重试的暂停中，允许跳过后继续
+        if (runner.pause) {
+          const all = await getAllConfig();
+          if (all.task) {
+            all.task.awaitingUserRetry = false;
+            // mark current failed/paused item skipped if possible
+            if (all.task.currentJobId && all.task.items) {
+              all.task.items = all.task.items.map((it) =>
+                it.jobId === all.task.currentJobId && (it.state === 'FAILED' || it.state === 'NOT_STARTED' || it.state === 'COMMUNICATION_CREATED')
+                  ? { ...it, state: 'SKIPPED', reasons: ['用户跳过'] }
+                  : it
+              );
+            }
+            await publishTask(all.task);
+          }
+          runner.pause = false;
+        }
         await log('warn', '将跳过当前岗位');
         return { ok: true };
+      }
+      case MSG.DISMISS_ERROR_MODAL:
+      case 'BHT_DISMISS_ERROR_MODAL': {
+        // 用户关闭错误弹窗：保持暂停，但清除 awaitingUserRetry，避免反复弹窗
+        runner.pause = true;
+        const all = await getAllConfig();
+        if (all.task) {
+          all.task.awaitingUserRetry = false;
+          all.task.status = TASK_STATUS.PAUSED;
+          all.task.updatedAt = Date.now();
+          // 保留 pauseReason 便于状态栏显示，但不再驱动弹窗
+          await publishTask(all.task);
+        }
+        await log('warn', '用户关闭错误提示，任务保持暂停');
+        return { ok: true };
+      }
       case MSG.EXPORT_CONFIG:
         return { ok: true, data: await exportAll() };
       case MSG.IMPORT_CONFIG:

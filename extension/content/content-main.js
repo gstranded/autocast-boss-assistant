@@ -164,9 +164,19 @@
 
   function normalizeText(input = "") {
     return String(input || "")
+      .replace(/【[^】]*】/g, "")
+      .replace(/\[[^\]]*\]/g, "")
       .replace(/\s+/g, "")
-      .replace(/[【】\[\]()（）]/g, "")
+      .replace(/[【】\[\]()（）·•|｜]/g, "")
       .toLowerCase();
+  }
+
+  function coreTitle(input = "") {
+    // 去城市后缀、括号说明，保留核心职位名
+    return normalizeText(String(input || "")
+      .replace(/[-—–].*$/, (m) => m) // keep for now
+      .replace(/（[^）]*）/g, "")
+      .replace(/\([^)]*\)/g, ""));
   }
 
   function hashStr(s) {
@@ -192,23 +202,34 @@
   function getJobCards() {
     const preferred = [
       "ul.rec-job-list li.job-card-box",
+      ".job-list-container ul li.job-card-box",
       ".job-list-container li.job-card-box",
       ".job-recommend-result li.job-card-box",
       ".search-job-result li.job-card-box",
+      ".recommend-result-job li.job-card-box",
       "li.job-card-box",
       ".job-card-box"
     ];
     let cards = [];
     for (const sel of preferred) {
       try {
-        const list = Array.from(document.querySelectorAll(sel));
+        const list = Array.from(document.querySelectorAll(sel)).filter((el) => {
+          // 排除详情区、侧栏推荐、聊天区
+          if (el.closest(".job-detail-box, .job-detail-container, .chat-container, .chat-box, .dialog-chat")) return false;
+          // 排除明显非主列表的小卡片区
+          const root = el.closest("ul, ol, .job-list, .job-list-container, .rec-job-list, .search-job-result");
+          if (root && root.querySelectorAll("li.job-card-box, .job-card-box").length < 3 && cards.length === 0) {
+            // still allow if only few cards on page
+          }
+          return true;
+        });
         if (list.length) { cards = list; break; }
       } catch (_) {}
     }
     if (!cards.length) {
       cards = Array.from(document.querySelectorAll("a.job-name"))
         .map((a) => {
-          if (a.closest(".job-detail-box, .job-detail-container")) return null;
+          if (a.closest(".job-detail-box, .job-detail-container, .chat-container, .chat-box")) return null;
           return a.closest("li.job-card-box") || a.closest(".job-card-box") || a.closest(".job-card-wrap") || a.closest("li") || a.parentElement;
         })
         .filter(Boolean);
@@ -243,7 +264,11 @@
     let jobId =
       card.getAttribute?.("data-jobid") ||
       card.getAttribute?.("data-job-id") ||
+      card.getAttribute?.("data-jid") ||
+      card.dataset?.jobid ||
+      card.dataset?.jid ||
       linkEl?.getAttribute?.("data-jobid") ||
+      linkEl?.getAttribute?.("data-jid") ||
       extractJobIdFromHref(href);
 
     // securityId 可能在详情 more link，卡片阶段先空
@@ -757,12 +782,15 @@ function dismissCommonDialogs() {
       if (!p) return -1;
       let score = 0;
       const t = normalizeText(p.title || "");
+      const tc = typeof coreTitle === 'function' ? coreTitle(p.title || '') : t;
+      const wantCore = typeof coreTitle === 'function' ? coreTitle(inputJob.title || '') : wantTitle;
       const co = normalizeText(p.company || "");
       if (wantId && p.jobId && p.jobId === wantId) score += 100;
       if (wantHrefId && (p.jobId === wantHrefId || (p.href && p.href.includes(wantHrefId)))) score += 80;
+      if (wantHref && p.href && (p.href === wantHref || p.href.includes(wantHrefId || '___'))) score += 70;
       if (wantTitle && t) {
-        if (t === wantTitle) score += 50;
-        else if (t.includes(wantTitle) || wantTitle.includes(t)) score += 30;
+        if (t === wantTitle || tc === wantCore) score += 50;
+        else if (t.includes(wantTitle) || wantTitle.includes(t) || (wantCore && tc && (tc.includes(wantCore) || wantCore.includes(tc)))) score += 35;
         else return -1;
       } else if (!wantId && !wantHrefId) {
         return -1;
@@ -770,7 +798,7 @@ function dismissCommonDialogs() {
       if (wantCompany && co) {
         if (co === wantCompany) score += 12;
         else if (co.includes(wantCompany) || wantCompany.includes(co)) score += 6;
-        else score -= 4;
+        // 公司不匹配不直接否决：推荐流公司字段常是 HR 名
       }
       return score;
     };
@@ -804,7 +832,7 @@ function dismissCommonDialogs() {
           best = { card, live: mergedLive, score: sc };
         }
       }
-      return bestScore >= 30 ? best : null;
+      return bestScore >= 25 ? best : null;
     };
 
     if (getJobCards().length === 0) {

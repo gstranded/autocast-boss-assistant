@@ -8,7 +8,9 @@
 #bht-float-root * { box-sizing: border-box; }
 #bht-float-root .bht-fab,
 #bht-float-root .bht-panel,
-#bht-float-root .bht-icon-btn { pointer-events: auto; }
+#bht-float-root .bht-panel-header,
+#bht-float-root .bht-icon-btn,
+#bht-float-root .bht-frame { pointer-events: auto; }
 
 #bht-float-root .bht-fab {
   position: fixed;
