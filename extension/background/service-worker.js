@@ -166,31 +166,52 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       const opId = 'op_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
       await chrome.storage.local.remove('bht_op_' + opId).catch(() => {});
       await chrome.storage.local.set({ ['bht_op_' + opId]: { status: 'pending', at: Date.now() } });
+      const fireOp = async () => {
+        const ack = await chrome.tabs.sendMessage(tab.id, {
+          type: 'BHT_RUN_OP',
+          payload: { opId, opType: type, opPayload: payload }
+        });
+        if (ack && ack.accepted) return true;
+        if (ack && ack.error === 'UNKNOWN_TYPE') return false;
+        // 旧 content 无 RUN_OP 时走失败，触发注入重试
+        return Boolean(ack && ack.ok !== false);
+      };
+      let fired = false;
       try {
-        await chrome.tabs.sendMessage(tab.id, {
-          type: 'BHT_RUN_OP',
-          payload: { opId, opType: type, opPayload: payload }
-        });
+        fired = await fireOp();
       } catch (eAck) {
-        await forceInjectContent(tab.id);
-        await sleep(200);
-        await chrome.tabs.sendMessage(tab.id, {
-          type: 'BHT_RUN_OP',
-          payload: { opId, opType: type, opPayload: payload }
-        });
+        fired = false;
       }
+      if (!fired) {
+        await forceInjectContent(tab.id);
+        await sleep(220);
+        fired = await fireOp();
+      }
+      if (!fired) throw new Error('RUN_OP_NOT_SUPPORTED');
       const started = Date.now();
-      while (Date.now() - started < 120000) {
-        await sleep(400);
+      let reinjectAt = started + 8000;
+      while (Date.now() - started < 90000) {
+        await sleep(350);
         const bag = await chrome.storage.local.get('bht_op_' + opId);
         const row = bag && bag['bht_op_' + opId];
         if (row && row.status === 'done') {
           try { await chrome.storage.local.remove('bht_op_' + opId); } catch (_) {}
           return row.result || { ok: false, error: 'EMPTY_OP_RESULT' };
         }
-        // 若 tab 仍在 BOSS 且过久 pending，偶尔 re-inject 但不重发（避免双跑）
+        // 超时前若仍 pending：可能 content 被导航销毁，重注入并重发一次同 opId（幂等由 content 覆盖写）
+        if (Date.now() > reinjectAt && type === MSG.START_CHAT) {
+          reinjectAt = Date.now() + 12000;
+          try {
+            const latest = await chrome.tabs.get(tab.id);
+            if (isBossUrl(latest?.url || '')) {
+              await forceInjectContent(tab.id);
+              await sleep(250);
+              await fireOp();
+            }
+          } catch (_) {}
+        }
       }
-      return { ok: false, error: 'OP_TIMEOUT', message: '操作超时（岗位定位/发消息）' };
+      return { ok: false, error: 'OP_TIMEOUT', message: '操作超时（岗位定位/发消息）。请保持在职位列表页并重新扫描预览' };
     } catch (bridgeErr) {
       // fall through to port/message
       console.warn('storage bridge fail', bridgeErr);

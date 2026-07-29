@@ -15,7 +15,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.2.9";
+  const BHT_CONTENT_VERSION = "1.3.0";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -1096,7 +1096,55 @@ async function startChat(job, opts = {}) {
       try { await ensureJobList({ maxWaitMs: 7000, scroll: true }); } catch (_) {}
     }
 
-    let picked = tryPickVisible(true) || tryPickVisible(false);
+    // HREF_FIRST_OPEN: 有 jobId/href 时优先直达，避免长滚动把列表刷成别的 Feed
+    let picked = null;
+    if (wantHrefId || wantHref) {
+      const byHrefNow = typeof findByHref === 'function' ? (findByHref(true) || findByHref(false)) : null;
+      if (byHrefNow) picked = byHrefNow;
+    }
+    if (!picked) picked = tryPickVisible(true) || tryPickVisible(false);
+
+    if (!picked && (wantHrefId || wantHref)) {
+      const fbEarly = await openJobByHrefFallback(wantHref || inputJob.href, inputJob.title || "");
+      if (fbEarly.ok) {
+        log("startChat early href fallback via", fbEarly.via, inputJob.title);
+        if (fbEarly.card) {
+          picked = { card: fbEarly.card, live: parseJobCard(fbEarly.card, 0), score: 90, via: fbEarly.via };
+        } else {
+          // 已尝试打开详情：直接走沟通按钮
+          if (typeof detectLoginModal === "function") {
+            const loginHit = detectLoginModal();
+            if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+          }
+          let clicked = { ok: false };
+          for (let i = 0; i < 16; i++) {
+            clicked = await clickChatButton();
+            if (clicked.ok) break;
+            await sleep(300);
+          }
+          if (clicked.ok) {
+            await sleep(400);
+            dismissCommonDialogs();
+            if (typeof detectLoginModal === "function") {
+              const loginHit = detectLoginModal();
+              if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+            }
+            const chatReady = await waitForChat(16000);
+            if (chatReady) {
+              return {
+                ok: true,
+                already: Boolean(clicked.already),
+                job: inputJob,
+                securityId: inputJob.securityId || "",
+                contentVersion: BHT_CONTENT_VERSION,
+                matchedVia: fbEarly.via,
+                matchScore: 90
+              };
+            }
+          }
+        }
+      }
+    }
 
     if (!picked) {
       try { window.scrollTo(0, 0); } catch (_) {}
@@ -1473,63 +1521,118 @@ async function startChat(job, opts = {}) {
     return { ok: true, count: cards.length };
   }
 
+  async function runOpByType(type, payload = {}) {
+    switch (type) {
+      case MSG.PING:
+      case "BHT_PING":
+        return { ok: true, page: pageInfo(), contentVersion: BHT_CONTENT_VERSION };
+      case MSG.GET_PAGE_INFO:
+      case "BHT_GET_PAGE_INFO":
+        return { ok: true, page: pageInfo(), contentVersion: BHT_CONTENT_VERSION };
+      case MSG.DIAGNOSE:
+      case "BHT_DIAGNOSE":
+        return { ok: true, ...diagnose(), contentVersion: BHT_CONTENT_VERSION };
+      case MSG.SCAN_JOBS:
+      case "BHT_SCAN_JOBS":
+        return await scanJobs(payload || {});
+      case MSG.START_CHAT:
+      case "BHT_START_CHAT":
+        return await startChat(payload?.job || payload, payload || {});
+      case MSG.GET_CHAT_SELF_MESSAGES:
+      case "BHT_GET_CHAT_SELF_MESSAGES":
+        await waitForChat(8000);
+        return { ok: true, messages: getSelfMessages(payload?.limit || 8) };
+      case MSG.SEND_TEXT:
+      case "BHT_SEND_TEXT":
+        return await sendText(payload?.text || "");
+      case MSG.SEND_IMAGE:
+      case "BHT_SEND_IMAGE":
+        return await sendImageFromDataUrl(payload?.dataUrl, payload?.fileName);
+      case MSG.HIGHLIGHT_JOBS:
+      case "BHT_HIGHLIGHT_JOBS":
+        return highlightJobs(payload?.map || {});
+      case MSG.CLOSE_CHAT:
+      case "BHT_CLOSE_CHAT":
+        return await closeChatPanel();
+      case MSG.ENSURE_JOB_LIST:
+      case "BHT_ENSURE_JOB_LIST":
+        return await ensureJobList(payload || {});
+      case MSG.RETURN_TO_LIST:
+      case "BHT_RETURN_TO_LIST":
+        return await returnToJobList();
+      default:
+        return { ok: false, error: "UNKNOWN_TYPE", type };
+    }
+  }
+
   const onBhtMessage = (message, _sender, sendResponse) => {
     const { type, payload } = message || {};
+
+    // storage 桥：立即 ACK，后台轮询结果，避免 SPA 点击打断 channel
+    if (type === "BHT_RUN_OP" || type === MSG.RUN_OP) {
+      const opId = payload?.opId;
+      const opType = payload?.opType || payload?.type;
+      const opPayload = payload?.opPayload || payload?.payload || {};
+      try {
+        sendResponse({ ok: true, accepted: true, opId, contentVersion: BHT_CONTENT_VERSION });
+      } catch (_) {}
+      (async () => {
+        let result;
+        try {
+          result = await runOpByType(opType, opPayload);
+        } catch (err) {
+          result = { ok: false, error: String(err?.message || err), contentVersion: BHT_CONTENT_VERSION };
+        }
+        try {
+          await chrome.storage.local.set({
+            ["bht_op_" + opId]: {
+              status: "done",
+              result,
+              at: Date.now(),
+              contentVersion: BHT_CONTENT_VERSION
+            }
+          });
+        } catch (e) {
+          log("storage write fail", e);
+        }
+        try {
+          chrome.runtime.sendMessage({ type: "BHT_OP_DONE", payload: { opId, result } }).catch(() => {});
+        } catch (_) {}
+      })();
+      return true;
+    }
+
     (async () => {
       try {
-        switch (type) {
-          case MSG.PING:
-            return { ok: true, page: pageInfo() };
-          case MSG.GET_PAGE_INFO:
-            return { ok: true, page: pageInfo() };
-          case MSG.DIAGNOSE:
-            return { ok: true, ...diagnose() };
-          case MSG.SCAN_JOBS:
-            return await scanJobs(payload || {});
-          case MSG.START_CHAT:
-            return await startChat(payload?.job || payload, payload || {});
-          case MSG.GET_CHAT_SELF_MESSAGES:
-            await waitForChat(8000);
-            return { ok: true, messages: getSelfMessages(payload?.limit || 8) };
-          case MSG.SEND_TEXT:
-            return await sendText(payload?.text || "");
-          case MSG.SEND_IMAGE:
-            return await sendImageFromDataUrl(payload?.dataUrl, payload?.fileName);
-          case MSG.HIGHLIGHT_JOBS:
-            return highlightJobs(payload?.map || {});
-          case MSG.CLOSE_CHAT:
-            return await closeChatPanel();
-          case MSG.ENSURE_JOB_LIST:
-            return await ensureJobList(payload || {});
-          case MSG.RETURN_TO_LIST:
-            return await returnToJobList();
-          default:
-            return { ok: false, error: "UNKNOWN_TYPE", type };
-        }
+        return await runOpByType(type, payload || {});
       } catch (err) {
         log("handler error", err);
         return { ok: false, error: String(err?.message || err) };
       }
-    })().then(sendResponse);
+    })().then((res) => {
+      try { sendResponse(res); } catch (_) {}
+    });
     return true;
   };
+  if (window.__BHT_ON_MESSAGE__ && window.__BHT_ON_MESSAGE__ !== onBhtMessage) {
+    try { chrome.runtime.onMessage.removeListener(window.__BHT_ON_MESSAGE__); } catch (_) {}
+  }
   window.__BHT_ON_MESSAGE__ = onBhtMessage;
   chrome.runtime.onMessage.addListener(onBhtMessage);
 
-  // 长耗时操作走 Port，避免 tabs.sendMessage 被 SPA 点击打断
+  // Port 备用通道
   if (!window.__BHT_ON_CONNECT__) {
     const onConnect = (port) => {
       if (!port || port.name !== "bht-op") return;
       port.onMessage.addListener((message) => {
         const { type, payload, reqId } = message || {};
-        const run = async () => {
+        (async () => {
           try {
             return await runOpByType(type, payload || {});
           } catch (err) {
             return { ok: false, error: String(err?.message || err) };
           }
-        };
-        run().then((result) => {
+        })().then((result) => {
           try { port.postMessage({ reqId, result }); } catch (_) {}
         });
       });
@@ -1537,7 +1640,6 @@ async function startChat(job, opts = {}) {
     window.__BHT_ON_CONNECT__ = onConnect;
     chrome.runtime.onConnect.addListener(onConnect);
   }
-
 
   log("content script ready v" + BHT_CONTENT_VERSION, location.href, "cards=", getJobCards().length);
 })();
