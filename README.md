@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/logo.png" alt="Boss 海投助手 Logo" width="120" />
+  <img src="https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/logo.png" alt="Boss 海投助手 Logo" width="120" />
 </p>
 
 <h1 align="center">Boss 海投助手</h1>
@@ -45,7 +45,7 @@ Boss 海投助手把差异化放在可靠性与可控性上，而不是极限自
 
 先扫描，再确认，最后投递。每条岗位都能看到**通过 / 跳过原因**。
 
-![任务页截图](docs/assets/screenshots/01-task.png)
+![任务页截图](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/01-task.png)
 
 **核心点**
 - 扫描预览汇总（扫描数 / 通过数 / 排除原因）
@@ -58,7 +58,7 @@ Boss 海投助手把差异化放在可靠性与可控性上，而不是极限自
 
 职位、公司、JD、地点分字段配置，不再只有一个关键词框。
 
-![筛选页截图](docs/assets/screenshots/02-filter.png)
+![筛选页截图](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/02-filter.png)
 
 **核心点**
 - 职位名 OR / AND / NOT
@@ -70,7 +70,7 @@ Boss 海投助手把差异化放在可靠性与可控性上，而不是极限自
 
 默认「自动识别」模式，避免和 BOSS 原生打招呼语重复。
 
-![消息页截图](docs/assets/screenshots/03-message.png)
+![消息页截图](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/03-message.png)
 
 **核心点**
 - 三种模式：原生补充 / 全插件发送 / 自动识别（默认）
@@ -81,7 +81,7 @@ Boss 海投助手把差异化放在可靠性与可控性上，而不是极限自
 
 不同方向用不同简历，避免“一张简历打天下”。
 
-![简历页截图](docs/assets/screenshots/04-resume.png)
+![简历页截图](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/04-resume.png)
 
 **核心点**
 - 多求职方案（图片简历 / 附件简历）
@@ -93,7 +93,7 @@ Boss 海投助手把差异化放在可靠性与可控性上，而不是极限自
 
 把账号安全边界做成一等功能。
 
-![设置页截图](docs/assets/screenshots/05-settings.png)
+![设置页截图](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/05-settings.png)
 
 **核心点**
 - 本次 / 每日 / 同公司上限
