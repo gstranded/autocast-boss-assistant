@@ -144,8 +144,8 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     MSG.CLOSE_CHAT,
     MSG.ENSURE_JOB_LIST
   ];
+  const longOps = [MSG.START_CHAT, MSG.SEND_TEXT, MSG.SEND_IMAGE, MSG.SCAN_JOBS, MSG.RETURN_TO_LIST];
 
-  // 仅在 ping 失败时强制注入，避免打断长耗时 startChat / 消息通道
   let needInject = forceInject;
   if (!needInject && critical.includes(type)) {
     try {
@@ -157,7 +157,71 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
   }
   if (needInject) {
     await forceInjectContent(tab.id);
-    await sleep(150);
+    await sleep(180);
+  }
+
+  // 长操作优先 Port，降低 channel closed
+  if (longOps.includes(type)) {
+    try {
+      const result = await new Promise((resolve, reject) => {
+        let done = false;
+        const reqId = 'r_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
+        let port;
+        try {
+          port = chrome.tabs.connect(tab.id, { name: 'bht-op' });
+        } catch (e) {
+          reject(e);
+          return;
+        }
+        const timer = setTimeout(() => {
+          if (done) return;
+          done = true;
+          try { port.disconnect(); } catch (_) {}
+          reject(new Error('PORT_TIMEOUT'));
+        }, 120000);
+        port.onMessage.addListener((msg) => {
+          if (!msg || msg.reqId !== reqId) return;
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          try { port.disconnect(); } catch (_) {}
+          resolve(msg.result);
+        });
+        port.onDisconnect.addListener(() => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          const err = chrome.runtime.lastError?.message || 'PORT_DISCONNECTED';
+          reject(new Error(err));
+        });
+        try {
+          port.postMessage({ type, payload, reqId });
+        } catch (e) {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          reject(e);
+        }
+      });
+      if (result) return result;
+    } catch (errPort) {
+      const msgP = String(errPort?.message || errPort || '');
+      if (retries > 0) {
+        await forceInjectContent(tab.id);
+        await sleep(400);
+        return sendToBoss(type, payload, { retries: retries - 1, forceInject: true });
+      }
+      // fall through to sendMessage once
+      try {
+        return await chrome.tabs.sendMessage(tab.id, { type, payload });
+      } catch (e2) {
+        return {
+          ok: false,
+          error: 'CONTENT_PORT_FAIL',
+          message: msgP + ' | ' + String(e2?.message || e2)
+        };
+      }
+    }
   }
 
   try {
@@ -165,7 +229,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       return await chrome.tabs.sendMessage(tab.id, { type, payload });
     } catch (err0) {
       const msg0 = String(err0?.message || err0 || "");
-      if (retries > 0 && /message channel closed|Receiving end does not exist|asynchronous response|Could not establish/i.test(msg0)) {
+      if (retries > 0 && /message channel closed|Receiving end does not exist|asynchronous response|Could not establish|PORT_/i.test(msg0)) {
         await forceInjectContent(tab.id);
         await sleep(450);
         return sendToBoss(type, payload, { retries: retries - 1, forceInject: true });

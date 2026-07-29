@@ -14,7 +14,7 @@
     DIAGNOSE: "BHT_DIAGNOSE"
   };
 
-  const BHT_CONTENT_VERSION = "1.2.6";
+  const BHT_CONTENT_VERSION = "1.2.7";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -838,8 +838,11 @@ function dismissCommonDialogs() {
       a.className = "job-name bht-synthetic-job";
       a.textContent = title || "job";
       a.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0;pointer-events:auto;";
+      const stopNav = (e) => { try { e.preventDefault(); e.stopPropagation(); } catch (_) {} };
+      a.addEventListener("click", stopNav, true);
       document.body.appendChild(a);
-      a.click();
+      // 触发站点自己的委托点击逻辑，同时阻止整页跳转
+      a.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
       await sleep(900);
       a.remove();
       if (firstEl(SELECTORS.detailRoot) || firstEl(SELECTORS.chatOnDetail) || hasUsableChatInput()) {
@@ -1440,6 +1443,50 @@ function dismissCommonDialogs() {
   };
   window.__BHT_ON_MESSAGE__ = onBhtMessage;
   chrome.runtime.onMessage.addListener(onBhtMessage);
+
+  // 长耗时操作走 Port，避免 tabs.sendMessage 被 SPA 点击打断
+  if (!window.__BHT_ON_CONNECT__) {
+    const onConnect = (port) => {
+      if (!port || port.name !== "bht-op") return;
+      port.onMessage.addListener((message) => {
+        const { type, payload, reqId } = message || {};
+        const run = async () => {
+          try {
+            switch (type) {
+              case MSG.START_CHAT:
+                return await startChat(payload?.job || payload, payload || {});
+              case MSG.SEND_TEXT:
+                return await sendText(payload?.text || "");
+              case MSG.SEND_IMAGE:
+                return await sendImageFromDataUrl(payload?.dataUrl, payload?.fileName);
+              case MSG.SCAN_JOBS:
+                return await scanJobs(payload || {});
+              case MSG.ENSURE_JOB_LIST:
+                return await ensureJobList(payload || {});
+              case MSG.RETURN_TO_LIST:
+                return await returnToJobList();
+              case MSG.CLOSE_CHAT:
+                return await closeChatPanel();
+              case MSG.DIAGNOSE:
+                return { ok: true, ...diagnose() };
+              case MSG.PING:
+                return { ok: true, page: pageInfo(), contentVersion: BHT_CONTENT_VERSION };
+              default:
+                return { ok: false, error: "UNKNOWN_TYPE", type };
+            }
+          } catch (err) {
+            return { ok: false, error: String(err?.message || err) };
+          }
+        };
+        run().then((result) => {
+          try { port.postMessage({ reqId, result }); } catch (_) {}
+        });
+      });
+    };
+    window.__BHT_ON_CONNECT__ = onConnect;
+    chrome.runtime.onConnect.addListener(onConnect);
+  }
+
 
   log("content script ready v" + BHT_CONTENT_VERSION, location.href, "cards=", getJobCards().length);
 })();

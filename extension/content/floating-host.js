@@ -79,8 +79,8 @@
       const frame = document.getElementById("bht-frame");
       if (frame) {
         // FORCE_IFRAME_RELOAD: 每次打开都带版本号，避免浮窗卡在旧 UI
-        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=1.2.6");
-        if (!frame.src || !frame.src.includes("v=1.2.6")) {
+        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=1.2.7");
+        if (!frame.src || !frame.src.includes("v=1.2.7")) {
           frame.src = next;
         }
       }
