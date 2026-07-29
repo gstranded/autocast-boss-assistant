@@ -300,8 +300,9 @@ function itemErrorHint(task, row) {
 }
 
 async function waitWhilePaused(task) {
-  // 只在进入暂停时发布一次，避免弹窗被反复触发
-  if (runner.pause && task) {
+  // 进入暂停时只发布一次，避免侧栏弹窗被反复刷出
+  if (runner.pause && task && !runner.pausePublished) {
+    runner.pausePublished = true;
     task.status = TASK_STATUS.PAUSED;
     task.updatedAt = Date.now();
     await publishTask(task);
@@ -309,6 +310,7 @@ async function waitWhilePaused(task) {
   while (runner.pause && !runner.abort) {
     await sleep(400);
   }
+  runner.pausePublished = false;
 }
 
 async function processOneJob(task, resultRow, config) {
@@ -368,33 +370,19 @@ async function processOneJob(task, resultRow, config) {
   await log('info', `开始沟通：${job.title} @ ${job.company || ''}`, { jobId: job.jobId });
 
 
-  // ENSURE_JOB_LIST before start
+
+// ENSURE_JOB_LIST before start (轻量：真正查找+点击都在 START_CHAT 原子完成)
   {
-    // 轻量回到列表，避免过度滚动
-    await sendToBoss(MSG.CLOSE_CHAT, {});
-    await sleep(300);
-    // 用一次扫描拿最新岗位，但 startChat 会自己从顶部找卡
-    const rescanned = await sendToBoss(MSG.SCAN_JOBS, { scroll: true, maxRounds: 2 });
-    if (rescanned?.ok && Array.isArray(rescanned.jobs) && rescanned.jobs.length) {
-      const norm = (x) => String(x || "").replace(/\s+/g, "").replace(/[【】\[\]()（）]/g, "").toLowerCase();
-      const hit =
-        rescanned.jobs.find((j) => j.jobId && job.jobId && j.jobId === job.jobId) ||
-        rescanned.jobs.find((j) => norm(j.title) === norm(job.title) && (!job.company || norm(j.company) === norm(job.company))) ||
-        rescanned.jobs.find((j) => norm(j.title) === norm(job.title)) ||
-        rescanned.jobs.find((j) => {
-          const a = norm(j.title), t = norm(job.title);
-          return a && t && (a.includes(t) || t.includes(a));
-        });
-      if (hit) {
-        Object.assign(job, hit);
-        resultRow.job = job;
-        await log("info", "已匹配到列表岗位：" + (job.title || ""), { jobId: job.jobId });
-      } else {
-        await log("warn", "扫描列表未精确命中，将按标题从页面顶部查找：" + (job.title || ""), { jobId: job.jobId });
+    try { await sendToBoss(MSG.CLOSE_CHAT, {}); } catch (_) {}
+    await sleep(200);
+    try {
+      const ensured = await sendToBoss(MSG.ENSURE_JOB_LIST, { maxWaitMs: 5000, scroll: false });
+      if (ensured && ensured.ok === false) {
+        await log('warn', ensured.message || '职位列表暂未就绪，将直接按标题查找', { jobId: job.jobId });
       }
-    }
+    } catch (_) {}
+    await sleep(150);
   }
-  await sleep(300);
   const chatRes = await sendToBoss(MSG.START_CHAT, { job, skipScroll: true });
   if (!chatRes?.ok) {
     item.state = 'FAILED';
@@ -473,11 +461,24 @@ async function processOneJob(task, resultRow, config) {
     const sendRes = await sendToBoss(MSG.SEND_TEXT, { text: step.text });
     if (!sendRes?.ok) {
       item.state = 'FAILED';
-      item.reasons = [reasonText(REASON.EXEC_SEND_TEXT_FAIL, sendRes?.error || '')];
+      let sendCode = REASON.EXEC_SEND_TEXT_FAIL;
+      if (sendRes?.error === 'LOGIN_REQUIRED') sendCode = REASON.LIMIT_PLATFORM;
+      if (sendRes?.error === 'CHAT_TIMEOUT' || sendRes?.error === 'INPUT_NOT_FOUND') sendCode = REASON.EXEC_CHAT_TIMEOUT;
+      item.reasons = [reasonText(sendCode, sendRes?.message || sendRes?.error || '')];
+      task.pauseReason = item.reasons[0];
+      task.lastErrorDetail = '岗位：' + (job.title || '') + ' @ ' + (job.company || '') + '\n发送内容：' + String(step.text || '').slice(0, 80);
       task.counters.failed += 1;
       task.consecutiveFails += 1;
       await bumpDailyStat('fail');
-      await log('error', `发送失败：${job.title}`, { jobId: job.jobId });
+      await log('error', '发送失败：' + (job.title || '') + ' - ' + item.reasons[0], { jobId: job.jobId });
+      if (sendRes?.error === 'LOGIN_REQUIRED') {
+        runner.pause = true;
+        task.awaitingUserRetry = true;
+        task.status = TASK_STATUS.PAUSED;
+        await publishTask(task);
+        await log('error', task.pauseReason + '（任务已停止）', { jobId: job.jobId });
+        return 'limited';
+      }
       // RETURN_TO_LIST after send fail
       await sendToBoss(MSG.RETURN_TO_LIST, {});
       return 'failed';
@@ -579,6 +580,7 @@ async function runTaskLoop(taskId) {
   runner.pause = false;
   runner.skipCurrent = false;
   runner.pauseLogged = false;
+  runner.pausePublished = false;
 
   try {
     let config = await getAllConfig();
@@ -791,6 +793,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             await publishTask(all0.task);
           }
           runner.pauseLogged = false;
+          runner.pausePublished = false;
           // reset FAILED for retry
           {
             const all1 = await getAllConfig();

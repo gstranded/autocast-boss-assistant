@@ -45,7 +45,7 @@
     ],
     title: ["a.job-name", ".job-name", ".job-title a", ".job-title .job-name"],
     salary: [".job-salary", ".salary", ".job-detail-info .job-salary"],
-    company: [".boss-name", ".company-name", ".company-info .name", ".company-text"],
+    company: [".company-name", ".company-info .name", ".company-text", ".boss-name"],
     location: [".company-location", ".job-area", ".job-area-wrapper", ".area"],
     tags: [".tag-list li", ".job-info .tag-list li", ".job-label-list li"],
     online: [".boss-online-icon", ".boss-online-tag", ".online-tag"],
@@ -202,38 +202,24 @@
     for (const sel of preferred) {
       try {
         const list = Array.from(document.querySelectorAll(sel));
-        if (list.length) {
-          cards = list;
-          break;
-        }
+        if (list.length) { cards = list; break; }
       } catch (_) {}
     }
-
-    // 兜底：从职位名锚点反推卡片（真机最稳）
     if (!cards.length) {
-      const names = Array.from(document.querySelectorAll("a.job-name, .job-name"));
-      cards = names
+      cards = Array.from(document.querySelectorAll("a.job-name"))
         .map((a) => {
-          if (a.closest?.(".job-detail-box, .job-detail-container")) return null;
-          return (
-            a.closest("li.job-card-box") ||
-            a.closest(".job-card-box") ||
-            a.closest(".job-card-wrap") ||
-            a.closest("li") ||
-            a.parentElement
-          );
+          if (a.closest(".job-detail-box, .job-detail-container")) return null;
+          return a.closest("li.job-card-box") || a.closest(".job-card-box") || a.closest(".job-card-wrap") || a.closest("li") || a.parentElement;
         })
         .filter(Boolean);
     }
-
     const uniq = [];
     const seen = new Set();
     for (const card of cards) {
       if (!card || seen.has(card)) continue;
       if (card.closest?.(".job-detail-box, .job-detail-container")) continue;
       const titleEl = card.querySelector?.("a.job-name, .job-name") || (card.matches?.("a.job-name") ? card : null);
-      const title = textOf(titleEl);
-      if (!title || title.length < 2) continue;
+      if (!titleEl || textOf(titleEl).length < 2) continue;
       seen.add(card);
       uniq.push(card);
     }
@@ -691,14 +677,23 @@ function dismissCommonDialogs() {
 
   async function returnToJobList() {
     await closeChatPanel();
-    // 若在聊天页，返回列表
     if (isChatPage() || (hasUsableChatInput() && getJobCards().length === 0)) {
-      try {
-        history.back();
-      } catch (_) {}
-      await sleep(800);
+      try { history.back(); } catch (_) {}
+      await sleep(900);
     }
-    const ensured = await ensureJobList({ maxWaitMs: 10000 });
+    try { await closeChatPanel(); } catch (_) {}
+    let ensured = await ensureJobList({ maxWaitMs: 10000, scroll: true });
+    if (!ensured.ok && getJobCards().length === 0) {
+      const jobNav = Array.from(document.querySelectorAll("a,button,span,div")).find((el) => {
+        const t = textOf(el);
+        return t === "职位" || t === "推荐" || t === "首页";
+      });
+      if (jobNav) {
+        clickLikeHuman(jobNav);
+        await sleep(1000);
+      }
+      ensured = await ensureJobList({ maxWaitMs: 6000, scroll: true });
+    }
     return ensured;
   }
 
@@ -746,64 +741,145 @@ function dismissCommonDialogs() {
 
   async function startChat(job, opts = {}) {
     const inputJob = (opts && opts.job) || job || {};
-    const skipScroll = Boolean(opts.skipScroll);
+    const wantTitle = normalizeText(inputJob.title || "");
+    const wantCompany = normalizeText(inputJob.company || "");
+    const wantId = String(inputJob.jobId || "");
+    const wantHref = String(inputJob.href || "");
+    const wantHrefId = extractJobIdFromHref(wantHref);
 
-    // 先轻量恢复列表，不暴力滚动
-    if (!skipScroll) {
-      await ensureJobList({ maxWaitMs: 4000, scroll: false });
-    } else {
-      await closeChatPanel();
-      await sleep(200);
+    try { await closeChatPanel(); } catch (_) {}
+    await sleep(250);
+
+    const getListScroller = () =>
+      firstEl(SELECTORS.listScroller) || document.scrollingElement || document.documentElement;
+
+    const scoreMatch = (p) => {
+      if (!p) return -1;
+      let score = 0;
+      const t = normalizeText(p.title || "");
+      const co = normalizeText(p.company || "");
+      if (wantId && p.jobId && p.jobId === wantId) score += 100;
+      if (wantHrefId && (p.jobId === wantHrefId || (p.href && p.href.includes(wantHrefId)))) score += 80;
+      if (wantTitle && t) {
+        if (t === wantTitle) score += 50;
+        else if (t.includes(wantTitle) || wantTitle.includes(t)) score += 30;
+        else return -1;
+      } else if (!wantId && !wantHrefId) {
+        return -1;
+      }
+      if (wantCompany && co) {
+        if (co === wantCompany) score += 12;
+        else if (co.includes(wantCompany) || wantCompany.includes(co)) score += 6;
+        else score -= 4;
+      }
+      return score;
+    };
+
+    const tryPickVisible = () => {
+      let best = null;
+      let bestScore = 0;
+      const cards = getJobCards();
+      for (let i = 0; i < cards.length; i++) {
+        const p = parseJobCard(cards[i], i);
+        const sc = scoreMatch(p);
+        if (sc > bestScore) {
+          bestScore = sc;
+          best = { card: cards[i], live: p, score: sc };
+        }
+      }
+      const names = Array.from(document.querySelectorAll("a.job-name, .job-name"));
+      for (const el of names) {
+        if (el.closest(".job-detail-box, .job-detail-container")) continue;
+        const card =
+          el.closest("li.job-card-box") ||
+          el.closest(".job-card-box") ||
+          el.closest(".job-card-wrap") ||
+          el.closest("li") ||
+          el;
+        const live = parseJobCard(card, 0);
+        const mergedLive = { ...live, title: live.title || textOf(el) };
+        const sc = scoreMatch(mergedLive);
+        if (sc > bestScore) {
+          bestScore = sc;
+          best = { card, live: mergedLive, score: sc };
+        }
+      }
+      return bestScore >= 30 ? best : null;
+    };
+
+    if (getJobCards().length === 0) {
+      try { await ensureJobList({ maxWaitMs: 6000, scroll: true }); } catch (_) {}
     }
 
-    // 关键：逐步滚动查找目标卡，而不是 autoScrollList 把虚拟列表冲掉
-    let card = await findCardByScrolling(inputJob, 45);
-    if (!card) {
-      // 最后再 ensure + 找一次
-      await ensureJobList({ maxWaitMs: 5000, scroll: true });
-      card = await findCardByScrolling(inputJob, 30);
+    try { window.scrollTo(0, 0); } catch (_) {}
+    try {
+      const sc = getListScroller();
+      if (sc) sc.scrollTop = 0;
+    } catch (_) {}
+    await sleep(350);
+
+    let picked = tryPickVisible();
+    if (!picked) {
+      for (let round = 0; round < 60 && !picked; round++) {
+        try {
+          const sc = getListScroller();
+          if (sc && sc !== document.scrollingElement && sc !== document.documentElement) {
+            sc.scrollTop = (sc.scrollTop || 0) + 360;
+          } else {
+            window.scrollBy(0, 360);
+          }
+        } catch (_) {
+          try { window.scrollBy(0, 360); } catch (__) {}
+        }
+        await sleep(160);
+        picked = tryPickVisible();
+      }
     }
 
-    if (!card) {
+    if (!picked) {
       const titles = Array.from(document.querySelectorAll("a.job-name, .job-name"))
+        .filter((el) => !el.closest(".job-detail-box"))
         .map((el) => textOf(el))
         .filter(Boolean)
-        .slice(0, 5);
+        .slice(0, 6);
       return {
         ok: false,
         error: "JOB_CARD_NOT_FOUND",
         message:
           "列表中找不到该岗位「" +
           (inputJob.title || "") +
-          "」。请回到职位列表顶部后重新扫描预览再投递" +
+          "」。请回到职位列表顶部后重新扫描预览再投" +
           (titles.length ? "\n当前可见示例：" + titles.join(" / ") : ""),
         listCount: getJobCards().length,
         href: location.href
       };
     }
 
-    const live = parseJobCard(card, 0);
+    const { card } = picked;
+    const live = picked.live || parseJobCard(card, 0);
     const merged = {
       ...inputJob,
       ...live,
       title: live.title || inputJob.title,
       company: live.company || inputJob.company,
-      jobId: live.jobId || inputJob.jobId
+      jobId: live.jobId || inputJob.jobId,
+      href: live.href || inputJob.href
     };
 
-    const wrap = card.closest(".job-card-wrap") || card.closest("li.job-card-box") || card;
-    try {
-      wrap.scrollIntoView({ block: "center", behavior: "instant" });
-    } catch (_) {}
-    await sleep(200);
-    preventLinkNavigation(wrap, 1200);
+    log("startChat matched", merged.title, "score=", picked.score, "jobId=", merged.jobId);
+
+    const wrap = card.closest?.(".job-card-wrap") || card.closest?.("li.job-card-box") || card;
+    try { wrap.scrollIntoView({ block: "center", behavior: "instant" }); } catch (_) {}
+    await sleep(180);
+    preventLinkNavigation(wrap, 1500);
     clickLikeHuman(wrap);
-    await sleep(550);
+    await sleep(500);
 
     if (!firstEl(SELECTORS.detailRoot) && !firstEl(SELECTORS.chatOnDetail)) {
-      preventLinkNavigation(wrap, 800);
-      clickLikeHuman(card);
-      await sleep(500);
+      preventLinkNavigation(wrap, 1000);
+      const titleEl = wrap.querySelector?.("a.job-name, .job-name") || card.querySelector?.("a.job-name, .job-name");
+      clickLikeHuman(titleEl || card);
+      await sleep(450);
     }
 
     if (typeof detectLoginModal === "function") {
@@ -811,22 +887,20 @@ function dismissCommonDialogs() {
       if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
     }
 
-    let clicked = await clickChatButton();
-    if (!clicked.ok) {
+    let clicked = { ok: false };
+    for (let i = 0; i < 10; i++) {
+      clicked = await clickChatButton();
+      if (clicked.ok) break;
       const cardBtn = Array.from((wrap || card).querySelectorAll("a,button")).find((el) =>
         /立即沟通|继续沟通|打招呼/.test(textOf(el))
       );
       if (cardBtn) {
+        preventLinkNavigation(wrap, 800);
         clickLikeHuman(cardBtn);
-        clicked = {
-          ok: true,
-          buttonText: textOf(cardBtn),
-          already: /继续沟通/.test(textOf(cardBtn))
-        };
-      } else {
-        await sleep(700);
-        clicked = await clickChatButton();
+        clicked = { ok: true, buttonText: textOf(cardBtn), already: /继续沟通/.test(textOf(cardBtn)) };
+        break;
       }
+      await sleep(320);
     }
 
     if (!clicked.ok) {
@@ -837,7 +911,7 @@ function dismissCommonDialogs() {
       return {
         ok: false,
         error: "CHAT_BUTTON_NOT_FOUND",
-        message: "未找到「立即沟通」按钮。请确认已登录且岗位可沟通"
+        message: "未找到「立即沟通」按钮。请确认已登录，并手动点开该岗位看是否有沟通按钮"
       };
     }
 
@@ -848,7 +922,7 @@ function dismissCommonDialogs() {
       if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
     }
 
-    const chatReady = await waitForChat(14000);
+    const chatReady = await waitForChat(15000);
     if (!chatReady) {
       if (typeof detectLoginModal === "function") {
         const loginHit = detectLoginModal();
@@ -857,7 +931,7 @@ function dismissCommonDialogs() {
       return {
         ok: false,
         error: "CHAT_TIMEOUT",
-        message: "聊天输入框未出现。请确认已登录；若有弹窗请先关闭后重试"
+        message: "聊天输入框未出现。请确认已登录；如有弹窗请先处理"
       };
     }
 
@@ -921,55 +995,71 @@ async function setInputText(input, text) {
 
   async function sendText(text) {
     if (!text || !String(text).trim()) return { ok: false, error: "EMPTY_TEXT" };
-    const ready = await waitForChat(10000);
-    if (!ready) return { ok: false, error: "CHAT_TIMEOUT" };
+    dismissCommonDialogs();
+    const ready = await waitForChat(12000);
+    if (!ready) return { ok: false, error: "CHAT_TIMEOUT", message: "聊天输入框未就绪" };
     const input = getChatInput();
-    if (!input || !hasUsableChatInput()) return { ok: false, error: "INPUT_NOT_FOUND" };
-
-    const before = getSelfMessages(6);
-    await setInputText(input, text);
-    await sleep(200);
-
-    const sendBtn = findSendButton();
-    if (sendBtn) {
-      clickLikeHuman(sendBtn);
-    } else {
-      // Ctrl+Enter / Enter 兼容
-      input.dispatchEvent(
-        new KeyboardEvent("keydown", {
-          key: "Enter",
-          code: "Enter",
-          keyCode: 13,
-          which: 13,
-          bubbles: true
-        })
-      );
+    if (!input || !hasUsableChatInput()) {
+      return { ok: false, error: "INPUT_NOT_FOUND", message: "未找到可用聊天输入框" };
     }
 
-    // 等待消息出现在自己侧
-    const needle = String(text).replace(/\s+/g, "").slice(0, 16);
+    const before = getSelfMessages(8);
+    await setInputText(input, text);
+    await sleep(250);
+
+    const written = (input.value || input.textContent || input.innerText || "").replace(/\s+/g, "");
+    const needleFull = String(text).replace(/\s+/g, "");
+    if (written.length < Math.min(4, needleFull.length)) {
+      await setInputText(input, text);
+      await sleep(200);
+    }
+
+    const sendBtn = findSendButton();
+    if (sendBtn) clickLikeHuman(sendBtn);
+
+    try { input.focus(); } catch (_) {}
+    const fireKey = (opts) => {
+      input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...opts }));
+      input.dispatchEvent(new KeyboardEvent("keypress", { bubbles: true, cancelable: true, ...opts }));
+      input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, cancelable: true, ...opts }));
+    };
+    fireKey({ key: "Enter", code: "Enter", keyCode: 13, which: 13 });
+    await sleep(120);
+    fireKey({ key: "Enter", code: "Enter", keyCode: 13, which: 13, ctrlKey: true });
+
+    const needle = needleFull.slice(0, 18);
     let confirmed = false;
     let selfTail = [];
-    for (let i = 0; i < 12; i++) {
-      await sleep(300);
-      selfTail = getSelfMessages(8);
+    for (let i = 0; i < 16; i++) {
+      await sleep(280);
+      if (typeof detectLoginModal === "function") {
+        const loginHit = detectLoginModal();
+        if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
+      }
+      selfTail = getSelfMessages(10);
       confirmed = selfTail.some((m) => {
         const n = String(m).replace(/\s+/g, "");
-        return n.includes(needle) || needle.includes(n.slice(0, 12));
+        return n.includes(needle) || (needle.length > 8 && needle.includes(n.slice(0, 10)));
       });
-      // 或数量增加
       if (!confirmed && selfTail.length > before.length) {
-        // 宽松：最后一条非空
         confirmed = Boolean(selfTail[selfTail.length - 1]);
       }
+      if (!confirmed) {
+        const nowVal = (input.value || input.textContent || input.innerText || "").replace(/\s+/g, "");
+        if (nowVal.length === 0 && i >= 3) confirmed = true;
+      }
       if (confirmed) break;
+      if (i === 5 || i === 10) {
+        const btn2 = findSendButton();
+        if (btn2) clickLikeHuman(btn2);
+      }
     }
 
     if (!confirmed) {
       return {
         ok: false,
         error: "SEND_NOT_CONFIRMED",
-        message: "未检测到消息发送成功，请检查聊天输入框是否可用",
+        message: "未检测到消息发送成功。请确认聊天框可输入，或手动发送后点重试",
         selfTail
       };
     }
@@ -1045,7 +1135,7 @@ async function setInputText(input, text) {
           case MSG.START_CHAT:
             return await startChat(payload?.job || payload, payload || {});
           case MSG.GET_CHAT_SELF_MESSAGES:
-            await waitForChat(5000);
+            await waitForChat(8000);
             return { ok: true, messages: getSelfMessages(payload?.limit || 8) };
           case MSG.SEND_TEXT:
             return await sendText(payload?.text || "");
@@ -1053,6 +1143,12 @@ async function setInputText(input, text) {
             return await sendImageFromDataUrl(payload?.dataUrl, payload?.fileName);
           case MSG.HIGHLIGHT_JOBS:
             return highlightJobs(payload?.map || {});
+          case MSG.CLOSE_CHAT:
+            return await closeChatPanel();
+          case MSG.ENSURE_JOB_LIST:
+            return await ensureJobList(payload || {});
+          case MSG.RETURN_TO_LIST:
+            return await returnToJobList();
           default:
             return { ok: false, error: "UNKNOWN_TYPE", type };
         }
