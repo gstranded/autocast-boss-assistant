@@ -128,19 +128,28 @@
   }
 
   function preventLinkNavigation(root, ms = 600) {
-    const scope = root || document;
-    const anchors = Array.from(scope.querySelectorAll("a[href]"));
-    const onClick = (e) => {
-      try {
-        e.preventDefault();
-        e.stopPropagation();
-      } catch (_) {}
-    };
-    anchors.forEach((a) => a.addEventListener("click", onClick, true));
-    setTimeout(() => {
-      anchors.forEach((a) => a.removeEventListener("click", onClick, true));
-    }, ms);
-    return anchors.length;
+    try {
+      const scope = root && root.querySelectorAll ? root : document;
+      const anchors = Array.from(scope.querySelectorAll("a[href], a.job-name"))
+        .filter((a) => a && typeof a.addEventListener === "function");
+      const onClick = (e) => {
+        try {
+          e.preventDefault();
+          e.stopPropagation();
+        } catch (_) {}
+      };
+      anchors.forEach((a) => {
+        try { a.addEventListener("click", onClick, true); } catch (_) {}
+      });
+      setTimeout(() => {
+        anchors.forEach((a) => {
+          try { a.removeEventListener("click", onClick, true); } catch (_) {}
+        });
+      }, ms);
+      return anchors.length;
+    } catch (_) {
+      return 0;
+    }
   }
 
   function clickLikeHuman(el) {
