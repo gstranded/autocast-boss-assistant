@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Boss 海投助手 - filter</title>
+<style>
+:root {
+  --bg: #0b1220;
+  --panel: #111a2e;
+  --card: #16233d;
+  --line: #243353;
+  --text: #e8eefc;
+  --muted: #93a4c3;
+  --primary: #3b82f6;
+  --success: #22c55e;
+  --danger: #ef4444;
+  --warn: #f59e0b;
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.app { min-height: 100vh; display: flex; flex-direction: column; }
+.header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 14px 14px 10px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, #12203b, #0b1220);
+}
+.brand { font-weight: 700; font-size: 15px; }
+.tagline { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.badge {
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #1f2937;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.badge.ok { background: rgba(34,197,94,.15); color: #86efac; }
+.badge.bad { background: rgba(239,68,68,.15); color: #fca5a5; }
+
+.tabs {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+  background: #0e1730;
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+.tabs button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 8px 4px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.tabs button.active {
+  background: var(--card);
+  color: var(--text);
+  font-weight: 600;
+}
+
+main { padding: 10px; flex: 1; }
+.panel { display: none; }
+.panel.active { display: block; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+  margin-bottom: 10px;
+}
+.card-title { font-weight: 700; margin-bottom: 8px; }
+.card-title.row, .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+
+label { display: block; color: var(--muted); margin: 8px 0 4px; font-size: 12px; }
+input, textarea, select {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: #0f1a30;
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 10px;
+  outline: none;
+}
+textarea { resize: vertical; }
+input:focus, textarea:focus, select:focus { border-color: var(--primary); }
+
+.btn-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.btn {
+  border: 1px solid var(--line);
+  background: #1a2744;
+  color: var(--text);
+  border-radius: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+.btn:hover { filter: brightness(1.08); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn.primary { background: var(--primary); border-color: #2563eb; }
+.btn.success { background: #16a34a; border-color: #15803d; }
+.btn.danger { background: #dc2626; border-color: #b91c1c; }
+.btn.tiny { padding: 4px 8px; font-size: 12px; }
+.btn.block { width: 100%; margin-top: 10px; }
+.file-btn { display: inline-flex; align-items: center; }
+
+.status-line { margin-top: 10px; color: #dbe7ff; }
+.counters { margin-top: 4px; color: var(--muted); font-size: 12px; }
+.warnings { margin-top: 8px; color: #fcd34d; font-size: 12px; }
+.summary {
+  background: #0f1a30;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  margin-bottom: 8px;
+}
+.list { max-height: 280px; overflow: auto; display: flex; flex-direction: column; gap: 6px; }
+.item {
+  background: #0f1a30;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+}
+.item.pass { border-color: rgba(34,197,94,.45); }
+.item.reject { border-color: rgba(148,163,184,.35); }
+.item .t { font-weight: 600; }
+.item .m { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.item .r { margin-top: 4px; font-size: 12px; color: #c7d2fe; }
+.item.pass .r { color: #86efac; }
+.item.reject .r { color: #fca5a5; }
+
+.logs {
+  max-height: 240px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+.log {
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: #0f1a30;
+  border-left: 3px solid #64748b;
+}
+.log.info { border-left-color: #60a5fa; }
+.log.success { border-left-color: #22c55e; }
+.log.warn { border-left-color: #f59e0b; }
+.log.error { border-left-color: #ef4444; }
+
+.segments { display: flex; flex-direction: column; gap: 8px; }
+.seg {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+  background: #0f1a30;
+}
+.seg .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.check { display: flex; align-items: center; gap: 6px; color: var(--text); }
+.check input { width: auto; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.thumbs img {
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}
+.help { margin: 0; padding-left: 18px; color: var(--muted); }
+.help li { margin: 4px 0; }
+
+.profile-list, .binding-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.profile-item, .binding-item {
+  border: 1px solid var(--line);
+  background: #0f1a30;
+  border-radius: 8px;
+  padding: 8px;
+}
+.profile-item.active { border-color: #3b82f6; box-shadow: 0 0 0 1px rgba(59,130,246,.35); }
+.profile-item .name { font-weight: 600; }
+.profile-item .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.profile-item .actions, .binding-item .actions { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.pill {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(59,130,246,.18);
+  color: #93c5fd;
+  margin-left: 6px;
+}
+.pill.default { background: rgba(34,197,94,.18); color: #86efac; }
+.binding-item input, .binding-item select { margin-top: 4px; }
+body { width: 420px; min-height: 820px; }
+html, body { background: #0b1220; }
+.shot-wrap { width: 420px; margin: 0 auto; }
+</style>
+</head>
+<body>
+<div class="shot-wrap">
+<div class="app">
+  <header class="header">
+    <div>
+      <div class="brand">Boss 海投助手</div>
+      <div class="tagline">预览 · 可解释 · 不重复 · 可控</div>
+    </div>
+    <div class="badge ok">已连接 BOSS 页面</div>
+  </header>
+  <nav class="tabs">
+    <button class="">任务</button>
+    <button class="active">筛选</button>
+    <button class="">消息</button>
+    <button class="">简历</button>
+    <button class="">设置</button>
+  </nav>
+  <main>
+    <section class="panel active">
+  <div class="card">
+    <div class="card-title">职位名称</div>
+    <label>包含任意 OR</label>
+    <textarea rows="2">Java, Go, 后端</textarea>
+    <label>必须同时包含 AND</label>
+    <textarea rows="2">Agent, 大模型</textarea>
+    <label>排除任意 NOT</label>
+    <textarea rows="2">外包, 驻场, 销售</textarea>
+  </div>
+  <div class="card">
+    <div class="card-title">地点与条件</div>
+    <label>地点包含</label>
+    <input value="广州, 深圳" />
+    <label>地点匹配</label>
+    <select><option>包含匹配</option></select>
+    <div class="grid-2">
+      <div><label>最低月薪（元）</label><input value="15000" /></div>
+      <div><label>最高月薪（元）</label><input value="40000" /></div>
+    </div>
+    <label class="check"><input type="checkbox" checked/>排除猎头</label>
+    <label class="check"><input type="checkbox" checked/>排除外包/驻场</label>
+    <button class="btn primary block">保存筛选</button>
+  </div>
+</section>
+  </main>
+</div>
+</div>
+</body>
+</html>

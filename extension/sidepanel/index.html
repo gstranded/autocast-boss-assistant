@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Boss 海投助手</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <div>
+          <div class="brand">Boss 海投助手</div>
+          <div class="tagline">预览 · 可解释 · 不重复 · 可控</div>
+        </div>
+        <div id="connBadge" class="badge">未连接页面</div>
+      </header>
+
+      <nav class="tabs" id="tabs">
+        <button data-tab="task" class="active">任务</button>
+        <button data-tab="filter">筛选</button>
+        <button data-tab="message">消息</button>
+        <button data-tab="resume">简历</button>
+        <button data-tab="settings">设置</button>
+      </nav>
+
+      <main>
+        <!-- TASK -->
+        <section class="panel active" id="tab-task">
+          <div class="card">
+            <div class="card-title">任务控制</div>
+            <div class="btn-row">
+              <button id="btnPreview" class="btn primary">扫描预览</button>
+              <button id="btnDiagnose" class="btn">页面诊断</button>
+              <button id="btnStart" class="btn success" disabled>确认投递</button>
+              <button id="btnPause" class="btn" disabled>暂停</button>
+              <button id="btnResume" class="btn" disabled>继续</button>
+              <button id="btnSkip" class="btn" disabled>跳过当前</button>
+              <button id="btnStop" class="btn danger" disabled>停止</button>
+            </div>
+            <div id="taskStatus" class="status-line">状态：空闲</div>
+            <div id="taskCounters" class="counters">成功 0 · 跳过 0 · 失败 0 · 已处理 0</div>
+            <div id="taskWarnings" class="warnings"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-title row">
+              <span>预览结果</span>
+              <label class="check"><input type="checkbox" id="selectAllPass" checked />全选通过项</label>
+            </div>
+            <div id="summaryBox" class="summary">尚未扫描</div>
+            <div id="previewList" class="list"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-title row">
+              <span>实时日志</span>
+              <button id="btnClearLogs" class="btn tiny">清空</button>
+            </div>
+            <div id="logList" class="logs"></div>
+          </div>
+        </section>
+
+        <!-- FILTER -->
+        <section class="panel" id="tab-filter">
+          <div class="card">
+            <div class="card-title">职位名称</div>
+            <label>包含任意 OR</label>
+            <textarea id="titleOr" rows="2" placeholder="Java, Go, 后端"></textarea>
+            <label>必须同时包含 AND</label>
+            <textarea id="titleAnd" rows="2" placeholder="Agent, 大模型"></textarea>
+            <label>排除任意 NOT</label>
+            <textarea id="titleNot" rows="2" placeholder="外包, 驻场, 销售"></textarea>
+          </div>
+          <div class="card">
+            <div class="card-title">公司 / JD</div>
+            <label>公司包含 OR</label>
+            <textarea id="companyOr" rows="2"></textarea>
+            <label>公司排除 NOT</label>
+            <textarea id="companyNot" rows="2"></textarea>
+            <label>JD 包含 OR</label>
+            <textarea id="jdOr" rows="2"></textarea>
+            <label>JD 必须 AND</label>
+            <textarea id="jdAnd" rows="2"></textarea>
+            <label>JD 排除 NOT</label>
+            <textarea id="jdNot" rows="2"></textarea>
+          </div>
+          <div class="card">
+            <div class="card-title">地点与条件</div>
+            <label>地点包含</label>
+            <input id="locInclude" placeholder="广州, 深圳" />
+            <label>地点排除</label>
+            <input id="locExclude" placeholder="南沙, 坪山" />
+            <label>地点匹配</label>
+            <select id="locMode">
+              <option value="contains">包含匹配</option>
+              <option value="exact">精确匹配</option>
+            </select>
+            <div class="grid-2">
+              <div>
+                <label>最低月薪（元）</label>
+                <input id="salaryMin" type="number" placeholder="例如 15000" />
+              </div>
+              <div>
+                <label>最高月薪（元）</label>
+                <input id="salaryMax" type="number" placeholder="例如 40000" />
+              </div>
+            </div>
+            <label>HR 活跃</label>
+            <select id="activeWithin">
+              <option value="">不限</option>
+              <option value="today">今日活跃</option>
+              <option value="3d">3 日内</option>
+              <option value="week">一周内</option>
+            </select>
+            <label class="check"><input type="checkbox" id="excludeHunter" />排除猎头</label>
+            <label class="check"><input type="checkbox" id="excludeOutsource" />排除外包/驻场</label>
+          </div>
+          <div class="card">
+            <div class="card-title">黑白名单</div>
+            <label>公司黑名单（逗号/换行分隔）</label>
+            <textarea id="blacklist" rows="3"></textarea>
+            <label>公司白名单</label>
+            <textarea id="whitelist" rows="3"></textarea>
+            <label class="check"><input type="checkbox" id="whitelistOnly" />仅投白名单公司</label>
+            <button id="btnSaveFilter" class="btn primary block">保存筛选</button>
+          </div>
+        </section>
+
+        <!-- MESSAGE -->
+        <section class="panel" id="tab-message">
+          <div class="card">
+            <div class="card-title">发送模式</div>
+            <select id="messageMode">
+              <option value="auto_detect">C. 自动识别（推荐）</option>
+              <option value="native_plus">A. 使用原生打招呼 + 插件补充</option>
+              <option value="plugin_only">B. 完全由插件发送</option>
+            </select>
+            <label>相似度阈值（0.5-1）</label>
+            <input id="similarityThreshold" type="number" min="0.5" max="1" step="0.01" />
+            <div class="hint">变量：{HR称呼} {职位名称} {公司名称} {匹配技能} {工作城市}</div>
+          </div>
+          <div class="card">
+            <div class="card-title row">
+              <span>消息段落</span>
+              <button id="btnAddSeg" class="btn tiny">新增一段</button>
+            </div>
+            <div id="segments" class="segments"></div>
+            <button id="btnSaveMessage" class="btn primary block">保存消息模板</button>
+          </div>
+        </section>
+
+        <!-- RESUME -->
+        <section class="panel" id="tab-resume">
+          <div class="card">
+            <div class="card-title">发送策略</div>
+            <label class="check"><input type="checkbox" id="autoSendImageResume" />自动发送图片简历</label>
+            <label class="check"><input type="checkbox" id="autoSendAttachmentResume" />自动发送附件简历</label>
+            <label>发送时机</label>
+            <select id="resumeSendTiming">
+              <option value="on_request">HR 请求后再发（推荐，当前自动任务不强制发）</option>
+              <option value="after_text">文本发送完成后立即发送</option>
+              <option value="manual">仅手动</option>
+            </select>
+          </div>
+
+          <div class="card">
+            <div class="card-title row">
+              <span>求职方案 / 简历档案</span>
+              <button id="btnAddProfile" class="btn tiny">新建方案</button>
+            </div>
+            <div id="profileList" class="profile-list"></div>
+            <div class="hint">点击方案可切换编辑；星标为默认方案（筛选未命中绑定规则时使用）。</div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">当前方案内容</div>
+            <label>方案名称</label>
+            <input id="profileName" placeholder="例如：广州 AI 岗" />
+            <label>图片简历（可多选，按选择顺序串行发送）</label>
+            <input id="imageFiles" type="file" accept="image/*" multiple />
+            <div id="imagePreview" class="thumbs"></div>
+            <button id="btnClearImages" class="btn tiny">清空图片</button>
+            <label>附件简历（PDF/DOC/DOCX）</label>
+            <input id="attachFile" type="file" accept=".pdf,.doc,.docx,application/pdf" />
+            <div id="attachInfo" class="hint"></div>
+            <button id="btnClearAttach" class="btn tiny">清除附件</button>
+            <div class="btn-row" style="margin-top:10px">
+              <button id="btnSaveResume" class="btn primary">保存当前方案</button>
+              <button id="btnSetDefaultProfile" class="btn">设为默认</button>
+              <button id="btnDeleteProfile" class="btn danger">删除方案</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title row">
+              <span>岗位 → 方案绑定规则</span>
+              <button id="btnAddBinding" class="btn tiny">新增规则</button>
+            </div>
+            <div class="hint">按优先级从小到大匹配职位名/JD 关键词，命中则使用对应简历方案。</div>
+            <div id="bindingList" class="binding-list"></div>
+            <button id="btnSaveBindings" class="btn primary block">保存绑定规则</button>
+          </div>
+        </section>
+
+        <!-- SETTINGS -->
+        <section class="panel" id="tab-settings">
+          <div class="card">
+            <div class="card-title">频率与上限</div>
+            <div class="grid-2">
+              <div>
+                <label>本次最多沟通</label>
+                <input id="taskMaxCommunicate" type="number" min="1" />
+              </div>
+              <div>
+                <label>每日最多沟通</label>
+                <input id="dailyMaxCommunicate" type="number" min="1" />
+              </div>
+              <div>
+                <label>同公司每天最多</label>
+                <input id="companyDailyMax" type="number" min="1" />
+              </div>
+              <div>
+                <label>同 HR 冷却天数</label>
+                <input id="bossCooldownDays" type="number" min="0" />
+              </div>
+              <div>
+                <label>连续失败暂停</label>
+                <input id="consecutiveFailPause" type="number" min="1" />
+              </div>
+            </div>
+            <label class="check"><input type="checkbox" id="neverRepeatJob" />同一职位永不重复</label>
+            <button id="btnSaveSettings" class="btn primary block">保存设置</button>
+          </div>
+          <div class="card">
+            <div class="card-title">导入 / 导出</div>
+            <div class="btn-row">
+              <button id="btnExport" class="btn">导出 JSON</button>
+              <label class="btn file-btn">导入 JSON<input id="importFile" type="file" accept="application/json,.json" hidden /></label>
+            </div>
+            <div class="hint">配置默认保存在本地。导出文件可能包含简历数据，请妥善保管。</div>
+          </div>
+          <div class="card">
+            <div class="card-title">使用说明</div>
+            <ol class="help">
+              <li>打开 BOSS 直聘推荐/搜索职位列表页</li>
+              <li>在侧栏配置筛选与消息，先点「扫描预览」</li>
+              <li>核对将投递岗位与跳过原因后，再「确认投递」</li>
+              <li>可随时暂停 / 停止；刷新后可继续未完成任务</li>
+            </ol>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,629 @@
+import { MSG } from '../shared/messaging.js';
+import {
+  appendHistory,
+  appendLog,
+  bumpDailyStat,
+  clearLogs,
+  clearTask,
+  exportAll,
+  getAllConfig,
+  getHistory,
+  getIdempotencyMap,
+  getLogs,
+  getTodayStats,
+  hasIdempotent,
+  importAll,
+  markIdempotent,
+  saveBindings,
+  saveFilters,
+  saveLists,
+  saveMessageTemplate,
+  saveResumes,
+  saveSettings,
+  saveTask
+} from '../shared/storage.js';
+import { evaluateJob, summarizePreview } from '../shared/filter-engine.js';
+import { checkDedup, checkLimits, jobIdempotencyKey, resumeIdempotencyKey } from '../shared/dedup.js';
+import { planMessageSegments } from '../shared/message-planner.js';
+import { pickResumeProfile } from '../shared/template.js';
+import { REASON, reasonText } from '../shared/reason-codes.js';
+import { TASK_STATUS } from '../shared/constants.js';
+import { normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
+
+let runner = {
+  running: false,
+  abort: false,
+  pause: false,
+  skipCurrent: false
+};
+
+chrome.runtime.onInstalled.addListener(async () => {
+  await getAllConfig();
+  if (chrome.sidePanel?.setPanelBehavior) {
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+  }
+});
+
+chrome.action?.onClicked?.addListener(async (tab) => {
+  if (chrome.sidePanel?.open && tab?.windowId != null) {
+    await chrome.sidePanel.open({ windowId: tab.windowId });
+  }
+});
+
+async function getActiveBossTab() {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tab = tabs[0];
+  if (tab?.id != null && /zhipin\.com|bosszhipin\.com/i.test(tab.url || '')) return tab;
+  const all = await chrome.tabs.query({ url: ['*://*.zhipin.com/*', '*://*.bosszhipin.com/*'] });
+  return all.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0] || null;
+}
+
+async function sendToBoss(type, payload = {}) {
+  const tab = await getActiveBossTab();
+  if (!tab?.id) {
+    return { ok: false, error: 'NO_BOSS_TAB', message: '请先打开 BOSS 直聘职位列表页' };
+  }
+  try {
+    return await chrome.tabs.sendMessage(tab.id, { type, payload });
+  } catch (err) {
+    // 尝试动态注入
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ['content/content-main.js'],
+        injectImmediately: true
+      });
+      await sleep(200);
+      return await chrome.tabs.sendMessage(tab.id, { type, payload });
+    } catch (e2) {
+      return {
+        ok: false,
+        error: 'CONTENT_INJECT_FAIL',
+        message: String(e2?.message || err?.message || e2)
+      };
+    }
+  }
+}
+
+async function log(level, message, extra = {}) {
+  const entry = await appendLog({ level, message, ...extra });
+  try {
+    chrome.runtime.sendMessage({ type: MSG.LOG_EVENT, payload: entry }).catch(() => {});
+  } catch (_) {}
+  return entry;
+}
+
+async function publishTask(task) {
+  await saveTask(task);
+  try {
+    chrome.runtime.sendMessage({ type: MSG.TASK_EVENT, payload: task }).catch(() => {});
+  } catch (_) {}
+}
+
+function ensureItem(task, job) {
+  let item = task.items.find((x) => x.jobId === job.jobId);
+  if (!item) {
+    item = {
+      jobId: job.jobId,
+      bossId: job.bossId,
+      company: job.company,
+      title: job.title,
+      state: 'NOT_STARTED',
+      reasons: [],
+      selected: true
+    };
+    task.items.push(item);
+  }
+  return item;
+}
+
+async function runPreview(payload = {}) {
+  await log('info', '开始扫描预览…');
+  const config = await getAllConfig();
+  const scan = await sendToBoss(MSG.SCAN_JOBS, { scroll: payload.scroll !== false, maxRounds: payload.maxRounds || 6 });
+  if (!scan?.ok) {
+    await log('error', scan?.message || '扫描失败', { error: scan?.error });
+    return { ok: false, ...scan };
+  }
+
+  const history = config.history || [];
+  const todayStats = await getTodayStats();
+  const idempotency = config.idempotency || {};
+  const results = [];
+
+  for (const job of scan.jobs || []) {
+    const filterRes = evaluateJob(job, config.filters, config.lists, config.settings);
+    let decision = filterRes.decision;
+    let reasonCodes = filterRes.reasonCodes || [];
+    let reasonTexts = filterRes.reasonTexts || [];
+    let passReasons = filterRes.passReasons || [];
+
+    if (decision === 'pass') {
+      const dedup = checkDedup(job, {
+        settings: config.settings,
+        history,
+        todayStats,
+        taskItemKeys: new Set(),
+        idempotency
+      });
+      if (!dedup.ok) {
+        decision = 'reject';
+        reasonCodes = dedup.reasonCodes;
+        reasonTexts = dedup.reasonTexts;
+        passReasons = [];
+      }
+    }
+
+    results.push({
+      job,
+      decision,
+      reasonCodes,
+      reasonTexts,
+      passReasons,
+      selected: decision === 'pass'
+    });
+  }
+
+  const summary = summarizePreview(results);
+  const passRate = summary.scanned ? summary.pass / summary.scanned : 0;
+  const warnings = [];
+  if (summary.scanned >= 10 && passRate > 0.8) warnings.push('通过率超过 80%，请检查筛选是否过宽');
+  if (summary.scanned >= 10 && passRate < 0.05) warnings.push('通过率低于 5%，请检查筛选是否过严');
+
+  const task = {
+    id: uid('task'),
+    status: TASK_STATUS.AWAITING_CONFIRM,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    summary,
+    warnings,
+    results,
+    items: results.map((r) => ({
+      jobId: r.job.jobId,
+      bossId: r.job.bossId,
+      company: r.job.company,
+      title: r.job.title,
+      state: r.decision === 'pass' ? 'NOT_STARTED' : 'SKIPPED',
+      reasons: r.reasonTexts,
+      selected: r.selected,
+      decision: r.decision
+    })),
+    counters: { processed: 0, success: 0, skipped: 0, failed: 0 },
+    currentJobId: null,
+    consecutiveFails: 0
+  };
+
+  await publishTask(task);
+
+  // highlight
+  const map = {};
+  for (const r of results) map[r.job.jobId] = { decision: r.decision };
+  await sendToBoss(MSG.HIGHLIGHT_JOBS, { map });
+
+  await log('success', `预览完成：扫描 ${summary.scanned}，通过 ${summary.pass}，排除 ${summary.reject}`);
+  return { ok: true, task, summary, warnings };
+}
+
+async function waitWhilePaused(task) {
+  while (runner.pause && !runner.abort) {
+    task.status = TASK_STATUS.PAUSED;
+    task.updatedAt = Date.now();
+    await publishTask(task);
+    await sleep(300);
+  }
+}
+
+async function processOneJob(task, resultRow, config) {
+  const job = resultRow.job;
+  const item = ensureItem(task, job);
+  task.currentJobId = job.jobId;
+  task.updatedAt = Date.now();
+  await publishTask(task);
+
+  if (runner.skipCurrent) {
+    runner.skipCurrent = false;
+    item.state = 'SKIPPED';
+    item.reasons = [reasonText(REASON.EXEC_USER_SKIP)];
+    task.counters.skipped += 1;
+    await bumpDailyStat('skip');
+    await log('warn', `跳过：${job.title}`, { jobId: job.jobId, reason: REASON.EXEC_USER_SKIP });
+    return 'skipped';
+  }
+
+  // limits
+  const todayStats = await getTodayStats();
+  const limit = checkLimits({
+    settings: config.settings,
+    taskSuccessCount: task.counters.success,
+    todayStats
+  });
+  if (!limit.ok) {
+    await log('warn', limit.reasonTexts[0], { reason: limit.reasonCodes[0] });
+    runner.pause = true;
+    task.status = TASK_STATUS.PAUSED;
+    task.pauseReason = limit.reasonTexts[0];
+    await publishTask(task);
+    return 'limited';
+  }
+
+  // re-check dedup
+  const history = await getHistory();
+  const idempotency = await getIdempotencyMap();
+  const dedup = checkDedup(job, {
+    settings: config.settings,
+    history,
+    todayStats,
+    taskItemKeys: new Set(
+      task.items.filter((x) => x.state === 'COMPLETED' || x.state === 'SKIPPED').map((x) => x.jobId)
+    ),
+    idempotency
+  });
+  if (!dedup.ok) {
+    item.state = 'SKIPPED';
+    item.reasons = dedup.reasonTexts;
+    task.counters.skipped += 1;
+    await bumpDailyStat('skip');
+    await log('info', `${job.title} - ${dedup.reasonTexts[0]}`, { jobId: job.jobId });
+    return 'skipped';
+  }
+
+  await log('info', `开始沟通：${job.title} @ ${job.company || ''}`, { jobId: job.jobId });
+  const chatRes = await sendToBoss(MSG.START_CHAT, { job });
+  if (!chatRes?.ok) {
+    item.state = 'FAILED';
+    let code = REASON.EXEC_CLICK_FAIL;
+    if (chatRes?.error === 'CHAT_TIMEOUT') code = REASON.EXEC_CHAT_TIMEOUT;
+    if (chatRes?.error === 'LOGIN_REQUIRED') code = REASON.LIMIT_PLATFORM;
+    item.reasons = [reasonText(code, chatRes?.message || chatRes?.error || '')];
+    task.counters.failed += 1;
+    task.consecutiveFails += 1;
+    await bumpDailyStat('fail');
+    await log('error', `沟通失败：${item.reasons[0]}`, { jobId: job.jobId });
+    if (chatRes?.error === 'LOGIN_REQUIRED') {
+      runner.pause = true;
+      task.status = TASK_STATUS.PAUSED;
+      task.pauseReason = chatRes.message || '需要登录';
+      await publishTask(task);
+      return 'limited';
+    }
+    return 'failed';
+  }
+  if (chatRes.securityId) job.securityId = chatRes.securityId;
+  if (chatRes.detailSalary && !job.salary) job.salary = chatRes.detailSalary;
+
+  item.state = 'COMMUNICATION_CREATED';
+  await bumpDailyStat('communicate', 1, normalizeText(job.company || ''));
+
+  // messages
+  const selfRes = await sendToBoss(MSG.GET_CHAT_SELF_MESSAGES, { limit: 8 });
+  const recentSelfMessages = selfRes?.messages || [];
+  const plan = planMessageSegments({
+    mode: config.settings.messageMode,
+    template: config.messageTemplate,
+    job: {
+      ...job,
+      hrName: job.hrName || 'HR',
+      city: job.location
+    },
+    recentSelfMessages,
+    threshold: config.settings.similarityThreshold,
+    idempotency
+  });
+
+  if (plan.nativeDetected) {
+    item.state = 'NATIVE_GREETING_DETECTED';
+    await log('info', '检测到原生/已发打招呼，跳过第一段', { jobId: job.jobId });
+  }
+
+  for (const step of plan.plan) {
+    await waitWhilePaused(task);
+    if (runner.abort) return 'aborted';
+    if (runner.skipCurrent) break;
+
+    if (!step.render.ok) {
+      item.state = 'FAILED';
+      item.reasons = step.render.reasonTexts;
+      task.counters.failed += 1;
+      task.consecutiveFails += 1;
+      await bumpDailyStat('fail');
+      await log('error', step.render.reasonTexts[0], { jobId: job.jobId });
+      return 'failed';
+    }
+
+    if (await hasIdempotent(step.key)) continue;
+
+    const sendRes = await sendToBoss(MSG.SEND_TEXT, { text: step.text });
+    if (!sendRes?.ok) {
+      item.state = 'FAILED';
+      item.reasons = [reasonText(REASON.EXEC_SEND_TEXT_FAIL, sendRes?.error || '')];
+      task.counters.failed += 1;
+      task.consecutiveFails += 1;
+      await bumpDailyStat('fail');
+      await log('error', `发送失败：${job.title}`, { jobId: job.jobId });
+      return 'failed';
+    }
+
+    await markIdempotent(step.key, { jobId: job.jobId, segment: step.index });
+    item.state = step.stateName;
+    await log('success', `已发送第 ${step.index + 1} 段消息`, { jobId: job.jobId });
+    await sleep(randomBetween(config.settings.segmentIntervalMs));
+  }
+
+  // resume
+  const profile = pickResumeProfile(job, config.resumes, config.bindings);
+  const timing = config.settings.resumeSendTiming;
+  const shouldSendResume = timing === 'after_text';
+
+  if (shouldSendResume && profile) {
+    if (config.settings.autoSendImageResume && profile.images?.length) {
+      for (let i = 0; i < profile.images.length; i++) {
+        const img = profile.images[i];
+        const key = resumeIdempotencyKey(job, `image_${i}`, profile.id);
+        if (await hasIdempotent(key)) continue;
+        const imgRes = await sendToBoss(MSG.SEND_IMAGE, {
+          dataUrl: img.dataUrl,
+          fileName: img.name || `resume_${i + 1}.png`
+        });
+        if (!imgRes?.ok) {
+          await log('warn', `图片简历发送失败：${imgRes?.message || imgRes?.error || ''}`, { jobId: job.jobId });
+          break;
+        }
+        await markIdempotent(key, { jobId: job.jobId });
+        item.state = 'IMAGE_RESUME_SENT';
+        await log('success', `图片简历已发送 ${i + 1}/${profile.images.length}`, { jobId: job.jobId });
+        await sleep(randomBetween(config.settings.segmentIntervalMs));
+      }
+    }
+    // 附件：页面上传控件差异大，记录意图，提示用户必要时手动
+    if (config.settings.autoSendAttachmentResume && profile.attachment?.dataUrl) {
+      const key = resumeIdempotencyKey(job, 'file', profile.id);
+      if (!(await hasIdempotent(key))) {
+        const fileRes = await sendToBoss(MSG.SEND_IMAGE, {
+          dataUrl: profile.attachment.dataUrl,
+          fileName: profile.attachment.name || 'resume.pdf'
+        });
+        if (fileRes?.ok) {
+          await markIdempotent(key, { jobId: job.jobId });
+          item.state = 'ATTACHMENT_RESUME_SENT';
+          await log('success', '附件简历已尝试发送', { jobId: job.jobId });
+        } else {
+          await log('warn', '附件简历自动发送不可用，请在聊天中手动发送', { jobId: job.jobId });
+        }
+      }
+    }
+  }
+
+  if (runner.skipCurrent) {
+    runner.skipCurrent = false;
+    item.state = 'SKIPPED';
+    item.reasons = [reasonText(REASON.EXEC_USER_SKIP)];
+    task.counters.skipped += 1;
+    await bumpDailyStat('skip');
+    return 'skipped';
+  }
+
+  item.state = 'COMPLETED';
+  item.reasons = [reasonText(REASON.OK_ITEM_COMPLETED)];
+  task.counters.success += 1;
+  task.consecutiveFails = 0;
+  await bumpDailyStat('success');
+  await markIdempotent(jobIdempotencyKey(job), { jobId: job.jobId });
+  await appendHistory({
+    jobId: job.jobId,
+    bossId: job.bossId,
+    company: job.company,
+    title: job.title,
+    securityId: job.securityId,
+    status: 'success',
+    taskId: task.id
+  });
+  await log('success', `完成：${job.title}`, { jobId: job.jobId });
+  return 'success';
+}
+
+async function runTaskLoop(taskId) {
+  if (runner.running) return { ok: false, error: 'ALREADY_RUNNING' };
+  runner.running = true;
+  runner.abort = false;
+  runner.pause = false;
+  runner.skipCurrent = false;
+
+  try {
+    let config = await getAllConfig();
+    let task = config.task;
+    if (!task || task.id !== taskId) {
+      return { ok: false, error: 'TASK_NOT_FOUND' };
+    }
+
+    task.status = TASK_STATUS.RUNNING;
+    task.updatedAt = Date.now();
+    await publishTask(task);
+
+    const queue = (task.results || []).filter((r) => r.selected && r.decision === 'pass');
+    for (const row of queue) {
+      await waitWhilePaused(task);
+      if (runner.abort) break;
+
+      // refresh config each item for live setting changes
+      config = await getAllConfig();
+      task = config.task;
+      if (!task) break;
+
+      const item = task.items.find((x) => x.jobId === row.job.jobId);
+      if (item && (item.state === 'COMPLETED' || item.state === 'SKIPPED')) {
+        continue;
+      }
+
+      const outcome = await processOneJob(task, row, config);
+      task.counters.processed += 1;
+      task.updatedAt = Date.now();
+      await publishTask(task);
+
+      if (outcome === 'limited') break;
+      if (outcome === 'aborted') break;
+
+      if (task.consecutiveFails >= (config.settings.consecutiveFailPause || 3)) {
+        task.status = TASK_STATUS.PAUSED;
+        task.pauseReason = reasonText(REASON.EXEC_CONSECUTIVE_FAIL);
+        runner.pause = true;
+        await publishTask(task);
+        await log('error', task.pauseReason);
+        break;
+      }
+
+      await sleep(randomBetween(config.settings.jobIntervalMs));
+    }
+
+    config = await getAllConfig();
+    task = config.task;
+    if (task) {
+      if (runner.abort) {
+        task.status = TASK_STATUS.STOPPED;
+        await log('warn', '任务已停止');
+      } else if (task.status === TASK_STATUS.PAUSED || runner.pause) {
+        task.status = TASK_STATUS.PAUSED;
+        await log('warn', task.pauseReason || '任务已暂停');
+      } else {
+        task.status = TASK_STATUS.COMPLETED;
+        await log('success', '任务已完成');
+      }
+      task.updatedAt = Date.now();
+      task.currentJobId = null;
+      await publishTask(task);
+    }
+    return { ok: true, task };
+  } catch (err) {
+    await log('error', `任务异常：${err?.message || err}`);
+    const config = await getAllConfig();
+    if (config.task) {
+      config.task.status = TASK_STATUS.FAILED;
+      config.task.updatedAt = Date.now();
+      await publishTask(config.task);
+    }
+    return { ok: false, error: String(err?.message || err) };
+  } finally {
+    runner.running = false;
+  }
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  const { type, payload } = message || {};
+  (async () => {
+    switch (type) {
+      case MSG.GET_STATE: {
+        const all = await getAllConfig();
+        const tab = await getActiveBossTab();
+        return {
+          ok: true,
+          ...all,
+          activeTab: tab ? { id: tab.id, url: tab.url, title: tab.title } : null,
+          runner: { running: runner.running, pause: runner.pause }
+        };
+      }
+      case MSG.SAVE_SETTINGS:
+        await saveSettings(payload);
+        return { ok: true };
+      case MSG.SAVE_FILTERS:
+        await saveFilters(payload);
+        return { ok: true };
+      case MSG.SAVE_TEMPLATE:
+        await saveMessageTemplate(payload);
+        return { ok: true };
+      case MSG.SAVE_LISTS:
+        await saveLists(payload);
+        return { ok: true };
+      case MSG.SAVE_RESUMES:
+        await saveResumes(payload);
+        return { ok: true };
+      case MSG.SAVE_BINDINGS:
+        await saveBindings(payload);
+        return { ok: true };
+      case MSG.RUN_PREVIEW:
+        return await runPreview(payload || {});
+      case MSG.CONFIRM_AND_START: {
+        const all = await getAllConfig();
+        let task = all.task;
+        if (!task) return { ok: false, error: 'NO_TASK' };
+        if (payload?.selectedJobIds) {
+          const setIds = new Set(payload.selectedJobIds);
+          task.results = (task.results || []).map((r) => ({
+            ...r,
+            selected: setIds.has(r.job.jobId)
+          }));
+          task.items = (task.items || []).map((it) => ({
+            ...it,
+            selected: setIds.has(it.jobId)
+          }));
+        }
+        task.status = TASK_STATUS.RUNNING;
+        await publishTask(task);
+        // async loop
+        runTaskLoop(task.id);
+        return { ok: true, taskId: task.id };
+      }
+      case MSG.PAUSE_TASK:
+        runner.pause = true;
+        {
+          const all = await getAllConfig();
+          if (all.task) {
+            all.task.status = TASK_STATUS.PAUSED;
+            all.task.pauseReason = reasonText(REASON.EXEC_USER_PAUSE);
+            await publishTask(all.task);
+          }
+        }
+        await log('warn', '用户暂停任务');
+        return { ok: true };
+      case MSG.RESUME_TASK: {
+        runner.pause = false;
+        runner.abort = false;
+        const all = await getAllConfig();
+        if (!all.task) return { ok: false, error: 'NO_TASK' };
+        all.task.status = TASK_STATUS.RUNNING;
+        await publishTask(all.task);
+        if (!runner.running) runTaskLoop(all.task.id);
+        await log('info', '继续任务');
+        return { ok: true };
+      }
+      case MSG.STOP_TASK:
+        runner.abort = true;
+        runner.pause = false;
+        {
+          const all = await getAllConfig();
+          if (all.task) {
+            all.task.status = TASK_STATUS.STOPPED;
+            await publishTask(all.task);
+          }
+        }
+        await log('warn', '用户停止任务');
+        return { ok: true };
+      case MSG.SKIP_CURRENT:
+        runner.skipCurrent = true;
+        await log('warn', '将跳过当前岗位');
+        return { ok: true };
+      case MSG.EXPORT_CONFIG:
+        return { ok: true, data: await exportAll() };
+      case MSG.IMPORT_CONFIG:
+        await importAll(payload?.data || payload, { merge: Boolean(payload?.merge) });
+        return { ok: true };
+      case MSG.GET_LOGS:
+        return { ok: true, logs: await getLogs(payload?.limit || 200) };
+      case MSG.CLEAR_LOGS:
+        await clearLogs();
+        return { ok: true };
+      case MSG.DIAGNOSE:
+        return await sendToBoss(MSG.DIAGNOSE, payload || {});
+      case MSG.PING:
+        return { ok: true, from: 'background' };
+      default:
+        // content/log events ignored here
+        if (type === MSG.LOG_EVENT || type === MSG.TASK_EVENT) return { ok: true };
+        return { ok: false, error: 'UNKNOWN_TYPE', type };
+    }
+  })()
+    .then(sendResponse)
+    .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+  return true;
+});
+
+// 供调试
+globalThis.__BHT_BG__ = { runner, runPreview };
