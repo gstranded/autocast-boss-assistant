@@ -117,7 +117,7 @@ async function forceInjectContent(tabId) {
   }
 }
 
-async function sendToBoss(type, payload = {}, { retries = 1, forceInject = false } = {}) {
+async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false } = {}) {
   const tab = await getActiveBossTab({ allowInactiveBossTab: false });
   if (!tab?.id) {
     const active = (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
@@ -135,7 +135,6 @@ async function sendToBoss(type, payload = {}, { retries = 1, forceInject = false
     };
   }
 
-  // 关键操作前强制注入最新 content，避免扩展重载后仍跑旧脚本
   const critical = [
     MSG.START_CHAT,
     MSG.SEND_TEXT,
@@ -145,8 +144,20 @@ async function sendToBoss(type, payload = {}, { retries = 1, forceInject = false
     MSG.CLOSE_CHAT,
     MSG.ENSURE_JOB_LIST
   ];
-  if (forceInject || critical.includes(type)) {
+
+  // 仅在 ping 失败时强制注入，避免打断长耗时 startChat / 消息通道
+  let needInject = forceInject;
+  if (!needInject && critical.includes(type)) {
+    try {
+      const pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
+      if (!pong?.ok) needInject = true;
+    } catch (_) {
+      needInject = true;
+    }
+  }
+  if (needInject) {
     await forceInjectContent(tab.id);
+    await sleep(150);
   }
 
   try {
@@ -154,17 +165,14 @@ async function sendToBoss(type, payload = {}, { retries = 1, forceInject = false
       return await chrome.tabs.sendMessage(tab.id, { type, payload });
     } catch (err0) {
       const msg0 = String(err0?.message || err0 || "");
-      // 注入后再试
-      await forceInjectContent(tab.id);
-      if (retries > 0 && /message channel closed|Receiving end does not exist|asynchronous response/i.test(msg0)) {
-        await sleep(500);
+      if (retries > 0 && /message channel closed|Receiving end does not exist|asynchronous response|Could not establish/i.test(msg0)) {
+        await forceInjectContent(tab.id);
+        await sleep(450);
         return sendToBoss(type, payload, { retries: retries - 1, forceInject: true });
       }
-      try {
-        return await chrome.tabs.sendMessage(tab.id, { type, payload });
-      } catch (err1) {
-        throw err1;
-      }
+      await forceInjectContent(tab.id);
+      await sleep(200);
+      return await chrome.tabs.sendMessage(tab.id, { type, payload });
     }
   } catch (err) {
     try {
@@ -177,7 +185,7 @@ async function sendToBoss(type, payload = {}, { retries = 1, forceInject = false
         };
       }
       await forceInjectContent(tab.id);
-      await sleep(200);
+      await sleep(250);
       return await chrome.tabs.sendMessage(tab.id, { type, payload });
     } catch (e2) {
       return {
@@ -400,12 +408,15 @@ async function processOneJob(task, resultRow, config) {
     try {
       const ensured = await sendToBoss(MSG.ENSURE_JOB_LIST, { maxWaitMs: 5000, scroll: false });
       if (ensured && ensured.ok === false) {
-        await log('warn', ensured.message || '职位列表暂未就绪，将直接按标题查找', { jobId: job.jobId });
+        await log('warn', ensured.message || '职位列表暂未就绪，将直接按职位信息查找', { jobId: job.jobId });
       }
     } catch (_) {}
     await sleep(150);
   }
   const chatRes = await sendToBoss(MSG.START_CHAT, { job, skipScroll: true });
+  if (chatRes?.contentVersion) {
+    await log('info', 'content v' + chatRes.contentVersion + (chatRes.matchedVia ? (' · 匹配:' + chatRes.matchedVia) : ''), { jobId: job.jobId });
+  }
   if (!chatRes?.ok) {
     item.state = 'FAILED';
     let code = REASON.EXEC_CLICK_FAIL;
@@ -648,28 +659,55 @@ async function runTaskLoop(taskId) {
           break;
         }
       }
-      const outcome = await processOneJob(task, row, config);
-      // ENSURE_JOB_LIST between jobs
-      if (outcome === 'success' || outcome === 'failed' || outcome === 'skipped') {
-        await sendToBoss(MSG.RETURN_TO_LIST, {});
-        await sleep(500);
-      }
-      // awaitingUserRetry on fail
-      if (outcome === 'failed') {
+      let outcome = await processOneJob(task, row, config);
+
+      // 失败后等待用户：关闭=保持暂停不自动继续；重试=重置当前岗位后再跑一次
+      while (outcome === 'failed') {
+        // 回列表，避免卡在会话页
+        try { await sendToBoss(MSG.RETURN_TO_LIST, {}); } catch (_) {}
+        await sleep(400);
+
+        config = await getAllConfig();
+        task = config.task;
+        if (!task) break;
+
         task.status = TASK_STATUS.PAUSED;
         task.awaitingUserRetry = true;
+        task.retryCurrent = false;
         task.pauseReason = task.pauseReason || itemErrorHint(task, row) || '岗位处理失败，请查看原因后重试';
-        task.lastErrorDetail = [
-          '岗位：' + (row.job?.title || ''),
-          '公司：' + (row.job?.company || ''),
-          '原因：' + ((task.items.find(x => x.jobId === row.job.jobId) || {}).reasons || []).join('；')
-        ].filter(Boolean).join('\n');
+        task.lastErrorDetail = ['岗位：' + (row.job?.title || ''), '公司：' + (row.job?.company || ''), '原因：' + ((task.items.find((x) => x.jobId === row.job.jobId) || {}).reasons || []).join('；')].filter(Boolean).join('\n');
         runner.pause = true;
         await publishTask(task);
-        // 等用户点重试/关闭；不再重复 log pauseReason（processOneJob 已记录）
         await waitWhilePaused(task);
-        if (runner.abort) break;
-        // 用户点重试后，不增加 processed 重复？已失败计一次
+        if (runner.abort) {
+          outcome = 'aborted';
+          break;
+        }
+
+        config = await getAllConfig();
+        task = config.task;
+        if (!task) break;
+        const it = task.items?.find((x) => x.jobId === row.job.jobId);
+        if (it && it.state === 'NOT_STARTED' && task.retryCurrent === true) {
+          // 用户点了重试：再试当前岗位
+          task.retryCurrent = false;
+          await publishTask(task);
+          outcome = await processOneJob(task, row, config);
+          continue;
+        }
+        // 用户关闭后点继续：不重试当前失败项，进入下一岗
+        task.retryCurrent = false;
+        task.awaitingUserRetry = false;
+        // 手动继续时不把历史失败累计成自动熔断
+        task.consecutiveFails = 0;
+        await publishTask(task);
+        break;
+      }
+
+      // 成功/跳过后再回列表；失败已在上面回过
+      if (outcome === 'success' || outcome === 'skipped') {
+        try { await sendToBoss(MSG.RETURN_TO_LIST, {}); } catch (_) {}
+        await sleep(500);
       }
       task.counters.processed += 1;
       task.updatedAt = Date.now();
@@ -811,29 +849,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await log('warn', '用户暂停任务');
         return { ok: true };
       case MSG.RESUME_TASK: {
-        if (true) {
+        {
           const all0 = await getAllConfig();
           if (all0.task) {
             all0.task.awaitingUserRetry = false;
-            all0.task.pauseReason = '';
-            all0.task.lastErrorDetail = '';
+            // payload.retry === true 表示弹窗「重试」：只重置当前失败岗位
+            const wantRetry = Boolean(payload?.retry);
+            if (wantRetry) {
+              const curId = all0.task.currentJobId;
+              all0.task.items = (all0.task.items || []).map((it) => {
+                if (curId && it.jobId === curId && it.state === 'FAILED') {
+                  return { ...it, state: 'NOT_STARTED', reasons: [] };
+                }
+                // 无 currentJobId 时，仅重置最近一个 FAILED
+                return it;
+              });
+              if (!all0.task.currentJobId) {
+                const lastFail = [...(all0.task.items || [])].reverse().find((it) => it.state === 'FAILED');
+                if (lastFail) {
+                  all0.task.items = all0.task.items.map((it) =>
+                    it.jobId === lastFail.jobId ? { ...it, state: 'NOT_STARTED', reasons: [] } : it
+                  );
+                  all0.task.currentJobId = lastFail.jobId;
+                }
+              }
+              all0.task.retryCurrent = true;
+              all0.task.consecutiveFails = 0;
+              all0.task.pauseReason = '';
+              all0.task.lastErrorDetail = '';
+            } else {
+              // 工具栏「继续」：不自动重置失败项，跳过它们往下跑
+              all0.task.retryCurrent = false;
+              all0.task.pauseReason = '';
+              all0.task.lastErrorDetail = '';
+            }
             await publishTask(all0.task);
           }
           runner.pauseLogged = false;
           runner.pausePublished = false;
-          // reset FAILED for retry
-          {
-            const all1 = await getAllConfig();
-            if (all1.task?.items) {
-              all1.task.items = all1.task.items.map((it) =>
-                it.state === 'FAILED' ? { ...it, state: 'NOT_STARTED', reasons: [] } : it
-              );
-              all1.task.consecutiveFails = 0;
-              await publishTask(all1.task);
-            }
-          }
         }
-        // RESUME_TASK guard
         {
           const guard = await assertBossContext();
           if (!guard.ok) {
@@ -848,7 +902,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         all.task.status = TASK_STATUS.RUNNING;
         await publishTask(all.task);
         if (!runner.running) runTaskLoop(all.task.id);
-        await log('info', '继续任务');
+        await log('info', payload?.retry ? '重试当前岗位' : '继续任务');
         return { ok: true };
       }
       case MSG.STOP_TASK:
@@ -887,17 +941,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case MSG.DISMISS_ERROR_MODAL:
       case 'BHT_DISMISS_ERROR_MODAL': {
-        // 用户关闭错误弹窗：保持暂停，但清除 awaitingUserRetry，避免反复弹窗
+        // 用户关闭错误弹窗：保持暂停，不自动重试、不进入下一岗
         runner.pause = true;
+        runner.abort = false;
         const all = await getAllConfig();
         if (all.task) {
           all.task.awaitingUserRetry = false;
+          all.task.retryCurrent = false;
           all.task.status = TASK_STATUS.PAUSED;
           all.task.updatedAt = Date.now();
-          // 保留 pauseReason 便于状态栏显示，但不再驱动弹窗
           await publishTask(all.task);
         }
-        await log('warn', '用户关闭错误提示，任务保持暂停');
+        await log('warn', '用户关闭错误提示，任务保持暂停（不会自动重试）');
         return { ok: true };
       }
       case MSG.EXPORT_CONFIG:

@@ -14,7 +14,7 @@
     DIAGNOSE: "BHT_DIAGNOSE"
   };
 
-  const BHT_CONTENT_VERSION = "1.2.4";
+  const BHT_CONTENT_VERSION = "1.2.5";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -188,12 +188,16 @@
       .toLowerCase();
   }
 
-  function coreTitle(input = "") {
-    // 去城市后缀、括号说明，保留核心职位名
-    return normalizeText(String(input || "")
-      .replace(/[-—–].*$/, (m) => m) // keep for now
-      .replace(/（[^）]*）/g, "")
-      .replace(/\([^)]*\)/g, ""));
+      function coreTitle(input = "") {
+    // strip city/paren suffixes
+    return normalizeText(
+      String(input || "")
+        .replace(/（[^）]*）/g, "")
+        .replace(/\([^)]*\)/g, "")
+        .replace(/【[^】]*】/g, "")
+        .replace(/\[[^\]]*\]/g, "")
+        .replace(/[-—–·][\u4e00-\u9fa5A-Za-z0-9/／、]{1,20}$/g, "")
+    );
   }
 
   function hashStr(s) {
@@ -791,19 +795,40 @@ function dismissCommonDialogs() {
     return null;
   }
 
-  async function startChat(job, opts = {}) {
+﻿  async function startChat(job, opts = {}) {
     const inputJob = (opts && opts.job) || job || {};
     const wantTitle = normalizeText(inputJob.title || "");
     const wantCompany = normalizeText(inputJob.company || "");
     const wantId = String(inputJob.jobId || "");
     const wantHref = String(inputJob.href || "");
-    const wantHrefId = extractJobIdFromHref(wantHref) || (wantId && !wantId.startsWith("name_") && !wantId.startsWith("dom_") ? wantId : "");
+    const wantHrefId =
+      extractJobIdFromHref(wantHref) ||
+      (wantId && !wantId.startsWith("name_") && !wantId.startsWith("dom_") ? wantId : "");
 
     try { await closeChatPanel(); } catch (_) {}
-    await sleep(200);
+    await sleep(180);
 
-    const getListScroller = () =>
-      firstEl(SELECTORS.listScroller) || document.scrollingElement || document.documentElement;
+    const getListScroller = () => {
+      const bySel = firstEl(SELECTORS.listScroller);
+      if (bySel) return bySel;
+      const list =
+        document.querySelector("ul.rec-job-list") ||
+        document.querySelector(".job-list-container") ||
+        document.querySelector(".job-recommend-result") ||
+        document.querySelector(".search-job-result");
+      if (list) {
+        let p = list;
+        for (let i = 0; i < 6 && p; i++) {
+          try {
+            const st = getComputedStyle(p);
+            const oy = st.overflowY || st.overflow;
+            if ((oy === "auto" || oy === "scroll") && p.scrollHeight > p.clientHeight + 40) return p;
+          } catch (_) {}
+          p = p.parentElement;
+        }
+      }
+      return document.scrollingElement || document.documentElement;
+    };
 
     const mainListRoot = () =>
       document.querySelector("ul.rec-job-list") ||
@@ -811,38 +836,40 @@ function dismissCommonDialogs() {
       document.querySelector(".job-recommend-result") ||
       document.querySelector(".search-job-result") ||
       document.querySelector(".recommend-result-job") ||
+      document.querySelector(".job-list-box") ||
       null;
 
-    const isInMainList = (el) => {
+    const isInMainList = (el, strict = true) => {
       if (!el) return false;
-      if (el.closest(".job-detail-box, .job-detail-container, .chat-container, .chat-box, .dialog-chat, #chat-box")) return false;
+      if (el.closest(".job-detail-box, .job-detail-container, .chat-container, .chat-box, .dialog-chat, #chat-box")) {
+        return false;
+      }
       const root = mainListRoot();
       if (root) return root.contains(el);
-      // 无主列表容器时，至少排除详情/聊天
-      return true;
+      return !strict;
     };
 
     const visibleTitleSamples = () => {
       const root = mainListRoot() || document;
       return Array.from(root.querySelectorAll("a.job-name, .job-name"))
-        .filter((el) => isInMainList(el))
+        .filter((el) => isInMainList(el, false))
         .map((el) => textOf(el))
         .filter(Boolean)
-        .slice(0, 6);
+        .slice(0, 8);
     };
 
     const scoreMatch = (p) => {
       if (!p) return -1;
       let score = 0;
       const t = normalizeText(p.title || "");
-      const tc = typeof coreTitle === "function" ? coreTitle(p.title || "") : t;
-      const wantCore = typeof coreTitle === "function" ? coreTitle(inputJob.title || "") : wantTitle;
+      const tc = coreTitle(p.title || "");
+      const wantCore = coreTitle(inputJob.title || "");
       const co = normalizeText(p.company || "");
       if (wantId && p.jobId && p.jobId === wantId) score += 100;
       if (wantHrefId && (p.jobId === wantHrefId || (p.href && p.href.includes(wantHrefId)))) score += 100;
       if (wantHref && p.href && (p.href === wantHref || (wantHrefId && p.href.includes(wantHrefId)))) score += 90;
       if (wantTitle && t) {
-        if (t === wantTitle || tc === wantCore) score += 50;
+        if (t === wantTitle || (wantCore && tc === wantCore)) score += 50;
         else if (
           t.includes(wantTitle) ||
           wantTitle.includes(t) ||
@@ -850,7 +877,9 @@ function dismissCommonDialogs() {
         ) {
           score += 35;
         } else if (!(wantId || wantHrefId)) {
-          return -1;
+          if (!(wantCompany && co && (co === wantCompany || co.includes(wantCompany) || wantCompany.includes(co)))) {
+            return -1;
+          }
         }
       } else if (!wantId && !wantHrefId) {
         return -1;
@@ -869,12 +898,13 @@ function dismissCommonDialogs() {
       el.closest("li") ||
       el;
 
-    // 1) 最高优先：按 job_detail href / jobId 直接定位主列表锚点
-    const findByHref = () => {
+    const findByHref = (strict = true) => {
       if (!wantHrefId && !wantHref) return null;
-      const anchors = Array.from(document.querySelectorAll("a.job-name[href], a[href*='job_detail']"));
+      const anchors = Array.from(
+        document.querySelectorAll("a.job-name[href], a[href*='job_detail'], a[href*='jobId=']")
+      );
       for (const el of anchors) {
-        if (!isInMainList(el)) continue;
+        if (!isInMainList(el, strict)) continue;
         const href = el.href || el.getAttribute("href") || "";
         const id = extractJobIdFromHref(href);
         if (wantHrefId && (id === wantHrefId || href.includes(wantHrefId))) {
@@ -901,13 +931,13 @@ function dismissCommonDialogs() {
       return null;
     };
 
-    const tryPickVisible = () => {
-      const byHref = findByHref();
+    const tryPickVisible = (strict = true) => {
+      const byHref = findByHref(strict);
       if (byHref) return byHref;
 
       let best = null;
       let bestScore = 0;
-      const cards = getJobCards().filter((card) => isInMainList(card));
+      const cards = getJobCards().filter((card) => isInMainList(card, strict));
       for (let i = 0; i < cards.length; i++) {
         const p = parseJobCard(cards[i], i);
         const sc = scoreMatch(p);
@@ -917,7 +947,9 @@ function dismissCommonDialogs() {
         }
       }
       const root = mainListRoot() || document;
-      const names = Array.from(root.querySelectorAll("a.job-name, .job-name")).filter((el) => isInMainList(el));
+      const names = Array.from(root.querySelectorAll("a.job-name, .job-name")).filter((el) =>
+        isInMainList(el, strict)
+      );
       for (const el of names) {
         const card = cardFromNameEl(el);
         const live = parseJobCard(card, 0);
@@ -928,16 +960,15 @@ function dismissCommonDialogs() {
           best = { card, live: mergedLive, score: sc, via: "name" };
         }
       }
-      return bestScore >= 25 ? best : null;
+      const minScore = wantHrefId || (wantId && !String(wantId).startsWith("name_")) ? 25 : 35;
+      return bestScore >= minScore ? best : null;
     };
 
-    // 确保主列表在
     if (getJobCards().length === 0) {
-      try { await ensureJobList({ maxWaitMs: 6000, scroll: true }); } catch (_) {}
+      try { await ensureJobList({ maxWaitMs: 7000, scroll: true }); } catch (_) {}
     }
 
-    // 先不滚动直接找（href 命中可立刻点）
-    let picked = tryPickVisible();
+    let picked = tryPickVisible(true) || tryPickVisible(false);
 
     if (!picked) {
       try { window.scrollTo(0, 0); } catch (_) {}
@@ -945,25 +976,44 @@ function dismissCommonDialogs() {
         const sc = getListScroller();
         if (sc) sc.scrollTop = 0;
       } catch (_) {}
-      await sleep(300);
-      picked = tryPickVisible();
+      await sleep(280);
+      picked = tryPickVisible(true) || tryPickVisible(false);
     }
 
     if (!picked) {
-      for (let round = 0; round < 70 && !picked; round++) {
+      for (let round = 0; round < 90 && !picked; round++) {
         try {
           const sc = getListScroller();
           if (sc && sc !== document.scrollingElement && sc !== document.documentElement) {
-            sc.scrollTop = (sc.scrollTop || 0) + 380;
+            sc.scrollTop = (sc.scrollTop || 0) + 420;
           } else {
-            window.scrollBy(0, 380);
+            window.scrollBy(0, 420);
           }
         } catch (_) {
-          try { window.scrollBy(0, 380); } catch (__) {}
+          try { window.scrollBy(0, 420); } catch (__) {}
         }
-        await sleep(150);
-        picked = tryPickVisible();
+        await sleep(140);
+        picked = tryPickVisible(true) || tryPickVisible(false);
+        if (!picked && round > 0 && round % 15 === 0) {
+          try {
+            const jobNav = Array.from(document.querySelectorAll("a,button,span")).find((el) => {
+              const t = textOf(el);
+              return t === "职位" || t === "推荐";
+            });
+            if (jobNav) clickLikeHuman(jobNav);
+          } catch (_) {}
+        }
       }
+    }
+
+    if (!picked) {
+      try {
+        await returnToJobList();
+      } catch (_) {
+        try { await ensureJobList({ maxWaitMs: 5000, scroll: true }); } catch (__) {}
+      }
+      await sleep(300);
+      picked = tryPickVisible(true) || tryPickVisible(false);
     }
 
     if (!picked) {
@@ -981,6 +1031,7 @@ function dismissCommonDialogs() {
         listCount: getJobCards().length,
         href: location.href,
         wantHrefId,
+        contentVersion: BHT_CONTENT_VERSION,
         samples: titles
       };
     }
@@ -1001,30 +1052,31 @@ function dismissCommonDialogs() {
     const wrap = card.closest?.(".job-card-wrap") || card.closest?.("li.job-card-box") || card;
     try { wrap.scrollIntoView({ block: "center", behavior: "instant" }); } catch (_) {}
     await sleep(160);
-    preventLinkNavigation(wrap, 1500);
+    preventLinkNavigation(wrap, 1800);
 
-    // 优先点职位名锚点（BOSS 靠它激活右侧详情），再点卡片
     const titleEl =
       wrap.querySelector?.("a.job-name, .job-name") ||
       card.querySelector?.("a.job-name, .job-name") ||
       null;
     if (titleEl) clickLikeHuman(titleEl);
     else clickLikeHuman(wrap);
-    await sleep(500);
+    await sleep(550);
 
     if (!firstEl(SELECTORS.detailRoot) && !firstEl(SELECTORS.chatOnDetail)) {
-      preventLinkNavigation(wrap, 1000);
+      preventLinkNavigation(wrap, 1200);
       clickLikeHuman(titleEl || card || wrap);
-      await sleep(450);
+      await sleep(500);
     }
 
     if (typeof detectLoginModal === "function") {
       const loginHit = detectLoginModal();
-      if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
+      if (loginHit.ok) {
+        return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+      }
     }
 
     let clicked = { ok: false };
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 16; i++) {
       clicked = await clickChatButton();
       if (clicked.ok) break;
       const cardBtn = Array.from((wrap || card).querySelectorAll("a,button")).find((el) =>
@@ -1036,18 +1088,25 @@ function dismissCommonDialogs() {
         clicked = { ok: true, buttonText: textOf(cardBtn), already: /继续沟通/.test(textOf(cardBtn)) };
         break;
       }
-      await sleep(300);
+      if (i === 6) {
+        preventLinkNavigation(wrap, 800);
+        clickLikeHuman(titleEl || card || wrap);
+      }
+      await sleep(320);
     }
 
     if (!clicked.ok) {
       if (typeof detectLoginModal === "function") {
         const loginHit = detectLoginModal();
-        if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
+        if (loginHit.ok) {
+          return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+        }
       }
       return {
         ok: false,
         error: "CHAT_BUTTON_NOT_FOUND",
-        message: "未找到「立即沟通」按钮。请确认已登录，并手动点开该岗位看是否有沟通按钮"
+        message: "未找到「立即沟通」按钮。请确认已登录，并手动点开该岗位看是否有沟通按钮",
+        contentVersion: BHT_CONTENT_VERSION
       };
     }
 
@@ -1055,86 +1114,55 @@ function dismissCommonDialogs() {
     dismissCommonDialogs();
     if (typeof detectLoginModal === "function") {
       const loginHit = detectLoginModal();
-      if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
+      if (loginHit.ok) {
+        return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+      }
     }
 
-    const chatReady = await waitForChat(15000);
+    const chatReady = await waitForChat(16000);
     if (!chatReady) {
       if (typeof detectLoginModal === "function") {
         const loginHit = detectLoginModal();
-        if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
+        if (loginHit.ok) {
+          return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+        }
       }
       return {
         ok: false,
         error: "CHAT_TIMEOUT",
-        message: "聊天输入框未出现。请确认已登录；如有弹窗请先处理"
+        message: "聊天输入框未出现。请确认已登录；如有弹窗请先处理",
+        contentVersion: BHT_CONTENT_VERSION
       };
     }
+
+    const more = firstEl(SELECTORS.moreLink);
+    const securityId = extractSecurityId(more?.href || "") || merged.securityId || "";
+    const detailRoot = firstEl(SELECTORS.detailRoot) || document;
+    const detailSalary = textOf(firstEl(SELECTORS.salary, detailRoot));
 
     return {
       ok: true,
       already: Boolean(clicked.already),
-      job: merged,
-      securityId: merged.securityId || "",
-      detailSalary: merged.salary || "",
-      chatPage: isChatPage(),
-      href: location.href,
-      via: picked.via
+      job: { ...merged, securityId, salary: merged.salary || detailSalary },
+      securityId,
+      detailSalary,
+      contentVersion: BHT_CONTENT_VERSION,
+      matchedVia: picked.via,
+      matchScore: picked.score
     };
   }
 
 
-async function setInputText(input, text) {
-    input.focus();
-    await sleep(80);
-    if (input.tagName === "TEXTAREA" || input.tagName === "INPUT") {
-      const proto = input.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const desc = Object.getOwnPropertyDescriptor(proto, "value");
-      desc?.set?.call(input, text);
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-    } else {
-      // contenteditable / BOSS 自定义输入
-      try {
-        const sel = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(input);
-        sel.removeAllRanges();
-        sel.addRange(range);
-      } catch (_) {}
-      let inserted = false;
-      try {
-        inserted = document.execCommand("insertText", false, text);
-      } catch (_) {}
-      if (!inserted) {
-        input.textContent = text;
-        input.innerHTML = "";
-        input.appendChild(document.createTextNode(text));
-      }
-      input.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-    }
-    await sleep(120);
-  }
-
-  function findSendButton() {
-    const nodes = Array.from(document.querySelectorAll("button,a,div[role='button'],span"));
-    // 避免点到「发送简历」等
-    const exact = nodes.find((el) => {
-      const t = textOf(el);
-      return t === "发送" || t === "发送消息";
-    });
-    if (exact) return exact;
-    return (
-      nodes.find((el) => /^发送$|发送消息|^send$/i.test(textOf(el))) ||
-      firstEl(SELECTORS.sendBtn)
-    );
-  }
-
   async function sendText(text) {
     if (!text || !String(text).trim()) return { ok: false, error: "EMPTY_TEXT" };
     dismissCommonDialogs();
-    const ready = await waitForChat(12000);
+    let ready = await waitForChat(14000);
+    if (!ready) {
+      // 再试一次：有时点完立即沟通后输入框延迟出现
+      dismissCommonDialogs();
+      await sleep(500);
+      ready = await waitForChat(8000);
+    }
     if (!ready) return { ok: false, error: "CHAT_TIMEOUT", message: "聊天输入框未就绪" };
     const input = getChatInput();
     if (!input || !hasUsableChatInput()) {

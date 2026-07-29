@@ -4,7 +4,7 @@ import { reasonText } from '../shared/reason-codes.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
-const BHT_UI_VERSION = "1.2.4";
+const BHT_UI_VERSION = "1.2.5";
 // FLOAT_MODE_FORCE_BOSS: floating host only injects on BOSS pages
 const state = {
   modalDismissed: false,
@@ -961,11 +961,12 @@ $('bht-modal-close')?.addEventListener('click', async () => {
 
 $('bht-modal-retry')?.addEventListener('click', async () => {
   state.modalDismissed = false;
+  state.modalClosedForKey = '';
   state.lastModalKey = '';
   const modal = $('bht-modal');
   if (modal) modal.hidden = true;
   toast('正在重试当前失败岗位…', 'warn', 1500);
-  const res = await api(MSG.RESUME_TASK);
+  const res = await api(MSG.RESUME_TASK, { retry: true });
   if (!res?.ok) {
     state.modalDismissed = false;
     showErrorModal('重试失败', res?.message || res?.error || '请重新扫描预览后再试', { showRetry: true, force: true });
