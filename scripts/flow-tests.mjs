@@ -42,11 +42,12 @@ test("background ensures list before chat and returns after job", () => {
 
 test("content startChat is href-first and versioned", () => {
   const s = fs.readFileSync("extension/content/content-main.js", "utf8");
-  assert.ok(s.includes('BHT_CONTENT_VERSION = "1.2.7"'));
+  assert.ok(s.includes('BHT_CONTENT_VERSION = "1.2.8"'));
   assert.ok(s.includes("matchedVia"));
   assert.ok(s.includes("tryPickVisible"));
   assert.ok(s.includes("JOB_CARD_NOT_FOUND"));
   assert.ok(s.includes("openJobByHrefFallback"));
+  assert.ok(s.includes("installJobNavGuard") || s.includes("bht-op"));
   assert.ok(s.includes("bht-op"));
   assert.ok(s.includes("uiErrorDismissed") === false); // content may not have it
 });

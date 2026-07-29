@@ -206,6 +206,20 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       if (result) return result;
     } catch (errPort) {
       const msgP = String(errPort?.message || errPort || '');
+      // START_CHAT_RECOVER: 点击导致脚本上下文销毁时，等页面稳定后重试
+      if (type === MSG.START_CHAT && /PORT_DISCONNECTED|Receiving end does not exist|message channel closed/i.test(msgP)) {
+        await sleep(1200);
+        try {
+          const latest = await chrome.tabs.get(tab.id);
+          if (isBossUrl(latest?.url || '')) {
+            await forceInjectContent(tab.id);
+            await sleep(350);
+            if (retries > 0) {
+              return sendToBoss(type, payload, { retries: retries - 1, forceInject: true });
+            }
+          }
+        } catch (_) {}
+      }
       if (retries > 0) {
         await forceInjectContent(tab.id);
         await sleep(400);

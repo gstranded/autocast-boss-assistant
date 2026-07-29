@@ -14,7 +14,7 @@
     DIAGNOSE: "BHT_DIAGNOSE"
   };
 
-  const BHT_CONTENT_VERSION = "1.2.7";
+  const BHT_CONTENT_VERSION = "1.2.8";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -133,6 +133,30 @@
       } catch (_) {}
     }
     return [];
+  }
+
+  function installJobNavGuard(ms = 20000) {
+    const blocker = (e) => {
+      try {
+        const t = e.target;
+        const a = t && t.closest ? t.closest("a[href], area[href]") : null;
+        if (!a) return;
+        const href = a.href || a.getAttribute("href") || "";
+        if (/job_detail|geek\/job|\/job\//i.test(href)) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
+        }
+      } catch (_) {}
+    };
+    document.addEventListener("click", blocker, true);
+    const timer = setTimeout(() => {
+      try { document.removeEventListener("click", blocker, true); } catch (_) {}
+    }, ms);
+    return () => {
+      clearTimeout(timer);
+      try { document.removeEventListener("click", blocker, true); } catch (_) {}
+    };
   }
 
   function preventLinkNavigation(root, ms = 600) {
@@ -853,7 +877,50 @@ function dismissCommonDialogs() {
     return { ok: false };
   }
 
-  async function startChat(job, opts = {}) {
+    async function startChatOnCurrentDetail(job = {}) {
+    if (typeof detectLoginModal === "function") {
+      const loginHit = detectLoginModal();
+      if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+    }
+    let clicked = { ok: false };
+    for (let i = 0; i < 12; i++) {
+      clicked = await clickChatButton();
+      if (clicked.ok) break;
+      await sleep(300);
+    }
+    if (!clicked.ok) {
+      if (typeof detectLoginModal === "function") {
+        const loginHit = detectLoginModal();
+        if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+      }
+      return { ok: false, error: "CHAT_BUTTON_NOT_FOUND", message: "当前页未找到立即沟通按钮", contentVersion: BHT_CONTENT_VERSION };
+    }
+    await sleep(400);
+    dismissCommonDialogs();
+    const chatReady = await waitForChat(16000);
+    if (!chatReady) {
+      if (typeof detectLoginModal === "function") {
+        const loginHit = detectLoginModal();
+        if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+      }
+      return { ok: false, error: "CHAT_TIMEOUT", message: "聊天输入框未出现", contentVersion: BHT_CONTENT_VERSION };
+    }
+    return {
+      ok: true,
+      already: Boolean(clicked.already),
+      job: job || {},
+      contentVersion: BHT_CONTENT_VERSION,
+      matchedVia: "current-detail"
+    };
+  }
+
+async function startChat(job, opts = {}) {
+    // 若已在详情/聊天页，直接点沟通（用于导航后恢复）
+    if (firstEl(SELECTORS.detailRoot) || firstEl(SELECTORS.chatOnDetail) || hasUsableChatInput()) {
+      if (getJobCards().length < 3) {
+        return await startChatOnCurrentDetail((opts && opts.job) || job || {});
+      }
+    }
     const inputJob = (opts && opts.job) || job || {};
     const wantTitle = normalizeText(inputJob.title || "");
     const wantCompany = normalizeText(inputJob.company || "");
@@ -863,6 +930,8 @@ function dismissCommonDialogs() {
       extractJobIdFromHref(wantHref) ||
       (wantId && !wantId.startsWith("name_") && !wantId.startsWith("dom_") ? wantId : "");
 
+    const releaseNavGuard = installJobNavGuard(25000);
+    try {
     try { await closeChatPanel(); } catch (_) {}
     await sleep(180);
 
@@ -1266,8 +1335,10 @@ function dismissCommonDialogs() {
       matchedVia: picked.via,
       matchScore: picked.score
     };
+  } finally {
+      try { releaseNavGuard && releaseNavGuard(); } catch (_) {}
+    }
   }
-
 
   async function sendText(text) {
     if (!text || !String(text).trim()) return { ok: false, error: "EMPTY_TEXT" };
