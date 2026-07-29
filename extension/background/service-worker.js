@@ -28,6 +28,7 @@ import { planMessageSegments } from '../shared/message-planner.js';
 import { pickResumeProfile } from '../shared/template.js';
 import { REASON, reasonText } from '../shared/reason-codes.js';
 import { TASK_STATUS } from '../shared/constants.js';
+import { isBossUrl, isBossTab, bossUrlGuardMessage, BOSS_MATCH_PATTERNS } from '../shared/boss-url.js';
 import { normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
 
 let runner = {
@@ -42,35 +43,104 @@ chrome.runtime.onInstalled.addListener(async () => {
   if (chrome.sidePanel?.setPanelBehavior) {
     await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   }
+  await refreshSidePanelForAllTabs();
 });
 
-chrome.action?.onClicked?.addListener(async (tab) => {
-  if (chrome.sidePanel?.open && tab?.windowId != null) {
-    await chrome.sidePanel.open({ windowId: tab.windowId });
+async function setSidePanelForTab(tabId, url) {
+  if (!chrome.sidePanel?.setOptions || tabId == null) return;
+  const enabled = isBossUrl(url || "");
+  try {
+    await chrome.sidePanel.setOptions({
+      tabId,
+      path: "sidepanel/index.html",
+      enabled
+    });
+  } catch (_) {}
+}
+
+async function refreshSidePanelForAllTabs() {
+  if (!chrome.sidePanel?.setOptions) return;
+  try {
+    const tabs = await chrome.tabs.query({});
+    await Promise.all(tabs.map((t) => setSidePanelForTab(t.id, t.url || "")));
+  } catch (_) {}
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.url || changeInfo.status === "complete") {
+    setSidePanelForTab(tabId, changeInfo.url || tab?.url || "");
   }
 });
 
-async function getActiveBossTab() {
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    await setSidePanelForTab(tabId, tab?.url || "");
+  } catch (_) {}
+});
+  }
+});
+
+chrome.action?.onClicked?.addListener(async (tab) => {
+  if (!isBossTab(tab)) {
+    try {
+      if (tab?.id != null) await setSidePanelForTab(tab.id, tab.url || "");
+    } catch (_) {}
+    return;
+  }
+  if (chrome.sidePanel?.open && tab?.windowId != null) {
+    await setSidePanelForTab(tab.id, tab.url || "");
+    await chrome.sidePanel.open({ windowId: tab.windowId, tabId: tab.id });
+  }
+});
+  }
+});
+
+async function getActiveBossTab({ allowInactiveBossTab = false } = {}) {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  const tab = tabs[0];
-  if (tab?.id != null && /zhipin\.com|bosszhipin\.com/i.test(tab.url || '')) return tab;
-  const all = await chrome.tabs.query({ url: ['*://*.zhipin.com/*', '*://*.bosszhipin.com/*'] });
+  const active = tabs[0];
+  if (isBossTab(active)) return active;
+
+  // 严格模式：当前激活页不是 BOSS 时，默认不跨标签操作
+  if (!allowInactiveBossTab) return null;
+
+  const all = await chrome.tabs.query({ url: BOSS_MATCH_PATTERNS });
   return all.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0] || null;
 }
 
 async function sendToBoss(type, payload = {}) {
-  const tab = await getActiveBossTab();
+  const tab = await getActiveBossTab({ allowInactiveBossTab: false });
   if (!tab?.id) {
-    return { ok: false, error: 'NO_BOSS_TAB', message: '请先打开 BOSS 直聘职位列表页' };
+    const active = (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+    return {
+      ok: false,
+      error: "NO_BOSS_TAB",
+      message: bossUrlGuardMessage(active?.url || "")
+    };
+  }
+  // 注入前再次校验 URL，防止标签在异步过程中导航到非 BOSS 页
+  if (!isBossUrl(tab.url || "")) {
+    return {
+      ok: false,
+      error: "NOT_BOSS_URL",
+      message: bossUrlGuardMessage(tab.url || "")
+    };
   }
   try {
     return await chrome.tabs.sendMessage(tab.id, { type, payload });
   } catch (err) {
-    // 尝试动态注入
     try {
+      const latest = await chrome.tabs.get(tab.id);
+      if (!isBossUrl(latest?.url || "")) {
+        return {
+          ok: false,
+          error: "NOT_BOSS_URL",
+          message: bossUrlGuardMessage(latest?.url || "")
+        };
+      }
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        files: ['content/content-main.js'],
+        files: ["content/content-main.js"],
         injectImmediately: true
       });
       await sleep(200);
@@ -78,11 +148,25 @@ async function sendToBoss(type, payload = {}) {
     } catch (e2) {
       return {
         ok: false,
-        error: 'CONTENT_INJECT_FAIL',
+        error: "CONTENT_INJECT_FAIL",
         message: String(e2?.message || err?.message || e2)
       };
     }
   }
+}
+
+async function assertBossContext() {
+  const tab = await getActiveBossTab({ allowInactiveBossTab: false });
+  if (!tab) {
+    const active = (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+    return {
+      ok: false,
+      error: "NO_BOSS_TAB",
+      message: bossUrlGuardMessage(active?.url || ""),
+      activeTab: active ? { id: active.id, url: active.url, title: active.title } : null
+    };
+  }
+  return { ok: true, tab };
 }
 
 async function log(level, message, extra = {}) {
@@ -454,6 +538,18 @@ async function runTaskLoop(taskId) {
         continue;
       }
 
+      // assertBossContext before process
+      {
+        const guard = await assertBossContext();
+        if (!guard.ok) {
+          runner.pause = true;
+          task.status = TASK_STATUS.PAUSED;
+          task.pauseReason = guard.message;
+          await publishTask(task);
+          await log("warn", guard.message);
+          break;
+        }
+      }
       const outcome = await processOneJob(task, row, config);
       task.counters.processed += 1;
       task.updatedAt = Date.now();
@@ -517,6 +613,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           ok: true,
           ...all,
           activeTab: tab ? { id: tab.id, url: tab.url, title: tab.title } : null,
+          activeIsBoss: Boolean(tab),
+          bossOnly: true,
           runner: { running: runner.running, pause: runner.pause }
         };
       }
@@ -538,9 +636,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MSG.SAVE_BINDINGS:
         await saveBindings(payload);
         return { ok: true };
-      case MSG.RUN_PREVIEW:
+      case MSG.RUN_PREVIEW: {
+        const guard = await assertBossContext();
+        if (!guard.ok) {
+          await log("warn", guard.message);
+          return guard;
+        }
         return await runPreview(payload || {});
+      }
       case MSG.CONFIRM_AND_START: {
+        // CONFIRM_AND_START guard
+        {
+          const guard = await assertBossContext();
+          if (!guard.ok) {
+            await log("warn", guard.message);
+            return guard;
+          }
+        }
         const all = await getAllConfig();
         let task = all.task;
         if (!task) return { ok: false, error: 'NO_TASK' };
@@ -574,6 +686,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await log('warn', '用户暂停任务');
         return { ok: true };
       case MSG.RESUME_TASK: {
+        // RESUME_TASK guard
+        {
+          const guard = await assertBossContext();
+          if (!guard.ok) {
+            await log("warn", guard.message);
+            return guard;
+          }
+        }
         runner.pause = false;
         runner.abort = false;
         const all = await getAllConfig();

@@ -29,6 +29,26 @@ function setConn(ok, text) {
   el.className = `badge ${ok ? 'ok' : 'bad'}`;
 }
 
+function setBossMode(isBoss, reason = '') {
+  state.isBoss = Boolean(isBoss);
+  state.bossBlockReason = reason || '';
+  const ids = ['btnPreview', 'btnDiagnose', 'btnStart', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'];
+  ids.forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    if (!isBoss) {
+      el.disabled = true;
+      el.title = reason || '仅在 BOSS 直聘页面可用';
+    } else {
+      el.title = '';
+    }
+  });
+  if (!isBoss) {
+    $('taskStatus').textContent = '状态：未在 BOSS 页面（功能已锁定）';
+    if (reason) $('taskWarnings').textContent = reason;
+  }
+}
+
 function kwJoin(arr) {
   return (arr || []).join(', ');
 }
@@ -316,6 +336,13 @@ function statusLabel(status) {
 }
 
 function updateTaskUI(task, runner = {}) {
+  if (state.isBoss === false) {
+    ['btnPreview', 'btnDiagnose', 'btnStart', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
+      const el = $(id);
+      if (el) el.disabled = true;
+    });
+    return;
+  }
   const status = task?.status || 'idle';
   $('taskStatus').textContent = `状态：${statusLabel(status)}${task?.pauseReason ? `（${task.pauseReason}）` : ''}`;
   const c = task?.counters || { success: 0, skipped: 0, failed: 0, processed: 0 };
@@ -435,8 +462,16 @@ async function refresh() {
   renderPreview(res.task);
   updateTaskUI(res.task, res.runner);
   renderLogs(res.logs || []);
-  if (res.activeTab) setConn(true, '已连接 BOSS 页面');
-  else setConn(false, '未连接页面');
+  const isBoss = Boolean(res.activeIsBoss || res.activeTab);
+  if (isBoss) {
+    setConn(true, '已连接 BOSS 页面');
+    setBossMode(true);
+  } else {
+    const reason = '当前不是 BOSS 直聘页面，助手仅在 zhipin.com 生效';
+    setConn(false, '未连接 BOSS');
+    setBossMode(false, reason);
+  }
+  if (isBoss) updateTaskUI(res.task, res.runner);
 }
 
 async function saveFilters() {
@@ -646,6 +681,8 @@ function bindEvents() {
   });
 
   $('btnPreview').addEventListener('click', async () => {
+    // BOSS_ONLY_GUARD_PREVIEW
+    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用');
     await saveFilters();
     $('btnPreview').disabled = true;
     $('taskStatus').textContent = '状态：扫描中…';
@@ -660,6 +697,8 @@ function bindEvents() {
   });
 
   $('btnDiagnose')?.addEventListener('click', async () => {
+    // BOSS_ONLY_GUARD_DIAG
+    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用');
     const res = await api(MSG.DIAGNOSE);
     if (!res?.ok) {
       toast(res?.message || res?.error || '诊断失败：请先打开 BOSS 职位页');
@@ -684,6 +723,8 @@ function bindEvents() {
   });
 
   $('btnStart').addEventListener('click', async () => {
+    // BOSS_ONLY_GUARD_START
+    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用');
     const selectedJobIds = Array.from(state.selected);
     if (!selectedJobIds.length) {
       toast('请至少选择一个通过岗位');
@@ -699,6 +740,8 @@ function bindEvents() {
     await refresh();
   });
   $('btnResume').addEventListener('click', async () => {
+    // BOSS_ONLY_GUARD_RESUME
+    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用');
     await api(MSG.RESUME_TASK);
     await refresh();
   });

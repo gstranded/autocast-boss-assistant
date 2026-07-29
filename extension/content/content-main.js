@@ -14,6 +14,19 @@
   if (window.__BHT_CONTENT_LOADED__) return;
   window.__BHT_CONTENT_LOADED__ = true;
 
+  function isBossHost(hostname) {
+    const host = String(hostname || "").toLowerCase();
+    return host === "zhipin.com" || host.endsWith(".zhipin.com") ||
+      host === "bosszhipin.com" || host.endsWith(".bosszhipin.com");
+  }
+
+  // 双保险：即使被错误注入到其他页面也立即退出，不注册监听、不改 DOM
+  if (!isBossHost(location.hostname)) {
+    console.log("[BHT content] inactive on non-BOSS host:", location.hostname);
+    return;
+  }
+
+
   const log = (...args) => console.log("[BHT content]", ...args);
 
   const SELECTORS = {
