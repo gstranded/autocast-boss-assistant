@@ -228,7 +228,8 @@ function renderProfileList() {
       flushActiveProfileForm();
       state.config.resumes.defaultProfileId = btn.getAttribute('data-default');
       await api(MSG.SAVE_RESUMES, state.config.resumes);
-      await refresh();
+      state.formDirty = false;
+  await refresh({ soft: false });
       toast('已更新默认方案');
     });
   });
@@ -460,8 +461,9 @@ async function refresh(options = {}) {
   }
 
   const editing = isEditingForm();
-  // 软刷新或正在输入时：不覆盖筛选/消息/设置/简历表单
-  if (!soft && !editing) {
+  const keepForm = soft || editing || state.formDirty;
+  // 软刷新 / 正在输入 / 有未保存修改：绝不回填表单
+  if (!keepForm) {
     state.draftBindings = (res.bindings?.rules || []).map((r, i) => ({
       id: r.id || `rule_${i}`,
       keywords: r.keywords || [],
@@ -476,8 +478,11 @@ async function refresh(options = {}) {
     renderBindings();
   }
 
-  if (!editing) {
+  if (!editing && !state.formDirty) {
     renderPreview(res.task);
+  } else if (!editing) {
+    // 仅更新计数文案，不重绘列表打断
+    updateTaskUI(res.task, res.runner);
   }
   updateTaskUI(res.task, res.runner);
   renderLogs(res.logs || []);
@@ -504,7 +509,8 @@ async function saveFilters() {
   await api(MSG.SAVE_FILTERS, filters);
   await api(MSG.SAVE_LISTS, lists);
   await api(MSG.SAVE_SETTINGS, settings);
-  await refresh();
+  state.formDirty = false;
+  await refresh({ soft: false });
   toast('筛选已保存');
 }
 
@@ -513,14 +519,16 @@ async function saveMessage() {
   const settings = readSettingsPatch(state.config.settings);
   await api(MSG.SAVE_TEMPLATE, template);
   await api(MSG.SAVE_SETTINGS, settings);
-  await refresh();
+  state.formDirty = false;
+  await refresh({ soft: false });
   toast('消息模板已保存');
 }
 
 async function saveSettings() {
   const settings = readSettingsPatch(state.config.settings);
   await api(MSG.SAVE_SETTINGS, settings);
-  await refresh();
+  state.formDirty = false;
+  await refresh({ soft: false });
   toast('设置已保存');
 }
 
@@ -578,7 +586,8 @@ async function saveResume() {
   await api(MSG.SAVE_SETTINGS, settings);
   $('imageFiles').value = '';
   $('attachFile').value = '';
-  await refresh();
+  state.formDirty = false;
+  await refresh({ soft: false });
   toast('当前方案已保存');
 }
 
@@ -587,7 +596,8 @@ async function saveBindings() {
     .filter((r) => (r.keywords || []).length && r.profileId)
     .sort((a, b) => (a.priority || 0) - (b.priority || 0));
   await api(MSG.SAVE_BINDINGS, { rules });
-  await refresh();
+  state.formDirty = false;
+  await refresh({ soft: false });
   toast('绑定规则已保存');
 }
 
@@ -636,7 +646,8 @@ function bindEvents() {
     if (!resumes.defaultProfileId) resumes.defaultProfileId = id;
     state.activeProfileId = id;
     await api(MSG.SAVE_RESUMES, resumes);
-    await refresh();
+    state.formDirty = false;
+  await refresh({ soft: false });
     toast('已新建方案');
   });
 
@@ -645,7 +656,8 @@ function bindEvents() {
     const resumes = structuredClone(state.config.resumes);
     resumes.defaultProfileId = state.activeProfileId || resumes.defaultProfileId;
     await api(MSG.SAVE_RESUMES, resumes);
-    await refresh();
+    state.formDirty = false;
+  await refresh({ soft: false });
     toast('已设为默认方案');
   });
 
@@ -665,7 +677,8 @@ function bindEvents() {
     };
     await api(MSG.SAVE_RESUMES, resumes);
     await api(MSG.SAVE_BINDINGS, bindings);
-    await refresh();
+    state.formDirty = false;
+  await refresh({ soft: false });
     toast('方案已删除');
   });
 
@@ -674,7 +687,8 @@ function bindEvents() {
     const profile = resumes.profiles.find((p) => p.id === state.activeProfileId);
     if (profile) profile.images = [];
     await api(MSG.SAVE_RESUMES, resumes);
-    await refresh();
+    state.formDirty = false;
+  await refresh({ soft: false });
     toast('已清空图片');
   });
 
@@ -683,7 +697,8 @@ function bindEvents() {
     const profile = resumes.profiles.find((p) => p.id === state.activeProfileId);
     if (profile) profile.attachment = null;
     await api(MSG.SAVE_RESUMES, resumes);
-    await refresh();
+    state.formDirty = false;
+  await refresh({ soft: false });
     toast('已清除附件');
   });
 
@@ -713,7 +728,8 @@ function bindEvents() {
     } else if (res.summary) {
       toast(`扫描 ${res.summary.scanned}，通过 ${res.summary.pass}`);
     }
-    await refresh();
+    state.formDirty = false;
+  await refresh({ soft: false });
   });
 
   $('btnDiagnose')?.addEventListener('click', async () => {
@@ -752,30 +768,36 @@ function bindEvents() {
     }
     const res = await api(MSG.CONFIRM_AND_START, { selectedJobIds });
     if (!res?.ok) toast(res?.error || '启动失败');
-    await refresh();
+    state.formDirty = false;
+  await refresh({ soft: false });
   });
 
   $('btnPause').addEventListener('click', async () => {
     await api(MSG.PAUSE_TASK);
-    await refresh();
+    state.formDirty = false;
+  await refresh({ soft: false });
   });
   $('btnResume').addEventListener('click', async () => {
     // BOSS_ONLY_GUARD_RESUME
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用');
     await api(MSG.RESUME_TASK);
-    await refresh();
+    state.formDirty = false;
+  await refresh({ soft: false });
   });
   $('btnStop').addEventListener('click', async () => {
     await api(MSG.STOP_TASK);
-    await refresh();
+    state.formDirty = false;
+  await refresh({ soft: false });
   });
   $('btnSkip').addEventListener('click', async () => {
     await api(MSG.SKIP_CURRENT);
-    await refresh();
+    state.formDirty = false;
+  await refresh({ soft: false });
   });
   $('btnClearLogs').addEventListener('click', async () => {
     await api(MSG.CLEAR_LOGS);
-    await refresh();
+    state.formDirty = false;
+  await refresh({ soft: false });
   });
 
   $('selectAllPass').addEventListener('change', () => {
@@ -808,7 +830,8 @@ function bindEvents() {
       const data = JSON.parse(text);
       const res = await api(MSG.IMPORT_CONFIG, { data });
       if (!res?.ok) throw new Error(res?.error || '导入失败');
-      await refresh();
+      state.formDirty = false;
+  await refresh({ soft: false });
       toast('导入成功');
     } catch (e) {
       toast(String(e.message || e));

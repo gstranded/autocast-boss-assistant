@@ -40,9 +40,7 @@ let runner = {
 
 chrome.runtime.onInstalled.addListener(async () => {
   await getAllConfig();
-  if (chrome.sidePanel?.setPanelBehavior) {
-    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
-  }
+  // side panel disabled: using floating panel + action popup
   await refreshSidePanelForAllTabs();
 });
 

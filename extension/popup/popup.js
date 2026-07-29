@@ -9,22 +9,25 @@ async function getActiveTab() {
 
 function renderGuide(version) {
   app.innerHTML = `
-    <div class="brand blue">Boss 海投助手</div>
+    <div class="hero">
+      <img class="logo" src="../assets/icons/icon128.png" alt="logo" />
+      <div class="brand">Boss 海投助手</div>
+    </div>
     <div class="title">请前往 BOSS 直聘页面使用插件</div>
     <div class="guide">
-      <h3>使用说明</h3>
+      <div class="guide-title">使用说明</div>
       <ol>
         <li>打开 <b>BOSS 直聘</b> 职位推荐/搜索列表页</li>
-        <li>点击扩展图标，或点击页面右下角悬浮球打开面板</li>
-        <li>配置筛选、消息模板与简历方案</li>
-        <li>先点「扫描预览」，核对将投递岗位</li>
-        <li>确认后开始投递，可随时暂停/停止</li>
+        <li>打开插件后，点击页面右下角 <b>悬浮球</b></li>
+        <li>配置筛选、打招呼消息与简历方案</li>
+        <li>先点「扫描预览」，核对通过/跳过原因</li>
+        <li>确认投递；发送自定义消息后会自动继续下一岗</li>
       </ol>
     </div>
     <div class="actions">
       <button class="btn primary" id="openBoss">打开 BOSS 直聘</button>
     </div>
-    <div class="hint">仅在 zhipin.com / bosszhipin.com 生效</div>
+    <div class="hint">本插件仅在 zhipin.com / bosszhipin.com 生效</div>
     <div class="footer">
       <span>v${version}</span>
       <a href="https://github.com/gstranded/boss-haitou-assistant" target="_blank" rel="noreferrer">说明</a>
@@ -38,40 +41,51 @@ function renderGuide(version) {
 
 function renderBossReady(tab, version) {
   app.innerHTML = `
-    <div class="brand blue">Boss 海投助手</div>
-    <div class="status"><span class="dot"></span>已连接到 BOSS 页面，可打开悬浮面板</div>
+    <div class="hero">
+      <img class="logo" src="../assets/icons/icon128.png" alt="logo" />
+      <div class="brand">Boss 海投助手</div>
+    </div>
+    <div class="status"><span class="dot"></span>已在 BOSS 页面，可使用悬浮插件</div>
+    <div class="guide">
+      <div class="guide-title">快捷操作</div>
+      <ol>
+        <li>点击下方按钮打开可拖动悬浮面板</li>
+        <li>也可直接点页面右下角圆形悬浮球</li>
+        <li>不用时点面板「— / ×」收起成小图标</li>
+      </ol>
+    </div>
     <div class="actions">
       <button class="btn primary" id="openPanel">打开悬浮面板</button>
       <button class="btn ghost" id="toggleFab">显示/隐藏悬浮球</button>
     </div>
-    <div class="hint">面板可拖动；不用时可收起成右下角小图标</div>
     <div class="footer">
       <span>v${version}</span>
-      <span title="${tab.url || ""}">当前为 BOSS 页</span>
+      <span>BOSS 已连接</span>
     </div>
   `;
-  document.getElementById("openPanel").addEventListener("click", async () => {
+  async function sendFloat(type) {
     try {
-      await chrome.tabs.sendMessage(tab.id, { type: "BHT_FLOAT_OPEN" });
+      return await chrome.tabs.sendMessage(tab.id, { type });
     } catch {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         files: ["content/floating-host.js"]
       });
-      await chrome.tabs.sendMessage(tab.id, { type: "BHT_FLOAT_OPEN" });
+      return chrome.tabs.sendMessage(tab.id, { type });
     }
+  }
+  document.getElementById("openPanel").addEventListener("click", async () => {
+    await sendFloat("BHT_FLOAT_OPEN");
     window.close();
   });
   document.getElementById("toggleFab").addEventListener("click", async () => {
-    try {
-      await chrome.tabs.sendMessage(tab.id, { type: "BHT_FLOAT_TOGGLE_FAB" });
-    } catch (_) {}
+    await sendFloat("BHT_FLOAT_TOGGLE_FAB");
     window.close();
   });
 }
 
 const manifest = chrome.runtime.getManifest();
-const version = manifest.version || "1.0.0";
+const version = manifest.version || "1.1.1";
 const tab = await getActiveTab();
 if (tab && isBossUrl(tab.url || "")) renderBossReady(tab, version);
 else renderGuide(version);

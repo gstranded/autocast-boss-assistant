@@ -80,10 +80,10 @@ export function isSimilar(a, b, threshold = 0.85) {
 }
 
 export function parseKeywords(text = '') {
-  return String(text)
-    // 支持：换行、中英文逗号、顿号、分号、竖线、反斜杠、斜杠
+  return String(text || '')
+    // 支持：换行 / 中英文逗号 / 顿号 / 分号 / 竖线 / 反斜杠 / 斜杠
     .split(/[\n,，、;；|\\/]+/)
-    .map((s) => s.trim())
+    .map((x) => x.trim())
     .filter(Boolean);
 }
 
