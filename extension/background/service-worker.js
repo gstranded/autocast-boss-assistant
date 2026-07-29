@@ -381,8 +381,10 @@ async function processOneJob(task, resultRow, config) {
     if (chatRes?.error === 'LOGIN_REQUIRED') {
       runner.pause = true;
       task.status = TASK_STATUS.PAUSED;
-      task.pauseReason = chatRes.message || '需要登录';
+      task.pauseReason = chatRes.message || '请先登录 BOSS 直聘后再投递';
       await publishTask(task);
+      // LOGIN_REQUIRED_USER_HINT
+      await log('error', task.pauseReason + '（任务已停止）', { jobId: job.jobId });
       return 'limited';
     }
     // RETURN_TO_LIST after fail

@@ -127,6 +127,22 @@
     return [];
   }
 
+  function preventLinkNavigation(root, ms = 600) {
+    const scope = root || document;
+    const anchors = Array.from(scope.querySelectorAll("a[href]"));
+    const onClick = (e) => {
+      try {
+        e.preventDefault();
+        e.stopPropagation();
+      } catch (_) {}
+    };
+    anchors.forEach((a) => a.addEventListener("click", onClick, true));
+    setTimeout(() => {
+      anchors.forEach((a) => a.removeEventListener("click", onClick, true));
+    }, ms);
+    return anchors.length;
+  }
+
   function clickLikeHuman(el) {
     if (!el) return false;
     try {
@@ -429,7 +445,48 @@
     return { ok: true, buttonText, already: /继续沟通/.test(buttonText) };
   }
 
-  function dismissCommonDialogs() {
+  
+  function detectLoginModal() {
+    const bodyText = (document.body?.innerText || "").replace(/\s+/g, " ");
+    const markers = [
+      "登录立即与BOSS沟通",
+      "APP扫码登录",
+      "登录/注册",
+      "短信验证码",
+      "发送验证码",
+      "微信登录/注册",
+      "扫码登录",
+      "请先登录",
+      "手机号登录"
+    ];
+    const hit = markers.some((m) => bodyText.includes(m));
+    // dialog-ish containers
+    const dialog = Array.from(document.querySelectorAll("div,section,form")).find((el) => {
+      const t = textOf(el);
+      if (!t || t.length > 800) return false;
+      return /登录\/注册|APP扫码登录|登录立即与BOSS沟通|短信验证码/.test(t);
+    });
+    if (hit || dialog) {
+      return {
+        ok: true,
+        message: "检测到登录弹窗，请先登录 BOSS 直聘后再使用海投功能"
+      };
+    }
+    // buttons
+    const loginBtn = Array.from(document.querySelectorAll("button,a,div")).find((el) => {
+      const t = textOf(el);
+      return t === "登录/注册" || t === "登录" || t === "APP扫码登录";
+    });
+    if (loginBtn && /登录/.test(bodyText.slice(0, 2000))) {
+      return {
+        ok: true,
+        message: "检测到未登录状态，请先登录 BOSS 直聘后再投递"
+      };
+    }
+    return { ok: false };
+  }
+
+function dismissCommonDialogs() {
     const labels = /确定|继续|我知道了|开启|同意|稍后|允许|关闭|取消/;
     // 优先点确认类，避免误点取消
     const preferred = Array.from(document.querySelectorAll("button,a,.btn")).filter((el) =>
@@ -634,8 +691,26 @@
 
     await sleep(450);
     dismissCommonDialogs();
+    {
+      const loginHit = detectLoginModal();
+      if (loginHit.ok) {
+        return {
+          ok: false,
+          error: "LOGIN_REQUIRED",
+          message: loginHit.message
+        };
+      }
+    }
     const chatReady = await waitForChat(14000);
     if (!chatReady) {
+      const loginHit = detectLoginModal();
+      if (loginHit.ok) {
+        return {
+          ok: false,
+          error: "LOGIN_REQUIRED",
+          message: loginHit.message
+        };
+      }
       const login = Array.from(document.querySelectorAll("a,button,div")).find((el) =>
         /登录|注册|扫码登录/.test(textOf(el))
       );
@@ -643,7 +718,7 @@
         return {
           ok: false,
           error: "LOGIN_REQUIRED",
-          message: "检测到登录提示，请先登录 BOSS 直聘后再投递"
+          message: "检测到登录相关界面，请先登录 BOSS 直聘后再投递"
         };
       }
       return {
