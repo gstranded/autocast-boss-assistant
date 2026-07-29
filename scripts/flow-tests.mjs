@@ -23,6 +23,12 @@ test("content exposes return/ensure/close handlers", () => {
   ]) assert.ok(s.includes(k), "missing " + k);
 });
 
+test("background force-injects content on critical ops", () => {
+  const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(s.includes("forceInjectContent"));
+  assert.ok(s.includes("critical.includes"));
+});
+
 test("background ensures list before chat and returns after job", () => {
   const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
   assert.ok(s.includes("ENSURE_JOB_LIST before start"));

@@ -77,8 +77,12 @@
     fab.classList.toggle("is-hidden", open);
     if (open) {
       const frame = document.getElementById("bht-frame");
-      if (frame && !frame.src) {
-        frame.src = chrome.runtime.getURL("sidepanel/index.html?mode=float");
+      if (frame) {
+        // FORCE_IFRAME_RELOAD: 每次打开都带版本号，避免浮窗卡在旧 UI
+        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=1.2.4");
+        if (!frame.src || !frame.src.includes("v=1.2.4")) {
+          frame.src = next;
+        }
       }
       restorePos(panel);
     }
