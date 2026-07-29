@@ -65,12 +65,13 @@
         <section class="panel" id="tab-filter">
           <div class="card">
             <div class="card-title">职位名称</div>
+            <div class="hint">关键词分隔符支持：英文逗号 , ／ 中文逗号 ， ／ 顿号 、 ／ 反斜杠 \\ ／ 斜杠 / ／ 换行</div>
             <label>包含任意 OR</label>
-            <textarea id="titleOr" rows="2" placeholder="Java, Go, 后端"></textarea>
+            <textarea id="titleOr" rows="2" placeholder="Java, Go、后端 或 Java\Go"></textarea>
             <label>必须同时包含 AND</label>
             <textarea id="titleAnd" rows="2" placeholder="Agent, 大模型"></textarea>
             <label>排除任意 NOT</label>
-            <textarea id="titleNot" rows="2" placeholder="外包, 驻场, 销售"></textarea>
+            <textarea id="titleNot" rows="2" placeholder="外包,驻场、销售 可用 , ， 、 \ 分隔"></textarea>
           </div>
           <div class="card">
             <div class="card-title">公司 / JD</div>
@@ -252,6 +253,7 @@
         </section>
       </main>
     </div>
+    <script>if (new URLSearchParams(location.search).get('mode') === 'float') document.documentElement.classList.add('float-mode');</script>
     <script type="module" src="./app.js"></script>
   </body>
 </html>

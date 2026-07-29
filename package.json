@@ -1,6 +1,6 @@
 {
   "name": "boss-haitou-assistant",
-  "version": "1.0.3",
+  "version": "1.1.1",
   "private": true,
   "type": "module",
   "description": "Boss 海投助手 Chrome 扩展",

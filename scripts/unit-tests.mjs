@@ -36,6 +36,17 @@ test("salary parse 15-25K", () => {
 test("parseKeywords", () => {
   assert.deepEqual(parseKeywords("Java, Go，后端"), ["Java", "Go", "后端"]);
 });
+test("parseKeywords multi separators", () => {
+  assert.deepEqual(parseKeywords("Java,Go，Spring、Redis\\Docker/K8s"), [
+    "Java",
+    "Go",
+    "Spring",
+    "Redis",
+    "Docker",
+    "K8s"
+  ]);
+  assert.deepEqual(parseKeywords("外包、驻场,销售"), ["外包", "驻场", "销售"]);
+});
 
 console.log("2) filter-engine");
 const filters = {

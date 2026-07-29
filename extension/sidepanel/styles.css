@@ -203,3 +203,18 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
 }
 .pill.default { background: rgba(34,197,94,.18); color: #86efac; }
 .binding-item input, .binding-item select { margin-top: 4px; }
+/* floating iframe mode */
+html.float-mode, html.float-mode body {
+  width: 100%;
+  min-height: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+html.float-mode .app {
+  height: 100vh;
+  max-height: 100vh;
+}
+html.float-mode main {
+  overflow: auto;
+  max-height: calc(100vh - 110px);
+}

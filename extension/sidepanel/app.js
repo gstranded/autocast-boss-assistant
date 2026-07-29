@@ -438,30 +438,50 @@ function renderLogs(logs = []) {
   });
 }
 
-async function refresh() {
+
+function isFormField(el) {
+  if (!el || !el.tagName) return false;
+  const tag = el.tagName.toUpperCase();
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+}
+
+function isEditingForm() {
+  return isFormField(document.activeElement);
+}
+
+/** soft: 仅刷新任务/连接/日志，不覆盖正在编辑的表单 */
+async function refresh(options = {}) {
+  const soft = options.soft === true;
   const res = await api(MSG.GET_STATE);
   if (!res?.ok) return;
   state.config = res;
   if (!state.activeProfileId) {
     state.activeProfileId = res.resumes?.defaultProfileId || res.resumes?.profiles?.[0]?.id || null;
   }
-  // keep draft bindings if user is mid-edit? refresh from storage by default
-  state.draftBindings = (res.bindings?.rules || []).map((r, i) => ({
-    id: r.id || `rule_${i}`,
-    keywords: r.keywords || [],
-    profileId: r.profileId,
-    priority: r.priority ?? i
-  }));
 
-  fillFilters(res.filters, res.lists, res.settings);
-  fillSettings(res.settings);
-  renderSegments(res.messageTemplate);
-  renderProfileList();
-  renderResumeEditor();
-  renderBindings();
-  renderPreview(res.task);
+  const editing = isEditingForm();
+  // 软刷新或正在输入时：不覆盖筛选/消息/设置/简历表单
+  if (!soft && !editing) {
+    state.draftBindings = (res.bindings?.rules || []).map((r, i) => ({
+      id: r.id || `rule_${i}`,
+      keywords: r.keywords || [],
+      profileId: r.profileId,
+      priority: r.priority ?? i
+    }));
+    fillFilters(res.filters, res.lists, res.settings);
+    fillSettings(res.settings);
+    renderSegments(res.messageTemplate);
+    renderProfileList();
+    renderResumeEditor();
+    renderBindings();
+  }
+
+  if (!editing) {
+    renderPreview(res.task);
+  }
   updateTaskUI(res.task, res.runner);
   renderLogs(res.logs || []);
+
   const isBoss = Boolean(res.activeIsBoss || res.activeTab);
   if (isBoss) {
     setConn(true, '已连接 BOSS 页面');
@@ -812,4 +832,4 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 bindEvents();
 refresh();
-setInterval(refresh, 3000);
+setInterval(() => refresh({ soft: true }), 3000);

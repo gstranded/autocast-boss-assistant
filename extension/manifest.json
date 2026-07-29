@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "__MSG_extName__",
   "description": "__MSG_extDesc__",
-  "version": "1.0.3",
+  "version": "1.1.1",
   "default_locale": "zh_CN",
   "icons": {
     "16": "assets/icons/icon16.png",
@@ -11,7 +11,8 @@
     "128": "assets/icons/icon128.png"
   },
   "action": {
-    "default_title": "Boss 海投助手",
+    "default_title": "Boss HaiTou Assistant",
+    "default_popup": "popup/popup.html",
     "default_icon": {
       "16": "assets/icons/icon16.png",
       "32": "assets/icons/icon32.png",
@@ -22,12 +23,8 @@
     "service_worker": "background/service-worker.js",
     "type": "module"
   },
-  "side_panel": {
-    "default_path": "sidepanel/index.html"
-  },
   "permissions": [
     "storage",
-    "sidePanel",
     "tabs",
     "scripting",
     "alarms",
@@ -48,9 +45,29 @@
         "*://bosszhipin.com/*"
       ],
       "js": [
-        "content/content-main.js"
+        "content/content-main.js",
+        "content/floating-host.js"
+      ],
+      "css": [
+        "content/floating-host.css"
       ],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "sidepanel/*",
+        "shared/*",
+        "assets/icons/*",
+        "content/floating-host.css"
+      ],
+      "matches": [
+        "*://*.zhipin.com/*",
+        "*://zhipin.com/*",
+        "*://*.bosszhipin.com/*",
+        "*://bosszhipin.com/*"
+      ]
     }
   ]
 }
