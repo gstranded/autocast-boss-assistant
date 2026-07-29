@@ -15,7 +15,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.3.0";
+  const BHT_CONTENT_VERSION = "1.3.1";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -1522,6 +1522,15 @@ async function startChat(job, opts = {}) {
   }
 
   async function runOpByType(type, payload = {}) {
+    const lockKey = String(type || '');
+    const needLock = /START_CHAT|SEND_TEXT|SEND_IMAGE|SCAN_JOBS/.test(lockKey) || /BHT_START_CHAT|BHT_SEND_TEXT|BHT_SEND_IMAGE|BHT_SCAN_JOBS/.test(lockKey);
+    if (needLock) {
+      if (window.__BHT_OP_LOCK__) {
+        return { ok: false, error: 'OP_BUSY', message: '已有操作进行中', contentVersion: BHT_CONTENT_VERSION };
+      }
+      window.__BHT_OP_LOCK__ = lockKey;
+    }
+    try {
     switch (type) {
       case MSG.PING:
       case "BHT_PING":
@@ -1562,6 +1571,11 @@ async function startChat(job, opts = {}) {
         return await returnToJobList();
       default:
         return { ok: false, error: "UNKNOWN_TYPE", type };
+    }
+    } finally {
+      if (needLock && window.__BHT_OP_LOCK__ === lockKey) {
+        window.__BHT_OP_LOCK__ = null;
+      }
     }
   }
 

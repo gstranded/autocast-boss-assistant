@@ -200,12 +200,19 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
         }
         // 超时前若仍 pending：可能 content 被导航销毁，重注入并重发一次同 opId（幂等由 content 覆盖写）
         if (Date.now() > reinjectAt && type === MSG.START_CHAT) {
-          reinjectAt = Date.now() + 12000;
+          reinjectAt = Date.now() + 10000;
           try {
             const latest = await chrome.tabs.get(tab.id);
-            if (isBossUrl(latest?.url || '')) {
+            if (!isBossUrl(latest?.url || '')) continue;
+            // 仅当 content 已死（ping 失败）才重注入并重发，避免双开 startChat
+            let alive = false;
+            try {
+              const pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
+              alive = Boolean(pong?.ok);
+            } catch (_) { alive = false; }
+            if (!alive) {
               await forceInjectContent(tab.id);
-              await sleep(250);
+              await sleep(280);
               await fireOp();
             }
           } catch (_) {}
