@@ -78,8 +78,6 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
     await setSidePanelForTab(tabId, tab?.url || "");
   } catch (_) {}
 });
-  }
-});
 
 chrome.action?.onClicked?.addListener(async (tab) => {
   if (!isBossTab(tab)) {
@@ -91,8 +89,6 @@ chrome.action?.onClicked?.addListener(async (tab) => {
   if (chrome.sidePanel?.open && tab?.windowId != null) {
     await setSidePanelForTab(tab.id, tab.url || "");
     await chrome.sidePanel.open({ windowId: tab.windowId, tabId: tab.id });
-  }
-});
   }
 });
 
@@ -352,6 +348,19 @@ async function processOneJob(task, resultRow, config) {
   }
 
   await log('info', `开始沟通：${job.title} @ ${job.company || ''}`, { jobId: job.jobId });
+  // ENSURE_JOB_LIST before start
+  {
+    const listReady = await sendToBoss(MSG.ENSURE_JOB_LIST, { maxWaitMs: 10000 });
+    if (!listReady?.ok) {
+      item.state = 'FAILED';
+      item.reasons = [listReady?.message || '职位列表未就绪'];
+      task.counters.failed += 1;
+      task.consecutiveFails += 1;
+      await bumpDailyStat('fail');
+      await log('error', item.reasons[0], { jobId: job.jobId });
+      return 'failed';
+    }
+  }
   const chatRes = await sendToBoss(MSG.START_CHAT, { job });
   if (!chatRes?.ok) {
     item.state = 'FAILED';
@@ -370,6 +379,8 @@ async function processOneJob(task, resultRow, config) {
       await publishTask(task);
       return 'limited';
     }
+    // RETURN_TO_LIST after fail
+    await sendToBoss(MSG.RETURN_TO_LIST, {});
     return 'failed';
   }
   if (chatRes.securityId) job.securityId = chatRes.securityId;
@@ -424,6 +435,8 @@ async function processOneJob(task, resultRow, config) {
       task.consecutiveFails += 1;
       await bumpDailyStat('fail');
       await log('error', `发送失败：${job.title}`, { jobId: job.jobId });
+      // RETURN_TO_LIST after send fail
+      await sendToBoss(MSG.RETURN_TO_LIST, {});
       return 'failed';
     }
 
@@ -484,6 +497,17 @@ async function processOneJob(task, resultRow, config) {
     task.counters.skipped += 1;
     await bumpDailyStat('skip');
     return 'skipped';
+  }
+
+  // RETURN_TO_LIST after job
+  {
+    const back = await sendToBoss(MSG.RETURN_TO_LIST, {});
+    if (!back?.ok) {
+      await log('warn', back?.message || '返回职位列表失败，尝试继续', { jobId: job.jobId });
+      await sleep(800);
+    } else {
+      await sleep(randomBetween(config.settings.jobIntervalMs || [1200, 2200]));
+    }
   }
 
   item.state = 'COMPLETED';
@@ -551,6 +575,11 @@ async function runTaskLoop(taskId) {
         }
       }
       const outcome = await processOneJob(task, row, config);
+      // ENSURE_JOB_LIST between jobs
+      if (outcome === 'success' || outcome === 'failed' || outcome === 'skipped') {
+        await sendToBoss(MSG.RETURN_TO_LIST, {});
+        await sleep(500);
+      }
       task.counters.processed += 1;
       task.updatedAt = Date.now();
       await publishTask(task);

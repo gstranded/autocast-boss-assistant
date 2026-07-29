@@ -8,6 +8,9 @@
     SEND_TEXT: "BHT_SEND_TEXT",
     SEND_IMAGE: "BHT_SEND_IMAGE",
     HIGHLIGHT_JOBS: "BHT_HIGHLIGHT_JOBS",
+    ENSURE_JOB_LIST: "BHT_ENSURE_JOB_LIST",
+    RETURN_TO_LIST: "BHT_RETURN_TO_LIST",
+    CLOSE_CHAT: "BHT_CLOSE_CHAT",
     DIAGNOSE: "BHT_DIAGNOSE"
   };
 
@@ -326,19 +329,28 @@
 
   function findCardByJob(job) {
     const cards = getJobCards();
+    if (!cards.length) return null;
+    // 优先 jobId 精确匹配
+    if (job?.jobId) {
+      const byId = cards.find((c, i) => parseJobCard(c, i).jobId === job.jobId);
+      if (byId) return byId;
+    }
+    // 标题+公司
+    if (job?.title) {
+      const byTitle = cards.find((c, i) => {
+        const p = parseJobCard(c, i);
+        if (p.title !== job.title) return false;
+        if (job.company && p.company && p.company !== job.company) return false;
+        return true;
+      });
+      if (byTitle) return byTitle;
+    }
+    // 最后才用 index，且二次校验标题
     if (job?.index != null && cards[job.index]) {
       const parsed = parseJobCard(cards[job.index], job.index);
-      if (!job.jobId || parsed.jobId === job.jobId || parsed.title === job.title) {
-        return cards[job.index];
-      }
+      if (!job.title || parsed.title === job.title) return cards[job.index];
     }
-    return (
-      cards.find((c, i) => {
-        const p = parseJobCard(c, i);
-        if (job.jobId && p.jobId === job.jobId) return true;
-        return p.title === job.title && p.company === job.company;
-      }) || null
-    );
+    return null;
   }
 
   function getChatRoot() {
@@ -364,66 +376,212 @@
   }
 
   async function openJobDetail(job) {
+    const ensure = await ensureJobList({ maxWaitMs: 6000 });
+    if (!ensure.ok) return { ok: false, error: "LIST_NOT_READY", message: ensure.message };
+
     const card = findCardByJob(job);
     if (!card) return { ok: false, error: "JOB_CARD_NOT_FOUND" };
 
-    // 优先点卡片本体或标题，激活右侧详情
-    const titleLink = firstEl(SELECTORS.title, card);
-    clickLikeHuman(card);
-    if (titleLink) {
-      await sleep(120);
-      clickLikeHuman(titleLink);
-    }
-    await sleep(450);
+    const wrap = card.closest(".job-card-wrap") || card;
+    try {
+      wrap.scrollIntoView({ block: "center", behavior: "instant" });
+    } catch (_) {}
 
-    // 补充 securityId / 薪资从详情读取
+    // 阻止标题链接整页跳转，只激活右侧详情
+    preventLinkNavigation(wrap, 800);
+    clickLikeHuman(wrap);
+    await sleep(500);
+
+    // 详情未出现再点一次卡片主体（仍阻止 a 跳转）
+    if (!firstEl(SELECTORS.detailRoot) && !firstEl(SELECTORS.chatOnDetail)) {
+      preventLinkNavigation(wrap, 800);
+      clickLikeHuman(card);
+      await sleep(500);
+    }
+
     const more = firstEl(SELECTORS.moreLink);
     const securityId = extractSecurityId(more?.href || "");
-    const detailSalary = textOf(firstEl(SELECTORS.salary, firstEl(SELECTORS.detailRoot) || document));
+    const detailRoot = firstEl(SELECTORS.detailRoot) || document;
+    const detailSalary = textOf(firstEl(SELECTORS.salary, detailRoot));
     return {
       ok: true,
       securityId,
       detailSalary,
-      detailReady: Boolean(firstEl(SELECTORS.detailRoot))
+      detailReady: Boolean(firstEl(SELECTORS.detailRoot) || firstEl(SELECTORS.chatOnDetail))
     };
   }
 
   async function clickChatButton() {
-    // 详情区沟通按钮
     let btn =
       firstEl(SELECTORS.chatOnDetail) ||
-      Array.from(document.querySelectorAll("a,button")).find((el) =>
+      Array.from(document.querySelectorAll("a.op-btn-chat, a.op-btn, button")).find((el) =>
         /立即沟通|继续沟通|打招呼/.test(textOf(el))
       );
 
     if (!btn) return { ok: false, error: "CHAT_BUTTON_NOT_FOUND", buttonText: "" };
-
     const buttonText = textOf(btn);
+    // 已是继续沟通：也点开会话，便于发补充消息
     clickLikeHuman(btn);
     return { ok: true, buttonText, already: /继续沟通/.test(buttonText) };
+  }
+
+  function dismissCommonDialogs() {
+    const labels = /确定|继续|我知道了|开启|同意|稍后|允许|关闭|取消/;
+    // 优先点确认类，避免误点取消
+    const preferred = Array.from(document.querySelectorAll("button,a,.btn")).filter((el) =>
+      /确定|继续|我知道了|开启|同意|允许/.test(textOf(el))
+    );
+    if (preferred[0]) {
+      clickLikeHuman(preferred[0]);
+      return true;
+    }
+    const any = Array.from(document.querySelectorAll("button,a,.btn")).find((el) => labels.test(textOf(el)));
+    if (any && /确定|继续|我知道了/.test(textOf(any))) {
+      clickLikeHuman(any);
+      return true;
+    }
+    return false;
+  }
+
+  function isChatPage() {
+    return /\/chat|geek\/chat|conversation/i.test(location.pathname + location.hash);
+  }
+
+  function hasUsableChatInput() {
+    const input = getChatInput();
+    if (!input) return false;
+    // 排除隐藏节点
+    const style = window.getComputedStyle(input);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = input.getBoundingClientRect();
+    return rect.width > 20 && rect.height > 10;
+  }
+
+  async function waitForChat(timeoutMs = 12000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      dismissCommonDialogs();
+      if (hasUsableChatInput()) return true;
+      // 有聊天容器也继续等输入框
+      if (getChatRoot() && Date.now() - start > 1500) {
+        // 尝试聚焦容器
+        getChatRoot()?.click?.();
+      }
+      await sleep(280);
+    }
+    return hasUsableChatInput();
+  }
+
+  async function ensureJobList({ maxWaitMs = 8000 } = {}) {
+    if (getJobCards().length > 0) return { ok: true, count: getJobCards().length, restored: false };
+
+    // 若在聊天全页，先返回
+    if (isChatPage()) {
+      try {
+        history.back();
+      } catch (_) {}
+      await sleep(700);
+    }
+
+    // 关掉可能遮挡的聊天浮层
+    await closeChatPanel();
+
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+      if (getJobCards().length > 0) {
+        return { ok: true, count: getJobCards().length, restored: true };
+      }
+      // 尝试点顶部「职位」导航
+      const jobNav = Array.from(document.querySelectorAll("a,button,span,div")).find((el) => {
+        const t = textOf(el);
+        return t === "职位" || t === "推荐" || /职位列表|找工作/.test(t);
+      });
+      if (jobNav) clickLikeHuman(jobNav);
+      await sleep(400);
+    }
+
+    // 最后手段：若当前不在 geek jobs，跳到 jobs（仅 BOSS 域）
+    if (getJobCards().length === 0 && /zhipin\.com|bosszhipin\.com/i.test(location.hostname)) {
+      if (!/\/web\/geek\/jobs|\/web\/geek\/job/.test(location.pathname)) {
+        const target = location.origin + "/web/geek/jobs";
+        if (location.href !== target) {
+          location.href = target;
+          return { ok: false, error: "NAVIGATING_TO_LIST", message: "正在返回职位列表页" };
+        }
+      }
+    }
+
+    return {
+      ok: getJobCards().length > 0,
+      count: getJobCards().length,
+      message: getJobCards().length ? "" : "未找到职位列表，请打开 BOSS 职位推荐/搜索页"
+    };
+  }
+
+  async function closeChatPanel() {
+    const closeCandidates = Array.from(
+      document.querySelectorAll(
+        "button, a, i, span, div[class*='close'], .icon-close, .chat-close, [aria-label*='关闭']"
+      )
+    ).filter((el) => {
+      const t = textOf(el);
+      const aria = el.getAttribute?.("aria-label") || "";
+      const cls = String(el.className || "");
+      return (
+        t === "关闭" ||
+        t === "×" ||
+        t === "x" ||
+        /关闭/.test(aria) ||
+        /close|icon-close|chat-close/i.test(cls)
+      );
+    });
+    if (closeCandidates[0]) {
+      clickLikeHuman(closeCandidates[0]);
+      await sleep(350);
+    }
+    // ESC 关闭浮层
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }));
+    await sleep(200);
+    return { ok: true };
+  }
+
+  async function returnToJobList() {
+    await closeChatPanel();
+    // 若在聊天页，返回列表
+    if (isChatPage() || (hasUsableChatInput() && getJobCards().length === 0)) {
+      try {
+        history.back();
+      } catch (_) {}
+      await sleep(800);
+    }
+    const ensured = await ensureJobList({ maxWaitMs: 10000 });
+    return ensured;
   }
 
   async function startChat(job) {
     const opened = await openJobDetail(job);
     if (!opened.ok) return opened;
 
-    // 若卡片本身有按钮也可点
-    const card = findCardByJob(job);
-    const cardBtn = card
-      ? Array.from(card.querySelectorAll("a,button")).find((el) =>
-          /立即沟通|继续沟通|打招呼/.test(textOf(el))
-        )
-      : null;
-    if (cardBtn) {
+    // 详情区「立即沟通」优先，避免误点其它按钮
+    let clicked = await clickChatButton();
+    if (!clicked.ok) {
+      // 再尝试卡片内部按钮
+      const card = findCardByJob(job);
+      const cardBtn = card
+        ? Array.from(card.querySelectorAll("a,button")).find((el) =>
+            /立即沟通|继续沟通|打招呼/.test(textOf(el))
+          )
+        : null;
+      if (!cardBtn) return clicked;
       clickLikeHuman(cardBtn);
-    } else {
-      const clicked = await clickChatButton();
-      if (!clicked.ok) return clicked;
+      clicked = { ok: true, buttonText: textOf(cardBtn), already: /继续沟通/.test(textOf(cardBtn)) };
     }
 
-    const chatReady = await waitForChat(12000);
+    await sleep(400);
+    dismissCommonDialogs();
+
+    const chatReady = await waitForChat(14000);
     if (!chatReady) {
-      // 未登录时可能弹出登录框
       const login = Array.from(document.querySelectorAll("a,button,div")).find((el) =>
         /登录|注册|扫码登录/.test(textOf(el))
       );
@@ -434,72 +592,87 @@
           message: "检测到登录提示，请先登录 BOSS 直聘后再投递"
         };
       }
-      return { ok: false, error: "CHAT_TIMEOUT", securityId: opened.securityId };
+      return {
+        ok: false,
+        error: "CHAT_TIMEOUT",
+        securityId: opened.securityId,
+        message: "聊天窗口未出现，可能页面结构变化或被弹窗阻挡"
+      };
     }
+
     return {
       ok: true,
-      already: false,
+      already: Boolean(clicked.already),
       securityId: opened.securityId,
-      detailSalary: opened.detailSalary
+      detailSalary: opened.detailSalary,
+      chatPage: isChatPage(),
+      href: location.href
     };
-  }
-
-  function getSelfMessages(limit = 8) {
-    const root = getChatRoot() || document;
-    let nodes = allEl(SELECTORS.selfMsg, root);
-    let texts = nodes.map(textOf).filter(Boolean);
-    if (!texts.length) {
-      const bubbles = allEl(
-        [".message-item .text", ".msg-content", ".message-content", ".text"],
-        root
-      );
-      texts = bubbles.map(textOf).filter(Boolean).slice(-limit);
-    }
-    return texts.slice(-limit);
   }
 
   async function setInputText(input, text) {
     input.focus();
+    await sleep(80);
     if (input.tagName === "TEXTAREA" || input.tagName === "INPUT") {
-      const proto =
-        input.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const proto = input.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       const desc = Object.getOwnPropertyDescriptor(proto, "value");
       desc?.set?.call(input, text);
       input.dispatchEvent(new Event("input", { bubbles: true }));
       input.dispatchEvent(new Event("change", { bubbles: true }));
     } else {
-      input.focus();
+      // contenteditable / BOSS 自定义输入
       try {
-        document.execCommand("selectAll", false, null);
-        document.execCommand("insertText", false, text);
-      } catch (_) {
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(input);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      } catch (_) {}
+      let inserted = false;
+      try {
+        inserted = document.execCommand("insertText", false, text);
+      } catch (_) {}
+      if (!inserted) {
         input.textContent = text;
-        input.dispatchEvent(
-          new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" })
-        );
+        input.innerHTML = "";
+        input.appendChild(document.createTextNode(text));
       }
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
     }
     await sleep(120);
   }
 
   function findSendButton() {
+    const nodes = Array.from(document.querySelectorAll("button,a,div[role='button'],span"));
+    // 避免点到「发送简历」等
+    const exact = nodes.find((el) => {
+      const t = textOf(el);
+      return t === "发送" || t === "发送消息";
+    });
+    if (exact) return exact;
     return (
-      Array.from(document.querySelectorAll("button,a,div[role='button']")).find((el) =>
-        /^发送$|发送消息|^send$/i.test(textOf(el))
-      ) || firstEl(SELECTORS.sendBtn)
+      nodes.find((el) => /^发送$|发送消息|^send$/i.test(textOf(el))) ||
+      firstEl(SELECTORS.sendBtn)
     );
   }
 
   async function sendText(text) {
-    const ready = await waitForChat(8000);
+    if (!text || !String(text).trim()) return { ok: false, error: "EMPTY_TEXT" };
+    const ready = await waitForChat(10000);
     if (!ready) return { ok: false, error: "CHAT_TIMEOUT" };
     const input = getChatInput();
-    if (!input) return { ok: false, error: "INPUT_NOT_FOUND" };
+    if (!input || !hasUsableChatInput()) return { ok: false, error: "INPUT_NOT_FOUND" };
+
+    const before = getSelfMessages(6);
     await setInputText(input, text);
-    await sleep(160);
+    await sleep(200);
+
     const sendBtn = findSendButton();
-    if (sendBtn) clickLikeHuman(sendBtn);
-    else {
+    if (sendBtn) {
+      clickLikeHuman(sendBtn);
+    } else {
+      // Ctrl+Enter / Enter 兼容
       input.dispatchEvent(
         new KeyboardEvent("keydown", {
           key: "Enter",
@@ -510,14 +683,35 @@
         })
       );
     }
-    await sleep(500);
-    const self = getSelfMessages(5);
-    const ok = self.some(
-      (m) =>
-        m.includes(text.slice(0, Math.min(12, text.length))) ||
-        text.includes(m.slice(0, Math.min(12, m.length)))
-    );
-    return { ok: true, confirmed: ok, selfTail: self.slice(-3) };
+
+    // 等待消息出现在自己侧
+    const needle = String(text).replace(/\s+/g, "").slice(0, 16);
+    let confirmed = false;
+    let selfTail = [];
+    for (let i = 0; i < 12; i++) {
+      await sleep(300);
+      selfTail = getSelfMessages(8);
+      confirmed = selfTail.some((m) => {
+        const n = String(m).replace(/\s+/g, "");
+        return n.includes(needle) || needle.includes(n.slice(0, 12));
+      });
+      // 或数量增加
+      if (!confirmed && selfTail.length > before.length) {
+        // 宽松：最后一条非空
+        confirmed = Boolean(selfTail[selfTail.length - 1]);
+      }
+      if (confirmed) break;
+    }
+
+    if (!confirmed) {
+      return {
+        ok: false,
+        error: "SEND_NOT_CONFIRMED",
+        message: "未检测到消息发送成功，请检查聊天输入框是否可用",
+        selfTail
+      };
+    }
+    return { ok: true, confirmed: true, selfTail: selfTail.slice(-3) };
   }
 
   async function sendImageFromDataUrl(dataUrl, fileName = "resume.png") {
