@@ -165,7 +165,7 @@
   function normalizeText(input = "") {
     return String(input || "")
       .replace(/\s+/g, "")
-      .replace(/[“”]/g, '"')
+      .replace(/[【】\[\]()（）]/g, "")
       .toLowerCase();
   }
 
@@ -667,25 +667,80 @@ function dismissCommonDialogs() {
     return ensured;
   }
 
-  async function startChat(job) {
-    const inputJob = job || {};
-    await ensureJobList({ maxWaitMs: 8000, scroll: true });
+  async function findCardByScrolling(job, maxRounds = 30) {
+    let card = findCardByJob(job);
+    if (card) return card;
+    try { window.scrollTo(0, 0); } catch (_) {}
+    await sleep(300);
+    card = findCardByJob(job);
+    if (card) return card;
+    // 从顶部开始找，避免当前位置下方没有目标卡
+    try { window.scrollTo(0, 0); } catch (_) {}
+    await sleep(280);
 
-    let card = findCardByJob(inputJob);
-    if (!card) {
-      try { await autoScrollList(3); } catch (_) {}
-      card = findCardByJob(inputJob);
+    // 从当前可见区域向下找，避免一次滚太远把虚拟列表刷没
+    for (let i = 0; i < maxRounds; i++) {
+      // 直接按标题文本找链接（比整卡解析更稳）
+      const want = normalizeText(job?.title || "");
+      if (want) {
+        const nameEls = Array.from(document.querySelectorAll("a.job-name, .job-name, .job-title a"));
+        const hit = nameEls.find((el) => {
+          const t = normalizeText(textOf(el));
+          return t && (t === want || t.includes(want) || want.includes(t));
+        });
+        if (hit) {
+          return (
+            hit.closest("li.job-card-box") ||
+            hit.closest(".job-card-box") ||
+            hit.closest(".job-card-wrap") ||
+            hit.closest("li") ||
+            hit
+          );
+        }
+      }
+      card = findCardByJob(job);
+      if (card) return card;
+      try {
+        window.scrollBy(0, 360);
+      } catch (_) {}
+      await sleep(220);
     }
+    return null;
+  }
+
+  async function startChat(job, opts = {}) {
+    const inputJob = (opts && opts.job) || job || {};
+    const skipScroll = Boolean(opts.skipScroll);
+
+    // 先轻量恢复列表，不暴力滚动
+    if (!skipScroll) {
+      await ensureJobList({ maxWaitMs: 4000, scroll: false });
+    } else {
+      await closeChatPanel();
+      await sleep(200);
+    }
+
+    // 关键：逐步滚动查找目标卡，而不是 autoScrollList 把虚拟列表冲掉
+    let card = await findCardByScrolling(inputJob, skipScroll ? 8 : 24);
     if (!card) {
-      const titles = getJobCards().slice(0, 8).map((el, i) => parseJobCard(el, i).title).filter(Boolean);
+      // 最后再 ensure + 找一次
+      await ensureJobList({ maxWaitMs: 5000, scroll: true });
+      card = await findCardByScrolling(inputJob, 12);
+    }
+
+    if (!card) {
+      const titles = Array.from(document.querySelectorAll("a.job-name, .job-name"))
+        .map((el) => textOf(el))
+        .filter(Boolean)
+        .slice(0, 5);
       return {
         ok: false,
         error: "JOB_CARD_NOT_FOUND",
         message:
           "列表中找不到该岗位「" +
           (inputJob.title || "") +
-          "」。请重新扫描预览后再投递" +
-          (titles.length ? "\n当前可见示例：" + titles.slice(0, 3).join(" / ") : ""),
+          "」。请回到职位列表顶部后重新扫描预览再投递" +
+          (titles.length ? "\n当前可见示例：" + titles.join(" / ") : ""),
         listCount: getJobCards().length,
         href: location.href
       };
@@ -696,14 +751,19 @@ function dismissCommonDialogs() {
       ...inputJob,
       ...live,
       title: live.title || inputJob.title,
-      company: live.company || inputJob.company
+      company: live.company || inputJob.company,
+      jobId: live.jobId || inputJob.jobId
     };
 
-    const wrap = card.closest(".job-card-wrap") || card;
-    try { wrap.scrollIntoView({ block: "center", behavior: "instant" }); } catch (_) {}
-    preventLinkNavigation(wrap, 1000);
+    const wrap = card.closest(".job-card-wrap") || card.closest("li.job-card-box") || card;
+    try {
+      wrap.scrollIntoView({ block: "center", behavior: "instant" });
+    } catch (_) {}
+    await sleep(200);
+    preventLinkNavigation(wrap, 1200);
     clickLikeHuman(wrap);
-    await sleep(500);
+    await sleep(550);
+
     if (!firstEl(SELECTORS.detailRoot) && !firstEl(SELECTORS.chatOnDetail)) {
       preventLinkNavigation(wrap, 800);
       clickLikeHuman(card);
@@ -717,17 +777,22 @@ function dismissCommonDialogs() {
 
     let clicked = await clickChatButton();
     if (!clicked.ok) {
-      const cardBtn = Array.from(card.querySelectorAll("a,button")).find((el) =>
+      const cardBtn = Array.from((wrap || card).querySelectorAll("a,button")).find((el) =>
         /立即沟通|继续沟通|打招呼/.test(textOf(el))
       );
       if (cardBtn) {
         clickLikeHuman(cardBtn);
-        clicked = { ok: true, buttonText: textOf(cardBtn), already: /继续沟通/.test(textOf(cardBtn)) };
+        clicked = {
+          ok: true,
+          buttonText: textOf(cardBtn),
+          already: /继续沟通/.test(textOf(cardBtn))
+        };
       } else {
-        await sleep(800);
+        await sleep(700);
         clicked = await clickChatButton();
       }
     }
+
     if (!clicked.ok) {
       if (typeof detectLoginModal === "function") {
         const loginHit = detectLoginModal();
@@ -736,11 +801,11 @@ function dismissCommonDialogs() {
       return {
         ok: false,
         error: "CHAT_BUTTON_NOT_FOUND",
-        message: "未找到「立即沟通」按钮。请确认已登录，且该岗位可沟通"
+        message: "未找到「立即沟通」按钮。请确认已登录且岗位可沟通"
       };
     }
 
-    await sleep(500);
+    await sleep(450);
     dismissCommonDialogs();
     if (typeof detectLoginModal === "function") {
       const loginHit = detectLoginModal();
@@ -756,7 +821,7 @@ function dismissCommonDialogs() {
       return {
         ok: false,
         error: "CHAT_TIMEOUT",
-        message: "聊天输入框未出现。若弹出登录框请先登录；否则请手动点一次立即沟通"
+        message: "聊天输入框未出现。请确认已登录；若有弹窗请先关闭后重试"
       };
     }
 
@@ -942,7 +1007,7 @@ async function setInputText(input, text) {
           case MSG.SCAN_JOBS:
             return await scanJobs(payload || {});
           case MSG.START_CHAT:
-            return await startChat(payload?.job || payload);
+            return await startChat(payload?.job || payload, payload || {});
           case MSG.GET_CHAT_SELF_MESSAGES:
             await waitForChat(5000);
             return { ok: true, messages: getSelfMessages(payload?.limit || 8) };

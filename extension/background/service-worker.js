@@ -300,11 +300,14 @@ function itemErrorHint(task, row) {
 }
 
 async function waitWhilePaused(task) {
-  while (runner.pause && !runner.abort) {
+  // 只在进入暂停时发布一次，避免弹窗被反复触发
+  if (runner.pause && task) {
     task.status = TASK_STATUS.PAUSED;
     task.updatedAt = Date.now();
     await publishTask(task);
-    await sleep(300);
+  }
+  while (runner.pause && !runner.abort) {
+    await sleep(400);
   }
 }
 
@@ -389,7 +392,8 @@ async function processOneJob(task, resultRow, config) {
       await log("warn", listReady?.message || "职位列表暂未就绪，仍尝试沟通", { jobId: job.jobId });
     }
   }
-  const chatRes = await sendToBoss(MSG.START_CHAT, { job });
+  await sleep(400);
+  const chatRes = await sendToBoss(MSG.START_CHAT, { job, skipScroll: true });
   if (!chatRes?.ok) {
     item.state = 'FAILED';
     let code = REASON.EXEC_CLICK_FAIL;
