@@ -39,15 +39,19 @@ function setBossMode(isBoss, reason = '') {
     if (!isBoss) {
       el.disabled = true;
       el.title = reason || '仅在 BOSS 直聘页面可用';
+      el.style.opacity = '0.45';
     } else {
-      el.title = '';
-      // 回到 BOSS 页时先解除锁定，具体可用性交给 updateTaskUI
       el.disabled = false;
+      el.title = '';
+      el.style.opacity = '1';
     }
   });
   if (!isBoss) {
     $('taskStatus').textContent = '状态：未在 BOSS 页面（功能已锁定）';
     if (reason) $('taskWarnings').textContent = reason;
+  } else {
+    // 回到 BOSS 后用任务状态再精修一次
+    updateTaskUI(state.config?.task, state.config?.runner);
   }
 }
 
@@ -339,31 +343,32 @@ function statusLabel(status) {
 }
 
 function updateTaskUI(task, runner = {}) {
-  if (state.isBoss === false) {
-    ['btnPreview', 'btnDiagnose', 'btnStart', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
-      const el = $(id);
-      if (el) el.disabled = true;
-    });
-    return;
-  }
   const status = task?.status || 'idle';
   $('taskStatus').textContent = `状态：${statusLabel(status)}${task?.pauseReason ? `（${task.pauseReason}）` : ''}`;
   const c = task?.counters || { success: 0, skipped: 0, failed: 0, processed: 0 };
   $('taskCounters').textContent = `成功 ${c.success || 0} · 跳过 ${c.skipped || 0} · 失败 ${c.failed || 0} · 已处理 ${c.processed || 0}`;
-  $('taskWarnings').textContent = (task?.warnings || []).join('；');
+  if (!state.formDirty) {
+    $('taskWarnings').textContent = (task?.warnings || []).join('；');
+  }
 
-  const canStart = status === 'awaiting_confirm';
-  const running = status === 'running' || Boolean(runner?.running && status !== 'paused' && status !== 'stopped' && status !== 'completed');
-  const paused = status === 'paused' || Boolean(runner?.pause) || Boolean(task?.awaitingUserRetry);
-  const hasTask = Boolean(task && task.id);
-
-  // 明确可点逻辑
-  if ($('btnStart')) $('btnStart').disabled = !canStart;
-  if ($('btnPause')) $('btnPause').disabled = !(running || (hasTask && status === 'running'));
-  if ($('btnResume')) $('btnResume').disabled = !paused;
-  if ($('btnSkip')) $('btnSkip').disabled = !(running || paused);
-  if ($('btnStop')) $('btnStop').disabled = !(running || paused || canStart || hasTask);
-  if ($('btnPreview')) $('btnPreview').disabled = running;
+  // 控制按钮：在 BOSS 页始终可点，避免状态机误判导致“点不了”
+  const onBoss = state.isBoss !== false;
+  ['btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.disabled = !onBoss;
+    el.style.opacity = onBoss ? '1' : '0.45';
+  });
+  if ($('btnStart')) {
+    const canStart = status === 'awaiting_confirm';
+    // 允许在 paused 时也能点开始？不，开始仍需预览确认
+    $('btnStart').disabled = !(onBoss && canStart);
+  }
+  if ($('btnPreview')) {
+    const running = status === 'running' || Boolean(runner?.running && status === 'running');
+    $('btnPreview').disabled = !onBoss || running;
+  }
+  if ($('btnDiagnose')) $('btnDiagnose').disabled = !onBoss;
 }
 
 function renderPreview(task) {
@@ -624,8 +629,9 @@ function toast(msg, type = 'success', ms = 2200) {
 
 function showErrorModal(title, body, { showRetry = true, force = false } = {}) {
   const key = String(title || '') + '|' + String(body || '');
-  if (!force && state.modalDismissed && state.lastModalKey === key) {
-    return; // 用户点过关闭，同一错误不再反复弹
+  if (!force && state.modalDismissed) return;
+  if (!force && state.lastModalKey === key && !$('bht-modal')?.hidden === false) {
+    // 已显示同一错误，不重复打开
   }
   state.lastModalKey = key;
   if (force) state.modalDismissed = false;
@@ -634,6 +640,8 @@ function showErrorModal(title, body, { showRetry = true, force = false } = {}) {
     toast(body || title, 'error', 4000);
     return;
   }
+  // 若用户已关闭且非 force，直接返回
+  if (!force && state.modalDismissed) return;
   $('bht-modal-title').textContent = title || '投递失败';
   $('bht-modal-body').textContent = body || '发生未知错误';
   const retryBtn = $('bht-modal-retry');
@@ -836,49 +844,32 @@ function bindEvents() {
   });
 
   $('btnPause').addEventListener('click', async () => {
-    try {
-      const res = await api(MSG.PAUSE_TASK);
-      if (!res?.ok) toast(res?.message || res?.error || '暂停失败', 'error');
-      else toast('任务已暂停', 'warn');
-    } catch (e) {
-      toast(String(e.message || e), 'error');
-    }
+    const res = await api(MSG.PAUSE_TASK);
+    toast(res?.ok === false ? (res.message || '暂停失败') : '任务已暂停', res?.ok === false ? 'error' : 'warn');
     await refresh({ soft: true });
   });
   $('btnResume').addEventListener('click', async () => {
     state.modalDismissed = false;
-    hideErrorModal();
-    state.modalDismissed = false;
-    toast('继续任务…', 'warn', 1500);
-    try {
-      const res = await api(MSG.RESUME_TASK);
-      if (!res?.ok) toast(res?.message || res?.error || '继续失败', 'error', 3500);
-      else toast('已继续投递', 'success');
-    } catch (e) {
-      toast(String(e.message || e), 'error');
-    }
+    state.lastModalKey = '';
+    hideErrorModal?.();
+    const modal = $('bht-modal');
+    if (modal) modal.hidden = true;
+    toast('继续任务…', 'warn', 1200);
+    const res = await api(MSG.RESUME_TASK);
+    toast(res?.ok === false ? (res.message || res.error || '继续失败') : '已继续投递', res?.ok === false ? 'error' : 'success');
     await refresh({ soft: true });
   });
   $('btnStop').addEventListener('click', async () => {
     state.modalDismissed = true;
-    hideErrorModal();
-    try {
-      const res = await api(MSG.STOP_TASK);
-      if (!res?.ok) toast(res?.message || res?.error || '停止失败', 'error');
-      else toast('任务已停止', 'warn');
-    } catch (e) {
-      toast(String(e.message || e), 'error');
-    }
+    const modal = $('bht-modal');
+    if (modal) modal.hidden = true;
+    const res = await api(MSG.STOP_TASK);
+    toast(res?.ok === false ? (res.message || '停止失败') : '任务已停止', res?.ok === false ? 'error' : 'warn');
     await refresh({ soft: true });
   });
   $('btnSkip').addEventListener('click', async () => {
-    try {
-      const res = await api(MSG.SKIP_CURRENT);
-      if (!res?.ok) toast(res?.message || res?.error || '跳过失败', 'error');
-      else toast('已请求跳过当前岗位', 'warn');
-    } catch (e) {
-      toast(String(e.message || e), 'error');
-    }
+    const res = await api(MSG.SKIP_CURRENT);
+    toast(res?.ok === false ? (res.message || '跳过失败') : '已请求跳过当前岗位', res?.ok === false ? 'error' : 'warn');
     await refresh({ soft: true });
   });
 
@@ -959,12 +950,24 @@ function bindEvents() {
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === MSG.TASK_EVENT) {
     if (state.config) state.config.task = msg.payload;
-    updateTaskUI(msg.payload, state.config?.runner);
-    if (msg.payload?.summary && !state.formDirty) renderPreview(msg.payload);
-    if (msg.payload?.status === 'paused' && msg.payload?.pauseReason && msg.payload?.awaitingUserRetry) {
+    updateTaskUI(msg.payload, state.config?.runner || {});
+    if (msg.payload?.summary && !state.formDirty && !state.isEditing) {
+      // keep preview if needed
+    }
+    if (
+      msg.payload?.status === 'paused' &&
+      msg.payload?.awaitingUserRetry &&
+      msg.payload?.pauseReason &&
+      !state.modalDismissed
+    ) {
       const reason = msg.payload.pauseReason;
       const detail = msg.payload?.lastErrorDetail || '';
-      showErrorModal('投递已暂停', reason + (detail ? ('\n\n' + detail) : ''), { showRetry: true, force: false });
+      // force only first time for this pause
+      const force = state.lastModalKey !== ( '投递已暂停|' + reason + (detail ? ('\n\n' + detail) : '') );
+      showErrorModal('投递已暂停', reason + (detail ? ('\n\n' + detail) : ''), {
+        showRetry: true,
+        force: false
+      });
     }
   }
   if (msg?.type === MSG.LOG_EVENT) {
@@ -976,18 +979,22 @@ chrome.runtime.onMessage.addListener((msg) => {
 });
 
 $('bht-modal-close')?.addEventListener('click', async () => {
-  hideErrorModal();
+  state.modalDismissed = true;
+  const modal = $('bht-modal');
+  if (modal) modal.hidden = true;
   toast('已关闭，不会自动重试', 'warn', 2500);
   await refresh({ soft: true });
 });
 $('bht-modal-retry')?.addEventListener('click', async () => {
   state.modalDismissed = false;
-  hideErrorModal();
-  state.modalDismissed = false; // retry 后允许新错误再弹
+  state.lastModalKey = '';
+  const modal = $('bht-modal');
+  if (modal) modal.hidden = true;
   toast('正在重试…', 'warn', 1500);
   const res = await api(MSG.RESUME_TASK);
   if (!res?.ok) {
     toast(res?.message || res?.error || '重试失败', 'error', 3500);
+    state.modalDismissed = false;
     showErrorModal('重试失败', res?.message || res?.error || '请重新扫描预览后再试', { showRetry: true, force: true });
   } else {
     toast('已开始重试', 'success');

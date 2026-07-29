@@ -190,17 +190,52 @@
   }
 
   function getJobCards() {
-    const cards = allEl(SELECTORS.card);
-    // 去重：优先 li.job-card-box
+    const preferred = [
+      "ul.rec-job-list li.job-card-box",
+      ".job-list-container li.job-card-box",
+      ".job-recommend-result li.job-card-box",
+      ".search-job-result li.job-card-box",
+      "li.job-card-box",
+      ".job-card-box"
+    ];
+    let cards = [];
+    for (const sel of preferred) {
+      try {
+        const list = Array.from(document.querySelectorAll(sel));
+        if (list.length) {
+          cards = list;
+          break;
+        }
+      } catch (_) {}
+    }
+
+    // 兜底：从职位名锚点反推卡片（真机最稳）
+    if (!cards.length) {
+      const names = Array.from(document.querySelectorAll("a.job-name, .job-name"));
+      cards = names
+        .map((a) => {
+          if (a.closest?.(".job-detail-box, .job-detail-container")) return null;
+          return (
+            a.closest("li.job-card-box") ||
+            a.closest(".job-card-box") ||
+            a.closest(".job-card-wrap") ||
+            a.closest("li") ||
+            a.parentElement
+          );
+        })
+        .filter(Boolean);
+    }
+
     const uniq = [];
     const seen = new Set();
-    for (const c of cards) {
-      const key = c;
-      if (seen.has(key)) continue;
-      // 忽略过短节点
-      if (textOf(c).length < 6) continue;
-      seen.add(key);
-      uniq.push(c);
+    for (const card of cards) {
+      if (!card || seen.has(card)) continue;
+      if (card.closest?.(".job-detail-box, .job-detail-container")) continue;
+      const titleEl = card.querySelector?.("a.job-name, .job-name") || (card.matches?.("a.job-name") ? card : null);
+      const title = textOf(titleEl);
+      if (!title || title.length < 2) continue;
+      seen.add(card);
+      uniq.push(card);
     }
     return uniq;
   }
@@ -667,43 +702,44 @@ function dismissCommonDialogs() {
     return ensured;
   }
 
-  async function findCardByScrolling(job, maxRounds = 30) {
-    let card = findCardByJob(job);
-    if (card) return card;
-    try { window.scrollTo(0, 0); } catch (_) {}
-    await sleep(300);
-    card = findCardByJob(job);
-    if (card) return card;
-    // 从顶部开始找，避免当前位置下方没有目标卡
-    try { window.scrollTo(0, 0); } catch (_) {}
-    await sleep(280);
-
-    // 从当前可见区域向下找，避免一次滚太远把虚拟列表刷没
-    for (let i = 0; i < maxRounds; i++) {
-      // 直接按标题文本找链接（比整卡解析更稳）
-      const want = normalizeText(job?.title || "");
-      if (want) {
-        const nameEls = Array.from(document.querySelectorAll("a.job-name, .job-name, .job-title a"));
-        const hit = nameEls.find((el) => {
-          const t = normalizeText(textOf(el));
-          return t && (t === want || t.includes(want) || want.includes(t));
-        });
-        if (hit) {
-          return (
-            hit.closest("li.job-card-box") ||
-            hit.closest(".job-card-box") ||
-            hit.closest(".job-card-wrap") ||
-            hit.closest("li") ||
-            hit
-          );
-        }
-      }
-      card = findCardByJob(job);
+  async function findCardByScrolling(job, maxRounds = 40) {
+    const want = normalizeText(job?.title || "");
+    const tryFind = () => {
+      let card = findCardByJob(job);
       if (card) return card;
-      try {
-        window.scrollBy(0, 360);
-      } catch (_) {}
-      await sleep(220);
+      if (!want) return null;
+      const nameEls = Array.from(
+        document.querySelectorAll(
+          "ul.rec-job-list a.job-name, .job-list-container a.job-name, a.job-name, .job-name"
+        )
+      );
+      const hit = nameEls.find((el) => {
+        if (el.closest?.(".job-detail-box, .job-detail-container")) return false;
+        const t = normalizeText(textOf(el));
+        return t && (t === want || t.includes(want) || want.includes(t));
+      });
+      if (!hit) return null;
+      return (
+        hit.closest("li.job-card-box") ||
+        hit.closest(".job-card-box") ||
+        hit.closest(".job-card-wrap") ||
+        hit.closest("li") ||
+        hit
+      );
+    };
+
+    let card = tryFind();
+    if (card) return card;
+    try { window.scrollTo(0, 0); } catch (_) {}
+    await sleep(350);
+    card = tryFind();
+    if (card) return card;
+
+    for (let i = 0; i < maxRounds; i++) {
+      try { window.scrollBy(0, 320); } catch (_) {}
+      await sleep(200);
+      card = tryFind();
+      if (card) return card;
     }
     return null;
   }
@@ -721,11 +757,11 @@ function dismissCommonDialogs() {
     }
 
     // 关键：逐步滚动查找目标卡，而不是 autoScrollList 把虚拟列表冲掉
-    let card = await findCardByScrolling(inputJob, skipScroll ? 8 : 24);
+    let card = await findCardByScrolling(inputJob, 45);
     if (!card) {
       // 最后再 ensure + 找一次
       await ensureJobList({ maxWaitMs: 5000, scroll: true });
-      card = await findCardByScrolling(inputJob, 12);
+      card = await findCardByScrolling(inputJob, 30);
     }
 
     if (!card) {
