@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/logo.png" alt="Boss HaiTou Assistant Logo" width="120" />
+  <img src="https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/logo.png" alt="Boss HaiTou Assistant Logo" width="120" />
 </p>
 
 <h1 align="center">Boss HaiTou Assistant</h1>
@@ -45,31 +45,31 @@ Boss HaiTou Assistant optimizes for reliability and control—not reckless auto-
 
 Scan first, confirm second, deliver last. Every job shows pass/skip reasons.
 
-![Task panel](docs/assets/screenshots/01-task.png)
+![Task panel](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/01-task.png)
 
 ### 2) Filters: explainable AND / OR / NOT rules
 
 Separate fields for title, company, JD, and location.
 
-![Filter panel](docs/assets/screenshots/02-filter.png)
+![Filter panel](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/02-filter.png)
 
 ### 3) Messages: multi-segment send + greeting dedup
 
 Default auto-detect mode avoids repeating BOSS native greetings.
 
-![Message panel](docs/assets/screenshots/03-message.png)
+![Message panel](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/03-message.png)
 
 ### 4) Resumes: multi-profile switch + binding rules
 
 Different tracks use different resumes.
 
-![Resume panel](docs/assets/screenshots/04-resume.png)
+![Resume panel](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/04-resume.png)
 
 ### 5) Settings: rate limits + local config
 
 Safety limits are first-class features.
 
-![Settings panel](docs/assets/screenshots/05-settings.png)
+![Settings panel](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/05-settings.png)
 
 ---
 
