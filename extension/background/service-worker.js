@@ -363,24 +363,30 @@ async function processOneJob(task, resultRow, config) {
   }
 
   await log('info', `开始沟通：${job.title} @ ${job.company || ''}`, { jobId: job.jobId });
-  // ENSURE_JOB_LIST before start（软检测：失败不直接放弃，交给 START_CHAT 再试）
+
+  // ENSURE_JOB_LIST before start
   {
+    await sendToBoss(MSG.RETURN_TO_LIST, {});
+    await sleep(600);
     let listReady = await sendToBoss(MSG.ENSURE_JOB_LIST, { maxWaitMs: 8000, scroll: true });
-    if (!listReady?.ok) {
-      await log('warn', listReady?.message || '职位列表暂未就绪，尝试滚动重扫…', { jobId: job.jobId });
-      const rescanned = await sendToBoss(MSG.SCAN_JOBS, { scroll: true, maxRounds: 5 });
-      if (rescanned?.ok && rescanned.jobs?.length) {
-        // 用最新列表刷新当前 job 的 index/jobId（标题匹配）
-        const hit = rescanned.jobs.find((j) => j.jobId === job.jobId || j.title === job.title);
-        if (hit) {
-          Object.assign(job, hit);
-          resultRow.job = job;
-        }
+    const rescanned = await sendToBoss(MSG.SCAN_JOBS, { scroll: true, maxRounds: 3 });
+    if (rescanned?.ok && Array.isArray(rescanned.jobs) && rescanned.jobs.length) {
+      const norm = (x) => String(x || "").replace(/\s+/g, "").toLowerCase();
+      const hit =
+        rescanned.jobs.find((j) => j.jobId && job.jobId && j.jobId === job.jobId) ||
+        rescanned.jobs.find((j) => norm(j.title) === norm(job.title) && (!job.company || norm(j.company) === norm(job.company))) ||
+        rescanned.jobs.find((j) => norm(j.title) === norm(job.title)) ||
+        rescanned.jobs.find((j) => norm(j.title).includes(norm(job.title)) || norm(job.title).includes(norm(j.title)));
+      if (hit) {
+        Object.assign(job, hit);
+        resultRow.job = job;
         listReady = { ok: true, count: rescanned.jobs.length };
+        await log("info", "已匹配到列表岗位：" + (job.title || ""), { jobId: job.jobId });
+      } else {
+        await log("warn", "重扫后未精确匹配，将按标题尝试沟通：" + (job.title || ""), { jobId: job.jobId });
       }
-    }
-    if (!listReady?.ok) {
-      await log('warn', '列表仍未就绪，仍尝试直接沟通该岗位', { jobId: job.jobId });
+    } else if (!listReady?.ok) {
+      await log("warn", listReady?.message || "职位列表暂未就绪，仍尝试沟通", { jobId: job.jobId });
     }
   }
   const chatRes = await sendToBoss(MSG.START_CHAT, { job });
@@ -409,6 +415,10 @@ async function processOneJob(task, resultRow, config) {
     // RETURN_TO_LIST after fail
     await sendToBoss(MSG.RETURN_TO_LIST, {});
     return 'failed';
+  }
+  if (chatRes.job) {
+    Object.assign(job, chatRes.job);
+    resultRow.job = job;
   }
   if (chatRes.securityId) job.securityId = chatRes.securityId;
   if (chatRes.detailSalary && !job.salary) job.salary = chatRes.detailSalary;

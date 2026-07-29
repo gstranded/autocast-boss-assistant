@@ -950,14 +950,22 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 });
 
-$('bht-modal-close')?.addEventListener('click', () => {
+$('bht-modal-close')?.addEventListener('click', async () => {
   hideErrorModal();
+  // 关闭：明确不重试，保持暂停
+  toast('已关闭，不会自动重试。需要时再点「重试/继续」', 'warn', 3000);
+  await refresh({ soft: true });
 });
 $('bht-modal-retry')?.addEventListener('click', async () => {
   hideErrorModal();
-  toast('正在重试…', 'warn');
+  toast('正在重试…', 'warn', 1800);
   const res = await api(MSG.RESUME_TASK);
-  if (!res?.ok) toast(res?.message || res?.error || '重试失败', 'error');
+  if (!res?.ok) {
+    toast(res?.message || res?.error || '重试失败', 'error', 3500);
+    showErrorModal('重试失败', res?.message || res?.error || '请重新扫描预览后再试', { showRetry: true });
+  } else {
+    toast('已开始重试', 'success');
+  }
   await refresh({ soft: true });
 });
 

@@ -162,6 +162,13 @@
     return true;
   }
 
+  function normalizeText(input = "") {
+    return String(input || "")
+      .replace(/\s+/g, "")
+      .replace(/[“”]/g, '"')
+      .toLowerCase();
+  }
+
   function hashStr(s) {
     let h = 0;
     for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
@@ -243,7 +250,10 @@
     const activeText = textOf(activeEl) || (firstEl(SELECTORS.online, card) ? "在线" : "");
     const jd = [textOf(card), tags.join(" ")].join(" ");
 
-    if (!jobId) jobId = `dom_${index}_${hashStr(title + company + salary + location)}`;
+    if (!jobId) {
+      const stable = hashStr(normalizeText(title) + "|" + normalizeText(company));
+      jobId = (title || company) ? ("name_" + stable) : ("dom_" + index + "_" + stable);
+    }
 
     return {
       index,
@@ -345,26 +355,48 @@
 
   function findCardByJob(job) {
     const cards = getJobCards();
-    if (!cards.length) return null;
-    // 优先 jobId 精确匹配
-    if (job?.jobId) {
-      const byId = cards.find((c, i) => parseJobCard(c, i).jobId === job.jobId);
+    if (!cards.length || !job) return null;
+    const wantTitle = normalizeText(job.title || "");
+    const wantCompany = normalizeText(job.company || "");
+    const wantId = job.jobId || "";
+    const wantHref = job.href || "";
+
+    if (wantId) {
+      const byId = cards.find((el, i) => parseJobCard(el, i).jobId === wantId);
       if (byId) return byId;
     }
-    // 标题+公司
-    if (job?.title) {
-      const byTitle = cards.find((c, i) => {
-        const p = parseJobCard(c, i);
-        if (p.title !== job.title) return false;
-        if (job.company && p.company && p.company !== job.company) return false;
+    if (wantHref) {
+      const idFromHref = extractJobIdFromHref(wantHref);
+      if (idFromHref) {
+        const byHref = cards.find((el, i) => {
+          const p = parseJobCard(el, i);
+          return p.jobId === idFromHref || (p.href && p.href.includes(idFromHref));
+        });
+        if (byHref) return byHref;
+      }
+    }
+    if (wantTitle) {
+      const exact = cards.find((el, i) => {
+        const p = parseJobCard(el, i);
+        const t = normalizeText(p.title || "");
+        const co = normalizeText(p.company || "");
+        if (t !== wantTitle) return false;
+        if (wantCompany && co && co !== wantCompany) return false;
         return true;
       });
-      if (byTitle) return byTitle;
+      if (exact) return exact;
+      const fuzzy = cards.find((el, i) => {
+        const p = parseJobCard(el, i);
+        const t = normalizeText(p.title || "");
+        return t && (t.includes(wantTitle) || wantTitle.includes(t));
+      });
+      if (fuzzy) return fuzzy;
     }
-    // 最后才用 index，且二次校验标题
-    if (job?.index != null && cards[job.index]) {
-      const parsed = parseJobCard(cards[job.index], job.index);
-      if (!job.title || parsed.title === job.title) return cards[job.index];
+    if (job.index != null && cards[job.index]) {
+      const p = parseJobCard(cards[job.index], job.index);
+      if (!wantTitle || normalizeText(p.title).includes(wantTitle) || wantTitle.includes(normalizeText(p.title))) {
+        return cards[job.index];
+      }
     }
     return null;
   }
@@ -636,110 +668,110 @@ function dismissCommonDialogs() {
   }
 
   async function startChat(job) {
-    // 尽量恢复列表，但不因列表检测失败直接放弃（卡片可能仍在）
-    const ensured = await ensureJobList({ maxWaitMs: 8000, scroll: true });
-    let card = findCardByJob(job);
+    const inputJob = job || {};
+    await ensureJobList({ maxWaitMs: 8000, scroll: true });
 
-    // 二次模糊匹配：标题包含关系
-    if (!card && job?.title) {
-      const cards = getJobCards();
-      card = cards.find((c, i) => {
-        const p = parseJobCard(c, i);
-        return p.title && (p.title === job.title || p.title.includes(job.title) || job.title.includes(p.title));
-      }) || null;
-      if (card) {
-        // 同步最新 jobId
-        const parsed = parseJobCard(card, 0);
-        if (parsed.jobId) job.jobId = parsed.jobId;
-      }
-    }
-
+    let card = findCardByJob(inputJob);
     if (!card) {
+      try { await autoScrollList(3); } catch (_) {}
+      card = findCardByJob(inputJob);
+    }
+    if (!card) {
+      const titles = getJobCards().slice(0, 8).map((el, i) => parseJobCard(el, i).title).filter(Boolean);
       return {
         ok: false,
         error: "JOB_CARD_NOT_FOUND",
-        message: ensured?.ok
-          ? "列表中找不到该岗位，请重新扫描预览后再投递"
-          : (ensured?.message || "职位列表未就绪，请打开职位列表页并重新扫描预览"),
+        message:
+          "列表中找不到该岗位「" +
+          (inputJob.title || "") +
+          "」。请重新扫描预览后再投递" +
+          (titles.length ? "\n当前可见示例：" + titles.slice(0, 3).join(" / ") : ""),
         listCount: getJobCards().length,
         href: location.href
       };
     }
 
-    const opened = await openJobDetail(job);
-    if (!opened.ok && opened.error !== "LIST_NOT_READY") {
-      // openJobDetail 内部还会 ensure；若仅 list 警告但 card 在，继续
-      if (opened.error === "JOB_CARD_NOT_FOUND") return opened;
+    const live = parseJobCard(card, 0);
+    const merged = {
+      ...inputJob,
+      ...live,
+      title: live.title || inputJob.title,
+      company: live.company || inputJob.company
+    };
+
+    const wrap = card.closest(".job-card-wrap") || card;
+    try { wrap.scrollIntoView({ block: "center", behavior: "instant" }); } catch (_) {}
+    preventLinkNavigation(wrap, 1000);
+    clickLikeHuman(wrap);
+    await sleep(500);
+    if (!firstEl(SELECTORS.detailRoot) && !firstEl(SELECTORS.chatOnDetail)) {
+      preventLinkNavigation(wrap, 800);
+      clickLikeHuman(card);
+      await sleep(500);
     }
 
-    // 详情区立即沟通
+    if (typeof detectLoginModal === "function") {
+      const loginHit = detectLoginModal();
+      if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
+    }
+
     let clicked = await clickChatButton();
     if (!clicked.ok) {
       const cardBtn = Array.from(card.querySelectorAll("a,button")).find((el) =>
         /立即沟通|继续沟通|打招呼/.test(textOf(el))
       );
-      if (!cardBtn) {
-        return {
-          ok: false,
-          error: "CHAT_BUTTON_NOT_FOUND",
-          message: "未找到「立即沟通」按钮，请确认已登录且岗位可沟通"
-        };
+      if (cardBtn) {
+        clickLikeHuman(cardBtn);
+        clicked = { ok: true, buttonText: textOf(cardBtn), already: /继续沟通/.test(textOf(cardBtn)) };
+      } else {
+        await sleep(800);
+        clicked = await clickChatButton();
       }
-      clickLikeHuman(cardBtn);
-      clicked = { ok: true, buttonText: textOf(cardBtn), already: /继续沟通/.test(textOf(cardBtn)) };
+    }
+    if (!clicked.ok) {
+      if (typeof detectLoginModal === "function") {
+        const loginHit = detectLoginModal();
+        if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
+      }
+      return {
+        ok: false,
+        error: "CHAT_BUTTON_NOT_FOUND",
+        message: "未找到「立即沟通」按钮。请确认已登录，且该岗位可沟通"
+      };
     }
 
-    await sleep(450);
+    await sleep(500);
     dismissCommonDialogs();
-    {
+    if (typeof detectLoginModal === "function") {
       const loginHit = detectLoginModal();
-      if (loginHit.ok) {
-        return {
-          ok: false,
-          error: "LOGIN_REQUIRED",
-          message: loginHit.message
-        };
-      }
+      if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
     }
+
     const chatReady = await waitForChat(14000);
     if (!chatReady) {
-      const loginHit = detectLoginModal();
-      if (loginHit.ok) {
-        return {
-          ok: false,
-          error: "LOGIN_REQUIRED",
-          message: loginHit.message
-        };
-      }
-      const login = Array.from(document.querySelectorAll("a,button,div")).find((el) =>
-        /登录|注册|扫码登录/.test(textOf(el))
-      );
-      if (login) {
-        return {
-          ok: false,
-          error: "LOGIN_REQUIRED",
-          message: "检测到登录相关界面，请先登录 BOSS 直聘后再投递"
-        };
+      if (typeof detectLoginModal === "function") {
+        const loginHit = detectLoginModal();
+        if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
       }
       return {
         ok: false,
         error: "CHAT_TIMEOUT",
-        message: "聊天窗口未出现，请手动点一次「立即沟通」确认页面是否正常",
-        securityId: opened?.securityId
+        message: "聊天输入框未出现。若弹出登录框请先登录；否则请手动点一次立即沟通"
       };
     }
 
     return {
       ok: true,
       already: Boolean(clicked.already),
-      securityId: opened?.securityId,
-      detailSalary: opened?.detailSalary,
+      job: merged,
+      securityId: merged.securityId || "",
+      detailSalary: merged.salary || "",
       chatPage: isChatPage(),
       href: location.href
     };
   }
 
-  async function setInputText(input, text) {
+async function setInputText(input, text) {
     input.focus();
     await sleep(80);
     if (input.tagName === "TEXTAREA" || input.tagName === "INPUT") {
