@@ -592,6 +592,7 @@ async function processOneJob(task, resultRow, config) {
 
   item.state = 'COMMUNICATION_CREATED';
   await bumpDailyStat('communicate', 1, normalizeText(job.company || ''));
+  await log('success', '已进入沟通，开始发送消息', { jobId: job.jobId });
 
   // messages
   const selfRes = await sendToBoss(MSG.GET_CHAT_SELF_MESSAGES, { limit: 8 });
@@ -612,6 +613,11 @@ async function processOneJob(task, resultRow, config) {
   if (plan.nativeDetected) {
     item.state = 'NATIVE_GREETING_DETECTED';
     await log('info', '检测到原生/已发打招呼，跳过第一段', { jobId: job.jobId });
+  }
+  if (!plan.plan?.length) {
+    await log('warn', '没有待发送的消息段（可能都被跳过或模板为空），将继续尝试简历发送', { jobId: job.jobId });
+  } else {
+    await log('info', '准备发送 ' + plan.plan.length + ' 段消息', { jobId: job.jobId });
   }
 
   for (const step of plan.plan) {
@@ -665,11 +671,20 @@ async function processOneJob(task, resultRow, config) {
 
   // resume
   const profile = pickResumeProfile(job, config.resumes, config.bindings);
-  const timing = config.settings.resumeSendTiming;
-  const shouldSendResume = timing === 'after_text';
+  const timing = config.settings.resumeSendTiming || 'on_request';
+  const wantAutoImage = Boolean(config.settings.autoSendImageResume && profile?.images?.length);
+  const wantAutoFile = Boolean(config.settings.autoSendAttachmentResume && profile?.attachment?.dataUrl);
+  // 仅 after_text 自动发；勾选自动发但时机不对时给明确提示
+  const doResume = timing === 'after_text' && profile && (wantAutoImage || wantAutoFile);
+  if (timing === 'after_text' && profile && !wantAutoImage && !wantAutoFile) {
+    await log('info', '文本后发送简历已开启，但未勾选自动发图/附件或未上传简历文件', { jobId: job.jobId });
+  }
+  if ((wantAutoImage || wantAutoFile) && timing !== 'after_text') {
+    await log('warn', '已勾选自动发简历，但发送时机不是「文本发送完成后」。请到设置改为「文本发送完成后立即发送」', { jobId: job.jobId });
+  }
 
-  if (shouldSendResume && profile) {
-    if (config.settings.autoSendImageResume && profile.images?.length) {
+  if (doResume) {
+    if (wantAutoImage) {
       for (let i = 0; i < profile.images.length; i++) {
         const img = profile.images[i];
         const key = resumeIdempotencyKey(job, `image_${i}`, profile.id);
@@ -689,7 +704,7 @@ async function processOneJob(task, resultRow, config) {
       }
     }
     // 附件：页面上传控件差异大，记录意图，提示用户必要时手动
-    if (config.settings.autoSendAttachmentResume && profile.attachment?.dataUrl) {
+    if (wantAutoFile) {
       const key = resumeIdempotencyKey(job, 'file', profile.id);
       if (!(await hasIdempotent(key))) {
         const fileRes = await sendToBoss(MSG.SEND_IMAGE, {

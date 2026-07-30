@@ -15,7 +15,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.3.1";
+  const BHT_CONTENT_VERSION = "1.3.2";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -88,10 +88,15 @@
       "#chat-input",
       "div#chat-input",
       ".chat-input div[contenteditable='true']",
+      ".chat-conversation div[contenteditable='true']",
+      ".message-input div[contenteditable='true']",
       "div[contenteditable='true'][data-placeholder]",
+      "div[contenteditable='true'][data-slate-editor]",
+      "div.edit-area [contenteditable='true']",
       "div[contenteditable='true']",
       "textarea.input-area",
       "textarea[placeholder*='聊']",
+      "textarea[placeholder*='Enter']",
       ".chat-input textarea",
       ".message-input textarea"
     ],
@@ -1389,12 +1394,111 @@ async function startChat(job, opts = {}) {
     }
   }
 
+
+  function getSelfMessages(limit = 8) {
+    const nodes = allEl(SELECTORS.selfMsg);
+    const texts = nodes
+      .map((el) => textOf(el))
+      .filter((t) => t && t.length > 0);
+    // 兜底：聊天页常见自己侧气泡
+    if (!texts.length) {
+      const extra = Array.from(
+        document.querySelectorAll(
+          ".message-item.item-myself, .item-myself, [class*='myself'], [class*='message-mine'], .chat-message.mine"
+        )
+      )
+        .map((el) => textOf(el))
+        .filter((t) => t && t.length > 1 && t.length < 500);
+      texts.push(...extra);
+    }
+    return texts.slice(-Math.max(1, limit));
+  }
+
+  function findSendButton() {
+    // 优先明确的发送按钮，避开「发简历/换电话」
+    const nodes = Array.from(
+      document.querySelectorAll("button, a, div[role='button'], span.btn, .submit-button, .btn-send")
+    );
+    const visible = nodes.filter((el) => {
+      try {
+        const st = getComputedStyle(el);
+        if (st.display === "none" || st.visibility === "hidden" || st.opacity === "0") return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 8 && r.height > 8;
+      } catch (_) {
+        return true;
+      }
+    });
+    const exact = visible.find((el) => {
+      const t = textOf(el);
+      return t === "发送" || t === "发送消息";
+    });
+    if (exact) return exact;
+    const byClass = firstEl(SELECTORS.sendBtn);
+    if (byClass) return byClass;
+    return (
+      visible.find((el) => {
+        const t = textOf(el);
+        return /^(发送|发送消息|Send)$/i.test(t) && !/简历|电话|微信|表情/.test(t);
+      }) || null
+    );
+  }
+
+  async function setInputText(input, text) {
+    if (!input) return false;
+    try { input.scrollIntoView({ block: "center", behavior: "instant" }); } catch (_) {}
+    try { input.focus(); } catch (_) {}
+    await sleep(80);
+
+    const tag = (input.tagName || "").toUpperCase();
+    if (tag === "TEXTAREA" || tag === "INPUT") {
+      const proto = tag === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, "value");
+      try { desc?.set?.call(input, text); } catch (_) { input.value = text; }
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    } else {
+      // contenteditable（BOSS 聊天框）
+      try {
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(input);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      } catch (_) {}
+      let inserted = false;
+      try {
+        inserted = document.execCommand("selectAll", false, null);
+        inserted = document.execCommand("insertText", false, text) || inserted;
+      } catch (_) {}
+      if (!inserted) {
+        try {
+          input.innerHTML = "";
+          input.textContent = text;
+        } catch (_) {
+          try { input.innerText = text; } catch (__) {}
+        }
+      }
+      try {
+        input.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
+      } catch (_) {
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      // 再派发 composition 结束，兼容部分编辑器
+      try {
+        input.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: text }));
+      } catch (_) {}
+    }
+    await sleep(120);
+    return true;
+  }
+
   async function sendText(text) {
     if (!text || !String(text).trim()) return { ok: false, error: "EMPTY_TEXT" };
     dismissCommonDialogs();
     let ready = await waitForChat(14000);
     if (!ready) {
-      // 再试一次：有时点完立即沟通后输入框延迟出现
       dismissCommonDialogs();
       await sleep(500);
       ready = await waitForChat(8000);
@@ -1407,53 +1511,59 @@ async function startChat(job, opts = {}) {
 
     const before = getSelfMessages(8);
     await setInputText(input, text);
-    await sleep(250);
+    await sleep(280);
 
     const written = (input.value || input.textContent || input.innerText || "").replace(/\s+/g, "");
     const needleFull = String(text).replace(/\s+/g, "");
     if (written.length < Math.min(4, needleFull.length)) {
       await setInputText(input, text);
-      await sleep(200);
+      await sleep(220);
     }
 
+    // 优先点「发送」；BOSS 聊天页默认 Enter 发送
     const sendBtn = findSendButton();
-    if (sendBtn) clickLikeHuman(sendBtn);
-
-    try { input.focus(); } catch (_) {}
-    const fireKey = (opts) => {
-      input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...opts }));
-      input.dispatchEvent(new KeyboardEvent("keypress", { bubbles: true, cancelable: true, ...opts }));
-      input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, cancelable: true, ...opts }));
-    };
-    fireKey({ key: "Enter", code: "Enter", keyCode: 13, which: 13 });
-    await sleep(120);
-    fireKey({ key: "Enter", code: "Enter", keyCode: 13, which: 13, ctrlKey: true });
+    if (sendBtn) {
+      clickLikeHuman(sendBtn);
+    } else {
+      try { input.focus(); } catch (_) {}
+      const fireKey = (opts) => {
+        input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...opts }));
+        input.dispatchEvent(new KeyboardEvent("keypress", { bubbles: true, cancelable: true, ...opts }));
+        input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, cancelable: true, ...opts }));
+      };
+      fireKey({ key: "Enter", code: "Enter", keyCode: 13, which: 13 });
+    }
 
     const needle = needleFull.slice(0, 18);
     let confirmed = false;
     let selfTail = [];
-    for (let i = 0; i < 16; i++) {
-      await sleep(280);
+    for (let i = 0; i < 18; i++) {
+      await sleep(300);
       if (typeof detectLoginModal === "function") {
         const loginHit = detectLoginModal();
         if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
       }
-      selfTail = getSelfMessages(10);
+      selfTail = getSelfMessages(12);
       confirmed = selfTail.some((m) => {
         const n = String(m).replace(/\s+/g, "");
         return n.includes(needle) || (needle.length > 8 && needle.includes(n.slice(0, 10)));
       });
-      if (!confirmed && selfTail.length > before.length) {
-        confirmed = Boolean(selfTail[selfTail.length - 1]);
-      }
+      // 输入框被清空也视为已发送
       if (!confirmed) {
         const nowVal = (input.value || input.textContent || input.innerText || "").replace(/\s+/g, "");
-        if (nowVal.length === 0 && i >= 3) confirmed = true;
+        if (nowVal.length === 0 && i >= 2) confirmed = true;
+      }
+      if (!confirmed && selfTail.length > before.length) {
+        confirmed = true;
       }
       if (confirmed) break;
-      if (i === 5 || i === 10) {
+      if (i === 4 || i === 9 || i === 14) {
         const btn2 = findSendButton();
         if (btn2) clickLikeHuman(btn2);
+        else {
+          try { input.focus(); } catch (_) {}
+          input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        }
       }
     }
 
@@ -1465,41 +1575,67 @@ async function startChat(job, opts = {}) {
         selfTail
       };
     }
-    return { ok: true, confirmed: true, selfTail: selfTail.slice(-3) };
+    return { ok: true, confirmed: true, selfTail: selfTail.slice(-3), contentVersion: BHT_CONTENT_VERSION };
   }
 
   async function sendImageFromDataUrl(dataUrl, fileName = "resume.png") {
-    const moreBtn = Array.from(document.querySelectorAll("button,a,div,i,span")).find((el) =>
-      /图片|相册|附件|文件/.test(textOf(el))
-    );
-    if (moreBtn) clickLikeHuman(moreBtn);
-    await sleep(350);
+    // SEND_IMAGE_V2
+    if (!dataUrl) return { ok: false, error: "EMPTY_IMAGE" };
+    dismissCommonDialogs();
+    await waitForChat(8000);
 
-    const input = firstEl([
-      "input[type='file'][accept*='image']",
-      "input[type='file']"
-    ]);
+    // 打开图片/附件入口
+    const openers = Array.from(document.querySelectorAll("button,a,div,i,span,label")).filter((el) => {
+      const t = textOf(el);
+      const aria = el.getAttribute?.("aria-label") || "";
+      return /图片|相册|附件|文件|上传/.test(t) || /图片|相册|附件|文件|上传/.test(aria);
+    });
+    for (const el of openers.slice(0, 4)) {
+      try { clickLikeHuman(el); await sleep(280); } catch (_) {}
+    }
+
+    let input =
+      firstEl([
+        "input[type='file'][accept*='image']",
+        "input[type='file'][accept*='*']",
+        "input[type='file']"
+      ]) ||
+      Array.from(document.querySelectorAll("input[type='file']")).find(Boolean);
+
+    // 有些入口会延迟插入 input
+    if (!input) {
+      for (let i = 0; i < 8 && !input; i++) {
+        await sleep(250);
+        input = document.querySelector("input[type='file'][accept*='image'], input[type='file']");
+      }
+    }
     if (!input) {
       return {
         ok: false,
         error: "FILE_INPUT_NOT_FOUND",
-        message: "未找到上传控件。页面结构可能变化，请手动发送。"
+        message: "未找到上传控件。请确认已打开聊天，并手动点图片/附件发送简历"
       };
     }
 
-    const res = await fetch(dataUrl);
-    const blob = await res.blob();
-    const file = new File([blob], fileName, { type: blob.type || "image/png" });
-    const dt = new DataTransfer();
-    dt.items.add(file);
-    input.files = dt.files;
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    await sleep(900);
-    const sendBtn = findSendButton();
-    if (sendBtn) clickLikeHuman(sendBtn);
-    return { ok: true };
+    try {
+      const res = await fetch(dataUrl);
+      const blob = await res.blob();
+      const file = new File([blob], fileName, { type: blob.type || "image/png" });
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      input.files = dt.files;
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await sleep(900);
+      const sendBtn = findSendButton();
+      if (sendBtn) clickLikeHuman(sendBtn);
+      await sleep(600);
+      return { ok: true, contentVersion: BHT_CONTENT_VERSION };
+    } catch (err) {
+      return { ok: false, error: String(err?.message || err) };
+    }
   }
+
 
   function highlightJobs(map = {}) {
     const cards = getJobCards();
