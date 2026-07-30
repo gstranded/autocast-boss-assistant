@@ -718,6 +718,55 @@ async function processOneJob(task, resultRow, config) {
     await sleep(randomBetween(config.settings.segmentIntervalMs));
   }
 
+  for (const step of plan.plan) {
+    await waitWhilePaused(task);
+    if (runner.abort) return 'aborted';
+    if (runner.skipCurrent) break;
+
+    if (!step.render.ok) {
+      item.state = 'FAILED';
+      item.reasons = step.render.reasonTexts;
+      task.counters.failed += 1;
+      task.consecutiveFails += 1;
+      await bumpDailyStat('fail');
+      await log('error', step.render.reasonTexts[0], { jobId: job.jobId });
+      return 'failed';
+    }
+
+    if (await hasIdempotent(step.key)) continue;
+
+    const sendRes = await sendToBoss(MSG.SEND_TEXT, { text: step.text });
+    if (!sendRes?.ok) {
+      item.state = 'FAILED';
+      let sendCode = REASON.EXEC_SEND_TEXT_FAIL;
+      if (sendRes?.error === 'LOGIN_REQUIRED') sendCode = REASON.LIMIT_PLATFORM;
+      if (sendRes?.error === 'CHAT_TIMEOUT' || sendRes?.error === 'INPUT_NOT_FOUND') sendCode = REASON.EXEC_CHAT_TIMEOUT;
+      item.reasons = [reasonText(sendCode, sendRes?.message || sendRes?.error || '')];
+      task.pauseReason = item.reasons[0];
+      task.lastErrorDetail = '岗位：' + (job.title || '') + ' @ ' + (job.company || '') + '\n发送内容：' + String(step.text || '').slice(0, 80);
+      task.counters.failed += 1;
+      task.consecutiveFails += 1;
+      await bumpDailyStat('fail');
+      await log('error', '发送失败：' + (job.title || '') + ' - ' + item.reasons[0], { jobId: job.jobId });
+      if (sendRes?.error === 'LOGIN_REQUIRED') {
+        runner.pause = true;
+        task.awaitingUserRetry = true;
+        task.status = TASK_STATUS.PAUSED;
+        await publishTask(task);
+        await log('error', task.pauseReason + '（任务已停止）', { jobId: job.jobId });
+        return 'limited';
+      }
+      // RETURN_TO_LIST after send fail
+      await sendToBoss(MSG.RETURN_TO_LIST, {});
+      return 'failed';
+    }
+
+    await markIdempotent(step.key, { jobId: job.jobId, segment: step.index });
+    item.state = step.stateName;
+    await log('success', `已发送第 ${step.index + 1} 段消息`, { jobId: job.jobId });
+    await sleep(randomBetween(config.settings.segmentIntervalMs));
+  }
+
   // resume
   const profile = pickResumeProfile(job, config.resumes, config.bindings);
   const timing = config.settings.resumeSendTiming || 'on_request';
@@ -744,6 +793,45 @@ async function processOneJob(task, resultRow, config) {
       wantAutoImage ? ('图片' + (profile.images?.length || 0) + '张') : '',
       wantAutoFile ? '附件1份' : ''
     ].filter(Boolean).join(' + '), { jobId: job.jobId, profileId: profile.id });
+  }
+
+  if (doResume) {
+    if (wantAutoImage) {
+      for (let i = 0; i < profile.images.length; i++) {
+        const img = profile.images[i];
+        const key = resumeIdempotencyKey(job, `image_${i}`, profile.id);
+        if (await hasIdempotent(key)) continue;
+        const imgRes = await sendToBoss(MSG.SEND_IMAGE, {
+          dataUrl: img.dataUrl,
+          fileName: img.name || `resume_${i + 1}.png`
+        });
+        if (!imgRes?.ok) {
+          await log('warn', `图片简历发送失败：${imgRes?.message || imgRes?.error || ''}`, { jobId: job.jobId });
+          break;
+        }
+        await markIdempotent(key, { jobId: job.jobId });
+        item.state = 'IMAGE_RESUME_SENT';
+        await log('success', `图片简历已发送 ${i + 1}/${profile.images.length}`, { jobId: job.jobId });
+        await sleep(randomBetween(config.settings.segmentIntervalMs));
+      }
+    }
+    // 附件：页面上传控件差异大，记录意图，提示用户必要时手动
+    if (wantAutoFile) {
+      const key = resumeIdempotencyKey(job, 'file', profile.id);
+      if (!(await hasIdempotent(key))) {
+        const fileRes = await sendToBoss(MSG.SEND_IMAGE, {
+          dataUrl: profile.attachment.dataUrl,
+          fileName: profile.attachment.name || 'resume.pdf'
+        });
+        if (fileRes?.ok) {
+          await markIdempotent(key, { jobId: job.jobId });
+          item.state = 'ATTACHMENT_RESUME_SENT';
+          await log('success', '附件简历已尝试发送', { jobId: job.jobId });
+        } else {
+          await log('warn', '附件简历自动发送不可用，请在聊天中手动发送', { jobId: job.jobId });
+        }
+      }
+    }
   }
 
   if (doResume) {
@@ -883,6 +971,65 @@ async function runTaskLoop(taskId) {
         task = config.task;
         if (!task) break;
 
+async function runTaskLoop(taskId) {
+  if (runner.running) return { ok: false, error: 'ALREADY_RUNNING' };
+  runner.running = true;
+  runner.abort = false;
+  runner.pause = false;
+  runner.skipCurrent = false;
+  runner.pauseLogged = false;
+  runner.pausePublished = false;
+
+  try {
+    let config = await getAllConfig();
+    let task = config.task;
+    if (!task || task.id !== taskId) {
+      return { ok: false, error: 'TASK_NOT_FOUND' };
+    }
+
+    task.status = TASK_STATUS.RUNNING;
+    task.updatedAt = Date.now();
+    await publishTask(task);
+
+    const queue = (task.results || []).filter((r) => r.selected && r.decision === 'pass');
+    for (const row of queue) {
+      await waitWhilePaused(task);
+      if (runner.abort) break;
+
+      // refresh config each item for live setting changes
+      config = await getAllConfig();
+      task = config.task;
+      if (!task) break;
+
+      const item = task.items.find((x) => x.jobId === row.job.jobId);
+      if (item && (item.state === 'COMPLETED' || item.state === 'SKIPPED')) {
+        continue;
+      }
+
+      // assertBossContext before process
+      {
+        const guard = await assertBossContext();
+        if (!guard.ok) {
+          runner.pause = true;
+          task.status = TASK_STATUS.PAUSED;
+          task.pauseReason = guard.message;
+          await publishTask(task);
+          await log("warn", guard.message);
+          break;
+        }
+      }
+      let outcome = await processOneJob(task, row, config);
+
+      // 失败后等待用户：关闭=保持暂停不自动继续；重试=重置当前岗位后再跑一次
+      while (outcome === 'failed') {
+        // 回列表，避免卡在会话页
+        try { await sendToBoss(MSG.RETURN_TO_LIST, {}); } catch (_) {}
+        await sleep(400);
+
+        config = await getAllConfig();
+        task = config.task;
+        if (!task) break;
+
         task.status = TASK_STATUS.PAUSED;
         task.awaitingUserRetry = true;
         task.uiErrorDismissed = false;
@@ -927,23 +1074,30 @@ async function runTaskLoop(taskId) {
       task.updatedAt = Date.now();
       await publishTask(task);
 
-      if (outcome === 'limited') break;
-      if (outcome === 'aborted') break;
-
-      if (task.consecutiveFails >= (config.settings.consecutiveFailPause || 3)) {
-        task.status = TASK_STATUS.PAUSED;
-        task.pauseReason = reasonText(REASON.EXEC_CONSECUTIVE_FAIL);
-        runner.pause = true;
+        config = await getAllConfig();
+        task = config.task;
+        if (!task) break;
+        const it = task.items?.find((x) => x.jobId === row.job.jobId);
+        if (it && it.state === 'NOT_STARTED' && task.retryCurrent === true) {
+          // 用户点了重试：再试当前岗位
+          task.retryCurrent = false;
+          await publishTask(task);
+          outcome = await processOneJob(task, row, config);
+          continue;
+        }
+        // 用户关闭后点继续：不重试当前失败项，进入下一岗
+        task.retryCurrent = false;
+        task.awaitingUserRetry = false;
+        // 手动继续时不把历史失败累计成自动熔断
+        task.consecutiveFails = 0;
         await publishTask(task);
-        if (!runner.pauseLogged) { runner.pauseLogged = true; await log('error', task.pauseReason); }
         break;
       }
 
-      // minJobInterval guard
-      {
-        let iv = config.settings.jobIntervalMs || [3500, 6000];
-        if (Array.isArray(iv) && iv[0] < 2500) iv = [3500, 6000];
-        await sleep(randomBetween(iv));
+      // 成功/跳过后再回列表；失败已在上面回过
+      if (outcome === 'success' || outcome === 'skipped') {
+        try { await sendToBoss(MSG.RETURN_TO_LIST, {}); } catch (_) {}
+        await sleep(500);
       }
     }
 
@@ -1172,6 +1326,40 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await publishTask(all.task);
         if (!runner.running) runTaskLoop(all.task.id);
         await log('info', payload?.retry ? '重试当前岗位' : '继续任务');
+        return { ok: true };
+      }
+      case MSG.STOP_TASK:
+        runner.abort = true;
+        runner.pause = false;
+        {
+          const all = await getAllConfig();
+          if (all.task) {
+            all.task.status = TASK_STATUS.STOPPED;
+            await publishTask(all.task);
+          }
+        }
+        await log('warn', '用户停止任务');
+        return { ok: true };
+      case MSG.SKIP_CURRENT: {
+        runner.skipCurrent = true;
+        // 若在等待用户重试的暂停中，允许跳过后继续
+        if (runner.pause) {
+          const all = await getAllConfig();
+          if (all.task) {
+            all.task.awaitingUserRetry = false;
+            // mark current failed/paused item skipped if possible
+            if (all.task.currentJobId && all.task.items) {
+              all.task.items = all.task.items.map((it) =>
+                it.jobId === all.task.currentJobId && (it.state === 'FAILED' || it.state === 'NOT_STARTED' || it.state === 'COMMUNICATION_CREATED')
+                  ? { ...it, state: 'SKIPPED', reasons: ['用户跳过'] }
+                  : it
+              );
+            }
+            await publishTask(all.task);
+          }
+          runner.pause = false;
+        }
+        await log('warn', '将跳过当前岗位');
         return { ok: true };
       }
       case MSG.STOP_TASK:

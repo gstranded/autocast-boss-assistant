@@ -1116,5 +1116,109 @@ wireControlButtons();
 refresh();
 setInterval(() => {
   forceEnableControls();
+});
+
+$('bht-modal-retry')?.addEventListener('click', async () => {
+  state.modalDismissed = false;
+  state.modalClosedForKey = '';
+  state.lastModalKey = '';
+  const modal = $('bht-modal');
+  if (modal) modal.hidden = true;
+  toast('正在重试当前失败岗位…', 'warn', 1500);
+  const res = await api(MSG.RESUME_TASK, { retry: true });
+  if (!res?.ok) {
+    state.modalDismissed = false;
+    showErrorModal('重试失败', res?.message || res?.error || '请重新扫描预览后再试', { showRetry: true, force: true });
+  } else {
+    toast('已开始重试', 'success');
+  }
+  await refresh({ soft: true });
+});
+
+// 控制按钮强制可点 + 独立绑定（防止 disabled/重复状态导致失灵）
+function forceEnableControls() {
+  ['btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.disabled = false;
+    el.removeAttribute('disabled');
+    el.style.pointerEvents = 'auto';
+    el.style.opacity = '1';
+    el.style.cursor = 'pointer';
+    el.tabIndex = 0;
+  });
+}
+
+function wireControlButtons() {
+  const once = (id, handler) => {
+    const el = $(id);
+    if (!el) return;
+    if (el.dataset.bhtWired === '1') return;
+    el.dataset.bhtWired = '1';
+    el.addEventListener('click', async (ev) => {
+      forceEnableControls();
+      try {
+        await handler(ev);
+      } catch (err) {
+        toast(String(err?.message || err), 'error');
+      }
+    });
+  };
+
+  once('btnPause', async () => {
+    const res = await api(MSG.PAUSE_TASK);
+    toast(res?.ok === false ? (res.message || '暂停失败') : '任务已暂停', res?.ok === false ? 'error' : 'warn');
+    await refresh({ soft: true });
+  });
+
+  once('btnResume', async () => {
+    state.modalDismissed = false;
+    state.modalClosedForKey = '';
+    state.lastModalKey = '';
+    const modal = $('bht-modal');
+    if (modal) modal.hidden = true;
+    toast('继续任务…', 'warn', 1200);
+    const res = await api(MSG.RESUME_TASK);
+    toast(res?.ok === false ? (res.message || res.error || '继续失败') : '已继续投递', res?.ok === false ? 'error' : 'success');
+    await refresh({ soft: true });
+  });
+
+  once('btnSkip', async () => {
+    const res = await api(MSG.SKIP_CURRENT);
+    // 暂停等待中也允许跳过：清 pause 继续循环
+    if (state.config?.runner?.pause || state.config?.task?.status === 'paused') {
+      await api(MSG.RESUME_TASK);
+    }
+    toast(res?.ok === false ? (res.message || '跳过失败') : '已请求跳过当前岗位', res?.ok === false ? 'error' : 'warn');
+    await refresh({ soft: true });
+  });
+
+  once('btnStop', async () => {
+    state.modalDismissed = true;
+    state.modalClosedForKey = state.lastModalKey || 'stop';
+    const modal = $('bht-modal');
+    if (modal) modal.hidden = true;
+    const res = await api(MSG.STOP_TASK);
+    toast(res?.ok === false ? (res.message || '停止失败') : '任务已停止', res?.ok === false ? 'error' : 'warn');
+    await refresh({ soft: true });
+  });
+}
+
+// CONTROL_CAPTURE_INVOKE: 捕获阶段解除 disabled，避免“点了没反应”
+document.addEventListener('click', (e) => {
+  const btn = e.target?.closest?.('#btnPause, #btnResume, #btnSkip, #btnStop');
+  if (!btn) return;
+  if (btn.disabled) {
+    btn.disabled = false;
+    btn.removeAttribute('disabled');
+  }
+}, true);
+
+bindEvents();
+forceEnableControls();
+wireControlButtons();
+refresh();
+setInterval(() => {
+  forceEnableControls();
   refresh({ soft: true });
 }, 3000);
