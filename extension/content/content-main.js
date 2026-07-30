@@ -16,7 +16,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.4.2";
+  const BHT_CONTENT_VERSION = "1.4.3";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -1310,7 +1310,19 @@ async function startChatOnCurrentDetail(job = {}) {
 async function startChat(job, opts = {}) {
     try { rememberListHref(); } catch (_) {}
     const inputJob0 = (opts && opts.job) || job || {};
-    // 聊天输入已可用（含 SPA 跳转后恢复）：立刻返回成功，供后台继续 SEND_TEXT
+    const preferDirect = Boolean(
+      opts?.preferDirect ||
+      opts?.direct ||
+      opts?.skipListMatch ||
+      opts?.skipScroll
+    );
+    const onJobLikePage =
+      Boolean(firstEl(SELECTORS.detailRoot)) ||
+      Boolean(firstEl(SELECTORS.chatOnDetail)) ||
+      /\/chat/i.test(location.pathname) ||
+      /job_detail|encryptJobId|\/geek\/job/i.test(location.href);
+
+    // 聊天输入已可用：立刻成功
     if (hasUsableChatInput()) {
       return {
         ok: true,
@@ -1320,11 +1332,11 @@ async function startChat(job, opts = {}) {
         matchedVia: "already-in-chat"
       };
     }
-    // 若已在详情/聊天页，直接点沟通（用于导航后恢复）
-    if (firstEl(SELECTORS.detailRoot) || firstEl(SELECTORS.chatOnDetail) || /\/chat/i.test(location.pathname)) {
-      if (getJobCards().length < 3) {
-        return await startChatOnCurrentDetail(inputJob0);
-      }
+
+    // 双页架构：工作页已导航到目标岗详情时，禁止再回列表匹配/滚动
+    if (preferDirect || onJobLikePage) {
+      log("startChat preferDirect/onJobLike", { preferDirect, href: location.href.slice(0, 160), cards: getJobCards().length });
+      return await startChatOnCurrentDetail(inputJob0);
     }
     const inputJob = (opts && opts.job) || job || {};
     const wantTitle = normalizeText(inputJob.title || "");
@@ -2189,11 +2201,36 @@ async function startChat(job, opts = {}) {
       const opId = payload?.opId;
       const opType = payload?.opType || payload?.type;
       const opPayload = payload?.opPayload || payload?.payload || {};
+      const inflight = (window.__BHT_OP_INFLIGHT__ = window.__BHT_OP_INFLIGHT__ || Object.create(null));
+
+      // 同 opId 幂等：已在执行则只 ACK，不二次 run（避免 OP_BUSY 覆盖真结果）
+      if (opId && inflight[opId]) {
+        try {
+          sendResponse({ ok: true, accepted: true, deduped: true, opId, contentVersion: BHT_CONTENT_VERSION });
+        } catch (_) {}
+        return true;
+      }
+
       try {
         sendResponse({ ok: true, accepted: true, opId, contentVersion: BHT_CONTENT_VERSION });
       } catch (_) {}
+
       (async () => {
-        // 记录 opType，便于 SPA 跳转后 resume
+        if (opId) inflight[opId] = { opType, at: Date.now() };
+
+        // 若 storage 已是 done，不再重跑
+        try {
+          if (opId) {
+            const bag = await chrome.storage.local.get("bht_op_" + opId);
+            const row = bag && bag["bht_op_" + opId];
+            if (row && row.status === "done") {
+              log("RUN_OP skip already done", opId, row.result?.error || row.result?.ok);
+              delete inflight[opId];
+              return;
+            }
+          }
+        } catch (_) {}
+
         try {
           await chrome.storage.local.set({
             ["bht_op_" + opId]: {
@@ -2204,25 +2241,69 @@ async function startChat(job, opts = {}) {
             }
           });
         } catch (_) {}
+
+        // START_CHAT 允许更长；超时不强制清锁抢跑，由 finally 统一释放
+        const opTimeoutMs = /START_CHAT/.test(String(opType || ""))
+          ? 45000
+          : /SEND_TEXT|SEND_IMAGE|SCAN_JOBS/.test(String(opType || ""))
+            ? 30000
+            : 15000;
+
         let result;
-        const opTimeoutMs = /SEND_TEXT|START_CHAT|SEND_IMAGE|SCAN_JOBS/.test(String(opType || "")) ? 20000 : 15000;
+        let timedOut = false;
+        let workPromise;
         try {
+          workPromise = runOpByType(opType, opPayload);
           result = await Promise.race([
-            runOpByType(opType, opPayload),
-            sleep(opTimeoutMs).then(() => ({
-              ok: false,
-              error: "OP_INNER_TIMEOUT",
-              message: "页面内操作超时",
-              contentVersion: BHT_CONTENT_VERSION
-            }))
+            workPromise.then((r) => r),
+            sleep(opTimeoutMs).then(() => {
+              timedOut = true;
+              return {
+                ok: false,
+                error: "OP_INNER_TIMEOUT",
+                message: "页面内操作超时",
+                contentVersion: BHT_CONTENT_VERSION
+              };
+            })
           ]);
+          // 超时后仍等原任务收尾（最多再 15s），避免锁被提前清掉后并发
+          if (timedOut && workPromise) {
+            log("RUN_OP timed out, waiting work settle", opId, opType);
+            try {
+              const late = await Promise.race([
+                workPromise,
+                sleep(15000).then(() => null)
+              ]);
+              if (late && late.ok) result = late;
+            } catch (e) {
+              if (!result) result = { ok: false, error: String(e?.message || e), contentVersion: BHT_CONTENT_VERSION };
+            }
+          }
         } catch (err) {
           result = { ok: false, error: String(err?.message || err), contentVersion: BHT_CONTENT_VERSION };
         }
         if (!result) {
           result = { ok: false, error: "EMPTY_RESULT", contentVersion: BHT_CONTENT_VERSION };
         }
-        try { window.__BHT_OP_LOCK__ = null; } catch (_) {}
+
+        // 禁止用 OP_BUSY 覆盖已成功/已完成结果
+        try {
+          if (opId) {
+            const bag = await chrome.storage.local.get("bht_op_" + opId);
+            const row = bag && bag["bht_op_" + opId];
+            if (row && row.status === "done" && row.result && row.result.ok && !result.ok) {
+              log("RUN_OP skip overwrite success with fail", opId, result.error);
+              delete inflight[opId];
+              return;
+            }
+            if (result.error === "OP_BUSY") {
+              log("RUN_OP ignore OP_BUSY write", opId);
+              delete inflight[opId];
+              return;
+            }
+          }
+        } catch (_) {}
+
         try {
           await chrome.storage.local.set({
             ["bht_op_" + opId]: {
@@ -2239,9 +2320,11 @@ async function startChat(job, opts = {}) {
         try {
           chrome.runtime.sendMessage({ type: "BHT_OP_DONE", payload: { opId, result } }).catch(() => {});
         } catch (_) {}
+        if (opId) delete inflight[opId];
       })();
       return true;
     }
+
 
     (async () => {
       try {

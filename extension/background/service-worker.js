@@ -446,8 +446,16 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
         const bag = await chrome.storage.local.get('bht_op_' + opId);
         const row = bag && bag['bht_op_' + opId];
         if (row && row.status === 'done') {
-          try { await chrome.storage.local.remove('bht_op_' + opId); } catch (_) {}
           const result = row.result || { ok: false, error: 'EMPTY_OP_RESULT' };
+          if (result && result.error === 'OP_BUSY') {
+            try {
+              await chrome.storage.local.set({
+                ['bht_op_' + opId]: { status: 'pending', opType: type, at: Date.now(), note: 'ignore-op-busy' }
+              });
+            } catch (_) {}
+            continue;
+          }
+          try { await chrome.storage.local.remove('bht_op_' + opId); } catch (_) {}
           // 页面跳转中断：对发消息/开聊自动重试一次
           if (result && result.error === 'NAVIGATED' && (type === MSG.SEND_TEXT || type === MSG.START_CHAT) && !payload.__navRetried) {
             await forceInjectContent(tab.id);
@@ -491,30 +499,48 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
         }
         // 超时前若仍 pending：content 被导航销毁时重注入并重发
         if (Date.now() > reinjectAt && longOps.includes(type)) {
-          reinjectAt = Date.now() + 7000;
+          reinjectAt = Date.now() + 12000;
           try {
             const latest = await chrome.tabs.get(tab.id);
             if (!isBossUrl(latest?.url || '')) continue;
+
             let alive = false;
             let pong = null;
             try {
               pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
               alive = Boolean(pong?.ok);
             } catch (_) { alive = false; }
-            if (type === MSG.START_CHAT && alive && pong?.page?.hasChatInput) {
-              try { await chrome.storage.local.remove('bht_op_' + opId); } catch (_) {}
-              return {
-                ok: true,
-                already: true,
-                job: (payload && payload.job) || {},
-                matchedVia: 'bg-probe-chat-reinject',
-                contentVersion: pong?.contentVersion
-              };
+
+            // START_CHAT：只探测聊天是否已就绪，绝不对同一 opId 再 fireOp（防 OP_BUSY 覆盖）
+            if (type === MSG.START_CHAT) {
+              if (!alive) {
+                await forceInjectContent(tab.id);
+                await sleep(300);
+                try {
+                  pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
+                  alive = Boolean(pong?.ok);
+                } catch (_) { alive = false; }
+              }
+              if (alive && pong?.page?.hasChatInput) {
+                try { await chrome.storage.local.remove('bht_op_' + opId); } catch (_) {}
+                return {
+                  ok: true,
+                  already: true,
+                  job: (payload && payload.job) || {},
+                  matchedVia: 'bg-probe-chat-wait',
+                  contentVersion: pong?.contentVersion
+                };
+              }
+              // content 仍活着且在跑：继续等，不重复 START_CHAT
+              continue;
             }
-            // 重注入并重发同 opId（content 覆盖写结果）
-            await forceInjectContent(tab.id);
-            await sleep(280);
-            await fireOp();
+
+            // 其它长操作：仅当 content 已死时重注入并重发一次（content 侧 opId 幂等）
+            if (!alive) {
+              await forceInjectContent(tab.id);
+              await sleep(280);
+              await fireOp();
+            }
           } catch (_) {}
         }
       }
