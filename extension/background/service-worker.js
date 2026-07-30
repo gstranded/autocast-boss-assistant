@@ -138,13 +138,31 @@ async function forceInjectContent(tabId) {
 }
 
 
+
 function jobHrefUsable(href) {
   const h = String(href || "");
-  return /zhipin\.com|bosszhipin\.com/i.test(h) && /job_detail|jobId=|securityId=|\/job\//i.test(h);
+  if (!h || h === "#" || /^javascript:/i.test(h)) return false;
+  // 相对路径也可
+  const abs = /zhipin\.com|bosszhipin\.com/i.test(h) || h.startsWith("/") || h.startsWith("http");
+  if (!abs) return false;
+  return /job_detail|encryptJobId|securityId=|jobId=|\/geek\/job|\/job\//i.test(h);
+}
+
+function normalizeBossJobHref(href) {
+  const h = String(href || "").trim();
+  if (!h) return "";
+  try {
+    if (h.startsWith("http")) return h;
+    return new URL(h, "https://www.zhipin.com").href;
+  } catch (_) {
+    return h;
+  }
 }
 
 function verifyQueueJob(expected, actual) {
   if (!expected || !actual) return { ok: false, reason: "EMPTY" };
+  // 若实际还在列表页，不算打开成功
+  if (actual.isListPage) return { ok: false, reason: "STILL_ON_LIST", actual };
   const eId = String(expected.jobId || "");
   const aId = String(actual.jobId || "");
   if (eId && aId && eId === aId) return { ok: true, via: "jobId" };
@@ -156,20 +174,39 @@ function verifyQueueJob(expected, actual) {
   const ec = normalizeText(expected.company || "");
   const ac = normalizeText(actual.company || "");
   if (et && at && et === at && ec && ac && ec === ac) return { ok: true, via: "title+company" };
-  if (et && at && et === at && (!ec || !ac)) return { ok: true, via: "title" };
-  return { ok: false, reason: "IDENTITY_MISMATCH", expected: { title: expected.title, company: expected.company, jobId: eId }, actual: { title: actual.title, company: actual.company, jobId: aId } };
+  // 有 jobId 却对不上：失败，不允许弱匹配
+  if (eId && aId && eId !== aId) return { ok: false, reason: "JOBID_MISMATCH", expected: { jobId: eId, title: expected.title }, actual: { jobId: aId, title: actual.title } };
+  if (et && at && et === at) return { ok: true, via: "title-only", weak: true };
+  return {
+    ok: false,
+    reason: "IDENTITY_MISMATCH",
+    expected: { title: expected.title, company: expected.company, jobId: eId, href: expected.href },
+    actual: { title: actual.title, company: actual.company, jobId: aId, href: actual.href, isListPage: actual.isListPage }
+  };
 }
 
 async function waitTabComplete(tabId, timeoutMs = 45000) {
   const start = Date.now();
+  let lastUrl = "";
+  let stableSince = 0;
   while (Date.now() - start < timeoutMs) {
     try {
       const t = await chrome.tabs.get(tabId);
-      if (t.status === "complete" && isBossUrl(t.url || t.pendingUrl || "")) return t;
+      const url = t.url || t.pendingUrl || "";
+      if (t.status === "complete" && isBossUrl(url)) {
+        if (url === lastUrl) {
+          if (!stableSince) stableSince = Date.now();
+          // URL 稳定 800ms 再返回，避免 SPA 中间态
+          if (Date.now() - stableSince >= 800) return t;
+        } else {
+          lastUrl = url;
+          stableSince = Date.now();
+        }
+      }
     } catch (e) {
       return null;
     }
-    await sleep(250);
+    await sleep(200);
   }
   try { return await chrome.tabs.get(tabId); } catch (_) { return null; }
 }
@@ -180,11 +217,17 @@ async function ensureWorkerTab(task) {
   if (oldId) {
     try {
       const t = await chrome.tabs.get(oldId);
-      if (t && isBossUrl(t.url || t.pendingUrl || "")) return t;
-    } catch (_) {}
+      if (t && isBossUrl(t.url || t.pendingUrl || "")) {
+        await log("info", "复用投递工作页 tab=" + oldId + " url=" + String(t.url || "").slice(0, 160));
+        return t;
+      }
+      await log("warn", "旧工作页不可用，将重建 tab=" + oldId + " url=" + String(t?.url || ""));
+    } catch (_) {
+      await log("warn", "旧工作页已关闭，将重建 tab=" + oldId);
+    }
   }
-  const seed = task.listHref || "https://www.zhipin.com/web/geek/jobs";
-  const createOpts = { url: seed, active: true };
+  // 种子用 about:blank，避免先打开列表主页造成「在主页徘徊」的错觉
+  const createOpts = { url: "about:blank", active: true };
   if (task.execution.listTabId) {
     try { createOpts.openerTabId = task.execution.listTabId; } catch (_) {}
   }
@@ -193,65 +236,127 @@ async function ensureWorkerTab(task) {
   task.execution.workerWindowId = tab.windowId;
   task.execution.phase = "WORKER_READY";
   await publishTask(task);
-  await waitTabComplete(tab.id, 20000);
-  await forceInjectContent(tab.id);
-  await sleep(300);
+  await log("info", "新建投递工作页 tab=" + tab.id + "（将直接导航到岗位详情，不经列表主页）");
   return tab;
 }
 
 async function openQueueJobOnWorker(task, job) {
   const worker = await ensureWorkerTab(task);
   const tabId = worker.id;
-  const href = String(job.href || "");
-  if (!jobHrefUsable(href)) {
-    return { ok: false, error: "NO_HREF", message: "队列项缺少可用岗位链接，无法直达", tabId };
+  let href = normalizeBossJobHref(job.href || "");
+  if (!jobHrefUsable(href) && job.jobId && !String(job.jobId).startsWith("name_") && !String(job.jobId).startsWith("dom_")) {
+    // 尝试用 jobId 拼详情 URL
+    href = "https://www.zhipin.com/job_detail/" + job.jobId + ".html";
+    await log("info", "队列项原 href 不可用，尝试用 jobId 拼接详情 URL", {
+      jobId: job.jobId,
+      rawHref: String(job.href || "").slice(0, 160),
+      built: href
+    });
   }
+  if (!jobHrefUsable(href)) {
+    await log("error", "队列项无可用岗位链接，无法直达", {
+      jobId: job.jobId,
+      title: job.title,
+      rawHref: String(job.href || ""),
+      company: job.company
+    });
+    return { ok: false, error: "NO_HREF", message: "队列项缺少可用岗位链接（href 为空或不是详情页）。请重新扫描预览", tabId };
+  }
+
   task.execution.phase = "NAVIGATING_JOB";
   task.currentJobId = job.jobId;
   await publishTask(task);
+
+  let beforeUrl = "";
+  try { beforeUrl = (await chrome.tabs.get(tabId)).url || ""; } catch (_) {}
+  await log("info", "工作页导航→岗位详情", {
+    tabId,
+    beforeUrl: String(beforeUrl).slice(0, 160),
+    targetHref: String(href).slice(0, 200),
+    jobId: job.jobId,
+    title: job.title,
+    company: job.company
+  });
+
   try {
     await chrome.tabs.update(tabId, { url: href, active: true });
   } catch (e) {
+    await log("error", "工作页 tabs.update 失败：" + String(e?.message || e), { tabId, href });
     return { ok: false, error: "NAV_FAIL", message: String(e?.message || e), tabId };
   }
+
   const ready = await waitTabComplete(tabId, 45000);
-  if (!ready) return { ok: false, error: "TAB_LOAD_TIMEOUT", message: "岗位页加载超时", tabId };
+  let afterUrl = "";
+  try { afterUrl = ready?.url || (await chrome.tabs.get(tabId)).url || ""; } catch (_) {}
+  await log("info", "工作页导航完成", {
+    tabId,
+    afterUrl: String(afterUrl).slice(0, 200),
+    stillList: /\/web\/geek\/jobs/i.test(afterUrl),
+    isJobLike: /job_detail|encryptJobId|\/geek\/job/i.test(afterUrl)
+  });
+
+  if (!ready) {
+    return { ok: false, error: "TAB_LOAD_TIMEOUT", message: "岗位页加载超时 url=" + afterUrl, tabId };
+  }
+  if (/\/web\/geek\/jobs\/?($|\?)/i.test(afterUrl) && !/job_detail|encryptJobId/i.test(afterUrl)) {
+    await log("error", "导航后仍停在职位列表/主页，未进入详情。目标 href 可能无效", {
+      targetHref: href.slice(0, 200),
+      afterUrl: afterUrl.slice(0, 200)
+    });
+    return {
+      ok: false,
+      error: "STILL_ON_LIST",
+      message: "工作页仍在列表主页，未打开岗位详情。href=" + href.slice(0, 120),
+      tabId,
+      afterUrl
+    };
+  }
+
   await forceInjectContent(tabId);
-  await sleep(450);
-  // 详情/身份
+  await sleep(600);
+
   let detail = await sendToBoss(MSG.GET_CURRENT_JOB_DETAIL || "BHT_GET_CURRENT_JOB_DETAIL", {}, { tabId, forceInject: true });
-  if (!detail?.ok) {
-    // 兼容旧 content：用 PAGE_INFO
-    detail = await sendToBoss(MSG.GET_PAGE_INFO, {}, { tabId });
-    if (detail?.ok) {
-      detail = {
-        ok: true,
-        job: {
-          href: detail.page?.href || href,
-          jobId: job.jobId,
-          title: job.title,
-          company: job.company,
-          path: detail.page?.path || ""
-        }
-      };
-    }
+  await log("info", "工作页岗位详情解析", {
+    ok: Boolean(detail?.ok),
+    title: detail?.job?.title || "",
+    company: detail?.job?.company || "",
+    jobId: detail?.job?.jobId || "",
+    href: String(detail?.job?.href || afterUrl).slice(0, 160),
+    isListPage: detail?.job?.isListPage,
+    isJobPage: detail?.job?.isJobPage
+  });
+
+  if (!detail?.ok || !detail.job) {
+    return {
+      ok: false,
+      error: "DETAIL_PARSE_FAIL",
+      message: "已打开页面但无法解析岗位详情，不继续发送。url=" + String(afterUrl).slice(0, 160),
+      tabId,
+      afterUrl
+    };
   }
-  if (detail?.ok && detail.job) {
-    const v = verifyQueueJob(job, detail.job);
-    if (!v.ok) {
-      return {
-        ok: false,
-        error: "IDENTITY_MISMATCH",
-        message: "打开的岗位与队列不一致，已跳过（避免投错）",
-        verify: v,
-        tabId,
-        detail: detail.job
-      };
-    }
-    return { ok: true, tabId, detail: detail.job, matchedVia: v.via || "href-nav" };
+
+  const v = verifyQueueJob(job, detail.job);
+  if (!v.ok) {
+    await log("error", "岗位身份校验失败：" + (v.reason || "") , { verify: v, expectedTitle: job.title, actualTitle: detail.job.title });
+    return {
+      ok: false,
+      error: v.reason || "IDENTITY_MISMATCH",
+      message: "打开的岗位与队列不一致（" + (v.reason || "") + "），已跳过避免投错",
+      verify: v,
+      tabId,
+      detail: detail.job
+    };
   }
-  // 即使详情解析失败，仍允许继续点「立即沟通」（页面可能已是正确岗）
-  return { ok: true, tabId, detail: null, matchedVia: "href-nav-no-detail", weak: true };
+
+  await log("success", "工作页岗位就绪 · 校验通过(" + (v.via || "") + (v.weak ? ",weak" : "") + ")", {
+    tabId,
+    via: v.via,
+    url: String(detail.job.href || afterUrl).slice(0, 160),
+    title: detail.job.title,
+    company: detail.job.company
+  });
+  return { ok: true, tabId, detail: detail.job, matchedVia: v.via || "href-nav", afterUrl };
 }
 
 async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false, tabId = null } = {}) {
@@ -753,7 +858,13 @@ async function processOneJob(task, resultRow, config) {
     return 'skipped';
   }
 
-  await log('info', `开始沟通：${job.title} @ ${job.company || ''}`, { jobId: job.jobId });
+  await log('info', `开始沟通：${job.title} @ ${job.company || ''}`, {
+    jobId: job.jobId,
+    href: String(job.href || '').slice(0, 180),
+    securityId: job.securityId || '',
+    listHref: String(job.listHref || task.listHref || '').slice(0, 120),
+    workerTabId: task.execution?.workerTabId || null
+  });
   // version stamp for support
   // (content reports its version in START_CHAT response)
 
@@ -785,7 +896,12 @@ async function processOneJob(task, resultRow, config) {
       if (opened.detail.securityId) job.securityId = opened.detail.securityId;
       if (opened.detail.jobId && !job.jobId) job.jobId = opened.detail.jobId;
     }
-    await log('info', '工作页已打开岗位（' + (opened.matchedVia || 'href') + '）', { jobId: job.jobId, href: String(job.href || '').slice(0, 120) });
+    await log('info', '工作页已打开岗位（' + (opened.matchedVia || 'href') + '）', {
+      jobId: job.jobId,
+      href: String(job.href || '').slice(0, 160),
+      afterUrl: String(opened.afterUrl || opened.detail?.href || '').slice(0, 160),
+      tabId: opened.tabId
+    });
   } else {
     // 无 href：降级到列表页当前活动标签（兼容旧队列）
     await log('warn', '岗位无稳定链接，降级到列表匹配（稳定性较差）', { jobId: job.jobId });
@@ -906,7 +1022,11 @@ async function processOneJob(task, resultRow, config) {
 
     if (await hasIdempotent(step.key)) continue;
 
-    const sendRes = await sendToBoss(MSG.SEND_TEXT, { text: step.text }, tabOpt);
+    await log('info', '准备发送第 ' + (step.index + 1) + ' 段（' + String(step.text || '').slice(0, 40) + '…）', { jobId: job.jobId, tabId: tabOpt?.tabId });
+        const sendRes = await sendToBoss(MSG.SEND_TEXT, { text: step.text }, tabOpt);
+        await log(sendRes?.ok ? 'success' : 'error',
+          sendRes?.ok ? ('第 ' + (step.index + 1) + ' 段发送确认') : ('第 ' + (step.index + 1) + ' 段失败：' + (sendRes?.message || sendRes?.error || '')),
+          { jobId: job.jobId });
     if (!sendRes?.ok) {
       item.state = 'FAILED';
       let sendCode = REASON.EXEC_SEND_TEXT_FAIL;

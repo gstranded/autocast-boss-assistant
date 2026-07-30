@@ -16,7 +16,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.4.1";
+  const BHT_CONTENT_VERSION = "1.4.2";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -25,6 +25,7 @@
     try { chrome.runtime.onMessage.removeListener(window.__BHT_ON_MESSAGE__); } catch (_) {}
   }
   window.__BHT_CONTENT_VERSION__ = BHT_CONTENT_VERSION;
+  window.__BHT_OP_LOCK__ = null; // boot: 导航后新脚本不继承旧锁
   window.__BHT_CONTENT_LOADED__ = true;
 
   function isBossHost(hostname) {
@@ -480,6 +481,12 @@ function firstEl(selectors, root = document) {
     return String(s || "");
   }
 
+  function absolutizeHref(href = "") {
+    const h = String(href || "").trim();
+    if (!h || h === "#" || /^javascript:/i.test(h)) return "";
+    try { return new URL(h, location.origin).href; } catch (_) { return h; }
+  }
+
   function extractJobIdFromHref(href = "") {
     if (!href) return "";
     const m1 = String(href).match(/job_detail\/([^~.?\s/]+)/i);
@@ -555,7 +562,17 @@ function firstEl(selectors, root = document) {
       titleEl?.closest?.("a") ||
       firstEl(["a[href*='job_detail']", "a[href*='job']"], card);
 
-    const href = linkEl?.href || linkEl?.getAttribute?.("href") || "";
+    let href = absolutizeHref(linkEl?.href || linkEl?.getAttribute?.("href") || "");
+    // 卡片 data 属性兜底拼详情 URL
+    if (!href) {
+      const enc =
+        card.getAttribute?.("data-jobid") ||
+        card.getAttribute?.("data-job-id") ||
+        card.dataset?.jobid ||
+        card.dataset?.jid ||
+        "";
+      if (enc) href = absolutizeHref("/job_detail/" + enc + ".html");
+    }
     let jobId =
       card.getAttribute?.("data-jobid") ||
       card.getAttribute?.("data-job-id") ||
@@ -1193,6 +1210,9 @@ function dismissCommonDialogs() {
     
   function getCurrentJobDetail() {
     const href = location.href;
+    const isList = /\/web\/geek\/jobs|recommend|search/i.test(location.pathname + location.search);
+    const isChat = /\/chat/i.test(location.pathname);
+    const isJob = /job_detail|encryptJobId|\/geek\/job/i.test(location.href);
     const jobId = extractJobIdFromHref(href) || "";
     const detailRoot = firstEl(SELECTORS.detailRoot) || document;
     const title =
@@ -1230,7 +1250,10 @@ function dismissCommonDialogs() {
         location: locationText,
         salary,
         jd,
-        path: location.pathname
+        path: location.pathname,
+        isListPage: /\/web\/geek\/jobs|recommend/i.test(location.pathname),
+        isChatPage: /\/chat/i.test(location.pathname),
+        isJobPage: /job_detail|encryptJobId|\/geek\/job/i.test(location.href)
       },
       page: pageInfo(),
       contentVersion: BHT_CONTENT_VERSION
@@ -2153,6 +2176,7 @@ async function startChat(job, opts = {}) {
     } finally {
       if (needLock && window.__BHT_OP_LOCK__ === lockKey) {
         window.__BHT_OP_LOCK__ = null;
+        window.__BHT_OP_LOCK_AT__ = 0;
       }
     }
   }
