@@ -117,7 +117,7 @@ async function forceInjectContent(tabId) {
   }
 }
 
-async function sendToBoss(type, payload = {}, { retries = 1, forceInject = false } = {}) {
+async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false } = {}) {
   const tab = await getActiveBossTab({ allowInactiveBossTab: false });
   if (!tab?.id) {
     const active = (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
@@ -135,7 +135,6 @@ async function sendToBoss(type, payload = {}, { retries = 1, forceInject = false
     };
   }
 
-  // 关键操作前强制注入最新 content，避免扩展重载后仍跑旧脚本
   const critical = [
     MSG.START_CHAT,
     MSG.SEND_TEXT,
@@ -145,8 +144,205 @@ async function sendToBoss(type, payload = {}, { retries = 1, forceInject = false
     MSG.CLOSE_CHAT,
     MSG.ENSURE_JOB_LIST
   ];
-  if (forceInject || critical.includes(type)) {
+  const longOps = [MSG.START_CHAT, MSG.SEND_TEXT, MSG.SEND_IMAGE, MSG.SCAN_JOBS, MSG.RETURN_TO_LIST];
+
+  let needInject = forceInject;
+  if (!needInject && critical.includes(type)) {
+    try {
+      const pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
+      if (!pong?.ok) needInject = true;
+    } catch (_) {
+      needInject = true;
+    }
+  }
+  if (needInject) {
     await forceInjectContent(tab.id);
+    await sleep(180);
+  }
+
+  // 长操作优先 storage 桥（立即 ACK + 轮询结果），避免 SPA 销毁 channel
+  if (longOps.includes(type)) {
+    try {
+      const opId = 'op_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+      await chrome.storage.local.remove('bht_op_' + opId).catch(() => {});
+      await chrome.storage.local.set({ ['bht_op_' + opId]: { status: 'pending', opType: type, at: Date.now() } });
+      const fireOp = async () => {
+        const ack = await chrome.tabs.sendMessage(tab.id, {
+          type: 'BHT_RUN_OP',
+          payload: { opId, opType: type, opPayload: payload }
+        });
+        if (ack && ack.accepted) return true;
+        if (ack && ack.error === 'UNKNOWN_TYPE') return false;
+        // 旧 content 无 RUN_OP 时走失败，触发注入重试
+        return Boolean(ack && ack.ok !== false);
+      };
+      let fired = false;
+      try {
+        fired = await fireOp();
+      } catch (eAck) {
+        fired = false;
+      }
+      if (!fired) {
+        await forceInjectContent(tab.id);
+        await sleep(220);
+        fired = await fireOp();
+      }
+      if (!fired) throw new Error('RUN_OP_NOT_SUPPORTED');
+      const started = Date.now();
+      let reinjectAt = started + 8000;
+      while (Date.now() - started < 90000) {
+        await sleep(350);
+        const bag = await chrome.storage.local.get('bht_op_' + opId);
+        const row = bag && bag['bht_op_' + opId];
+        if (row && row.status === 'done') {
+          try { await chrome.storage.local.remove('bht_op_' + opId); } catch (_) {}
+          return row.result || { ok: false, error: 'EMPTY_OP_RESULT' };
+        }
+        // START_CHAT：若已进入聊天页且输入框可用，直接视为成功（SPA 跳转会杀死原 content）
+        if (type === MSG.START_CHAT && Date.now() - started > 2500) {
+          try {
+            let pong = null;
+            try {
+              pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
+            } catch (_) { pong = null; }
+            if (!pong?.ok) {
+              await forceInjectContent(tab.id);
+              await sleep(260);
+              try { pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} }); } catch (_) {}
+            }
+            const page = pong?.page || {};
+            if (page.hasChatInput || (page.isChatPage && page.hasChatInput !== false && pong?.ok)) {
+              // 二次确认：请求一次 PAGE_INFO
+              let info = page;
+              try {
+                const pi = await chrome.tabs.sendMessage(tab.id, { type: MSG.GET_PAGE_INFO, payload: {} });
+                if (pi?.page) info = pi.page;
+              } catch (_) {}
+              if (info.hasChatInput) {
+                try { await chrome.storage.local.remove('bht_op_' + opId); } catch (_) {}
+                return {
+                  ok: true,
+                  already: true,
+                  job: (payload && payload.job) || {},
+                  matchedVia: 'bg-probe-chat',
+                  contentVersion: pong?.contentVersion
+                };
+              }
+            }
+          } catch (_) {}
+        }
+        // 超时前若仍 pending：可能 content 被导航销毁，重注入并重发一次同 opId（幂等由 content 覆盖写）
+        if (Date.now() > reinjectAt && type === MSG.START_CHAT) {
+          reinjectAt = Date.now() + 8000;
+          try {
+            const latest = await chrome.tabs.get(tab.id);
+            if (!isBossUrl(latest?.url || '')) continue;
+            let alive = false;
+            let pong = null;
+            try {
+              pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
+              alive = Boolean(pong?.ok);
+            } catch (_) { alive = false; }
+            if (alive && pong?.page?.hasChatInput) {
+              try { await chrome.storage.local.remove('bht_op_' + opId); } catch (_) {}
+              return {
+                ok: true,
+                already: true,
+                job: (payload && payload.job) || {},
+                matchedVia: 'bg-probe-chat-reinject',
+                contentVersion: pong?.contentVersion
+              };
+            }
+            // 重注入并重发：聊天页上 startChat 会走 already-in-chat
+            await forceInjectContent(tab.id);
+            await sleep(280);
+            await fireOp();
+          } catch (_) {}
+        }
+      }
+      return { ok: false, error: 'OP_TIMEOUT', message: '操作超时（岗位定位/发消息）。请保持在职位列表页并重新扫描预览' };
+    } catch (bridgeErr) {
+      // fall through to port/message
+      console.warn('storage bridge fail', bridgeErr);
+    }
+  }
+
+  // 次选 Port
+  if (longOps.includes(type)) {
+    try {
+      const result = await new Promise((resolve, reject) => {
+        let done = false;
+        const reqId = 'r_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
+        let port;
+        try {
+          port = chrome.tabs.connect(tab.id, { name: 'bht-op' });
+        } catch (e) {
+          reject(e);
+          return;
+        }
+        const timer = setTimeout(() => {
+          if (done) return;
+          done = true;
+          try { port.disconnect(); } catch (_) {}
+          reject(new Error('PORT_TIMEOUT'));
+        }, 120000);
+        port.onMessage.addListener((msg) => {
+          if (!msg || msg.reqId !== reqId) return;
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          try { port.disconnect(); } catch (_) {}
+          resolve(msg.result);
+        });
+        port.onDisconnect.addListener(() => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          const err = chrome.runtime.lastError?.message || 'PORT_DISCONNECTED';
+          reject(new Error(err));
+        });
+        try {
+          port.postMessage({ type, payload, reqId });
+        } catch (e) {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          reject(e);
+        }
+      });
+      if (result) return result;
+    } catch (errPort) {
+      const msgP = String(errPort?.message || errPort || '');
+      // START_CHAT_RECOVER: 点击导致脚本上下文销毁时，等页面稳定后重试
+      if (type === MSG.START_CHAT && /PORT_DISCONNECTED|Receiving end does not exist|message channel closed/i.test(msgP)) {
+        await sleep(1200);
+        try {
+          const latest = await chrome.tabs.get(tab.id);
+          if (isBossUrl(latest?.url || '')) {
+            await forceInjectContent(tab.id);
+            await sleep(350);
+            if (retries > 0) {
+              return sendToBoss(type, payload, { retries: retries - 1, forceInject: true });
+            }
+          }
+        } catch (_) {}
+      }
+      if (retries > 0) {
+        await forceInjectContent(tab.id);
+        await sleep(400);
+        return sendToBoss(type, payload, { retries: retries - 1, forceInject: true });
+      }
+      // fall through to sendMessage once
+      try {
+        return await chrome.tabs.sendMessage(tab.id, { type, payload });
+      } catch (e2) {
+        return {
+          ok: false,
+          error: 'CONTENT_PORT_FAIL',
+          message: msgP + ' | ' + String(e2?.message || e2)
+        };
+      }
+    }
   }
 
   try {
@@ -154,17 +350,14 @@ async function sendToBoss(type, payload = {}, { retries = 1, forceInject = false
       return await chrome.tabs.sendMessage(tab.id, { type, payload });
     } catch (err0) {
       const msg0 = String(err0?.message || err0 || "");
-      // 注入后再试
-      await forceInjectContent(tab.id);
-      if (retries > 0 && /message channel closed|Receiving end does not exist|asynchronous response/i.test(msg0)) {
-        await sleep(500);
+      if (retries > 0 && /message channel closed|Receiving end does not exist|asynchronous response|Could not establish|PORT_/i.test(msg0)) {
+        await forceInjectContent(tab.id);
+        await sleep(450);
         return sendToBoss(type, payload, { retries: retries - 1, forceInject: true });
       }
-      try {
-        return await chrome.tabs.sendMessage(tab.id, { type, payload });
-      } catch (err1) {
-        throw err1;
-      }
+      await forceInjectContent(tab.id);
+      await sleep(200);
+      return await chrome.tabs.sendMessage(tab.id, { type, payload });
     }
   } catch (err) {
     try {
@@ -177,7 +370,7 @@ async function sendToBoss(type, payload = {}, { retries = 1, forceInject = false
         };
       }
       await forceInjectContent(tab.id);
-      await sleep(200);
+      await sleep(250);
       return await chrome.tabs.sendMessage(tab.id, { type, payload });
     } catch (e2) {
       return {
@@ -390,22 +583,16 @@ async function processOneJob(task, resultRow, config) {
   }
 
   await log('info', `开始沟通：${job.title} @ ${job.company || ''}`, { jobId: job.jobId });
+  // version stamp for support
+  // (content reports its version in START_CHAT response)
 
 
 
-// ENSURE_JOB_LIST before start (轻量：真正查找+点击都在 START_CHAT 原子完成)
-  {
-    try { await sendToBoss(MSG.CLOSE_CHAT, {}); } catch (_) {}
-    await sleep(200);
-    try {
-      const ensured = await sendToBoss(MSG.ENSURE_JOB_LIST, { maxWaitMs: 5000, scroll: false });
-      if (ensured && ensured.ok === false) {
-        await log('warn', ensured.message || '职位列表暂未就绪，将直接按标题查找', { jobId: job.jobId });
-      }
-    } catch (_) {}
-    await sleep(150);
+// 列表恢复交给 START_CHAT 原子处理，避免预先 CLOSE/ENSURE 打乱虚拟列表
+  const chatRes = await sendToBoss(MSG.START_CHAT, { job, skipScroll: false });
+  if (chatRes?.contentVersion) {
+    await log('info', 'content v' + chatRes.contentVersion + (chatRes.matchedVia ? (' · 匹配:' + chatRes.matchedVia) : ''), { jobId: job.jobId });
   }
-  const chatRes = await sendToBoss(MSG.START_CHAT, { job, skipScroll: true });
   if (!chatRes?.ok) {
     item.state = 'FAILED';
     let code = REASON.EXEC_CLICK_FAIL;
@@ -447,6 +634,7 @@ async function processOneJob(task, resultRow, config) {
 
   item.state = 'COMMUNICATION_CREATED';
   await bumpDailyStat('communicate', 1, normalizeText(job.company || ''));
+  await log('success', '已进入沟通，开始发送消息', { jobId: job.jobId });
 
   // messages
   const selfRes = await sendToBoss(MSG.GET_CHAT_SELF_MESSAGES, { limit: 8 });
@@ -467,6 +655,11 @@ async function processOneJob(task, resultRow, config) {
   if (plan.nativeDetected) {
     item.state = 'NATIVE_GREETING_DETECTED';
     await log('info', '检测到原生/已发打招呼，跳过第一段', { jobId: job.jobId });
+  }
+  if (!plan.plan?.length) {
+    await log('warn', '没有待发送的消息段（可能都被跳过或模板为空），将继续尝试简历发送', { jobId: job.jobId });
+  } else {
+    await log('info', '准备发送 ' + plan.plan.length + ' 段消息', { jobId: job.jobId });
   }
 
   for (const step of plan.plan) {
@@ -520,11 +713,20 @@ async function processOneJob(task, resultRow, config) {
 
   // resume
   const profile = pickResumeProfile(job, config.resumes, config.bindings);
-  const timing = config.settings.resumeSendTiming;
-  const shouldSendResume = timing === 'after_text';
+  const timing = config.settings.resumeSendTiming || 'on_request';
+  const wantAutoImage = Boolean(config.settings.autoSendImageResume && profile?.images?.length);
+  const wantAutoFile = Boolean(config.settings.autoSendAttachmentResume && profile?.attachment?.dataUrl);
+  // 仅 after_text 自动发；勾选自动发但时机不对时给明确提示
+  const doResume = timing === 'after_text' && profile && (wantAutoImage || wantAutoFile);
+  if (timing === 'after_text' && profile && !wantAutoImage && !wantAutoFile) {
+    await log('info', '文本后发送简历已开启，但未勾选自动发图/附件或未上传简历文件', { jobId: job.jobId });
+  }
+  if ((wantAutoImage || wantAutoFile) && timing !== 'after_text') {
+    await log('warn', '已勾选自动发简历，但发送时机不是「文本发送完成后」。请到设置改为「文本发送完成后立即发送」', { jobId: job.jobId });
+  }
 
-  if (shouldSendResume && profile) {
-    if (config.settings.autoSendImageResume && profile.images?.length) {
+  if (doResume) {
+    if (wantAutoImage) {
       for (let i = 0; i < profile.images.length; i++) {
         const img = profile.images[i];
         const key = resumeIdempotencyKey(job, `image_${i}`, profile.id);
@@ -544,7 +746,7 @@ async function processOneJob(task, resultRow, config) {
       }
     }
     // 附件：页面上传控件差异大，记录意图，提示用户必要时手动
-    if (config.settings.autoSendAttachmentResume && profile.attachment?.dataUrl) {
+    if (wantAutoFile) {
       const key = resumeIdempotencyKey(job, 'file', profile.id);
       if (!(await hasIdempotent(key))) {
         const fileRes = await sendToBoss(MSG.SEND_IMAGE, {
@@ -648,28 +850,57 @@ async function runTaskLoop(taskId) {
           break;
         }
       }
-      const outcome = await processOneJob(task, row, config);
-      // ENSURE_JOB_LIST between jobs
-      if (outcome === 'success' || outcome === 'failed' || outcome === 'skipped') {
-        await sendToBoss(MSG.RETURN_TO_LIST, {});
-        await sleep(500);
-      }
-      // awaitingUserRetry on fail
-      if (outcome === 'failed') {
+      let outcome = await processOneJob(task, row, config);
+
+      // 失败后等待用户：关闭=保持暂停不自动继续；重试=重置当前岗位后再跑一次
+      while (outcome === 'failed') {
+        // 回列表，避免卡在会话页
+        try { await sendToBoss(MSG.RETURN_TO_LIST, {}); } catch (_) {}
+        await sleep(400);
+
+        config = await getAllConfig();
+        task = config.task;
+        if (!task) break;
+
         task.status = TASK_STATUS.PAUSED;
         task.awaitingUserRetry = true;
+        task.uiErrorDismissed = false;
+        task.retryCurrent = false;
         task.pauseReason = task.pauseReason || itemErrorHint(task, row) || '岗位处理失败，请查看原因后重试';
-        task.lastErrorDetail = [
-          '岗位：' + (row.job?.title || ''),
-          '公司：' + (row.job?.company || ''),
-          '原因：' + ((task.items.find(x => x.jobId === row.job.jobId) || {}).reasons || []).join('；')
-        ].filter(Boolean).join('\n');
+        task.errorKey = [task.id || '', row.job?.jobId || '', task.pauseReason || ''].join('|');
+        task.lastErrorDetail = ['岗位：' + (row.job?.title || ''), '公司：' + (row.job?.company || ''), '原因：' + ((task.items.find((x) => x.jobId === row.job.jobId) || {}).reasons || []).join('；')].filter(Boolean).join('\n');
         runner.pause = true;
         await publishTask(task);
-        // 等用户点重试/关闭；不再重复 log pauseReason（processOneJob 已记录）
         await waitWhilePaused(task);
-        if (runner.abort) break;
-        // 用户点重试后，不增加 processed 重复？已失败计一次
+        if (runner.abort) {
+          outcome = 'aborted';
+          break;
+        }
+
+        config = await getAllConfig();
+        task = config.task;
+        if (!task) break;
+        const it = task.items?.find((x) => x.jobId === row.job.jobId);
+        if (it && it.state === 'NOT_STARTED' && task.retryCurrent === true) {
+          // 用户点了重试：再试当前岗位
+          task.retryCurrent = false;
+          await publishTask(task);
+          outcome = await processOneJob(task, row, config);
+          continue;
+        }
+        // 用户关闭后点继续：不重试当前失败项，进入下一岗
+        task.retryCurrent = false;
+        task.awaitingUserRetry = false;
+        // 手动继续时不把历史失败累计成自动熔断
+        task.consecutiveFails = 0;
+        await publishTask(task);
+        break;
+      }
+
+      // 成功/跳过后再回列表；失败已在上面回过
+      if (outcome === 'success' || outcome === 'skipped') {
+        try { await sendToBoss(MSG.RETURN_TO_LIST, {}); } catch (_) {}
+        await sleep(500);
       }
       task.counters.processed += 1;
       task.updatedAt = Date.now();
@@ -811,29 +1042,49 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await log('warn', '用户暂停任务');
         return { ok: true };
       case MSG.RESUME_TASK: {
-        if (true) {
+        {
           const all0 = await getAllConfig();
           if (all0.task) {
             all0.task.awaitingUserRetry = false;
-            all0.task.pauseReason = '';
-            all0.task.lastErrorDetail = '';
+            // payload.retry === true 表示弹窗「重试」：只重置当前失败岗位
+            const wantRetry = Boolean(payload?.retry);
+            if (wantRetry) {
+              const curId = all0.task.currentJobId;
+              all0.task.items = (all0.task.items || []).map((it) => {
+                if (curId && it.jobId === curId && it.state === 'FAILED') {
+                  return { ...it, state: 'NOT_STARTED', reasons: [] };
+                }
+                // 无 currentJobId 时，仅重置最近一个 FAILED
+                return it;
+              });
+              if (!all0.task.currentJobId) {
+                const lastFail = [...(all0.task.items || [])].reverse().find((it) => it.state === 'FAILED');
+                if (lastFail) {
+                  all0.task.items = all0.task.items.map((it) =>
+                    it.jobId === lastFail.jobId ? { ...it, state: 'NOT_STARTED', reasons: [] } : it
+                  );
+                  all0.task.currentJobId = lastFail.jobId;
+                }
+              }
+              all0.task.retryCurrent = true;
+              all0.task.uiErrorDismissed = false;
+              all0.task.consecutiveFails = 0;
+              all0.task.pauseReason = '';
+              all0.task.lastErrorDetail = '';
+              all0.task.errorKey = '';
+            } else {
+              // 工具栏「继续」：不自动重置失败项，跳过它们往下跑
+              all0.task.retryCurrent = false;
+              all0.task.uiErrorDismissed = true;
+              all0.task.pauseReason = '';
+              all0.task.lastErrorDetail = '';
+              all0.task.errorKey = '';
+            }
             await publishTask(all0.task);
           }
           runner.pauseLogged = false;
           runner.pausePublished = false;
-          // reset FAILED for retry
-          {
-            const all1 = await getAllConfig();
-            if (all1.task?.items) {
-              all1.task.items = all1.task.items.map((it) =>
-                it.state === 'FAILED' ? { ...it, state: 'NOT_STARTED', reasons: [] } : it
-              );
-              all1.task.consecutiveFails = 0;
-              await publishTask(all1.task);
-            }
-          }
         }
-        // RESUME_TASK guard
         {
           const guard = await assertBossContext();
           if (!guard.ok) {
@@ -848,7 +1099,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         all.task.status = TASK_STATUS.RUNNING;
         await publishTask(all.task);
         if (!runner.running) runTaskLoop(all.task.id);
-        await log('info', '继续任务');
+        await log('info', payload?.retry ? '重试当前岗位' : '继续任务');
         return { ok: true };
       }
       case MSG.STOP_TASK:
@@ -887,17 +1138,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case MSG.DISMISS_ERROR_MODAL:
       case 'BHT_DISMISS_ERROR_MODAL': {
-        // 用户关闭错误弹窗：保持暂停，但清除 awaitingUserRetry，避免反复弹窗
+        // 用户关闭错误弹窗：保持暂停，不自动重试、不进入下一岗
         runner.pause = true;
+        runner.abort = false;
         const all = await getAllConfig();
         if (all.task) {
           all.task.awaitingUserRetry = false;
+          all.task.uiErrorDismissed = true;
+          all.task.retryCurrent = false;
           all.task.status = TASK_STATUS.PAUSED;
           all.task.updatedAt = Date.now();
-          // 保留 pauseReason 便于状态栏显示，但不再驱动弹窗
           await publishTask(all.task);
         }
-        await log('warn', '用户关闭错误提示，任务保持暂停');
+        await log('warn', '用户关闭错误提示，任务保持暂停（不会自动重试）');
         return { ok: true };
       }
       case MSG.EXPORT_CONFIG:

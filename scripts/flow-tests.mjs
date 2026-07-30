@@ -31,11 +31,37 @@ test("background force-injects content on critical ops", () => {
 
 test("background ensures list before chat and returns after job", () => {
   const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
-  assert.ok(s.includes("ENSURE_JOB_LIST before start"));
+  assert.ok(s.includes("列表恢复交给 START_CHAT") || s.includes("START_CHAT"));
   assert.ok(s.includes("RETURN_TO_LIST after job"));
-  assert.ok(s.includes("ENSURE_JOB_LIST between jobs"));
   assert.ok(s.includes("RETURN_TO_LIST after fail"));
   assert.ok(s.includes("RETURN_TO_LIST after send fail"));
+  assert.ok(s.includes("retryCurrent"));
+  assert.ok(s.includes("payload?.retry"));
+  assert.ok(s.includes("while (outcome === 'failed')"));
+});
+
+test("content startChat is href-first and versioned", () => {
+  const s = fs.readFileSync("extension/content/content-main.js", "utf8");
+  assert.ok(s.includes('BHT_CONTENT_VERSION = "1.3.3"'));
+  assert.ok(s.includes("matchedVia"));
+  assert.ok(s.includes("tryPickVisible"));
+  assert.ok(s.includes("JOB_CARD_NOT_FOUND"));
+  assert.ok(s.includes("runOpByType"));
+  assert.ok(s.includes("setInputText"));
+  assert.ok(s.includes("findSendButton"));
+  assert.ok(s.includes("getSelfMessages"));
+  assert.ok(s.includes("BHT_RUN_OP") || s.includes("bht_op_"));
+  assert.ok(s.includes("openJobByHrefFallback"));
+  assert.ok(s.includes("installJobNavGuard") || s.includes("bht-op"));
+  assert.ok(s.includes("bht-op"));
+  assert.ok(s.includes("uiErrorDismissed") === false); // content may not have it
+});
+
+test("background modal dismiss flag + atomic startChat", () => {
+  const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(s.includes("uiErrorDismissed"));
+  assert.ok(s.includes("列表恢复交给 START_CHAT") || s.includes("skipScroll: false"));
+  assert.ok(s.includes("DISMISS_ERROR_MODAL"));
 });
 
 test("message protocol includes list control", () => {
