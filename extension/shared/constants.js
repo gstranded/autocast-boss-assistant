@@ -56,9 +56,9 @@ export const DEFAULT_SETTINGS = {
   neverRepeatJob: true,
   allowRepublishedJob: false,
   consecutiveFailPause: 3,
-  autoSendImageResume: false,
+  autoSendImageResume: true,
   autoSendAttachmentResume: false,
-  resumeSendTiming: 'on_request', // on_request | after_text | manual
+  resumeSendTiming: 'after_text', // on_request | after_text | manual
   previewRequired: true,
   whitelistOnly: false
 };

@@ -15,7 +15,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.3.6";
+  const BHT_CONTENT_VERSION = "1.3.7";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -41,7 +41,29 @@
 
   const log = (...args) => console.log("[BHT content]", ...args);
 
-  const SELECTORS = {
+  
+  function rememberListHref(forceHref) {
+    try {
+      const href = forceHref || location.href;
+      const cards = getJobCards().length;
+      if (forceHref || (cards >= 3 && /jobs|recommend|search|geek\/job/i.test(href))) {
+        sessionStorage.setItem("bht_list_href", href);
+        window.__BHT_LIST_HREF__ = href;
+        return href;
+      }
+    } catch (_) {}
+    return sessionStorage.getItem("bht_list_href") || window.__BHT_LIST_HREF__ || "";
+  }
+
+  function getSavedListHref() {
+    try {
+      return window.__BHT_LIST_HREF__ || sessionStorage.getItem("bht_list_href") || "";
+    } catch (_) {
+      return window.__BHT_LIST_HREF__ || "";
+    }
+  }
+
+const SELECTORS = {
     // 2026-07 真机：/web/geek/jobs
     card: [
       "ul.rec-job-list li.job-card-box",
@@ -658,6 +680,7 @@ function firstEl(selectors, root = document) {
   }
 
   async function scanJobs(payload = {}) {
+    try { rememberListHref(); } catch (_) {}
     if (payload.scroll) await autoScrollList(payload.maxRounds || 6);
     const cards = getJobCards();
     const jobs = cards.map((c, i) => parseJobCard(c, i));
@@ -927,7 +950,7 @@ function dismissCommonDialogs() {
     return hasUsableChatInput();
   }
 
-  async function ensureJobList({ maxWaitMs = 12000, scroll = true } = {}) {
+  async function ensureJobList({ maxWaitMs = 12000, scroll = true, noHomeNav = false } = {}) {
     const readyCount = () => getJobCards().length;
     if (readyCount() > 0) {
       return { ok: true, count: readyCount(), restored: false, href: location.href };
@@ -1027,26 +1050,56 @@ function dismissCommonDialogs() {
     return { ok: true, contentVersion: BHT_CONTENT_VERSION };
   }
 
-  async function returnToJobList() {
-    await closeChatPanel();
+  async function returnToJobList(payload = {}) {
+    const target = (payload && payload.listHref) || getSavedListHref();
+    try { await closeChatPanel(); } catch (_) {}
+    await sleep(250);
+
+    if (getJobCards().length >= 3) {
+      try { rememberListHref(); } catch (_) {}
+      return {
+        ok: true,
+        count: getJobCards().length,
+        href: location.href,
+        via: "still-on-list",
+        contentVersion: BHT_CONTENT_VERSION
+      };
+    }
+
+    if (target && location.href.split("#")[0] !== String(target).split("#")[0]) {
+      try { sessionStorage.setItem("bht_list_href", target); } catch (_) {}
+      setTimeout(() => {
+        try { location.assign(target); } catch (_) {
+          try { location.href = target; } catch (__) {}
+        }
+      }, 120);
+      return {
+        ok: true,
+        navigating: true,
+        href: target,
+        via: "scheduled-assign",
+        contentVersion: BHT_CONTENT_VERSION
+      };
+    }
+
     if (isChatPage() || (hasUsableChatInput() && getJobCards().length === 0)) {
       try { history.back(); } catch (_) {}
-      await sleep(900);
+      await sleep(1100);
+      try { await closeChatPanel(); } catch (_) {}
     }
-    try { await closeChatPanel(); } catch (_) {}
-    let ensured = await ensureJobList({ maxWaitMs: 10000, scroll: true });
-    if (!ensured.ok && getJobCards().length === 0) {
-      const jobNav = Array.from(document.querySelectorAll("a,button,span,div")).find((el) => {
-        const t = textOf(el);
-        return t === "职位" || t === "推荐" || t === "首页";
-      });
-      if (jobNav) {
-        clickLikeHuman(jobNav);
-        await sleep(1000);
-      }
-      ensured = await ensureJobList({ maxWaitMs: 6000, scroll: true });
+
+    let ensured = await ensureJobList({ maxWaitMs: 10000, scroll: true, noHomeNav: true });
+    if ((!ensured?.ok || (ensured.count || 0) < 1) && target) {
+      setTimeout(() => { try { location.assign(target); } catch (_) {} }, 80);
+      return {
+        ok: true,
+        navigating: true,
+        href: target,
+        via: "scheduled-assign-fallback",
+        contentVersion: BHT_CONTENT_VERSION
+      };
     }
-    return ensured;
+    return { ...ensured, contentVersion: BHT_CONTENT_VERSION };
   }
 
   async function findCardByScrolling(job, maxRounds = 40) {
@@ -1186,6 +1239,7 @@ function dismissCommonDialogs() {
   }
 
 async function startChat(job, opts = {}) {
+    try { rememberListHref(); } catch (_) {}
     const inputJob0 = (opts && opts.job) || job || {};
     // 聊天输入已可用（含 SPA 跳转后恢复）：立刻返回成功，供后台继续 SEND_TEXT
     if (hasUsableChatInput()) {
@@ -1872,41 +1926,81 @@ async function startChat(job, opts = {}) {
   }
 
   async function sendImageFromDataUrl(dataUrl, fileName = "resume.png") {
-    // SEND_IMAGE_V2
     if (!dataUrl) return { ok: false, error: "EMPTY_IMAGE" };
     dismissCommonDialogs();
     await waitForChat(8000);
+    const chatRoot = getChatRoot() || document.getElementById("bht-mock-chat") || document;
 
-    // 打开图片/附件入口
-    const openers = Array.from(document.querySelectorAll("button,a,div,i,span,label")).filter((el) => {
-      const t = textOf(el);
-      const aria = el.getAttribute?.("aria-label") || "";
-      return /图片|相册|附件|文件|上传/.test(t) || /图片|相册|附件|文件|上传/.test(aria);
-    });
-    for (const el of openers.slice(0, 4)) {
-      try { clickLikeHuman(el); await sleep(280); } catch (_) {}
-    }
+    const findFileInput = () => {
+      const roots = [chatRoot, document];
+      for (const root of roots) {
+        try {
+          const list = Array.from(root.querySelectorAll("input[type='file']"));
+          const prefer =
+            list.find((el) => /image|png|jpg|jpeg|\*/i.test(el.getAttribute("accept") || "")) ||
+            list[0];
+          if (prefer) return prefer;
+        } catch (_) {}
+      }
+      return null;
+    };
 
-    let input =
-      firstEl([
-        "input[type='file'][accept*='image']",
-        "input[type='file'][accept*='*']",
-        "input[type='file']"
-      ]) ||
-      Array.from(document.querySelectorAll("input[type='file']")).find(Boolean);
-
-    // 有些入口会延迟插入 input
+    let input = findFileInput();
     if (!input) {
-      for (let i = 0; i < 8 && !input; i++) {
-        await sleep(250);
-        input = document.querySelector("input[type='file'][accept*='image'], input[type='file']");
+      const bar =
+        (chatRoot.querySelector &&
+          (chatRoot.querySelector(".chat-tool, .message-controls, .chat-footer, .chat-action, .conversation-footer") ||
+            chatRoot)) ||
+        document;
+      const openers = Array.from(bar.querySelectorAll("button,a,div,i,span,label")).filter((el) => {
+        const t = textOf(el);
+        const aria = el.getAttribute?.("aria-label") || "";
+        const title = el.getAttribute?.("title") || "";
+        return /图片|相册|照片|发送图片/.test(t + aria + title);
+      });
+      for (const el of openers.slice(0, 3)) {
+        try {
+          clickLikeHuman(el);
+          await sleep(320);
+          input = findFileInput();
+          if (input) break;
+        } catch (_) {}
       }
     }
     if (!input) {
+      for (let i = 0; i < 10 && !input; i++) {
+        await sleep(280);
+        input = findFileInput();
+      }
+    }
+
+    if (!input) {
+      try {
+        const chatInput = getChatInput();
+        if (chatInput && hasUsableChatInput()) {
+          const res = await fetch(dataUrl);
+          const blob = await res.blob();
+          const file = new File([blob], fileName, { type: blob.type || "image/png" });
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          try { chatInput.focus(); } catch (_) {}
+          const pasteEv = new Event("paste", { bubbles: true, cancelable: true });
+          try { Object.defineProperty(pasteEv, "clipboardData", { value: dt }); } catch (_) {}
+          chatInput.dispatchEvent(pasteEv);
+          await sleep(700);
+          const sendBtn = findSendButton();
+          if (sendBtn) clickLikeHuman(sendBtn);
+          await sleep(600);
+          return { ok: true, via: "paste", contentVersion: BHT_CONTENT_VERSION };
+        }
+      } catch (e) {
+        log("image paste fail", e);
+      }
       return {
         ok: false,
         error: "FILE_INPUT_NOT_FOUND",
-        message: "未找到上传控件。请确认已打开聊天，并手动点图片/附件发送简历"
+        message: "未找到上传控件。请确认已打开聊天，或手动点图片发送简历",
+        contentVersion: BHT_CONTENT_VERSION
       };
     }
 
@@ -1919,16 +2013,22 @@ async function startChat(job, opts = {}) {
       input.files = dt.files;
       input.dispatchEvent(new Event("change", { bubbles: true }));
       input.dispatchEvent(new Event("input", { bubbles: true }));
-      await sleep(900);
+      await sleep(1000);
       const sendBtn = findSendButton();
       if (sendBtn) clickLikeHuman(sendBtn);
-      await sleep(600);
-      return { ok: true, contentVersion: BHT_CONTENT_VERSION };
+      const confirm = Array.from(document.querySelectorAll("button,a,.btn")).find(
+        (el) => /发送|确定|完成/.test(textOf(el)) && !/取消|关闭/.test(textOf(el))
+      );
+      if (confirm && confirm !== sendBtn) {
+        await sleep(300);
+        clickLikeHuman(confirm);
+      }
+      await sleep(700);
+      return { ok: true, via: "file-input", contentVersion: BHT_CONTENT_VERSION };
     } catch (err) {
-      return { ok: false, error: String(err?.message || err) };
+      return { ok: false, error: String(err?.message || err), contentVersion: BHT_CONTENT_VERSION };
     }
   }
-
 
   function highlightJobs(map = {}) {
     const cards = getJobCards();
@@ -1997,7 +2097,7 @@ async function startChat(job, opts = {}) {
         return await ensureJobList(payload || {});
       case MSG.RETURN_TO_LIST:
       case "BHT_RETURN_TO_LIST":
-        return await returnToJobList();
+        return await returnToJobList(payload || {});
       default:
         return { ok: false, error: "UNKNOWN_TYPE", type };
     }

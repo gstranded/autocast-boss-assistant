@@ -148,6 +148,7 @@
               <button id="btnAddSeg" class="btn tiny">新增一段</button>
             </div>
             <div id="segments" class="segments"></div>
+            <div class="hint">配置会自动保存（筛选/消息/简历/设置）；点按钮可立即落盘。</div>
             <button id="btnSaveMessage" class="btn primary block">保存消息模板</button>
           </div>
         </section>
@@ -161,8 +162,8 @@
             <label class="check"><input type="checkbox" id="autoSendAttachmentResume" />自动发送附件简历</label>
             <label>发送时机</label>
             <select id="resumeSendTiming">
-              <option value="on_request">HR 请求后再发（推荐，当前自动任务不强制发）</option>
-              <option value="after_text">文本发送完成后立即发送（自动发简历请选这项）</option>
+              <option value="on_request">文本后发送（兼容旧配置）</option>
+              <option value="after_text">文本发送完成后立即发送（推荐）</option>
               <option value="manual">仅手动</option>
             </select>
           </div>

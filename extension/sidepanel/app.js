@@ -4,7 +4,7 @@ import { reasonText } from '../shared/reason-codes.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
-const BHT_UI_VERSION = "1.3.6";
+const BHT_UI_VERSION = "1.3.7";
 // FLOAT_MODE_FORCE_BOSS: floating host only injects on BOSS pages
 const state = {
   modalDismissed: false,
@@ -222,7 +222,7 @@ function renderSegments(template) {
 }
 
 function readTemplate(base) {
-  const segments = (base.segments || []).map((seg) => {
+  const segments = (base?.segments || []).map((seg) => {
     const en = document.querySelector(`[data-en="${seg.id}"]`);
     const tx = document.querySelector(`[data-text="${seg.id}"]`);
     if (!tx) return seg;
@@ -232,7 +232,7 @@ function readTemplate(base) {
       text: tx.value
     };
   });
-  return { ...base, version: (base.version || 1) + 1, segments };
+  return { ...(base || { version: 1, segments: [] }), version: ((base && base.version) || 1) + 1, segments };
 }
 
 function getActiveProfile() {
@@ -575,13 +575,18 @@ async function saveFilters() {
   }
 
 async function saveMessage() {
-  const template = readTemplate(state.config.messageTemplate);
-  const settings = readSettingsPatch(state.config.settings);
+  const template = readTemplate(state.config?.messageTemplate || { version: 1, segments: [] });
+  const settings = readSettingsPatch(state.config?.settings || {});
   await api(MSG.SAVE_TEMPLATE, template);
   await api(MSG.SAVE_SETTINGS, settings);
-  state.formDirty = false;
-  await refresh({ soft: false });
+  if (state.config) {
+    state.config.messageTemplate = template;
+    state.config.settings = { ...(state.config.settings || {}), ...settings };
   }
+  state.formDirty = false;
+  await refresh({ soft: true });
+  return true;
+}
 
 async function saveSettings() {
   const settings = readSettingsPatch(state.config.settings);
@@ -657,16 +662,60 @@ async function saveBindings() {
   await refresh({ soft: false });
   }
 
+
+let autosaveTimer = null;
+let autosaving = false;
+async function flushAutosave() {
+  if (autosaving) return;
+  if (!chrome?.runtime?.id) return;
+  autosaving = true;
+  try {
+    const ok = [];
+    try { await saveFilters(); ok.push('筛选'); } catch (e) { console.warn('autosave filters', e); }
+    try { await saveMessage(); ok.push('消息'); } catch (e) { console.warn('autosave message', e); }
+    try { await saveSettings(); ok.push('设置'); } catch (e) { console.warn('autosave settings', e); }
+    try { await saveResume(); ok.push('简历'); } catch (e) { console.warn('autosave resume', e); }
+    try { await saveBindings(); ok.push('绑定'); } catch (e) { console.warn('autosave bind', e); }
+    state.formDirty = false;
+    if (ok.length) toast('已自动保存', 'success', 900);
+  } finally {
+    autosaving = false;
+  }
+}
+function scheduleAutosave() {
+  state.formDirty = true;
+  clearTimeout(autosaveTimer);
+  autosaveTimer = setTimeout(() => { flushAutosave(); }, 650);
+}
+function wireAutosave() {
+  const root = document.querySelector('main') || document.body;
+  if (!root || root.__bhtAutosave) return;
+  root.__bhtAutosave = true;
+  root.addEventListener('input', (e) => {
+    if (e.target && e.target.matches && e.target.matches('input, textarea, select')) scheduleAutosave();
+  }, true);
+  root.addEventListener('change', (e) => {
+    if (e.target && e.target.matches && e.target.matches('input, textarea, select')) scheduleAutosave();
+  }, true);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushAutosave();
+  });
+}
+
 function toast(msg, type = 'success', ms = 2200) {
   const el = $('bht-toast') || $('taskWarnings');
-  if (!el) return;
+  if (!el) {
+    try { console.log('[BHT toast]', type, msg); } catch (_) {}
+    return;
+  }
   if (el.id === 'bht-toast') {
     el.hidden = false;
+    el.style.display = 'block';
     el.textContent = msg;
     el.className = 'bht-toast ' + (type || 'success');
     clearTimeout(toast._timer);
     toast._timer = setTimeout(() => {
-      el.hidden = true;
+      el.hidden = true; el.style.display = 'none';
     }, ms);
   } else {
     el.textContent = msg;
@@ -720,9 +769,10 @@ function bindEvents() {
   $('btnSaveMessage').addEventListener('click', async () => {
     try {
       await saveMessage();
-      toast('消息模板已保存', 'success');
+      toast('消息模板已保存 ✓', 'success', 2600);
     } catch (e) {
-      toast(String(e.message || e), 'error', /扩展上下文|F5|失效/.test(String(e.message || e)) ? 6000 : 3500);
+      console.error('saveMessage', e);
+      toast(String(e?.message || e || '保存失败'), 'error', 6000);
     }
   });
   $('btnSaveSettings').addEventListener('click', async () => {

@@ -41,6 +41,26 @@ let runner = {
 
 chrome.runtime.onInstalled.addListener(async () => {
   await getAllConfig();
+  try {
+    // 一次性：若已上传图片但未开自动发，升级默认以符合「文本后发图」预期
+    const all = await chrome.storage.local.get(['bht_settings', 'bht_resumes', 'bht_migrated_137']);
+    if (!all.bht_migrated_137) {
+      const settings = all.bht_settings || {};
+      const resumes = all.bht_resumes || {};
+      const hasImg = (resumes.profiles || []).some((p) => (p.images || []).length);
+      let changed = false;
+      if (hasImg && settings.autoSendImageResume === false) {
+        settings.autoSendImageResume = true;
+        changed = true;
+      }
+      if (hasImg && settings.resumeSendTiming === 'on_request') {
+        settings.resumeSendTiming = 'after_text';
+        changed = true;
+      }
+      if (changed) await chrome.storage.local.set({ bht_settings: settings });
+      await chrome.storage.local.set({ bht_migrated_137: true });
+    }
+  } catch (_) {}
   // side panel disabled: using floating panel + action popup
   await refreshSidePanelForAllTabs();
 });
@@ -596,6 +616,20 @@ async function processOneJob(task, resultRow, config) {
 
 
 // 列表恢复交给 START_CHAT 原子处理，避免预先 CLOSE/ENSURE 打乱虚拟列表
+  // 记住职位列表 URL（含 BOSS 手动筛选）
+  try {
+    const pageRes = await sendToBoss(MSG.GET_PAGE_INFO, {});
+    const href = pageRes?.page?.href || pageRes?.href || '';
+    if (href && /jobs|recommend|search|geek\/job/i.test(href) && (pageRes?.page?.cardCount || 0) >= 1) {
+      task.listHref = href;
+      job.listHref = href;
+      await publishTask(task);
+      await log('info', '已记录列表页以便返回（保留 BOSS 筛选）', { href: String(href).slice(0, 180) });
+    } else if (task.listHref) {
+      job.listHref = task.listHref;
+    }
+  } catch (_) {}
+
   const chatRes = await sendToBoss(MSG.START_CHAT, { job, skipScroll: false });
   if (chatRes?.contentVersion) {
     await log('info', 'content v' + chatRes.contentVersion + (chatRes.matchedVia ? (' · 匹配:' + chatRes.matchedVia) : ''), { jobId: job.jobId });
@@ -728,7 +762,7 @@ async function processOneJob(task, resultRow, config) {
   const wantAutoImage = Boolean(flagImage && hasImages);
   const wantAutoFile = Boolean(flagFile && hasFile);
   // 仅 after_text 自动发；其余情况写清原因，避免「发了文字没发简历」困惑
-  const doResume = timing === 'after_text' && profile && (wantAutoImage || wantAutoFile);
+  const doResume = Boolean(profile && (wantAutoImage || wantAutoFile) && timing !== 'manual');
   if (!doResume) {
     let why = '';
     if (!profile) why = '未匹配到简历方案（请到「简历」页添加方案并设为默认/绑定规则）';
@@ -794,12 +828,41 @@ async function processOneJob(task, resultRow, config) {
     return 'skipped';
   }
 
-  // RETURN_TO_LIST after job
+  // RETURN_TO_LIST after job — 回到原筛选列表
   {
-    const back = await sendToBoss(MSG.RETURN_TO_LIST, {});
-    if (!back?.ok) {
-      await log('warn', back?.message || '返回职位列表失败，尝试继续', { jobId: job.jobId });
-      await sleep(800);
+    const listHref = job.listHref || task.listHref || '';
+    const back = await sendToBoss(MSG.RETURN_TO_LIST, { listHref });
+    if (back?.navigating || back?.via === 'scheduled-assign' || back?.via === 'scheduled-assign-fallback') {
+      for (let i = 0; i < 45; i++) {
+        await sleep(400);
+        try {
+          const pong = await sendToBoss(MSG.PING, {});
+          if ((pong?.page?.cardCount || 0) >= 3) break;
+        } catch (_) {}
+      }
+      await sleep(500);
+    } else if (!back?.ok) {
+      if (listHref) {
+        try {
+          const tab = await getActiveBossTab({ allowInactiveBossTab: true });
+          if (tab?.id) {
+            await chrome.tabs.update(tab.id, { url: listHref });
+            await log('info', '已导航回原筛选列表页', { jobId: job.jobId });
+            for (let i = 0; i < 40; i++) {
+              await sleep(400);
+              try {
+                const pong = await sendToBoss(MSG.PING, {});
+                if ((pong?.page?.cardCount || 0) >= 3) break;
+              } catch (_) {}
+            }
+          }
+        } catch (e) {
+          await log('warn', '返回列表导航失败：' + String(e?.message || e), { jobId: job.jobId });
+        }
+      } else {
+        await log('warn', back?.message || '返回职位列表失败，尝试继续', { jobId: job.jobId });
+        await sleep(800);
+      }
     } else {
       await sleep(randomBetween(config.settings.jobIntervalMs || [1200, 2200]));
     }
