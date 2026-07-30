@@ -4,7 +4,7 @@ import { reasonText } from '../shared/reason-codes.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
-const BHT_UI_VERSION = "1.3.7";
+const BHT_UI_VERSION = "1.3.8";
 // FLOAT_MODE_FORCE_BOSS: floating host only injects on BOSS pages
 const state = {
   modalDismissed: false,
@@ -222,17 +222,39 @@ function renderSegments(template) {
 }
 
 function readTemplate(base) {
-  const segments = (base?.segments || []).map((seg) => {
-    const en = document.querySelector(`[data-en="${seg.id}"]`);
-    const tx = document.querySelector(`[data-text="${seg.id}"]`);
-    if (!tx) return seg;
-    return {
+  const map = new Map();
+  for (const seg of base?.segments || []) {
+    const en = document.querySelector('[data-en="' + seg.id + '"]');
+    const tx = document.querySelector('[data-text="' + seg.id + '"]');
+    map.set(seg.id, {
       ...seg,
-      enabled: en ? en.checked : seg.enabled,
-      text: tx.value
-    };
+      enabled: en ? en.checked : seg.enabled !== false,
+      text: tx ? tx.value : (seg.text || '')
+    });
+  }
+  // DOM 中多出来的段（state 被 soft refresh 冲掉时仍能保存）
+  document.querySelectorAll('#segments [data-text]').forEach((tx) => {
+    const id = tx.getAttribute('data-text');
+    if (!id || map.has(id)) return;
+    const en = document.querySelector('[data-en="' + id + '"]');
+    map.set(id, { id, enabled: en ? en.checked : true, text: tx.value || '' });
   });
-  return { ...(base || { version: 1, segments: [] }), version: ((base && base.version) || 1) + 1, segments };
+  const domOrder = Array.from(document.querySelectorAll('#segments [data-text]'))
+    .map((el) => el.getAttribute('data-text'))
+    .filter(Boolean);
+  let segments;
+  if (domOrder.length) {
+    segments = domOrder.map((id) => map.get(id)).filter(Boolean);
+    for (const [id, seg] of map.entries()) {
+      if (!domOrder.includes(id)) segments.push(seg);
+    }
+  } else {
+    segments = Array.from(map.values());
+  }
+  return {
+    version: ((base && base.version) || 1) + 1,
+    segments
+  };
 }
 
 function getActiveProfile() {
@@ -516,13 +538,28 @@ async function refresh(options = {}) {
   const soft = options.soft === true;
   const res = await api(MSG.GET_STATE);
   if (!res?.ok) return;
+  const prevTemplate = state.config?.messageTemplate;
+  const prevSettings = state.config?.settings;
+  const prevFilters = state.config?.filters;
+  const prevLists = state.config?.lists;
+  const wasDirty = state.formDirty;
+  const editingNow = typeof isEditingForm === 'function' ? isEditingForm() : false;
+
   state.config = res;
+  if ((wasDirty || editingNow || soft) && prevTemplate) {
+    try { state.config.messageTemplate = readTemplate(prevTemplate); } catch (_) { state.config.messageTemplate = prevTemplate; }
+  }
+  if ((wasDirty || editingNow) && prevSettings) {
+    try { state.config.settings = { ...prevSettings, ...readSettingsPatch(prevSettings) }; } catch (_) { state.config.settings = prevSettings; }
+  }
+  if ((wasDirty || editingNow) && prevFilters) state.config.filters = prevFilters;
+  if ((wasDirty || editingNow) && prevLists) state.config.lists = prevLists;
   if (!state.activeProfileId) {
     state.activeProfileId = res.resumes?.defaultProfileId || res.resumes?.profiles?.[0]?.id || null;
   }
 
   const editing = isEditingForm();
-  const keepForm = soft || editing || state.formDirty;
+  const keepForm = soft || editing || state.formDirty || wasDirty;
   // 软刷新 / 正在输入 / 有未保存修改：绝不回填表单
   if (!keepForm) {
     state.draftBindings = (res.bindings?.rules || []).map((r, i) => ({
@@ -575,15 +612,15 @@ async function saveFilters() {
   }
 
 async function saveMessage() {
-  const template = readTemplate(state.config?.messageTemplate || { version: 1, segments: [] });
-  const settings = readSettingsPatch(state.config?.settings || {});
+  if (!state.config) state.config = {};
+  const template = readTemplate(state.config.messageTemplate || { version: 1, segments: [] });
+  const settings = readSettingsPatch(state.config.settings || {});
   await api(MSG.SAVE_TEMPLATE, template);
   await api(MSG.SAVE_SETTINGS, settings);
-  if (state.config) {
-    state.config.messageTemplate = template;
-    state.config.settings = { ...(state.config.settings || {}), ...settings };
-  }
+  state.config.messageTemplate = template;
+  state.config.settings = { ...(state.config.settings || {}), ...settings };
   state.formDirty = false;
+  renderSegments(template);
   await refresh({ soft: true });
   return true;
 }
@@ -801,16 +838,21 @@ function bindEvents() {
   });
 
   $('btnAddSeg').addEventListener('click', () => {
-    const template = readTemplate(state.config.messageTemplate);
+    if (!state.config) state.config = {};
+    const base = state.config.messageTemplate || { version: 1, segments: [] };
+    if (!Array.isArray(base.segments)) base.segments = [];
+    const template = readTemplate(base);
+    if (!Array.isArray(template.segments)) template.segments = [];
     template.segments.push({
-      id: `seg_${Date.now().toString(36)}`,
+      id: 'seg_' + Date.now().toString(36),
       enabled: true,
       text: ''
     });
     state.config.messageTemplate = template;
     state.formDirty = true;
     renderSegments(template);
-    toast('已新增消息段', 'success');
+    toast('已新增消息段（填写后自动保存）', 'success', 2200);
+    try { scheduleAutosave(); } catch (_) {}
   });
 
   $('btnAddProfile')?.addEventListener('click', async () => {

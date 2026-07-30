@@ -463,6 +463,7 @@ async function runPreview(payload = {}) {
     await log('error', scan?.message || '扫描失败', { error: scan?.error });
     return { ok: false, ...scan };
   }
+  const previewListHref = scan.listHref || '';
 
   const history = config.history || [];
   const todayStats = await getTodayStats();
@@ -531,7 +532,22 @@ async function runPreview(payload = {}) {
     consecutiveFails: 0
   };
 
-  await publishTask(task);
+  
+  task.listHref = previewListHref || task.listHref || '';
+  task.queue = (task.results || [])
+    .filter((r) => r.selected !== false && r.decision === 'pass')
+    .map((r, idx) => ({
+      index: idx,
+      jobId: r.job?.jobId,
+      title: r.job?.title,
+      company: r.job?.company,
+      href: r.job?.href || '',
+      securityId: r.job?.securityId || '',
+      status: 'pending'
+    }));
+  task.queueCursor = 0;
+  await log('info', '预览队列已建立：' + task.queue.length + ' 个待投；列表锚点 ' + String(task.listHref || '无').slice(0, 140));
+await publishTask(task);
 
   // highlight
   const map = {};
@@ -556,7 +572,9 @@ async function waitWhilePaused(task) {
 }
 
 async function processOneJob(task, resultRow, config) {
-  const job = resultRow.job;
+  const job = { ...resultRow.job };
+  if (!job.listHref && task.listHref) job.listHref = task.listHref;
+  resultRow.job = job;
   const item = ensureItem(task, job);
   task.currentJobId = job.jobId;
   task.updatedAt = Date.now();
@@ -664,6 +682,22 @@ async function processOneJob(task, resultRow, config) {
     }
     // RETURN_TO_LIST after fail
     await sendToBoss(MSG.RETURN_TO_LIST, {});
+    if (/找不到该岗位|列表中找不到|JOB_NOT_FOUND|LIST_NOT_READY/i.test(String(chatRes?.error || '') + String(chatRes?.message || ''))) {
+      item.state = 'SKIPPED';
+      item.reasons = [chatRes?.message || '列表中找不到该岗位，已跳过并继续下一岗'];
+      task.counters.skipped += 1;
+      task.consecutiveFails = Math.min(Number(task.consecutiveFails || 0), 1);
+      await appendHistory({
+        jobId: job.jobId,
+        company: job.company,
+        title: job.title,
+        status: 'skipped_missing',
+        taskId: task.id,
+        message: chatRes?.message || ''
+      });
+      await log('warn', '跳过无法定位的岗位，继续队列下一岗：' + (job.title || ''), { jobId: job.jobId });
+      return 'skipped';
+    }
     return 'failed';
   }
   if (chatRes.job) {
@@ -907,8 +941,41 @@ async function runTaskLoop(taskId) {
     task.updatedAt = Date.now();
     await publishTask(task);
 
-    const queue = (task.results || []).filter((r) => r.selected && r.decision === 'pass');
-    for (const row of queue) {
+    // 队列以预览快照为准（不是回页后再猜）
+    if (!task.queue || !task.queue.length) {
+      task.queue = (task.results || [])
+        .filter((r) => r.selected && r.decision === 'pass')
+        .map((r, idx) => ({
+          index: idx,
+          jobId: r.job?.jobId,
+          title: r.job?.title,
+          company: r.job?.company,
+          href: r.job?.href || '',
+          securityId: r.job?.securityId || '',
+          status: 'pending'
+        }));
+      task.queueCursor = 0;
+      await publishTask(task);
+    }
+    const queue = task.queue.map((q) => {
+      const row = (task.results || []).find((r) => r.job?.jobId === q.jobId);
+      return row || {
+        decision: 'pass',
+        selected: true,
+        job: {
+          jobId: q.jobId,
+          title: q.title,
+          company: q.company,
+          href: q.href,
+          securityId: q.securityId,
+          listHref: task.listHref
+        }
+      };
+    });
+    await log('info', '开始队列投递：共 ' + queue.length + ' 岗；锚点 ' + String(task.listHref || '无').slice(0, 120));
+
+    for (let qi = 0; qi < queue.length; qi++) {
+      const row = queue[qi];
       await waitWhilePaused(task);
       if (runner.abort) break;
 
@@ -920,6 +987,29 @@ async function runTaskLoop(taskId) {
       const item = task.items.find((x) => x.jobId === row.job.jobId);
       if (item && (item.state === 'COMPLETED' || item.state === 'SKIPPED')) {
         continue;
+      }
+
+      task.queueCursor = qi;
+      await publishTask(task);
+      await log('info', '队列进度 ' + (qi + 1) + '/' + queue.length + '：' + (row.job?.title || '') + ' @ ' + (row.job?.company || ''), {
+        jobId: row.job?.jobId
+      });
+
+      // 回列表再投下一岗（保留筛选 URL）
+      if (qi > 0) {
+        try {
+          const listHref = task.listHref || '';
+          await sendToBoss(MSG.RETURN_TO_LIST, { listHref });
+          for (let i = 0; i < 40; i++) {
+            await sleep(400);
+            try {
+              const pong = await sendToBoss(MSG.PING, {});
+              if ((pong?.page?.cardCount || 0) >= 3) break;
+            } catch (_) {}
+          }
+        } catch (e) {
+          await log('warn', '回列表继续下一岗失败：' + String(e?.message || e));
+        }
       }
 
       // assertBossContext before process
@@ -935,6 +1025,20 @@ async function runTaskLoop(taskId) {
         }
       }
       let outcome = await processOneJob(task, row, config);
+      try {
+        config = await getAllConfig();
+        task = config.task || task;
+        if (task?.queue) {
+          const q = task.queue.find((x) => x.jobId === row.job?.jobId);
+          if (q) {
+            q.status = outcome === 'success' ? 'done' : outcome === 'skipped' ? 'skipped' : 'failed';
+            q.finishedAt = Date.now();
+            q.outcome = outcome;
+          }
+          await publishTask(task);
+        }
+        await log('info', '队列项结果：' + (row.job?.title || '') + ' → ' + outcome + '（' + (qi + 1) + '/' + queue.length + '）', { jobId: row.job?.jobId });
+      } catch (_) {}
 
       // 失败后等待用户：关闭=保持暂停不自动继续；重试=重置当前岗位后再跑一次
       while (outcome === 'failed') {

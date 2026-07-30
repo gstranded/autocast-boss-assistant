@@ -15,7 +15,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.3.7";
+  const BHT_CONTENT_VERSION = "1.3.8";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -684,9 +684,7 @@ function firstEl(selectors, root = document) {
     if (payload.scroll) await autoScrollList(payload.maxRounds || 6);
     const cards = getJobCards();
     const jobs = cards.map((c, i) => parseJobCard(c, i));
-    return {
-      ok: true,
-      page: pageInfo(),
+    try{rememberListHref();}catch(_){} return { ok: true, listHref: (typeof getSavedListHref==="function"?getSavedListHref():"")||location.href, page: pageInfo(),
       jobs,
       count: jobs.length,
       diagnose: {
