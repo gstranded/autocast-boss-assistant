@@ -1,11 +1,13 @@
 {
   "name": "boss-haitou-assistant",
-  "version": "1.5.2",
+  "version": "1.5.4",
   "private": true,
   "type": "module",
   "description": "Boss 海投助手 Chrome 扩展",
   "scripts": {
     "test": "node scripts/unit-tests.mjs",
-    "smoke": "node scripts/smoke-test.mjs"
+    "smoke": "node scripts/smoke-test.mjs",
+    "release:check": "node scripts/sync-release-notes.mjs",
+    "release:sync": "node scripts/sync-release-notes.mjs --apply"
   }
 }

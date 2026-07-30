@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "__MSG_extName__",
   "description": "__MSG_extDesc__",
-  "version": "1.5.2",
+  "version": "1.5.4",
   "default_locale": "zh_CN",
   "icons": {
     "16": "assets/icons/icon16.png",
@@ -27,8 +27,6 @@
     "storage",
     "tabs",
     "scripting",
-    "alarms",
-    "notifications",
     "unlimitedStorage"
   ],
   "host_permissions": [
@@ -46,6 +44,7 @@
         "*://bosszhipin.com/*"
       ],
       "js": [
+        "shared/conversation-match.js",
         "content/content-main.js",
         "content/floating-host.js"
       ],

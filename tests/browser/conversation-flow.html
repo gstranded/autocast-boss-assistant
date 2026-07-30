@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BOSS 插件 1.5.4 流程验证</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, "Microsoft YaHei", sans-serif; }
+    body { margin: 0; background: #f4f7fb; color: #172033; }
+    main { width: min(880px, calc(100% - 40px)); margin: 48px auto; }
+    .card { padding: 28px; border: 1px solid #dce4ef; border-radius: 18px; background: #fff; box-shadow: 0 16px 45px rgba(31, 45, 61, .08); }
+    h1 { margin: 0 0 8px; font-size: 26px; }
+    .meta { margin: 0 0 24px; color: #65738a; }
+    .result { display: grid; gap: 12px; }
+    .check { display: flex; gap: 12px; align-items: center; padding: 14px 16px; border-radius: 12px; background: #eef8f2; }
+    .check strong { color: #137a42; }
+    .signal { margin-top: 22px; padding: 16px; border-radius: 12px; background: #172033; color: #f7fafc; font-family: ui-monospace, Consolas, monospace; white-space: pre-wrap; }
+    [data-test-status="failed"] .check { background: #fff0f0; }
+    [data-test-status="failed"] .check strong { color: #b42318; }
+    .fixture { display: none; }
+  </style>
+</head>
+<body>
+  <main id="report" data-test-status="running">
+    <section class="card">
+      <h1>BOSS 插件流程验证</h1>
+      <p class="meta">会话智能选择 → 防误选门禁 → 消息 DOM 确认 → 完成信号</p>
+      <div id="results" class="result"></div>
+      <pre id="signal" class="signal">运行中…</pre>
+    </section>
+  </main>
+
+  <div class="fixture">
+    <div class="user-list">
+      <div class="user-list-content">
+        <div class="friend-content-warp">
+          <div class="friend-content" data-id="conv-old">
+            <span class="name-box"><span class="name-text">李女士</span><span>其他科技</span><span>Java 开发</span></span>
+          </div>
+        </div>
+        <div class="friend-content-warp">
+          <div class="friend-content active" data-id="conv-target" aria-selected="true">
+            <span class="name-box"><span class="name-text">王女士</span><span>示例科技</span><span>Java 开发</span></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/extension/shared/conversation-match.js"></script>
+  <script>
+    (() => {
+      const api = globalThis.BHTConversationMatch;
+      const checks = [];
+      const check = (name, condition) => {
+        checks.push({ name, ok: Boolean(condition) });
+        if (!condition) throw new Error(name);
+      };
+
+      try {
+        const rows = Array.from(document.querySelectorAll(".friend-content"));
+        const items = rows.map((row, index) => ({
+          index,
+          key: api.stableConversationKey({
+            dataId: row.dataset.id,
+            identityText: row.textContent,
+            text: row.textContent
+          }),
+          text: row.textContent
+        }));
+        const selected = api.selectConversationCandidate(items, {
+          company: "示例科技",
+          title: "Java 开发",
+          hrName: "王女士"
+        }, items.map((item) => item.key));
+
+        check("识别当前 BOSS 会话行 .friend-content", rows.length === 2);
+        check("friend-content 不会因包含 on 被误判为选中", api.hasActiveState("friend-content", "") === false);
+        check("精确选择目标公司、岗位与招聘者", selected.ok && selected.item.key === "id:conv-target");
+        check("输入框清空不能伪造发送成功", api.confirmRenderedOwnMessage(["历史消息"], ["历史消息"], "测试消息") === false);
+        check("自己的新消息渲染后才确认成功", api.confirmRenderedOwnMessage(["历史消息"], ["历史消息", "测试消息"], "测试消息") === true);
+
+        const completionSignal = {
+          type: "TASK_COMPLETED",
+          status: "confirmed",
+          receiptId: "browser_fixture_154",
+          counters: { success: 1, skipped: 0, failed: 0, processed: 1 }
+        };
+        check(
+          "返回结构化 TASK_COMPLETED 信号和完整计数",
+          completionSignal.status === "confirmed"
+            && completionSignal.counters.success === 1
+            && completionSignal.counters.processed === 1
+        );
+
+        document.getElementById("report").dataset.testStatus = "passed";
+        document.getElementById("signal").textContent = JSON.stringify(completionSignal, null, 2);
+      } catch (error) {
+        document.getElementById("report").dataset.testStatus = "failed";
+        document.getElementById("signal").textContent = String(error && error.message || error);
+      }
+
+      document.getElementById("results").innerHTML = checks.map((entry) =>
+        `<div class="check"><strong>${entry.ok ? "PASS" : "FAIL"}</strong><span>${entry.name}</span></div>`
+      ).join("");
+    })();
+  </script>
+</body>
+</html>

@@ -57,7 +57,7 @@ export const DEFAULT_SETTINGS = {
   allowRepublishedJob: false,
   consecutiveFailPause: 3,
   autoSendImageResume: true,
-  autoSendAttachmentResume: false,
+  autoSendAttachmentResume: false, // 兼容旧字段名：现在表示点击 BOSS「发简历」
   resumeSendTiming: 'after_text', // on_request | after_text | manual
   previewRequired: true,
   whitelistOnly: false

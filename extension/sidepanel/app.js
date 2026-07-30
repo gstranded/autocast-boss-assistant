@@ -4,7 +4,8 @@ import { reasonText } from '../shared/reason-codes.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
-const BHT_UI_VERSION = "1.5.2";
+const BHT_UI_VERSION = "1.5.4";
+const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 // FLOAT_MODE_FORCE_BOSS: floating host only injects on BOSS pages
 const state = {
   modalDismissed: false,
@@ -12,7 +13,8 @@ const state = {
   config: null,
   selected: new Set(),
   activeProfileId: null,
-  draftBindings: []
+  draftBindings: [],
+  lastCompletionSignalId: ''
 };
 
 function isExtContextDead(err) {
@@ -289,7 +291,7 @@ function renderProfileList() {
         ${isDefault ? '<span class="pill default">默认</span>' : ''}
         ${isActive ? '<span class="pill">编辑中</span>' : ''}
       </div>
-      <div class="meta">图片 ${(p.images || []).length} 张 · 附件 ${p.attachment ? '已配置' : '无'}</div>
+      <div class="meta">图片 ${(p.images || []).length} 张 · 可发送 BOSS 在线简历</div>
       <div class="actions">
         <button class="btn tiny" data-switch="${p.id}">切换编辑</button>
         <button class="btn tiny" data-default="${p.id}">设默认</button>
@@ -332,9 +334,7 @@ function renderResumeEditor() {
     el.title = `${idx + 1}. ${img.name || ''}`;
     thumbs.appendChild(el);
   });
-  $('attachInfo').textContent = profile.attachment
-    ? `已保存附件：${profile.attachment.name} (${Math.round((profile.attachment.size || 0) / 1024)} KB)`
-    : '尚未选择附件';
+  $('attachInfo').textContent = '无需上传本地附件；启用发送策略后会点击聊天页「发简历」。';
 }
 
 function flushActiveProfileForm() {
@@ -450,6 +450,31 @@ function updateTaskUI(task, runner = {}) {
   }
   if ($('btnPreview')) $('btnPreview').disabled = !(onBoss && status !== 'running');
   if ($('btnDiagnose')) $('btnDiagnose').disabled = !onBoss;
+}
+
+function announceTaskCompletion(task) {
+  const signal = task?.completionSignal;
+  const terminalType =
+    task?.status === 'completed' ? 'TASK_COMPLETED' :
+    task?.status === 'stopped' ? 'TASK_STOPPED' :
+    '';
+  if (
+    !terminalType ||
+    signal?.type !== terminalType ||
+    signal?.status !== 'confirmed' ||
+    !signal?.receiptId ||
+    state.lastCompletionSignalId === signal.receiptId
+  ) {
+    return;
+  }
+  state.lastCompletionSignalId = signal.receiptId;
+  const c = signal.counters || task.counters || {};
+  const action = task.status === 'stopped' ? '任务已停止' : '投递任务已完成';
+  toast(
+    `${action}：已成功投递 ${c.success || 0} 份，跳过 ${c.skipped || 0}，失败 ${c.failed || 0}，共处理 ${c.processed || 0}`,
+    (c.failed || 0) > 0 ? 'warn' : 'success',
+    8000
+  );
 }
 
 function renderPreview(task) {
@@ -590,6 +615,7 @@ async function refresh(options = {}) {
     updateTaskUI(res.task, res.runner);
   }
   updateTaskUI(res.task, res.runner);
+  announceTaskCompletion(res.task);
   renderLogs(res.logs || []);
 
   const isBoss = Boolean(res.activeIsBoss || res.activeTab);
@@ -742,9 +768,9 @@ async function saveResume(opts = {}) {
   if (imageFiles?.length) {
     const images = appendImages ? profile.images.slice() : [];
     for (const f of Array.from(imageFiles)) {
-      if (f.size > 2.5 * 1024 * 1024) {
+      if (f.size > MAX_SOURCE_IMAGE_BYTES) {
         skipped += 1;
-        toast('图片过大已跳过（单张 ≤ 2.5MB）：' + f.name, 'error', 3500);
+        toast('图片过大已跳过（源文件单张 ≤ 8MB）：' + f.name, 'error', 3500);
         continue;
       }
       const dataUrl = await fileToCompressedDataUrl(f);
@@ -757,7 +783,7 @@ async function saveResume(opts = {}) {
       added += 1;
     }
     if (added === 0 && imageFiles.length > 0) {
-      throw new Error('没有成功导入任何图片（可能全部超限）。请压缩后重试');
+      throw new Error('没有成功导入任何图片（源文件需 ≤ 8MB）。请压缩后重试');
     }
     if (added > 0) profile.images = images;
   }
@@ -1154,10 +1180,10 @@ function bindEvents() {
       autoSendAttachmentResume: !!$('autoSendAttachmentResume')?.checked,
       resumeSendTiming: $('resumeSendTiming')?.value || 'on_request'
     };
-    if (settings.autoSendImageResume && settings.resumeSendTiming !== 'after_text') {
-      toast('提示：已勾选自动发图，但时机不是「文本发送完成后」。测试将按当前设置执行', 'warn', 3500);
-    } else if (!settings.autoSendImageResume) {
-      toast('提示：未勾选自动发图片简历，本次测试通常只发文字', 'warn', 2800);
+    if ((settings.autoSendImageResume || settings.autoSendAttachmentResume) && settings.resumeSendTiming !== 'after_text') {
+      toast('提示：已启用简历发送，但时机不是「文本发送完成后」，本次不会自动发简历', 'warn', 3500);
+    } else if (!settings.autoSendImageResume && !settings.autoSendAttachmentResume) {
+      toast('提示：未启用图片或 BOSS 在线简历，本次只发文字', 'warn', 2800);
     }
     toast('正在启动测试投递（仅 1 岗）…', 'warn', 1500);
     const res = await api(MSG.RUN_TEST_DELIVERY || 'BHT_RUN_TEST_DELIVERY', {
@@ -1253,6 +1279,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === MSG.TASK_EVENT) {
     if (state.config) state.config.task = msg.payload;
     updateTaskUI(msg.payload, state.config?.runner || {});
+    announceTaskCompletion(msg.payload);
     if (
       msg.payload?.status === 'paused' &&
       msg.payload?.awaitingUserRetry &&
@@ -1376,7 +1403,11 @@ function wireControlButtons() {
     const modal = $('bht-modal');
     if (modal) modal.hidden = true;
     const res = await api(MSG.STOP_TASK);
-    toast(res?.ok === false ? (res.message || '停止失败') : '任务已停止', res?.ok === false ? 'error' : 'warn');
+    if (res?.ok === false) {
+      toast(res.message || '停止失败', 'error');
+    } else if (res?.task) {
+      announceTaskCompletion(res.task);
+    }
     await refresh({ soft: true });
   });
 }

@@ -127,7 +127,7 @@ async function forceInjectContent(tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ["content/content-main.js"],
+      files: ["shared/conversation-match.js", "content/content-main.js"],
       injectImmediately: true
     });
     await sleep(120);
@@ -444,12 +444,13 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     MSG.START_CHAT,
     MSG.SEND_TEXT,
     MSG.SEND_IMAGE,
+    MSG.SEND_RESUME,
     MSG.SCAN_JOBS,
     MSG.RETURN_TO_LIST,
     MSG.CLOSE_CHAT,
     MSG.ENSURE_JOB_LIST
   ];
-  const longOps = [MSG.START_CHAT, MSG.SEND_TEXT, MSG.SEND_IMAGE, MSG.SCAN_JOBS, MSG.RETURN_TO_LIST];
+  const longOps = [MSG.START_CHAT, MSG.SEND_TEXT, MSG.SEND_IMAGE, MSG.SEND_RESUME, MSG.SCAN_JOBS, MSG.RETURN_TO_LIST];
 
   let needInject = forceInject;
   if (!needInject && critical.includes(type)) {
@@ -747,6 +748,36 @@ async function publishTask(task) {
   try {
     chrome.runtime.sendMessage({ type: MSG.TASK_EVENT, payload: task }).catch(() => {});
   } catch (_) {}
+}
+
+function taskCounterSnapshot(task) {
+  const counters = task?.counters || {};
+  return {
+    success: Number(counters.success || 0),
+    skipped: Number(counters.skipped || 0),
+    failed: Number(counters.failed || 0),
+    processed: Number(counters.processed || 0)
+  };
+}
+
+function taskSummaryText(task, status) {
+  const counters = taskCounterSnapshot(task);
+  const action = status === TASK_STATUS.STOPPED ? '任务已停止' : '投递任务已完成';
+  return `${action}：成功投递 ${counters.success} 份，跳过 ${counters.skipped}，失败 ${counters.failed}，共处理 ${counters.processed}`;
+}
+
+function setTaskTerminalSignal(task, status) {
+  const type = status === TASK_STATUS.STOPPED ? 'TASK_STOPPED' : 'TASK_COMPLETED';
+  const previous = task?.completionSignal?.type === type ? task.completionSignal : null;
+  task.completionSignal = {
+    type,
+    status: 'confirmed',
+    receiptId: previous?.receiptId || uid(status === TASK_STATUS.STOPPED ? 'task_stopped' : 'task_done'),
+    taskId: task.id,
+    counters: taskCounterSnapshot(task),
+    completedAt: previous?.completedAt || Date.now()
+  };
+  return task.completionSignal;
 }
 
 function ensureItem(task, job) {
@@ -1260,10 +1291,28 @@ async function processOneJob(task, resultRow, config) {
     if (await hasIdempotent(step.key)) continue;
 
     await log('info', '准备发送第 ' + (step.index + 1) + ' 段（' + String(step.text || '').slice(0, 40) + '…）', { jobId: job.jobId, tabId: tabOpt?.tabId });
-        const sendRes = await sendToBoss(MSG.SEND_TEXT, { text: step.text }, tabOpt);
-        await log(sendRes?.ok ? 'success' : 'error',
-          sendRes?.ok ? ('第 ' + (step.index + 1) + ' 段发送确认') : ('第 ' + (step.index + 1) + ' 段失败：' + (sendRes?.message || sendRes?.error || '')),
-          { jobId: job.jobId });
+    const sendResult = await sendToBoss(MSG.SEND_TEXT, {
+      text: step.text,
+      jobId: job.jobId,
+      segmentIndex: step.index,
+      conversationKey: conv?.active?.key || ''
+    }, tabOpt);
+    const receiptConfirmed =
+      sendResult?.ok === true &&
+      sendResult?.confirmed === true &&
+      sendResult?.receipt?.type === 'TEXT_SENT' &&
+      sendResult?.receipt?.status === 'confirmed';
+    const sendRes = receiptConfirmed
+      ? sendResult
+      : {
+          ...(sendResult || {}),
+          ok: false,
+          error: sendResult?.error || 'SEND_NOT_CONFIRMED',
+          message: sendResult?.message || '页面没有返回可验证的发送回执'
+        };
+    await log(sendRes?.ok ? 'success' : 'error',
+      sendRes?.ok ? ('第 ' + (step.index + 1) + ' 段发送确认') : ('第 ' + (step.index + 1) + ' 段失败：' + (sendRes?.message || sendRes?.error || '')),
+      { jobId: job.jobId, receiptId: sendRes?.receipt?.receiptId || '' });
     if (!sendRes?.ok) {
       item.state = 'FAILED';
       let sendCode = REASON.EXEC_SEND_TEXT_FAIL;
@@ -1290,8 +1339,18 @@ async function processOneJob(task, resultRow, config) {
     }
 
     await markIdempotent(step.key, { jobId: job.jobId, segment: step.index });
+    item.receipts = Array.isArray(item.receipts) ? item.receipts : [];
+    item.receipts.push(sendRes.receipt);
+    item.receipts = item.receipts.slice(-20);
+    item.lastReceipt = sendRes.receipt;
+    task.lastReceipt = sendRes.receipt;
     item.state = step.stateName;
-    await log('success', `已发送第 ${step.index + 1} 段消息`, { jobId: job.jobId });
+    task.updatedAt = Date.now();
+    await publishTask(task);
+    await log('success', `已发送第 ${step.index + 1} 段消息`, {
+      jobId: job.jobId,
+      receiptId: sendRes.receipt.receiptId
+    });
     await sleep(randomBetween(config.settings.segmentIntervalMs));
   }
 
@@ -1299,28 +1358,32 @@ async function processOneJob(task, resultRow, config) {
   const profile = pickResumeProfile(job, config.resumes, config.bindings);
   const timing = config.settings.resumeSendTiming || 'on_request';
   const hasImages = Boolean(profile?.images?.length);
-  const hasFile = Boolean(profile?.attachment?.dataUrl);
   const flagImage = Boolean(config.settings.autoSendImageResume);
-  const flagFile = Boolean(config.settings.autoSendAttachmentResume);
+  // 兼容旧设置字段：现在表示点击 BOSS 聊天页「发简历」，不再上传本地附件。
+  const flagPlatformResume = Boolean(config.settings.autoSendAttachmentResume);
   const wantAutoImage = Boolean(flagImage && hasImages);
-  const wantAutoFile = Boolean(flagFile && hasFile);
+  const wantPlatformResume = flagPlatformResume;
   // 仅 after_text 自动发；其余情况写清原因，避免「发了文字没发简历」困惑
-  const doResume = Boolean(profile && (wantAutoImage || wantAutoFile) && timing !== 'manual');
+  const doResume = Boolean((wantAutoImage || wantPlatformResume) && timing === 'after_text');
   if (!doResume) {
     let why = '';
-    if (!profile) why = '未匹配到简历方案（请到「简历」页添加方案并设为默认/绑定规则）';
-    else if (timing !== 'after_text') why = '发送时机为「' + (timing === 'on_request' ? 'HR请求后再发' : timing) + '」，自动任务不会强制发简历。请改为「文本发送完成后立即发送」';
-    else if (!flagImage && !flagFile) why = '未勾选「自动发送图片简历/附件简历」';
-    else if (!hasImages && !hasFile) why = '简历方案里还没有上传图片/附件';
-    else if (flagImage && !hasImages) why = '已勾选自动发图片，但方案中无图片';
-    else if (flagFile && !hasFile) why = '已勾选自动发附件，但方案中无附件';
+    if (timing !== 'after_text') why = '发送时机不是「文本发送完成后立即发送」';
+    else if (!flagImage && !flagPlatformResume) why = '未启用图片简历或 BOSS 在线简历';
+    else if (flagImage && !hasImages && !flagPlatformResume) why = '已启用图片简历，但当前方案中无图片';
     else why = '当前配置不满足自动发简历条件';
-    await log('info', '本次不自动发送简历：' + why, { jobId: job.jobId, timing, flagImage, flagFile, hasImages, hasFile, profileId: profile?.id || null });
+    await log('info', '本次不自动发送简历：' + why, {
+      jobId: job.jobId,
+      timing,
+      flagImage,
+      flagPlatformResume,
+      hasImages,
+      profileId: profile?.id || null
+    });
   } else {
     await log('info', '将自动发送简历：' + [
       wantAutoImage ? ('图片' + (profile.images?.length || 0) + '张') : '',
-      wantAutoFile ? '附件1份' : ''
-    ].filter(Boolean).join(' + '), { jobId: job.jobId, profileId: profile.id });
+      wantPlatformResume ? 'BOSS 在线简历' : ''
+    ].filter(Boolean).join(' + '), { jobId: job.jobId, profileId: profile?.id || null });
   }
 
   if (doResume) {
@@ -1343,20 +1406,42 @@ async function processOneJob(task, resultRow, config) {
         await sleep(randomBetween(config.settings.segmentIntervalMs));
       }
     }
-    // 附件：页面上传控件差异大，记录意图，提示用户必要时手动
-    if (wantAutoFile) {
-      const key = resumeIdempotencyKey(job, 'file', profile.id);
+    if (wantPlatformResume) {
+      const key = resumeIdempotencyKey(job, 'boss_online', profile?.id || 'boss_online');
       if (!(await hasIdempotent(key))) {
-        const fileRes = await sendToBoss(MSG.SEND_IMAGE, {
-          dataUrl: profile.attachment.dataUrl,
-          fileName: profile.attachment.name || 'resume.pdf'
+        const resumeRes = await sendToBoss(MSG.SEND_RESUME, {
+          jobId: job.jobId,
+          conversationKey: conv?.active?.key || ''
         }, tabOpt);
-        if (fileRes?.ok) {
+        const resumeConfirmed =
+          resumeRes?.ok === true &&
+          resumeRes?.confirmed === true &&
+          resumeRes?.receipt?.type === 'RESUME_SENT' &&
+          resumeRes?.receipt?.status === 'confirmed';
+        if (resumeConfirmed) {
           await markIdempotent(key, { jobId: job.jobId });
-          item.state = 'ATTACHMENT_RESUME_SENT';
-          await log('success', '附件简历已尝试发送', { jobId: job.jobId });
+          item.state = 'PLATFORM_RESUME_SENT';
+          item.resumeReceipt = resumeRes.receipt;
+          task.lastReceipt = resumeRes.receipt;
+          task.updatedAt = Date.now();
+          await publishTask(task);
+          await log('success', resumeRes?.already ? 'BOSS 在线简历此前已发送' : 'BOSS 在线简历发送确认', {
+            jobId: job.jobId,
+            receiptId: resumeRes.receipt.receiptId,
+            confirmedVia: resumeRes.receipt.confirmedVia
+          });
         } else {
-          await log('warn', '附件简历自动发送不可用，请在聊天中手动发送', { jobId: job.jobId });
+          item.state = 'FAILED';
+          item.reasons = [reasonText(REASON.EXEC_SEND_FILE_FAIL, resumeRes?.message || resumeRes?.error || '')];
+          task.pauseReason = item.reasons[0];
+          task.lastErrorDetail = '岗位：' + (job.title || '') + ' @ ' + (job.company || '') + '\nBOSS 在线简历发送未确认';
+          task.counters.failed += 1;
+          task.consecutiveFails += 1;
+          await bumpDailyStat('fail');
+          await log('error', 'BOSS 在线简历发送失败：' + (resumeRes?.message || resumeRes?.error || '未确认'), {
+            jobId: job.jobId
+          });
+          return 'failed';
         }
       }
     }
@@ -1374,6 +1459,15 @@ async function processOneJob(task, resultRow, config) {
   // 返回列表统一由 runTaskLoop 负责（避免双重 RETURN 打乱列表）
   item.state = 'COMPLETED';
   item.reasons = [reasonText(REASON.OK_ITEM_COMPLETED)];
+  item.completionSignal = {
+    type: 'JOB_COMPLETED',
+    status: 'confirmed',
+    receiptId: uid('job_done'),
+    jobId: job.jobId,
+    conversationKey: item.lastReceipt?.conversationKey || conv?.active?.key || '',
+    textReceipts: (item.receipts || []).map((receipt) => receipt.receiptId),
+    completedAt: Date.now()
+  };
   task.counters.success += 1;
   task.consecutiveFails = 0;
   await bumpDailyStat('success');
@@ -1583,13 +1677,15 @@ async function runTaskLoop(taskId) {
     if (task) {
       if (runner.abort) {
         task.status = TASK_STATUS.STOPPED;
-        await log('warn', '任务已停止');
+        setTaskTerminalSignal(task, TASK_STATUS.STOPPED);
+        await log('warn', taskSummaryText(task, TASK_STATUS.STOPPED));
       } else if (task.status === TASK_STATUS.PAUSED || runner.pause) {
         task.status = TASK_STATUS.PAUSED;
         await log('warn', task.pauseReason || '任务已暂停');
       } else {
         task.status = TASK_STATUS.COMPLETED;
-        await log('success', '任务已完成');
+        setTaskTerminalSignal(task, TASK_STATUS.COMPLETED);
+        await log('success', taskSummaryText(task, TASK_STATUS.COMPLETED));
       }
       task.updatedAt = Date.now();
       task.currentJobId = null;
@@ -1812,11 +1908,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const all = await getAllConfig();
           if (all.task) {
             all.task.status = TASK_STATUS.STOPPED;
+            all.task.updatedAt = Date.now();
+            setTaskTerminalSignal(all.task, TASK_STATUS.STOPPED);
             await publishTask(all.task);
+            await log('warn', taskSummaryText(all.task, TASK_STATUS.STOPPED));
+            return { ok: true, task: all.task };
           }
         }
-        await log('warn', '用户停止任务');
-        return { ok: true };
+        await log('warn', '用户停止任务：当前没有可汇报的任务');
+        return { ok: true, task: null };
       case MSG.SKIP_CURRENT: {
         runner.skipCurrent = true;
         // 若在等待用户重试的暂停中，允许跳过后继续

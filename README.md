@@ -1,253 +1,267 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/logo.svg" alt="Boss HaiTou Assistant Logo" width="128" />
+  <img src="https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/logo.svg" alt="Boss 海投助手" width="112" />
 </p>
 
 <h1 align="center">Boss 海投助手</h1>
 
-<p align="center">
-  <b>投递前可预览 · 筛选原因可解释 · 消息不重复 · 简历不发错 · 任务随时可控</b>
-</p>
+<p align="center">BOSS 直聘网页端的职位筛选、投递确认、分段消息和简历发送助手。</p>
 
 <p align="center">
-  面向 <a href="https://www.zhipin.com/">BOSS 直聘</a> 求职者的 Chrome / Edge MV3 浏览器扩展
+  <a href="https://github.com/gstranded/boss-haitou-assistant/releases">下载最新版</a> ·
+  <a href="README_EN.md">English</a> ·
+  <a href="PRIVACY.md">隐私政策</a> ·
+  <a href="LICENSE">MIT License</a>
 </p>
 
-<p align="center">
-  <a href="#-快速开始"><img src="https://img.shields.io/badge/快速开始-5%20min-blue?style=for-the-badge" alt="Quick Start" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License" /></a>
-  <a href="https://github.com/gstranded/boss-haitou-assistant/releases"><img src="https://img.shields.io/github/v/release/gstranded/boss-haitou-assistant?style=for-the-badge" alt="Release" /></a>
-  <a href="#-兼容性"><img src="https://img.shields.io/badge/Chrome%20%2F%20Edge-MV3-4285F4?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Browser" /></a>
-</p>
+> 当前通过 GitHub Release 安装，Chrome Web Store 和 Microsoft Edge Add-ons 尚未上架。安装前请先阅读本文的“使用边界”。
 
-<p align="center">
-  <a href="README.md"><b>简体中文</b></a> ·
-  <a href="README_EN.md">English</a>
-</p>
+## 安装
 
----
+### 从 Release 安装
 
-## ✨ 为什么做这个扩展？
+1. 打开 [Releases](https://github.com/gstranded/boss-haitou-assistant/releases)，下载最新的 `boss-haitou-assistant-vX.Y.Z.zip`。
+2. 解压 ZIP。
+3. Chrome 打开 `chrome://extensions`；Edge 打开 `edge://extensions`。
+4. 开启“开发者模式”。
+5. 点击“加载已解压的扩展程序”。
+6. 选择解压后的 `extension` 目录。
+7. 打开 [BOSS 直聘职位列表](https://www.zhipin.com/web/geek/jobs)，登录后刷新一次页面。
+8. 点击页面右侧悬浮按钮打开面板。
 
-公开的 BOSS 海投类工具已经很多，但真正让人难受的通常不是“点得不够快”，而是：
-
-- 规则一配错就**批量误投**
-- 原生打招呼 + 插件消息**重复**
-- 多方向求职时**简历发错**
-- 中断后**无法恢复**，跳过原因不透明
-
-Boss 海投助手把差异化放在可靠性与可控性上，而不是极限自动点击。
-
----
-
-## 🖼️ 界面导览（核心功能）
-
-### 1) 任务页：预览门禁 + 可控投递
-
-先扫描，再确认，最后投递。每条岗位都能看到**通过 / 跳过原因**。
-
-![任务页截图](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/01-task.png)
-
-**核心点**
-- 扫描预览汇总（扫描数 / 通过数 / 排除原因）
-- 勾选将投递岗位后，才允许「确认投递」
-- 暂停 / 继续 / 跳过当前 / 停止
-- 实时日志可追踪
-- 页面诊断：检查当前 BOSS 页选择器是否可用
-
-### 2) 筛选页：AND / OR / NOT 可解释规则
-
-职位、公司、JD、地点分字段配置，不再只有一个关键词框。
-
-![筛选页截图](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/02-filter.png)
-
-**核心点**
-- 职位名 OR / AND / NOT
-- 地点包含 / 排除 + 精确或包含匹配
-- 薪资区间、HR 活跃、猎头 / 外包识别
-- 公司黑白名单
-
-### 3) 消息页：多段发送 + 原生打招呼去重
-
-默认「自动识别」模式，避免和 BOSS 原生打招呼语重复。
-
-![消息页截图](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/03-message.png)
-
-**核心点**
-- 三种模式：原生补充 / 全插件发送 / 自动识别（默认）
-- 多段消息启停、模板变量
-- 相似度去重 + 幂等键，刷新重试不重发
-
-### 4) 简历页：多方案切换 + 规则绑定
-
-不同方向用不同简历，避免“一张简历打天下”。
-
-![简历页截图](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/04-resume.png)
-
-**核心点**
-- 多求职方案（图片简历 / 附件简历）
-- 设默认、切换编辑、删除
-- 关键词绑定规则（如 `LLM/Agent → AI 方案`）
-- 图片与附件独立开关
-
-### 5) 设置页：频率限制与本地配置
-
-把账号安全边界做成一等功能。
-
-![设置页截图](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/05-settings.png)
-
-**核心点**
-- 本次 / 每日 / 同公司上限
-- 同 HR 冷却天数
-- 配置导入导出（JSON，默认本地存储）
-
----
-
-## 🚀 快速开始
-
-> 和大多数开源 Chrome 扩展一样：下载源码或 Release 包后，用开发者模式「加载已解压的扩展程序」。
-
-### 方式 A：从 Release 安装（推荐）
-
-1. 打开 [Releases](https://github.com/gstranded/boss-haitou-assistant/releases)
-2. 下载最新的 `boss-haitou-assistant-vX.Y.Z.zip`
-3. 解压到任意目录（例如 `D:\boss-haitou-assistant`）
-4. 打开 Chrome / Edge 扩展管理页：
-   - Chrome：`chrome://extensions`
-   - Edge：`edge://extensions`
-5. 打开右上角 **开发者模式**
-6. 点击 **加载已解压的扩展程序**
-7. 选择解压后的 **`extension`** 目录
-8. 点击工具栏图标打开侧栏
-9. 打开 [BOSS 直聘职位列表页](https://www.zhipin.com/web/geek/jobs) 并登录后使用
-
-### 方式 B：从源码安装
+从源码安装时，克隆仓库后直接加载仓库里的 `extension/` 目录：
 
 ```bash
 git clone https://github.com/gstranded/boss-haitou-assistant.git
 cd boss-haitou-assistant
 ```
 
-然后在扩展管理页加载项目中的 `extension/` 目录（同上第 4-9 步）。
+## 第一次使用
 
-### 30 秒上手流程
+按下面的顺序配置，先测试一份，再开始批量任务。
 
-1. 在侧栏配置 **筛选 / 消息 / 简历 / 频率上限**
-2. 打开 BOSS 职位列表页
-3. 点击 **扫描预览**
-4. 核对将投递岗位与跳过原因
-5. 点击 **确认投递**
-6. 可随时暂停、跳过或停止
+1. 在“筛选”页填写目标职位、地点、薪资和排除条件。
+2. 在“消息”页选择发送模式，检查每一段文字。
+3. 在“简历”页建立方案，选择图片简历或启用 BOSS“发简历”。
+4. 在“设置”页把本次上限先改为 `1`。
+5. 回到“任务”页，点击“扫描预览”。
+6. 检查通过岗位、排除原因和勾选范围。
+7. 点击“投递一份测试”，确认打开了正确的聊天、消息确实发出、简历状态正确。
+8. 测试通过后再提高上限，重新扫描并点击“确认投递”。
 
----
+任务停止或完成时，面板会汇报：`成功 / 跳过 / 失败 / 已处理`。
 
-## 📦 项目结构
+![任务页](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/01-task.png)
 
-```text
-boss-haitou-assistant/
-├── extension/                 # 可直接加载的扩展根目录
-│   ├── manifest.json          # MV3 清单
-│   ├── background/            # 任务调度 / 配置中心
-│   ├── content/               # BOSS 页面适配
-│   ├── sidepanel/             # 侧栏 UI
-│   ├── shared/                # 规则、去重、模板等纯逻辑
-│   ├── assets/icons/          # 扩展图标
-│   └── _locales/              # 扩展多语言（zh_CN / en）
-├── docs/
-│   ├── assets/screenshots/    # README 截图
-│   ├── requirements/          # PRD / FRS / NFR
-│   └── adr/                   # 架构决策记录
-├── scripts/                   # 冒烟测试等脚本
-├── README.md                  # 中文文档（默认）
-└── README_EN.md               # English docs
-```
+## 筛选参数
 
----
+关键词可用英文逗号 `,`、中文逗号 `，`、顿号 `、`、正斜杠 `/`、反斜杠 `\` 或换行分隔。英文大小写不影响匹配。
 
-## ✅ 功能清单（V1）
+### 职位与 JD
 
-| 模块 | 能力 |
-|------|------|
-| 筛选引擎 | 职位/公司/JD/地点 AND·OR·NOT，薪资、活跃、猎头/外包、黑白名单 |
-| 预览门禁 | 扫描汇总 + 逐岗原因，确认后才发送 |
-| 多段消息 | 自动识别去重、模板变量、状态机、幂等 |
-| 多简历方案 | 多档案切换、关键词绑定、图片/附件独立开关 |
-| 防重复 | 职位 / HR / 公司三级 + 历史记录 |
-| 任务控制 | 开始确认、暂停、继续、停止、跳过、检查点恢复 |
-| 限流安全 | 本次/每日/同公司上限，连续失败自动暂停 |
-| 本地优先 | 配置与简历默认本地保存，支持 JSON 导入导出 |
+| 参数 | 作用 | 示例 |
+|---|---|---|
+| 职位名称：包含任意 OR | 命中任意一个词即可通过这一项；留空表示不限 | `Java, Go, 后端` |
+| 职位名称：必须同时包含 AND | 必须命中全部词；留空表示不限 | `Agent, 大模型` |
+| 职位名称：排除任意 NOT | 命中任意一个词就排除 | `外包, 驻场, 代招` |
+| 公司包含 OR | 公司名命中任意一个词才通过；留空表示不限 | `字节, 腾讯` |
+| 公司排除 NOT | 公司名命中任意一个词就排除 | `人力, 咨询` |
+| JD 包含 OR | 职位描述命中任意一个词才通过；留空表示不限 | `LLM, RAG` |
+| JD 必须 AND | 职位描述必须命中全部词 | `Python, Agent` |
+| JD 排除 NOT | 职位描述命中任意一个词就排除 | `培训, 驻场` |
 
----
+同一字段内的规则顺序是：先检查 NOT，再检查 OR / AND。任一必需条件不满足，岗位都会在预览中显示具体排除原因。
 
-## 🧪 本地自检
+### 地点、薪资与活跃度
+
+| 参数 | 作用 | 留空时 |
+|---|---|---|
+| 地点包含 | 岗位地点至少命中一个目标词 | 不限制地点 |
+| 地点排除 | 命中任意排除地点就跳过 | 不排除地点 |
+| 地点匹配：包含 | `广州` 可匹配 `广州·天河区` | — |
+| 地点匹配：精确 | 规范化后的地点必须完全相同 | — |
+| 最低月薪（元） | 岗位薪资上限低于该值时排除 | 不设下限 |
+| 最高月薪（元） | 岗位薪资下限高于该值时排除 | 不设上限 |
+| HR 活跃 | 可选不限、今日、3 日内、一周内 | 不限 |
+| 排除猎头 | 识别为猎头岗位时跳过 | 默认开启 |
+| 排除外包/驻场 | 识别为外包或驻场时跳过 | 默认开启 |
+
+薪资统一填写月薪金额，例如 `15000`，不要填写 `15K`。
+
+### 公司名单
+
+| 参数 | 作用 |
+|---|---|
+| 公司黑名单 | 公司名命中任意词就排除 |
+| 公司白名单 | 记录允许优先处理的公司 |
+| 仅投白名单公司 | 开启后，未命中白名单的公司全部跳过 |
+
+![筛选页](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/02-filter.png)
+
+## 消息参数
+
+### 发送模式
+
+| 模式 | 行为 | 适用情况 |
+|---|---|---|
+| 自动识别（推荐） | 检查当前会话最近的本人消息；若与第 1 段相似，就从第 2 段开始发送 | 不确定 BOSS 是否已经发送原生招呼语 |
+| 使用原生打招呼 + 插件补充 | 固定跳过模板第 1 段，从第 2 段开始发送 | 已确认 BOSS 一定会发送原生招呼语 |
+| 完全由插件发送 | 发送所有已启用的消息段 | 已关闭原生招呼语 |
+
+`相似度阈值` 可填 `0.5` 到 `1`，默认 `0.85`。值越低越容易判定为重复，从而跳过第 1 段；值越高要求文字越接近，误判重复更少，但也更可能再次发送近似内容。
+
+### 消息段
+
+- 每一段可以单独启用或删除。
+- 发送顺序就是页面中的段落顺序。
+- 同一岗位的同一段发送成功后会记录幂等键，刷新或恢复任务不会重复发送。
+- 段与段之间、岗位与岗位之间有随机等待，不能在面板修改。
+
+支持以下变量：
+
+| 变量 | 替换内容 |
+|---|---|
+| `{HR称呼}` | HR 名称；无法识别时使用 `HR` |
+| `{职位名称}` | 当前岗位名称 |
+| `{公司名称}` | 当前公司名称 |
+| `{匹配技能}` | 扫描阶段识别到的匹配技能 |
+| `{工作城市}` | 当前岗位城市或地点 |
+
+变量无法解析时，该消息段不会盲目发送，日志会显示失败原因。
+
+![消息页](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/03-message.png)
+
+## 简历参数
+
+### 发送开关
+
+| 参数 | 作用 |
+|---|---|
+| 自动发送图片简历 | 依次发送当前方案中的图片 |
+| 自动点击 BOSS“发简历” | 在匹配的聊天页点击 BOSS 自带的“发简历”按钮；不上传本地附件 |
+| 发送时机：文本发送完成后立即发送 | 文本收到成功回执后再发简历，推荐使用 |
+| 发送时机：文本后发送（兼容旧配置） | 只用于读取旧配置；当前版本不会据此自动发简历 |
+| 发送时机：仅手动 | 插件不自动发送任何简历 |
+
+图片简历的单张源文件上限是 `8 MB`，导入后会自动压缩再保存。因此 `3.60 MB` 不超限。多张图片仍会占用浏览器本地存储；若提示存储不足，减少图片数量或分辨率。
+
+BOSS 在线简历不需要选择文件。开启“自动点击 BOSS‘发简历’”后，插件只操作聊天页的“发简历”按钮，并等待页面确认信号。
+
+### 求职方案
+
+| 参数 | 作用 |
+|---|---|
+| 方案名称 | 用来区分不同方向，例如“广州 AI 岗” |
+| 图片简历 | 可多选；按页面显示顺序发送 |
+| 设为默认 | 没有绑定规则命中时使用该方案 |
+| 清空图片 | 只清除当前编辑方案的图片 |
+| 删除方案 | 删除当前方案；至少保留一个可用方案 |
+
+### 绑定规则
+
+| 参数 | 作用 |
+|---|---|
+| 关键词 | 在职位名和 JD 中匹配，任意一个词命中即算命中 |
+| 绑定方案 | 命中后使用哪一份求职方案 |
+| 优先级 | 数字越小越先判断；第一个命中的规则生效 |
+
+没有规则命中时使用默认方案。
+
+![简历页](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/04-resume.png)
+
+## 设置参数
+
+| 参数 | 默认值 | 作用 |
+|---|---:|---|
+| 本次最多沟通 | `30` | 当前任务允许成功创建沟通的最大岗位数 |
+| 每日最多沟通 | `80` | 当天累计沟通上限 |
+| 同公司每天最多 | `3` | 同一公司当天的沟通上限 |
+| 同 HR 冷却天数 | `30` | 冷却期内不再联系同一 HR；填 `0` 表示不冷却 |
+| 连续失败暂停 | `3` | 连续失败达到该次数后自动暂停，等待人工检查 |
+| 同一职位永不重复 | 开启 | 已投递职位以后不再进入队列 |
+
+“导出 JSON”会导出筛选、消息、设置和简历方案。“导入 JSON”会恢复这些配置。导出文件可能包含图片简历数据，不要公开上传。
+
+![设置页](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/05-settings.png)
+
+## 任务按钮
+
+| 按钮 | 作用 |
+|---|---|
+| 扫描预览 | 读取当前职位列表，运行全部筛选和防重复规则，不发送消息 |
+| 页面诊断 | 检查当前页面类型、关键选择器和内容脚本状态 |
+| 确认投递 | 对预览中已勾选的岗位建立队列并开始处理 |
+| 投递一份测试 | 只取当前勾选的第一个通过岗位，验证完整流程 |
+| 暂停 | 当前安全步骤结束后暂停，保留队列 |
+| 继续 | 从保存的游标恢复 |
+| 跳过当前 | 标记当前岗位为跳过并继续下一个 |
+| 停止 | 停止任务并汇报成功、跳过、失败、已处理数量 |
+| 全选通过项 | 批量勾选或取消预览中的通过岗位 |
+| 复制 / 清空日志 | 复制诊断日志或清除面板日志 |
+
+“确认投递”前必须核对岗位范围和消息内容。不要在无人看管时长时间运行。
+
+## 常见问题
+
+### 面板显示“未连接页面”
+
+确认当前网址属于 `zhipin.com` 或 `bosszhipin.com`，然后按 `F5` 刷新。只关闭再打开面板不能恢复已经失效的内容脚本。
+
+### 打开了职位，但没有切换到正确聊天
+
+先点“页面诊断”，再复制日志。当前版本会按职位、公司和 HR 综合匹配会话；无法确认目标会话时会暂停，不会把消息发到未知会话。
+
+### 日志显示消息已填入，但没有发送成功
+
+插件只把“聊天页出现本人新消息”视为成功回执。超时会记为失败或暂停，不会把“点击过按钮”伪装成发送成功。
+
+### “发简历”没有执行
+
+确认已经开启“自动点击 BOSS‘发简历’”，并选择“文本发送完成后立即发送”。若 BOSS 当前会话没有该按钮，插件会记录 `not_found`，不会退回到上传本地附件。
+
+### 页面改版后全部扫描失败
+
+运行“页面诊断”，把浏览器版本、扩展版本、当前页面 URL 和日志一起提交到 [Issues](https://github.com/gstranded/boss-haitou-assistant/issues)。
+
+## 数据与权限
+
+- 配置、历史、任务状态和图片简历保存在浏览器本地扩展存储中。
+- 扩展不提供自建服务器，不会把简历或聊天内容上传给作者。
+- 扩展只声明 BOSS 相关域名访问权限。
+- `tabs`、`scripting` 用于定位并恢复 BOSS 列表页和聊天页；`storage`、`unlimitedStorage` 用于本地配置、任务恢复和图片简历。
+- 卸载扩展会删除浏览器管理的本地扩展数据。也可以先导出配置，再从扩展管理页移除扩展。
+
+完整说明见 [隐私政策](PRIVACY.md)。
+
+## 使用边界
+
+1. 本项目与 BOSS 直聘无隶属或合作关系。
+2. 用户必须在预览页确认岗位范围和消息内容，并对发送行为负责。
+3. 请遵守目标网站条款、账号限制和当地法律，不要发送骚扰、欺诈或无关消息。
+4. 自动化会带来误投、限流或封禁风险。建议先投递一份测试，并使用保守上限。
+5. Chrome Web Store 要求代用户发消息前可确认内容和收件人；Microsoft Edge Add-ons 对自动生成或发送疑似垃圾消息的功能限制更严。当前 GitHub 版本不代表已经满足商店审核要求。
+
+商店准备和阻断项见 [上架清单](docs/STORE_PUBLISHING.md)。
+
+## 开发与测试
 
 ```bash
 npm test
-# 或
-node scripts/smoke-test.mjs
+npm run smoke
 ```
 
----
+项目入口：
 
-## 📚 文档
+```text
+extension/                 可直接加载的 MV3 扩展
+├─ background/             队列、状态机、发送回执
+├─ content/                BOSS 页面识别与交互
+├─ sidepanel/              面板 UI
+├─ shared/                 筛选、模板、去重、会话匹配
+└─ manifest.json
+```
 
-- [产品需求 PRD](docs/requirements/PRD.md)
-- [功能规格 FRS](docs/requirements/FRS.md)
-- [非功能需求 NFR](docs/requirements/NFR.md)
-- [架构决策 ADR](docs/adr/README.md)
-- [原因码表](docs/requirements/reason-codes.md)
+发布流程见 [Release 说明维护](docs/RELEASE_PROCESS.md)。每个 GitHub Release 必须使用中文写明“本次更新”和“修复的问题”。
 
----
-
-## 🌐 兼容性
-
-- 浏览器：Chromium 内核（Chrome / Edge）最新两个大版本
-- 平台：BOSS 直聘 Web（`*.zhipin.com`）
-- Manifest：V3
-- 扩展 UI 语言：简体中文（默认） / English（`_locales`）
-
----
-
-## ⚠️ 使用边界
-
-1. 本工具是**用户可控的辅助扩展**，不是“绕过平台风控”工具。
-2. 请合理设置频率上限，遵守 BOSS 直聘平台规则与账号安全要求。
-3. 简历与配置默认仅存本地；导出 JSON 请自行妥善保管。
-4. BOSS 页面改版可能导致选择器失效，可用「页面诊断」快速确认。
-5. 图片 / 附件自动上传依赖页面上传控件，失败时请手动补发。
-
----
-
-## 🗺️ 路线图
-
-- [x] V1：预览门禁、可解释筛选、多段去重、多简历方案、任务恢复
-- [ ] V2：多套完整求职方案一键切换、漏斗统计、规则解释增强
-- [ ] V2：AI 回复建议（生成 → 确认 → 发送，非默认全自动）
-- [ ] 跟进提醒与一键操作
-
----
-
-## 🤝 贡献
-
-欢迎 Issue / PR：
-
-1. Fork 本仓库
-2. 创建特性分支
-3. 提交改动
-4. 发起 Pull Request
-
-开发时请优先保证：
-- 预览门禁不被破坏
-- 跳过 / 失败有可读原因
-- 不引入“绕过风控”类能力
-
----
-
-## 📄 License
+## License
 
 [MIT](LICENSE) © 2026 gstranded
-
----
-
-<p align="center">
-  如果这个项目对你有帮助，欢迎点一个 ⭐ Star
-</p>

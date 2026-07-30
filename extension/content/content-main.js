@@ -8,6 +8,7 @@
     GET_CHAT_SELF_MESSAGES: "BHT_GET_CHAT_SELF_MESSAGES",
     SEND_TEXT: "BHT_SEND_TEXT",
     SEND_IMAGE: "BHT_SEND_IMAGE",
+    SEND_RESUME: "BHT_SEND_RESUME",
     HIGHLIGHT_JOBS: "BHT_HIGHLIGHT_JOBS",
     ENSURE_JOB_LIST: "BHT_ENSURE_JOB_LIST",
     RETURN_TO_LIST: "BHT_RETURN_TO_LIST",
@@ -16,7 +17,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.5.2";
+  const BHT_CONTENT_VERSION = "1.5.4";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -1922,7 +1923,7 @@ async function startChat(job, opts = {}) {
     return true;
   }
 
-  async function sendText(text) {
+  async function sendText(text, context = {}) {
     if (!text || !String(text).trim()) return { ok: false, error: "EMPTY_TEXT" };
     dismissCommonDialogs();
     let ready = await waitForChat(10000);
@@ -1937,7 +1938,7 @@ async function startChat(job, opts = {}) {
       return { ok: false, error: "INPUT_NOT_FOUND", message: "未找到可用聊天输入框" };
     }
 
-    const before = getSelfMessages(8);
+    const before = getSelfMessages(24);
     await setInputText(input, text);
     await sleep(280);
 
@@ -1962,37 +1963,21 @@ async function startChat(job, opts = {}) {
       fireKey({ key: "Enter", code: "Enter", keyCode: 13, which: 13 });
     }
 
-    const needle = needleFull.slice(0, 18);
+    const needle = needleFull;
     let confirmed = false;
     let selfTail = [];
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 25; i++) {
       await sleep(220);
       if (typeof detectLoginModal === "function") {
         const loginHit = detectLoginModal();
         if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
       }
-      selfTail = getSelfMessages(12);
-      confirmed = selfTail.some((m) => {
-        const n = String(m).replace(/\s+/g, "");
-        return n.includes(needle) || (needle.length > 8 && needle.includes(n.slice(0, 10)));
-      });
-      // 输入框被清空也视为已发送
-      if (!confirmed) {
-        const nowVal = (input.value || input.textContent || input.innerText || "").replace(/\s+/g, "");
-        if (nowVal.length === 0 && i >= 2) confirmed = true;
-      }
-      if (!confirmed && selfTail.length > before.length) {
-        confirmed = true;
-      }
+      selfTail = getSelfMessages(24);
+      // 只接受“自己的消息列表发生变化且出现预期文本”；输入框清空不能证明服务端已发送。
+      confirmed = ConversationMatch?.confirmRenderedOwnMessage
+        ? ConversationMatch.confirmRenderedOwnMessage(before, selfTail, needle)
+        : false;
       if (confirmed) break;
-      if (i === 3 || i === 7 || i === 10) {
-        const btn2 = findSendButton();
-        if (btn2) clickLikeHuman(btn2);
-        else {
-          try { input.focus(); } catch (_) {}
-          input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-        }
-      }
     }
 
     if (!confirmed) {
@@ -2003,7 +1988,215 @@ async function startChat(job, opts = {}) {
         selfTail
       };
     }
-    return { ok: true, confirmed: true, selfTail: selfTail.slice(-3), contentVersion: BHT_CONTENT_VERSION };
+    const activeConversation = getActiveConversationIdentity();
+    const sentAt = Date.now();
+    const receipt = {
+      type: "TEXT_SENT",
+      status: "confirmed",
+      receiptId: "text_" + sentAt + "_" + Math.random().toString(36).slice(2, 10),
+      jobId: context.jobId || "",
+      segmentIndex: Number.isInteger(context.segmentIndex) ? context.segmentIndex : null,
+      conversationKey: context.conversationKey || activeConversation.key || "",
+      confirmedVia: "self-message-dom",
+      sentAt,
+      contentVersion: BHT_CONTENT_VERSION
+    };
+    return {
+      ok: true,
+      confirmed: true,
+      receipt,
+      activeConversation,
+      selfTail: selfTail.slice(-3),
+      contentVersion: BHT_CONTENT_VERSION
+    };
+  }
+
+  function visibleActionElement(el) {
+    if (!el || el.getAttribute?.("aria-hidden") === "true") return false;
+    try {
+      const style = getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width > 8 && rect.height > 8;
+    } catch (_) {
+      return true;
+    }
+  }
+
+  function compactActionText(el) {
+    return textOf(el).replace(/\s+/g, "");
+  }
+
+  function findPlatformResumeButton({ includeAlreadySent = true } = {}) {
+    const chatRoot = getChatRoot() || document.getElementById("bht-mock-chat") || document;
+    const roots = [chatRoot, chatRoot?.parentElement, document].filter(Boolean);
+    const seen = new Set();
+    const candidates = [];
+    for (const root of roots) {
+      try {
+        for (const el of root.querySelectorAll("button, a, [role='button'], .btn, .chat-tool span, .chat-action span")) {
+          if (seen.has(el)) continue;
+          seen.add(el);
+          if (!visibleActionElement(el)) continue;
+          candidates.push(el);
+        }
+      } catch (_) {}
+    }
+    const sentPattern = /^(已发简历|简历已发送|已发送简历)$/;
+    if (includeAlreadySent) {
+      const already = candidates.find((el) => sentPattern.test(compactActionText(el)));
+      if (already) return { el: already, already: true };
+    }
+    const sendPattern = /^(发简历|发送简历|投递简历)$/;
+    const button = candidates.find((el) =>
+      sendPattern.test(compactActionText(el)) &&
+      !el.disabled &&
+      el.getAttribute?.("aria-disabled") !== "true"
+    );
+    return button ? { el: button, already: false } : null;
+  }
+
+  function findResumeConfirmButton() {
+    const dialogs = Array.from(document.querySelectorAll(
+      "[role='dialog'], .boss-dialog, .dialog-wrap, .dialog-container, .modal, .dialog"
+    )).filter((el) => visibleActionElement(el) && /简历/.test(textOf(el)));
+    for (const dialog of dialogs) {
+      const buttons = Array.from(dialog.querySelectorAll("button, a, [role='button'], .btn"))
+        .filter(visibleActionElement);
+      const confirm = buttons.find((el) =>
+        /^(发送|确定发送|确认发送|确认|确定)$/.test(compactActionText(el)) &&
+        !/取消|关闭/.test(compactActionText(el))
+      );
+      if (confirm) return confirm;
+    }
+    return null;
+  }
+
+  function resumeSuccessTextVisible() {
+    const selectors = [
+      ".toast",
+      ".toast-content",
+      ".message-tip",
+      ".alert",
+      "[role='status']",
+      "[role='dialog']",
+      ".boss-dialog",
+      ".dialog-wrap"
+    ];
+    try {
+      return Array.from(document.querySelectorAll(selectors.join(",")))
+        .filter(visibleActionElement)
+        .slice(-20)
+        .some((el) => {
+          const text = compactActionText(el);
+          return /简历.*(发送成功|已发送)|(发送成功|已发送).*简历/.test(text);
+        });
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function sendPlatformResume(context = {}) {
+    dismissCommonDialogs();
+    const ready = await waitForChat(10000);
+    if (!ready) {
+      return { ok: false, error: "CHAT_TIMEOUT", message: "聊天输入框未就绪，无法发送 BOSS 在线简历" };
+    }
+
+    const found = findPlatformResumeButton({ includeAlreadySent: true });
+    if (!found) {
+      return {
+        ok: false,
+        error: "RESUME_BUTTON_NOT_FOUND",
+        message: "聊天页未找到「发简历」按钮",
+        contentVersion: BHT_CONTENT_VERSION
+      };
+    }
+
+    const activeConversation = getActiveConversationIdentity();
+    const makeReceipt = (confirmedVia, already = false) => {
+      const sentAt = Date.now();
+      return {
+        type: "RESUME_SENT",
+        status: "confirmed",
+        receiptId: "resume_" + sentAt + "_" + Math.random().toString(36).slice(2, 10),
+        jobId: context.jobId || "",
+        conversationKey: context.conversationKey || activeConversation.key || "",
+        confirmedVia,
+        already,
+        sentAt,
+        contentVersion: BHT_CONTENT_VERSION
+      };
+    };
+
+    if (found.already) {
+      return {
+        ok: true,
+        confirmed: true,
+        already: true,
+        receipt: makeReceipt("button-already-sent", true),
+        activeConversation,
+        contentVersion: BHT_CONTENT_VERSION
+      };
+    }
+
+    const beforeMessages = getSelfMessages(30);
+    clickLikeHuman(found.el);
+
+    // 某些版本会弹出二次确认，只在“包含简历”的对话框内点击一次确认。
+    for (let i = 0; i < 8; i++) {
+      await sleep(200);
+      const confirm = findResumeConfirmButton();
+      if (confirm) {
+        clickLikeHuman(confirm);
+        break;
+      }
+    }
+
+    let confirmedVia = "";
+    let selfTail = beforeMessages;
+    for (let i = 0; i < 28; i++) {
+      await sleep(250);
+      selfTail = getSelfMessages(30);
+      const beforeSignature = beforeMessages.map((message) => String(message).replace(/\s+/g, "")).join("\n");
+      const afterSignature = selfTail.map((message) => String(message).replace(/\s+/g, "")).join("\n");
+      const resumeCardAdded =
+        beforeSignature !== afterSignature &&
+        selfTail.slice(-6).some((message) => /简历|在线简历|附件简历/.test(String(message)));
+      if (resumeCardAdded) {
+        confirmedVia = "self-message-resume-card";
+        break;
+      }
+      if (resumeSuccessTextVisible()) {
+        confirmedVia = "resume-success-status";
+        break;
+      }
+      const afterButton = findPlatformResumeButton({ includeAlreadySent: true });
+      if (afterButton?.already || (afterButton?.el && (afterButton.el.disabled || afterButton.el.getAttribute?.("aria-disabled") === "true"))) {
+        confirmedVia = "resume-button-state";
+        break;
+      }
+    }
+
+    if (!confirmedVia) {
+      return {
+        ok: false,
+        error: "RESUME_SEND_NOT_CONFIRMED",
+        message: "已点击「发简历」，但页面没有返回可验证的发送成功状态",
+        selfTail: selfTail.slice(-5),
+        activeConversation,
+        contentVersion: BHT_CONTENT_VERSION
+      };
+    }
+
+    return {
+      ok: true,
+      confirmed: true,
+      receipt: makeReceipt(confirmedVia),
+      activeConversation,
+      selfTail: selfTail.slice(-5),
+      contentVersion: BHT_CONTENT_VERSION
+    };
   }
 
   async function sendImageFromDataUrl(dataUrl, fileName = "resume.png") {
@@ -2276,7 +2469,13 @@ async function startChat(job, opts = {}) {
   }
 
   
+  const ConversationMatch = globalThis.BHTConversationMatch;
   const CONV_ROW_SELECTORS = [
+    ".user-list .user-list-content .friend-content-warp > .friend-content",
+    ".user-list .friend-content-warp > .friend-content",
+    ".friend-content-warp > .friend-content",
+    ".user-list .friend-content",
+    ".friend-content",
     ".geek-chat-list li",
     ".chat-user-list li",
     ".friend-list-item",
@@ -2288,26 +2487,83 @@ async function startChat(job, opts = {}) {
     ".chat-left li"
   ];
 
+  function conversationIdentityText(el) {
+    if (!el) return "";
+    const fields = [
+      ".friend-name",
+      ".user-name",
+      ".boss-name",
+      ".name-text",
+      ".name-box",
+      ".name",
+      ".company-name",
+      ".company",
+      ".job-name",
+      ".position-name",
+      ".position"
+    ];
+    const values = [];
+    for (const selector of fields) {
+      try {
+        for (const node of el.querySelectorAll(selector)) {
+          const value = textOf(node);
+          if (value && !values.includes(value)) values.push(value);
+        }
+      } catch (_) {}
+    }
+    if (values.length) return values.slice(0, 5).join("|");
+    return String(el.innerText || el.textContent || "")
+      .split(/\n+/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter((line) => !/^(今天|昨天|前天|\d{1,2}:\d{2}|\d{1,2}月\d{1,2}日|\d+)$/.test(line))
+      .slice(0, 3)
+      .join("|");
+  }
+
   function conversationKeyFromEl(el) {
     if (!el) return "";
     const a = el.closest?.("a[href]") || el.querySelector?.("a[href]") || (el.tagName === "A" ? el : null);
     const href = a?.href || a?.getAttribute?.("href") || "";
-    const dataId =
-      el.getAttribute?.("data-id") ||
-      el.getAttribute?.("data-uid") ||
-      el.getAttribute?.("data-boss-id") ||
-      el.getAttribute?.("data-convid") ||
-      el.dataset?.id ||
-      el.dataset?.uid ||
-      "";
-    const t = textOf(el).slice(0, 80);
-    return String(dataId || href || t);
+    const carriers = [
+      el,
+      el.closest?.(".friend-content-warp"),
+      el.parentElement,
+      el.parentElement?.parentElement
+    ].filter(Boolean);
+    let dataId = "";
+    for (const carrier of carriers) {
+      dataId =
+        carrier.getAttribute?.("data-id") ||
+        carrier.getAttribute?.("data-uid") ||
+        carrier.getAttribute?.("data-boss-id") ||
+        carrier.getAttribute?.("data-convid") ||
+        carrier.getAttribute?.("data-conversation-id") ||
+        carrier.getAttribute?.("data-friend-id") ||
+        carrier.dataset?.id ||
+        carrier.dataset?.uid ||
+        carrier.dataset?.bossId ||
+        carrier.dataset?.conversationId ||
+        carrier.dataset?.friendId ||
+        "";
+      if (dataId) break;
+    }
+    const identityText = conversationIdentityText(el);
+    const text = textOf(el);
+    if (ConversationMatch?.stableConversationKey) {
+      return ConversationMatch.stableConversationKey({ dataId, href, identityText, text });
+    }
+    return String(dataId || href || identityText || text.slice(0, 80));
   }
 
   function queryConversationRows() {
     for (const sel of CONV_ROW_SELECTORS) {
       try {
-        const list = Array.from(document.querySelectorAll(sel));
+        const list = Array.from(document.querySelectorAll(sel)).filter((el, index, all) => {
+          if (!el || all.indexOf(el) !== index || el.getAttribute?.("aria-hidden") === "true") return false;
+          const text = textOf(el);
+          return text.length > 1;
+        });
         if (list.length >= 1) return { sel, nodes: list };
       } catch (_) {}
     }
@@ -2318,8 +2574,9 @@ async function startChat(job, opts = {}) {
   function getActiveConversationIdentity() {
     const { nodes } = queryConversationRows();
     const active =
-      nodes.find((el) => /active|selected|current|on/i.test(el.className || "")) ||
-      nodes.find((el) => el.getAttribute?.("aria-selected") === "true") ||
+      nodes.find((el) => ConversationMatch?.hasActiveState
+        ? ConversationMatch.hasActiveState(el.className || "", el.getAttribute?.("aria-selected"))
+        : /(^|\s)(active|selected|current|on)(\s|$)/i.test(el.className || "")) ||
       null;
     const headEl =
       document.querySelector(".chat-top, .chat-header, .conversation-header, .base-info-single, .chat-main .base-info, .chat-person, .base-info") ||
@@ -2357,7 +2614,9 @@ async function startChat(job, opts = {}) {
         key,
         text: text.slice(0, 120),
         name: text.split(/\s+/)[0] || "",
-        active: /active|selected|current/i.test(el.className || ""),
+        active: ConversationMatch?.hasActiveState
+          ? ConversationMatch.hasActiveState(el.className || "", el.getAttribute?.("aria-selected"))
+          : /(^|\s)(active|selected|current|on)(\s|$)/i.test(el.className || ""),
         selector: sel
       };
     }).filter((x) => x.text.length > 1);
@@ -2445,48 +2704,23 @@ async function startChat(job, opts = {}) {
       dismissCommonDialogs();
       lastSnap = getConversationSnapshot();
       const items = lastSnap.items || [];
-      const candidates = items.filter((it) => it.key && !beforeKeys.has(it.key));
-
-      const scored = items.map((it) => {
-        const t = normalizeText(it.text);
-        let score = 0;
-        if (wantCompany && t.includes(wantCompany.slice(0, Math.min(4, wantCompany.length)))) score += 40;
-        if (wantCompany && t.includes(wantCompany)) score += 30;
-        if (wantTitle && t.includes(wantTitle.slice(0, Math.min(6, wantTitle.length)))) score += 35;
-        if (wantTitle && t.includes(wantTitle)) score += 40;
-        if (wantHr && t.includes(wantHr)) score += 25;
-        if (candidates.some((c) => c.key === it.key)) {
-          score += 35;
-          // 列表越靠前（越新）加分越多
-          score += Math.max(0, 15 - (it.index || 0));
-        }
-        return { it, score };
-      }).filter((x) => x.score >= 40).sort((a, b) => (b.score - a.score) || ((a.it.index || 0) - (b.it.index || 0)));
-
-      let pick = null;
-      let via = "";
-      if (scored[0] && scored[0].score >= 55) {
-        if (scored[1] && scored[1].score >= scored[0].score - 5 && scored[0].score < 90) {
-          return {
-            ok: false,
-            error: "CONVERSATION_AMBIGUOUS",
-            message: "消息列表中匹配到多个相似会话，已暂停避免发错人",
-            top: scored.slice(0, 3).map((s) => ({ score: s.score, text: s.it.text })),
-            contentVersion: BHT_CONTENT_VERSION
-          };
-        }
-        pick = scored[0].it;
-        via = "score:" + scored[0].score;
-      } else if (candidates.length === 1) {
-        pick = candidates[0];
-        via = "new-single";
-      } else if (candidates.length > 1 && wantCompany) {
-        const byCo = candidates.filter((it) => normalizeText(it.text).includes(wantCompany.slice(0, 4)));
-        if (byCo.length === 1) {
-          pick = byCo[0];
-          via = "new+company";
-        }
+      const selection = ConversationMatch?.selectConversationCandidate
+        ? ConversationMatch.selectConversationCandidate(items, job, beforeKeys)
+        : { ok: false, error: "CONVERSATION_NOT_FOUND", top: [] };
+      if (!selection.ok && selection.error === "CONVERSATION_AMBIGUOUS") {
+        return {
+          ok: false,
+          error: "CONVERSATION_AMBIGUOUS",
+          message: "消息列表中匹配到多个相似会话，已暂停避免发错人",
+          top: (selection.top || []).slice(0, 3).map((entry) => ({
+            score: entry.score,
+            text: entry.item?.text || ""
+          })),
+          contentVersion: BHT_CONTENT_VERSION
+        };
       }
+      const pick = selection.ok ? selection.item : null;
+      const via = selection.ok ? selection.via : "";
 
       if (pick) {
         const before = getActiveConversationIdentity();
@@ -2502,7 +2736,7 @@ async function startChat(job, opts = {}) {
           };
         }
         const clickable =
-          row.querySelector("a[href], [role='button'], .user-item, .friend-item, .conversation-item, .geek-info-card") ||
+          row.querySelector("a[href], [role='button'], .friend-content, .user-item, .friend-item, .conversation-item, .geek-info-card") ||
           row;
         try { clickable.scrollIntoView({ block: "center", behavior: "instant" }); } catch (_) {}
         clickLikeHuman(clickable);
@@ -2520,11 +2754,13 @@ async function startChat(job, opts = {}) {
           const headOk = conversationHeaderMatches(job);
           const textOnHead = pick.text && normalizeText(after.head || "").includes(normalizeText(pick.text).slice(0, 6));
           // 列表项自身变 active
-          const rowActive = /active|selected|current/i.test(row.className || "") || row.getAttribute?.("aria-selected") === "true";
+          const rowActive = ConversationMatch?.hasActiveState
+            ? ConversationMatch.hasActiveState(row.className || "", row.getAttribute?.("aria-selected"))
+            : /(^|\s)(active|selected|current|on)(\s|$)/i.test(row.className || "");
           // 输入框出现也算打开成功的强信号（但还要头部/公司校验）
           const inputReady = hasUsableChatInput();
 
-          if (keyChanged) { switched = true; switchVia = "key-changed"; break; }
+          if (keyChanged && (keyIsPick || headOk)) { switched = true; switchVia = "key-changed+identity"; break; }
           if (keyIsPick) { switched = true; switchVia = "key-is-pick"; break; }
           if (headOk) { switched = true; switchVia = "header-match"; break; }
           if (rowActive && (headOk || textOnHead || inputReady)) { switched = true; switchVia = "row-active"; break; }
@@ -2533,7 +2769,7 @@ async function startChat(job, opts = {}) {
           }
 
           if (i === 3 || i === 8 || i === 14) {
-            const a = row.querySelector("a[href], [role='button'], .user-item, .friend-item") || row;
+            const a = row.querySelector("a[href], [role='button'], .friend-content, .user-item, .friend-item") || row;
             clickLikeHuman(a);
           }
         }
@@ -2565,13 +2801,19 @@ async function startChat(job, opts = {}) {
           };
         }
 
-        // 身份：优先头部；头部空则用候选列表文本
+        // 身份必须来自已打开的头部或真正处于 active 状态的候选行，不能只凭“点过的文本”放行。
         const activeNow = getActiveConversationIdentity();
         const headN = normalizeText(activeNow.head || "");
         const pickN = normalizeText(pick.text || "");
-        const contextN = headN || pickN;
+        const activeIsPick = Boolean(
+          activeNow.key &&
+          pick.key &&
+          (activeNow.key === pick.key || activeNow.key.includes(String(pick.key).slice(0, 12)))
+        );
+        const contextN = normalizeText([headN, activeIsPick ? pickN : "", activeIsPick ? activeNow.text : ""].join(" "));
         let idOk = true;
-        if (wantCompany && contextN && !contextN.includes(wantCompany.slice(0, 3))) idOk = false;
+        if (!contextN) idOk = false;
+        if (wantCompany && !contextN.includes(wantCompany.slice(0, 3))) idOk = false;
         if (wantTitle && contextN && !contextN.includes(wantTitle.slice(0, 4)) && !pickN.includes(wantTitle.slice(0, 4))) {
           // 岗位名在列表预览里常被截断，仅公司命中也可
           if (!(wantCompany && contextN.includes(wantCompany.slice(0, 3)))) idOk = false;
@@ -2644,7 +2886,7 @@ async function startChat(job, opts = {}) {
 
 async function runOpByType(type, payload = {}) {
     const lockKey = String(type || '');
-    const needLock = /START_CHAT|SEND_TEXT|SEND_IMAGE|SCAN_JOBS/.test(lockKey) || /BHT_START_CHAT|BHT_SEND_TEXT|BHT_SEND_IMAGE|BHT_SCAN_JOBS/.test(lockKey);
+    const needLock = /START_CHAT|SEND_TEXT|SEND_IMAGE|SEND_RESUME|SCAN_JOBS/.test(lockKey) || /BHT_START_CHAT|BHT_SEND_TEXT|BHT_SEND_IMAGE|BHT_SEND_RESUME|BHT_SCAN_JOBS/.test(lockKey);
     if (needLock) {
       if (window.__BHT_OP_LOCK__) {
         return { ok: false, error: 'OP_BUSY', message: '已有操作进行中', contentVersion: BHT_CONTENT_VERSION };
@@ -2689,10 +2931,13 @@ async function runOpByType(type, payload = {}) {
         return { ok: true, messages: getSelfMessages(payload?.limit || 8) };
       case MSG.SEND_TEXT:
       case "BHT_SEND_TEXT":
-        return await sendText(payload?.text || "");
+        return await sendText(payload?.text || "", payload || {});
       case MSG.SEND_IMAGE:
       case "BHT_SEND_IMAGE":
         return await sendImageFromDataUrl(payload?.dataUrl, payload?.fileName);
+      case MSG.SEND_RESUME:
+      case "BHT_SEND_RESUME":
+        return await sendPlatformResume(payload || {});
       case MSG.HIGHLIGHT_JOBS:
       case "BHT_HIGHLIGHT_JOBS":
         return highlightJobs(payload?.map || {});
@@ -2768,7 +3013,7 @@ async function runOpByType(type, payload = {}) {
         // START_CHAT 允许更长；超时不强制清锁抢跑，由 finally 统一释放
         const opTimeoutMs = /START_CHAT/.test(String(opType || ""))
           ? 45000
-          : /SEND_TEXT|SEND_IMAGE|SCAN_JOBS/.test(String(opType || ""))
+          : /SEND_TEXT|SEND_IMAGE|SEND_RESUME|SCAN_JOBS/.test(String(opType || ""))
             ? 30000
             : 15000;
 

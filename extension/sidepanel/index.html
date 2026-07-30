@@ -157,9 +157,9 @@
         <section class="panel" id="tab-resume">
           <div class="card">
             <div class="card-title">发送策略</div>
-            <div class="hint auto-resume-hint">自动发图片简历需同时满足：①勾选本项 ②上传图片 ③发送时机选「文本发送完成后立即发送」</div>
+            <div class="hint auto-resume-hint">图片简历支持 ≤ 8 MB 源文件并自动压缩；BOSS 在线简历无需上传文件，直接点击聊天页「发简历」。</div>
             <label class="check"><input type="checkbox" id="autoSendImageResume" />自动发送图片简历</label>
-            <label class="check"><input type="checkbox" id="autoSendAttachmentResume" />自动发送附件简历</label>
+            <label class="check"><input type="checkbox" id="autoSendAttachmentResume" />自动点击 BOSS「发简历」</label>
             <label>发送时机</label>
             <select id="resumeSendTiming">
               <option value="on_request">文本后发送（兼容旧配置）</option>
@@ -181,14 +181,12 @@
             <div class="card-title">当前方案内容</div>
             <label>方案名称</label>
             <input id="profileName" placeholder="例如：广州 AI 岗" />
-            <label>图片简历（可多选，按选择顺序串行发送）</label>
+            <label>图片简历（源文件单张 ≤ 8 MB，导入后自动压缩）</label>
             <input id="imageFiles" type="file" accept="image/*" multiple />
             <div id="imagePreview" class="thumbs"></div>
             <button id="btnClearImages" class="btn tiny">清空图片</button>
-            <label>附件简历（PDF/DOC/DOCX）</label>
-            <input id="attachFile" type="file" accept=".pdf,.doc,.docx,application/pdf" />
-            <div id="attachInfo" class="hint"></div>
-            <button id="btnClearAttach" class="btn tiny">清除附件</button>
+            <label>BOSS 在线简历</label>
+            <div id="attachInfo" class="hint">无需上传本地附件；启用上方开关后，插件会在聊天页点击「发简历」。</div>
             <div class="btn-row" style="margin-top:10px">
               <button id="btnSaveResume" class="btn primary">保存当前方案</button>
               <button id="btnSetDefaultProfile" class="btn">设为默认</button>

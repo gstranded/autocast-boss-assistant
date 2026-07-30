@@ -7,7 +7,15 @@ import { checkDedup, checkLimits, segmentIdempotencyKey, jobIdempotencyKey } fro
 import { renderTemplate, pickResumeProfile } from "../extension/shared/template.js";
 import { isBossUrl, isBossHostname, isBossTab, bossUrlGuardMessage } from "../extension/shared/boss-url.js";
 import { reasonText, REASON } from "../extension/shared/reason-codes.js";
+import "../extension/shared/conversation-match.js";
 import fs from "fs";
+
+const {
+  hasActiveState,
+  stableConversationKey,
+  selectConversationCandidate,
+  confirmRenderedOwnMessage
+} = globalThis.BHTConversationMatch;
 
 let passed = 0;
 function test(name, fn) {
@@ -215,8 +223,89 @@ test("screenshots valid png", () => {
 });
 test("manifest version + hosts", () => {
   const m = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
+  assert.equal(m.version, "1.5.4");
   assert.ok(m.host_permissions.some((h) => h.includes("zhipin.com")));
   assert.ok(m.content_scripts[0].matches.every((h) => h.includes("zhipin.com") || h.includes("bosszhipin.com")));
+  assert.equal(m.content_scripts[0].js[0], "shared/conversation-match.js");
+});
+
+console.log("8) conversation selection + delivery receipt");
+test("friend-content is not mistaken for active", () => {
+  assert.equal(hasActiveState("friend-content", ""), false);
+  assert.equal(hasActiveState("friend-content active", ""), true);
+  assert.equal(hasActiveState("friend-content", "true"), true);
+});
+test("stable conversation key ignores changing preview text", () => {
+  const a = stableConversationKey({
+    identityText: "王女士|示例科技|Java 开发",
+    text: "王女士\n示例科技\nJava 开发\n10:21\n您好"
+  });
+  const b = stableConversationKey({
+    identityText: "王女士|示例科技|Java 开发",
+    text: "王女士\n示例科技\nJava 开发\n10:28\n收到简历"
+  });
+  assert.equal(a, b);
+});
+test("select exact company and title conversation", () => {
+  const picked = selectConversationCandidate([
+    { index: 0, key: "a", text: "李女士 其他科技 Java 开发" },
+    { index: 1, key: "b", text: "王女士 示例科技 Java 开发" }
+  ], {
+    company: "示例科技",
+    title: "Java 开发",
+    hrName: "王女士"
+  }, ["a", "b"]);
+  assert.equal(picked.ok, true);
+  assert.equal(picked.item.key, "b");
+});
+test("select the only newly-created conversation", () => {
+  const picked = selectConversationCandidate([
+    { index: 0, key: "new", text: "赵先生 新会话" },
+    { index: 1, key: "old", text: "历史会话" }
+  ], { company: "", title: "" }, ["old"]);
+  assert.equal(picked.ok, true);
+  assert.equal(picked.item.key, "new");
+  assert.equal(picked.via, "new-single");
+});
+test("ambiguous conversations stop instead of guessing", () => {
+  const picked = selectConversationCandidate([
+    { index: 0, key: "a", text: "示例科技 Java 工程师" },
+    { index: 1, key: "b", text: "示例科技 Java 工程师" }
+  ], { company: "示例科技", title: "Java 工程师" }, ["a", "b"]);
+  assert.equal(picked.ok, false);
+  assert.equal(picked.error, "CONVERSATION_AMBIGUOUS");
+});
+test("input clearing alone cannot confirm a send", () => {
+  assert.equal(
+    confirmRenderedOwnMessage(["历史消息"], ["历史消息"], "新的测试消息"),
+    false
+  );
+});
+test("new rendered own message confirms a send", () => {
+  assert.equal(
+    confirmRenderedOwnMessage(["历史消息"], ["历史消息", "新的测试消息"], "新的测试消息"),
+    true
+  );
+});
+test("content script requires rendered own-message receipt", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const sidepanel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const messaging = fs.readFileSync("extension/shared/messaging.js", "utf8");
+  assert.ok(content.includes(".friend-content"));
+  assert.ok(content.includes('".name-box"'));
+  assert.ok(content.includes('confirmedVia: "self-message-dom"'));
+  assert.ok(content.includes("sendPlatformResume"));
+  assert.ok(content.includes('type: "RESUME_SENT"'));
+  assert.ok(!content.includes("输入框被清空也视为已发送"));
+  assert.ok(background.includes("receiptConfirmed"));
+  assert.ok(background.includes("TASK_COMPLETED"));
+  assert.ok(background.includes("TASK_STOPPED"));
+  assert.ok(background.includes("成功投递"));
+  assert.ok(background.includes("MSG.SEND_RESUME"));
+  assert.ok(!background.includes("profile.attachment.dataUrl"));
+  assert.ok(sidepanel.includes("MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024"));
+  assert.ok(messaging.includes("BHT_SEND_RESUME"));
 });
 
 if (process.exitCode) {
