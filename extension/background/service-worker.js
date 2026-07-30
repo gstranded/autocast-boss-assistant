@@ -137,8 +137,134 @@ async function forceInjectContent(tabId) {
   }
 }
 
-async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false } = {}) {
-  const tab = await getActiveBossTab({ allowInactiveBossTab: false });
+
+function jobHrefUsable(href) {
+  const h = String(href || "");
+  return /zhipin\.com|bosszhipin\.com/i.test(h) && /job_detail|jobId=|securityId=|\/job\//i.test(h);
+}
+
+function verifyQueueJob(expected, actual) {
+  if (!expected || !actual) return { ok: false, reason: "EMPTY" };
+  const eId = String(expected.jobId || "");
+  const aId = String(actual.jobId || "");
+  if (eId && aId && eId === aId) return { ok: true, via: "jobId" };
+  const eSec = String(expected.securityId || "");
+  const aSec = String(actual.securityId || "");
+  if (eSec && aSec && eSec === aSec) return { ok: true, via: "securityId" };
+  const et = normalizeText(expected.title || "");
+  const at = normalizeText(actual.title || "");
+  const ec = normalizeText(expected.company || "");
+  const ac = normalizeText(actual.company || "");
+  if (et && at && et === at && ec && ac && ec === ac) return { ok: true, via: "title+company" };
+  if (et && at && et === at && (!ec || !ac)) return { ok: true, via: "title" };
+  return { ok: false, reason: "IDENTITY_MISMATCH", expected: { title: expected.title, company: expected.company, jobId: eId }, actual: { title: actual.title, company: actual.company, jobId: aId } };
+}
+
+async function waitTabComplete(tabId, timeoutMs = 45000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (t.status === "complete" && isBossUrl(t.url || t.pendingUrl || "")) return t;
+    } catch (e) {
+      return null;
+    }
+    await sleep(250);
+  }
+  try { return await chrome.tabs.get(tabId); } catch (_) { return null; }
+}
+
+async function ensureWorkerTab(task) {
+  if (!task.execution) task.execution = {};
+  const oldId = task.execution.workerTabId;
+  if (oldId) {
+    try {
+      const t = await chrome.tabs.get(oldId);
+      if (t && isBossUrl(t.url || t.pendingUrl || "")) return t;
+    } catch (_) {}
+  }
+  const seed = task.listHref || "https://www.zhipin.com/web/geek/jobs";
+  const createOpts = { url: seed, active: true };
+  if (task.execution.listTabId) {
+    try { createOpts.openerTabId = task.execution.listTabId; } catch (_) {}
+  }
+  const tab = await chrome.tabs.create(createOpts);
+  task.execution.workerTabId = tab.id;
+  task.execution.workerWindowId = tab.windowId;
+  task.execution.phase = "WORKER_READY";
+  await publishTask(task);
+  await waitTabComplete(tab.id, 20000);
+  await forceInjectContent(tab.id);
+  await sleep(300);
+  return tab;
+}
+
+async function openQueueJobOnWorker(task, job) {
+  const worker = await ensureWorkerTab(task);
+  const tabId = worker.id;
+  const href = String(job.href || "");
+  if (!jobHrefUsable(href)) {
+    return { ok: false, error: "NO_HREF", message: "队列项缺少可用岗位链接，无法直达", tabId };
+  }
+  task.execution.phase = "NAVIGATING_JOB";
+  task.currentJobId = job.jobId;
+  await publishTask(task);
+  try {
+    await chrome.tabs.update(tabId, { url: href, active: true });
+  } catch (e) {
+    return { ok: false, error: "NAV_FAIL", message: String(e?.message || e), tabId };
+  }
+  const ready = await waitTabComplete(tabId, 45000);
+  if (!ready) return { ok: false, error: "TAB_LOAD_TIMEOUT", message: "岗位页加载超时", tabId };
+  await forceInjectContent(tabId);
+  await sleep(450);
+  // 详情/身份
+  let detail = await sendToBoss(MSG.GET_CURRENT_JOB_DETAIL || "BHT_GET_CURRENT_JOB_DETAIL", {}, { tabId, forceInject: true });
+  if (!detail?.ok) {
+    // 兼容旧 content：用 PAGE_INFO
+    detail = await sendToBoss(MSG.GET_PAGE_INFO, {}, { tabId });
+    if (detail?.ok) {
+      detail = {
+        ok: true,
+        job: {
+          href: detail.page?.href || href,
+          jobId: job.jobId,
+          title: job.title,
+          company: job.company,
+          path: detail.page?.path || ""
+        }
+      };
+    }
+  }
+  if (detail?.ok && detail.job) {
+    const v = verifyQueueJob(job, detail.job);
+    if (!v.ok) {
+      return {
+        ok: false,
+        error: "IDENTITY_MISMATCH",
+        message: "打开的岗位与队列不一致，已跳过（避免投错）",
+        verify: v,
+        tabId,
+        detail: detail.job
+      };
+    }
+    return { ok: true, tabId, detail: detail.job, matchedVia: v.via || "href-nav" };
+  }
+  // 即使详情解析失败，仍允许继续点「立即沟通」（页面可能已是正确岗）
+  return { ok: true, tabId, detail: null, matchedVia: "href-nav-no-detail", weak: true };
+}
+
+async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false, tabId = null } = {}) {
+  let tab = null;
+  if (tabId != null) {
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch (_) {
+      return { ok: false, error: "TARGET_TAB_CLOSED", message: "目标标签页已关闭，请重新开始任务" };
+    }
+  } else {
+    tab = await getActiveBossTab({ allowInactiveBossTab: false });
+  }
   if (!tab?.id) {
     const active = (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
     return {
@@ -221,7 +347,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
           if (result && result.error === 'NAVIGATED' && (type === MSG.SEND_TEXT || type === MSG.START_CHAT) && !payload.__navRetried) {
             await forceInjectContent(tab.id);
             await sleep(350);
-            return await sendToBoss(type, { ...payload, __navRetried: true }, { retries, forceInject: true });
+            return await sendToBoss(type, { ...payload, __navRetried: true }, { retries, forceInject: true, tabId: tab.id });
           }
           return result;
         }
@@ -349,7 +475,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
             await forceInjectContent(tab.id);
             await sleep(350);
             if (retries > 0) {
-              return sendToBoss(type, payload, { retries: retries - 1, forceInject: true });
+              return sendToBoss(type, payload, { retries: retries - 1, forceInject: true, tabId: tab.id });
             }
           }
         } catch (_) {}
@@ -357,7 +483,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       if (retries > 0) {
         await forceInjectContent(tab.id);
         await sleep(400);
-        return sendToBoss(type, payload, { retries: retries - 1, forceInject: true });
+        return sendToBoss(type, payload, { retries: retries - 1, forceInject: true, tabId: tab.id });
       }
       // fall through to sendMessage once
       try {
@@ -380,7 +506,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       if (retries > 0 && /message channel closed|Receiving end does not exist|asynchronous response|Could not establish|PORT_/i.test(msg0)) {
         await forceInjectContent(tab.id);
         await sleep(450);
-        return sendToBoss(type, payload, { retries: retries - 1, forceInject: true });
+        return sendToBoss(type, payload, { retries: retries - 1, forceInject: true, tabId: tab.id });
       }
       await forceInjectContent(tab.id);
       await sleep(200);
@@ -634,21 +760,47 @@ async function processOneJob(task, resultRow, config) {
 
 
 // 列表恢复交给 START_CHAT 原子处理，避免预先 CLOSE/ENSURE 打乱虚拟列表
-  // 记住职位列表 URL（含 BOSS 手动筛选）
-  try {
-    const pageRes = await sendToBoss(MSG.GET_PAGE_INFO, {});
-    const href = pageRes?.page?.href || pageRes?.href || '';
-    if (href && /jobs|recommend|search|geek\/job/i.test(href) && (pageRes?.page?.cardCount || 0) >= 1) {
-      task.listHref = href;
-      job.listHref = href;
-      await publishTask(task);
-      await log('info', '已记录列表页以便返回（保留 BOSS 筛选）', { href: String(href).slice(0, 180) });
-    } else if (task.listHref) {
-      job.listHref = task.listHref;
+    // 工作页直达岗位 href（列表页不动；正常路径不再 RETURN_TO_LIST 找下一岗）
+  if (task.listHref && !job.listHref) job.listHref = task.listHref;
+  let workerTabId = task.execution?.workerTabId || null;
+  if (jobHrefUsable(job.href)) {
+    const opened = await openQueueJobOnWorker(task, job);
+    if (!opened.ok) {
+      item.state = 'SKIPPED';
+      item.reasons = [opened.message || opened.error || '无法直达岗位'];
+      task.counters.skipped += 1;
+      await appendHistory({
+        jobId: job.jobId,
+        company: job.company,
+        title: job.title,
+        status: opened.error === 'IDENTITY_MISMATCH' ? 'identity_mismatch' : 'skipped_nav',
+        taskId: task.id,
+        message: opened.message || ''
+      });
+      await log('warn', '跳过：' + (opened.message || opened.error) + ' · ' + (job.title || ''), { jobId: job.jobId });
+      return 'skipped';
     }
-  } catch (_) {}
+    workerTabId = opened.tabId;
+    if (opened.detail) {
+      if (opened.detail.securityId) job.securityId = opened.detail.securityId;
+      if (opened.detail.jobId && !job.jobId) job.jobId = opened.detail.jobId;
+    }
+    await log('info', '工作页已打开岗位（' + (opened.matchedVia || 'href') + '）', { jobId: job.jobId, href: String(job.href || '').slice(0, 120) });
+  } else {
+    // 无 href：降级到列表页当前活动标签（兼容旧队列）
+    await log('warn', '岗位无稳定链接，降级到列表匹配（稳定性较差）', { jobId: job.jobId });
+    try {
+      const listTab = task.execution?.listTabId;
+      if (listTab) workerTabId = listTab;
+      else {
+        const t = await getActiveBossTab({ allowInactiveBossTab: true });
+        workerTabId = t?.id || null;
+      }
+    } catch (_) {}
+  }
 
-  const chatRes = await sendToBoss(MSG.START_CHAT, { job, skipScroll: false });
+  const tabOpt = workerTabId ? { tabId: workerTabId, forceInject: true } : { forceInject: true };
+  const chatRes = await sendToBoss(MSG.START_CHAT, { job, skipScroll: false, preferDirect: true }, tabOpt);
   if (chatRes?.contentVersion) {
     await log('info', 'content v' + chatRes.contentVersion + (chatRes.matchedVia ? (' · 匹配:' + chatRes.matchedVia) : ''), { jobId: job.jobId });
   }
@@ -712,7 +864,7 @@ async function processOneJob(task, resultRow, config) {
   await log('success', '已进入沟通，开始发送消息', { jobId: job.jobId });
 
   // messages
-  const selfRes = await sendToBoss(MSG.GET_CHAT_SELF_MESSAGES, { limit: 8 });
+  const selfRes = await sendToBoss(MSG.GET_CHAT_SELF_MESSAGES, { limit: 8 }, tabOpt);
   const recentSelfMessages = selfRes?.messages || [];
   const plan = planMessageSegments({
     mode: config.settings.messageMode,
@@ -754,7 +906,7 @@ async function processOneJob(task, resultRow, config) {
 
     if (await hasIdempotent(step.key)) continue;
 
-    const sendRes = await sendToBoss(MSG.SEND_TEXT, { text: step.text });
+    const sendRes = await sendToBoss(MSG.SEND_TEXT, { text: step.text }, tabOpt);
     if (!sendRes?.ok) {
       item.state = 'FAILED';
       let sendCode = REASON.EXEC_SEND_TEXT_FAIL;
@@ -823,7 +975,7 @@ async function processOneJob(task, resultRow, config) {
         const imgRes = await sendToBoss(MSG.SEND_IMAGE, {
           dataUrl: img.dataUrl,
           fileName: img.name || `resume_${i + 1}.png`
-        });
+        }, tabOpt);
         if (!imgRes?.ok) {
           await log('warn', `图片简历发送失败：${imgRes?.message || imgRes?.error || ''}`, { jobId: job.jobId });
           break;
@@ -841,7 +993,7 @@ async function processOneJob(task, resultRow, config) {
         const fileRes = await sendToBoss(MSG.SEND_IMAGE, {
           dataUrl: profile.attachment.dataUrl,
           fileName: profile.attachment.name || 'resume.pdf'
-        });
+        }, tabOpt);
         if (fileRes?.ok) {
           await markIdempotent(key, { jobId: job.jobId });
           item.state = 'ATTACHMENT_RESUME_SENT';
@@ -1042,27 +1194,8 @@ async function runTaskLoop(taskId) {
         break;
       }
 
-      // 成功/跳过后再回列表；失败已在上面回过
-      // 每岗结束后只回列表一次（带 listHref，保住 BOSS 筛选）
-      {
-        const listHref = task.listHref || row.job?.listHref || '';
-        try {
-          const back = await sendToBoss(MSG.RETURN_TO_LIST, { listHref });
-          if (back?.navigating || listHref) {
-            for (let i = 0; i < 40; i++) {
-              await sleep(400);
-              try {
-                const pong = await sendToBoss(MSG.PING, {});
-                if ((pong?.page?.cardCount || 0) >= 3) break;
-              } catch (_) {}
-            }
-          } else {
-            await sleep(500);
-          }
-        } catch (_) {
-          await sleep(500);
-        }
-      }
+      // 双页模式：工作页直接打开下一岗 href，正常路径不再 RETURN_TO_LIST
+      // （失败暂停时 while 里仍会尝试回列表，便于用户操作）
       task.counters.processed += 1;
       task.updatedAt = Date.now();
       await publishTask(task);

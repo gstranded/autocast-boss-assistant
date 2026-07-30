@@ -4,6 +4,7 @@
     GET_PAGE_INFO: "BHT_GET_PAGE_INFO",
     SCAN_JOBS: "BHT_SCAN_JOBS",
     START_CHAT: "BHT_START_CHAT",
+    GET_CURRENT_JOB_DETAIL: "BHT_GET_CURRENT_JOB_DETAIL",
     GET_CHAT_SELF_MESSAGES: "BHT_GET_CHAT_SELF_MESSAGES",
     SEND_TEXT: "BHT_SEND_TEXT",
     SEND_IMAGE: "BHT_SEND_IMAGE",
@@ -15,7 +16,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.4.0";
+  const BHT_CONTENT_VERSION = "1.4.1";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -1189,7 +1190,54 @@ function dismissCommonDialogs() {
     return { ok: false };
   }
 
-    async function startChatOnCurrentDetail(job = {}) {
+    
+  function getCurrentJobDetail() {
+    const href = location.href;
+    const jobId = extractJobIdFromHref(href) || "";
+    const detailRoot = firstEl(SELECTORS.detailRoot) || document;
+    const title =
+      textOf(firstEl(SELECTORS.title, detailRoot)) ||
+      textOf(document.querySelector(".job-name, .job-title, h1")) ||
+      "";
+    const company =
+      textOf(firstEl(SELECTORS.company, detailRoot)) ||
+      textOf(document.querySelector(".company-name, .company-info .name")) ||
+      "";
+    const locationText =
+      textOf(firstEl(SELECTORS.location, detailRoot)) ||
+      textOf(document.querySelector(".job-location, .job-area, .company-location")) ||
+      "";
+    const salary =
+      textOf(firstEl(SELECTORS.salary, detailRoot)) ||
+      textOf(document.querySelector(".job-salary, .salary")) ||
+      "";
+    const jd =
+      textOf(document.querySelector(".job-detail-section, .job-sec-text, .job-detail, .detail-content")) ||
+      textOf(detailRoot).slice(0, 4000);
+    let securityId = extractSecurityId(href);
+    try {
+      const more = firstEl(SELECTORS.moreLink, detailRoot);
+      securityId = extractSecurityId(more?.href || "") || securityId;
+    } catch (_) {}
+    return {
+      ok: true,
+      job: {
+        href,
+        jobId,
+        securityId: securityId || "",
+        title,
+        company,
+        location: locationText,
+        salary,
+        jd,
+        path: location.pathname
+      },
+      page: pageInfo(),
+      contentVersion: BHT_CONTENT_VERSION
+    };
+  }
+
+async function startChatOnCurrentDetail(job = {}) {
     if (typeof detectLoginModal === "function") {
       const loginHit = detectLoginModal();
       if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
@@ -2071,6 +2119,9 @@ async function startChat(job, opts = {}) {
       case MSG.SCAN_JOBS:
       case "BHT_SCAN_JOBS":
         return await scanJobs(payload || {});
+      case MSG.GET_CURRENT_JOB_DETAIL:
+      case "BHT_GET_CURRENT_JOB_DETAIL":
+        return getCurrentJobDetail();
       case MSG.START_CHAT:
       case "BHT_START_CHAT":
         return await startChat(payload?.job || payload, payload || {});
