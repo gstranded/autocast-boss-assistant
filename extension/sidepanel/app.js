@@ -1204,6 +1204,7 @@ document.addEventListener('click', (e) => {
 bindEvents();
 forceEnableControls();
 wireControlButtons();
+try { wireAutosave(); } catch (_) {}
 refresh();
 setInterval(() => {
   forceEnableControls();
