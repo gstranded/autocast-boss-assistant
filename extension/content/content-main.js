@@ -16,7 +16,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.4.3";
+  const BHT_CONTENT_VERSION = "1.5.0";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -2131,7 +2131,311 @@ async function startChat(job, opts = {}) {
     return { ok: true, count: cards.length };
   }
 
-  async function runOpByType(type, payload = {}) {
+  
+  function clickStayOnListDialog() {
+    // BOSS 点击立即沟通后常见：留在此页 / 前往牛人/消息
+    const candidates = Array.from(
+      document.querySelectorAll("button,a,.btn,div[role='button'],span.btn,div.btn")
+    ).filter((el) => {
+      try {
+        const r = el.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8) return false;
+        const st = getComputedStyle(el);
+        if (st.display === "none" || st.visibility === "hidden") return false;
+      } catch (_) {}
+      return true;
+    });
+    const stay = candidates.find((el) => /留在此页|留在当前|继续停留|取消跳转/.test(textOf(el)));
+    if (stay) {
+      clickLikeHuman(stay);
+      return { ok: true, text: textOf(stay) };
+    }
+    // 有的弹窗只有「继续沟通」在浮层里
+    const cont = candidates.find((el) => textOf(el) === "继续沟通" || textOf(el) === "我知道了");
+    if (cont) {
+      clickLikeHuman(cont);
+      return { ok: true, text: textOf(cont), soft: true };
+    }
+    return { ok: false };
+  }
+
+  async function triggerConversationOnList(job = {}) {
+    try { rememberListHref(); } catch (_) {}
+    dismissCommonDialogs();
+    if (typeof detectLoginModal === "function") {
+      const loginHit = detectLoginModal();
+      if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+    }
+
+    await ensureJobList({ maxWaitMs: 8000, scroll: true, noHomeNav: true });
+    let card = findCardByJob(job);
+    if (!card) {
+      try { card = await findCardByScrolling(job, 50); } catch (_) {}
+    }
+    if (!card) {
+      const samples = getJobCards().slice(0, 5).map((el, i) => parseJobCard(el, i).title).filter(Boolean);
+      return {
+        ok: false,
+        error: "LIST_JOB_NOT_FOUND",
+        message: "列表中找不到岗位「" + (job.title || "") + "」",
+        samples,
+        listCount: getJobCards().length,
+        href: location.href,
+        contentVersion: BHT_CONTENT_VERSION
+      };
+    }
+
+    const release = installJobNavGuard(12000);
+    try {
+      const wrap = card.closest?.(".job-card-wrap, li, .job-card-box") || card;
+      try { wrap.scrollIntoView({ block: "center", behavior: "instant" }); } catch (_) {}
+      await sleep(200);
+      // 点卡片切换右侧详情（拦截整页跳转）
+      preventLinkNavigation(wrap, 1500);
+      clickLikeHuman(wrap);
+      await sleep(700);
+
+      // 再点一次标题区域提高详情刷新概率
+      const titleEl = firstEl(SELECTORS.title, wrap) || wrap;
+      preventLinkNavigation(wrap, 1500);
+      clickLikeHuman(titleEl);
+      await sleep(600);
+
+      // 验证右侧详情大致匹配
+      const detailTitle =
+        textOf(firstEl(SELECTORS.title, firstEl(SELECTORS.detailRoot) || document)) ||
+        textOf(document.querySelector(".job-detail .job-name, .job-detail-box .job-name, .job-name"));
+      const want = normalizeText(job.title || "");
+      const got = normalizeText(detailTitle || "");
+      const titleOk = !want || !got || got.includes(want.slice(0, 8)) || want.includes(got.slice(0, 8));
+      if (!titleOk) {
+        log("list detail title weak match", { want: job.title, got: detailTitle });
+      }
+
+      // 点立即沟通 / 继续沟通（详情区优先）
+      let clicked = { ok: false };
+      for (let i = 0; i < 14; i++) {
+        const scope =
+          firstEl(SELECTORS.detailRoot) ||
+          document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+          document;
+        let btn =
+          firstEl(SELECTORS.chatOnDetail, scope) ||
+          Array.from(scope.querySelectorAll("a,button,div,span")).find((el) =>
+            /立即沟通|继续沟通/.test(textOf(el))
+          ) ||
+          Array.from(document.querySelectorAll("a.op-btn-chat, a.op-btn, button, div[class*='btn']")).find((el) =>
+            /立即沟通|继续沟通/.test(textOf(el))
+          );
+        if (btn) {
+          const buttonText = textOf(btn);
+          clickLikeHuman(btn);
+          clicked = { ok: true, buttonText, already: /继续沟通/.test(buttonText) };
+          break;
+        }
+        await sleep(280);
+      }
+      if (!clicked.ok) {
+        if (typeof detectLoginModal === "function") {
+          const loginHit = detectLoginModal();
+          if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+        }
+        return {
+          ok: false,
+          error: "CHAT_BUTTON_NOT_FOUND",
+          message: "列表详情区未找到「立即沟通」按钮",
+          detailTitle,
+          href: location.href,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+      }
+
+      await sleep(450);
+      let stay = clickStayOnListDialog();
+      if (!stay.ok) {
+        await sleep(500);
+        stay = clickStayOnListDialog();
+      }
+      // 再关一次常见弹层
+      dismissCommonDialogs();
+
+      return {
+        ok: true,
+        phase: "CHAT_TRIGGERED",
+        buttonText: clicked.buttonText,
+        already: Boolean(clicked.already),
+        stayed: Boolean(stay.ok),
+        stayText: stay.text || "",
+        detailTitle: detailTitle || "",
+        listHref: location.href,
+        contentVersion: BHT_CONTENT_VERSION
+      };
+    } finally {
+      try { release && release(); } catch (_) {}
+    }
+  }
+
+  function conversationKeyFromEl(el) {
+    if (!el) return "";
+    const a = el.closest?.("a[href]") || el.querySelector?.("a[href]") || (el.tagName === "A" ? el : null);
+    const href = a?.href || a?.getAttribute?.("href") || "";
+    const dataId =
+      el.getAttribute?.("data-id") ||
+      el.getAttribute?.("data-uid") ||
+      el.getAttribute?.("data-boss-id") ||
+      el.dataset?.id ||
+      "";
+    const t = textOf(el).slice(0, 80);
+    return dataId || href || t;
+  }
+
+  function getConversationSnapshot() {
+    const selectors = [
+      ".geek-chat-list li",
+      ".chat-user-list li",
+      ".friend-list-item",
+      ".user-list li",
+      "[class*='friend-list'] li",
+      "[class*='chat-list'] li",
+      ".chat-container .user-list .user-item",
+      "div[class*='conversation'] li",
+      ".chat-left li"
+    ];
+    let nodes = [];
+    for (const sel of selectors) {
+      try {
+        const list = Array.from(document.querySelectorAll(sel));
+        if (list.length >= 1) { nodes = list; break; }
+      } catch (_) {}
+    }
+    // fallback: any list item with avatar in left rail
+    if (!nodes.length) {
+      nodes = Array.from(document.querySelectorAll(".chat-left li, .chat-box li, aside li")).slice(0, 80);
+    }
+    const items = nodes.slice(0, 60).map((el, index) => {
+      const text = textOf(el);
+      const key = conversationKeyFromEl(el) || ("idx_" + index + "_" + text.slice(0, 24));
+      return {
+        index,
+        key,
+        text: text.slice(0, 120),
+        name: text.split(/\s+/)[0] || "",
+        active: /active|selected|current/i.test(el.className || "")
+      };
+    }).filter((x) => x.text.length > 1);
+    return {
+      ok: true,
+      href: location.href,
+      isChatPage: /\/chat/i.test(location.pathname),
+      count: items.length,
+      keys: items.map((x) => x.key),
+      items,
+      contentVersion: BHT_CONTENT_VERSION
+    };
+  }
+
+  async function waitAndOpenConversation(payload = {}) {
+    const job = payload.job || {};
+    const beforeKeys = new Set(payload.beforeKeys || []);
+    const wantTitle = normalizeText(job.title || "");
+    const wantCompany = normalizeText(job.company || "");
+    const wantHr = normalizeText(job.hrName || job.bossName || "");
+    const deadline = Date.now() + (payload.timeoutMs || 18000);
+
+    let lastSnap = null;
+    while (Date.now() < deadline) {
+      if (!/\/chat/i.test(location.pathname)) {
+        // 若误在列表，不强制跳转（由后台打开消息页）
+      }
+      dismissCommonDialogs();
+      lastSnap = getConversationSnapshot();
+      const items = lastSnap.items || [];
+
+      // 1) 新增会话
+      let candidates = items.filter((it) => it.key && !beforeKeys.has(it.key));
+      // 2) 全文匹配公司/岗位
+      const scored = items.map((it) => {
+        const t = normalizeText(it.text);
+        let score = 0;
+        if (wantCompany && t.includes(wantCompany.slice(0, Math.min(4, wantCompany.length)))) score += 40;
+        if (wantCompany && t.includes(wantCompany)) score += 30;
+        if (wantTitle && t.includes(wantTitle.slice(0, Math.min(6, wantTitle.length)))) score += 35;
+        if (wantTitle && t.includes(wantTitle)) score += 40;
+        if (wantHr && t.includes(wantHr)) score += 25;
+        if (candidates.some((c) => c.key === it.key)) score += 20; // 新增加权
+        return { it, score };
+      }).filter((x) => x.score >= 40).sort((a, b) => b.score - a.score);
+
+      let pick = null;
+      let via = "";
+      if (scored[0] && scored[0].score >= 55) {
+        // 避免歧义
+        if (scored[1] && scored[1].score >= scored[0].score - 5 && scored[0].score < 90) {
+          return {
+            ok: false,
+            error: "CONVERSATION_AMBIGUOUS",
+            message: "消息列表中匹配到多个相似会话，已暂停避免发错人",
+            top: scored.slice(0, 3).map((s) => ({ score: s.score, text: s.it.text })),
+            contentVersion: BHT_CONTENT_VERSION
+          };
+        }
+        pick = scored[0].it;
+        via = "score:" + scored[0].score;
+      } else if (candidates.length === 1) {
+        pick = candidates[0];
+        via = "new-single";
+      } else if (candidates.length > 1 && wantCompany) {
+        const byCo = candidates.filter((it) => normalizeText(it.text).includes(wantCompany.slice(0, 4)));
+        if (byCo.length === 1) { pick = byCo[0]; via = "new+company"; }
+      }
+
+      if (pick) {
+        // 点击会话
+        const nodes = Array.from(document.querySelectorAll(
+          ".geek-chat-list li, .chat-user-list li, .friend-list-item, .user-list li, [class*='friend-list'] li, [class*='chat-list'] li, .chat-left li, aside li"
+        ));
+        const el =
+          nodes.find((n) => conversationKeyFromEl(n) === pick.key) ||
+          nodes[pick.index] ||
+          nodes.find((n) => textOf(n).includes((pick.text || "").slice(0, 10)));
+        if (el) {
+          clickLikeHuman(el);
+          await sleep(700);
+          // 头部校验（宽松）
+          const head = textOf(document.querySelector(".chat-top, .chat-header, .conversation-header, .base-info-single, .chat-main .base-info") || document.body).slice(0, 200);
+          const headN = normalizeText(head);
+          const okHead =
+            (!wantCompany || headN.includes(wantCompany.slice(0, 3))) ||
+            (!wantTitle || headN.includes(wantTitle.slice(0, 4))) ||
+            true; // 打开后仍允许发送，匹配信息记日志
+          await waitForChat(10000);
+          const ready = hasUsableChatInput();
+          return {
+            ok: ready,
+            error: ready ? "" : "CHAT_TIMEOUT",
+            message: ready ? "" : "已打开会话但输入框未就绪",
+            matchedVia: via,
+            conversationText: pick.text,
+            head: head.slice(0, 120),
+            headOk: okHead,
+            contentVersion: BHT_CONTENT_VERSION
+          };
+        }
+      }
+      await sleep(450);
+    }
+
+    return {
+      ok: false,
+      error: "CONVERSATION_NOT_FOUND",
+      message: "消息页未找到对应会话（已等待）。公司=" + (job.company || "") + " 岗位=" + (job.title || ""),
+      snapshotCount: lastSnap?.count || 0,
+      sample: (lastSnap?.items || []).slice(0, 5).map((x) => x.text),
+      contentVersion: BHT_CONTENT_VERSION
+    };
+  }
+
+async function runOpByType(type, payload = {}) {
     const lockKey = String(type || '');
     const needLock = /START_CHAT|SEND_TEXT|SEND_IMAGE|SCAN_JOBS/.test(lockKey) || /BHT_START_CHAT|BHT_SEND_TEXT|BHT_SEND_IMAGE|BHT_SCAN_JOBS/.test(lockKey);
     if (needLock) {
@@ -2157,6 +2461,15 @@ async function startChat(job, opts = {}) {
       case MSG.GET_CURRENT_JOB_DETAIL:
       case "BHT_GET_CURRENT_JOB_DETAIL":
         return getCurrentJobDetail();
+      case "BHT_TRIGGER_CONVERSATION":
+      case MSG.TRIGGER_CONVERSATION:
+        return await triggerConversationOnList((payload && payload.job) || payload || {});
+      case "BHT_GET_CONVERSATION_SNAPSHOT":
+      case MSG.GET_CONVERSATION_SNAPSHOT:
+        return getConversationSnapshot();
+      case "BHT_WAIT_OPEN_CONVERSATION":
+      case MSG.WAIT_OPEN_CONVERSATION:
+        return await waitAndOpenConversation(payload || {});
       case MSG.START_CHAT:
       case "BHT_START_CHAT":
         return await startChat(payload?.job || payload, payload || {});

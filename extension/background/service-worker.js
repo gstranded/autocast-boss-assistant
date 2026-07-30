@@ -240,6 +240,58 @@ async function ensureWorkerTab(task) {
   return tab;
 }
 
+
+async function ensureMessageTab(task) {
+  if (!task.execution) task.execution = {};
+  const oldId = task.execution.messageTabId;
+  if (oldId) {
+    try {
+      const t = await chrome.tabs.get(oldId);
+      if (t && isBossUrl(t.url || t.pendingUrl || "")) {
+        // 确保在消息中心
+        if (!/\/chat/i.test(t.url || "")) {
+          await chrome.tabs.update(oldId, { url: "https://www.zhipin.com/web/geek/chat", active: false });
+          await waitTabComplete(oldId, 25000);
+          await forceInjectContent(oldId);
+        }
+        await log("info", "[消息页] 复用 tab=" + oldId + " url=" + String(t.url || "").slice(0, 120));
+        return t;
+      }
+    } catch (_) {}
+  }
+  const tab = await chrome.tabs.create({
+    url: "https://www.zhipin.com/web/geek/chat",
+    active: true,
+    openerTabId: task.execution.listTabId || undefined
+  });
+  task.execution.messageTabId = tab.id;
+  task.execution.messageWindowId = tab.windowId;
+  task.execution.phase = "MESSAGE_TAB_READY";
+  await publishTask(task);
+  await waitTabComplete(tab.id, 30000);
+  await forceInjectContent(tab.id);
+  await sleep(400);
+  await log("info", "[消息页] 已创建 tab=" + tab.id);
+  return tab;
+}
+
+async function ensureListTab(task) {
+  if (!task.execution) task.execution = {};
+  if (task.execution.listTabId) {
+    try {
+      const t = await chrome.tabs.get(task.execution.listTabId);
+      if (t && isBossUrl(t.url || "")) return t;
+    } catch (_) {}
+  }
+  const t = await getActiveBossTab({ allowInactiveBossTab: true });
+  if (t?.id) {
+    task.execution.listTabId = t.id;
+    task.execution.listWindowId = t.windowId;
+    await publishTask(task);
+  }
+  return t;
+}
+
 async function openQueueJobOnWorker(task, job) {
   const worker = await ensureWorkerTab(task);
   const tabId = worker.id;
@@ -900,52 +952,131 @@ async function processOneJob(task, resultRow, config) {
     // 工作页直达岗位 href（列表页不动；正常路径不再 RETURN_TO_LIST 找下一岗）
   if (task.listHref && !job.listHref) job.listHref = task.listHref;
   let workerTabId = task.execution?.workerTabId || null;
-  if (jobHrefUsable(job.href)) {
-    const opened = await openQueueJobOnWorker(task, job);
-    if (!opened.ok) {
-      item.state = 'SKIPPED';
-      item.reasons = [opened.message || opened.error || '无法直达岗位'];
+  await log('info', `[任务] 开始处理：${job.title} @ ${job.company || ''}`, {
+    jobId: job.jobId,
+    href: String(job.href || '').slice(0, 160),
+    securityId: job.securityId || '',
+    listHref: String(job.listHref || task.listHref || '').slice(0, 140)
+  });
+
+  // ===== v1.5 主路径：列表页建会话 + 消息页发送 =====
+  const listTab = await ensureListTab(task);
+  const listTabId = listTab?.id || task.execution?.listTabId || null;
+  if (!listTabId) {
+    item.state = 'FAILED';
+    item.reasons = ['未绑定列表页，请在职位列表页重新扫描预览'];
+    task.counters.failed += 1;
+    await log('error', '[列表页] 未找到列表标签页', { jobId: job.jobId });
+    return 'failed';
+  }
+  const listOpt = { tabId: listTabId, forceInject: true };
+
+  let messageTab;
+  try {
+    messageTab = await ensureMessageTab(task);
+  } catch (e) {
+    item.state = 'FAILED';
+    item.reasons = ['无法打开消息页：' + String(e?.message || e)];
+    task.counters.failed += 1;
+    await log('error', '[消息页] 创建失败：' + String(e?.message || e), { jobId: job.jobId });
+    return 'failed';
+  }
+  const msgTabId = messageTab.id;
+  const msgOpt = { tabId: msgTabId, forceInject: true };
+
+  // 消息页快照（点击沟通前）
+  let beforeSnap = await sendToBoss(MSG.GET_CONVERSATION_SNAPSHOT || 'BHT_GET_CONVERSATION_SNAPSHOT', {}, msgOpt);
+  await log('info', '[消息页] 沟通前会话快照 count=' + (beforeSnap?.count || 0), {
+    href: beforeSnap?.href,
+    sample: (beforeSnap?.items || []).slice(0, 3).map((x) => x.text)
+  });
+
+  // 列表页：定位 + 立即沟通 + 留在此页
+  await log('info', '[列表页] 定位并触发沟通', { jobId: job.jobId, title: job.title, tabId: listTabId });
+  const trig = await sendToBoss(
+    MSG.TRIGGER_CONVERSATION || 'BHT_TRIGGER_CONVERSATION',
+    { job },
+    listOpt
+  );
+  await log(
+    trig?.ok ? 'success' : 'error',
+    trig?.ok
+      ? ('[列表页] 已触发沟通 btn=' + (trig.buttonText || '') + (trig.stayed ? ' · 已点留在此页' : ' · 未检测到留在此页弹窗') + (trig.already ? ' · 继续沟通' : ''))
+      : ('[列表页] 触发沟通失败：' + (trig?.message || trig?.error || '')),
+    { jobId: job.jobId, detailTitle: trig?.detailTitle, samples: trig?.samples }
+  );
+  if (!trig?.ok) {
+    item.state = /LIST_JOB_NOT_FOUND|找不到/.test(String(trig?.error || '')) ? 'SKIPPED' : 'FAILED';
+    item.reasons = [trig?.message || trig?.error || '列表页触发沟通失败'];
+    if (item.state === 'SKIPPED') {
       task.counters.skipped += 1;
-      await appendHistory({
-        jobId: job.jobId,
-        company: job.company,
-        title: job.title,
-        status: opened.error === 'IDENTITY_MISMATCH' ? 'identity_mismatch' : 'skipped_nav',
-        taskId: task.id,
-        message: opened.message || ''
-      });
-      await log('warn', '跳过：' + (opened.message || opened.error) + ' · ' + (job.title || ''), { jobId: job.jobId });
+      await appendHistory({ jobId: job.jobId, title: job.title, company: job.company, status: 'skipped_list', taskId: task.id });
       return 'skipped';
     }
-    workerTabId = opened.tabId;
-    if (opened.detail) {
-      if (opened.detail.securityId) job.securityId = opened.detail.securityId;
-      if (opened.detail.jobId && !job.jobId) job.jobId = opened.detail.jobId;
-    }
-    await log('info', '工作页已打开岗位（' + (opened.matchedVia || 'href') + '）', {
-      jobId: job.jobId,
-      href: String(job.href || '').slice(0, 160),
-      afterUrl: String(opened.afterUrl || opened.detail?.href || '').slice(0, 160),
-      tabId: opened.tabId
-    });
-  } else {
-    // 无 href：降级到列表页当前活动标签（兼容旧队列）
-    await log('warn', '岗位无稳定链接，降级到列表匹配（稳定性较差）', { jobId: job.jobId });
-    try {
-      const listTab = task.execution?.listTabId;
-      if (listTab) workerTabId = listTab;
-      else {
-        const t = await getActiveBossTab({ allowInactiveBossTab: true });
-        workerTabId = t?.id || null;
-      }
-    } catch (_) {}
+    task.counters.failed += 1;
+    task.consecutiveFails += 1;
+    task.pauseReason = item.reasons[0];
+    return 'failed';
   }
 
-  const tabOpt = workerTabId ? { tabId: workerTabId, forceInject: true } : { forceInject: true };
-  const chatRes = await sendToBoss(MSG.START_CHAT, { job, skipScroll: false, preferDirect: true }, tabOpt);
-  if (chatRes?.contentVersion) {
-    await log('info', 'content v' + chatRes.contentVersion + (chatRes.matchedVia ? (' · 匹配:' + chatRes.matchedVia) : ''), { jobId: job.jobId });
+  // 消息页：等待并打开会话
+  await sleep(800);
+  await log('info', '[消息页] 等待并匹配会话…', { jobId: job.jobId, company: job.company, title: job.title });
+  let conv = await sendToBoss(
+    MSG.WAIT_OPEN_CONVERSATION || 'BHT_WAIT_OPEN_CONVERSATION',
+    { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 18000 },
+    msgOpt
+  );
+  // 再试一次：刷新快照差异
+  if (!conv?.ok && conv?.error === 'CONVERSATION_NOT_FOUND') {
+    await sleep(1000);
+    await forceInjectContent(msgTabId);
+    conv = await sendToBoss(
+      MSG.WAIT_OPEN_CONVERSATION || 'BHT_WAIT_OPEN_CONVERSATION',
+      { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 12000 },
+      msgOpt
+    );
   }
+  await log(
+    conv?.ok ? 'success' : 'error',
+    conv?.ok
+      ? ('[消息页] 会话已打开 via=' + (conv.matchedVia || '') + ' · ' + String(conv.conversationText || '').slice(0, 60))
+      : ('[消息页] 会话匹配失败：' + (conv?.message || conv?.error || '')),
+    { jobId: job.jobId, sample: conv?.sample, head: conv?.head }
+  );
+
+  if (!conv?.ok) {
+    if (conv?.error === 'CONVERSATION_AMBIGUOUS') {
+      item.state = 'FAILED';
+      item.reasons = [conv.message || '会话歧义'];
+      task.counters.failed += 1;
+      task.pauseReason = item.reasons[0];
+      task.awaitingUserRetry = true;
+      runner.pause = true;
+      task.status = TASK_STATUS.PAUSED;
+      await publishTask(task);
+      await log('error', '[消息页] 会话不唯一，已暂停避免发错', { jobId: job.jobId, top: conv.top });
+      return 'failed';
+    }
+    item.state = 'SKIPPED';
+    item.reasons = [conv?.message || '未找到会话'];
+    task.counters.skipped += 1;
+    await appendHistory({ jobId: job.jobId, title: job.title, company: job.company, status: 'conversation_not_found', taskId: task.id });
+    await log('warn', '[任务] 跳过：消息页未找到会话 · ' + (job.title || ''), { jobId: job.jobId });
+    return 'skipped';
+  }
+
+  // 兼容后续逻辑：视为 chat 已就绪
+  const chatRes = {
+    ok: true,
+    already: Boolean(trig.already),
+    matchedVia: 'list-trigger+' + (conv.matchedVia || 'msg'),
+    contentVersion: conv.contentVersion || trig.contentVersion,
+    job
+  };
+  const tabOpt = msgOpt;
+  // 下面继续原有发消息/简历逻辑（使用消息页 tabOpt）
+
   if (!chatRes?.ok) {
     item.state = 'FAILED';
     let code = REASON.EXEC_CLICK_FAIL;
