@@ -4,7 +4,7 @@ import { reasonText } from '../shared/reason-codes.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
-const BHT_UI_VERSION = "1.3.8";
+const BHT_UI_VERSION = "1.3.9";
 // FLOAT_MODE_FORCE_BOSS: floating host only injects on BOSS pages
 const state = {
   modalDismissed: false,
@@ -597,42 +597,55 @@ async function refresh(options = {}) {
   if (isBoss) updateTaskUI(res.task, res.runner);
 }
 
-async function saveFilters() {
+async function saveFilters(opts = {}) {
   const filters = readFilters();
   const lists = {
     companyBlacklist: parseKeywords($('blacklist').value.replace(/\n/g, ',')),
     companyWhitelist: parseKeywords($('whitelist').value.replace(/\n/g, ','))
   };
-  const settings = readSettingsPatch(state.config.settings);
+  const settings = readSettingsPatch(state.config?.settings || {});
   await api(MSG.SAVE_FILTERS, filters);
   await api(MSG.SAVE_LISTS, lists);
   await api(MSG.SAVE_SETTINGS, settings);
-  state.formDirty = false;
-  await refresh({ soft: false });
+  if (state.config) {
+    state.config.filters = filters;
+    state.config.lists = lists;
+    state.config.settings = { ...(state.config.settings || {}), ...settings };
   }
+  if (opts.refresh !== false) {
+    state.formDirty = false;
+    await refresh({ soft: true });
+  }
+}
 
-async function saveMessage() {
+async function saveMessage(opts = {}) {
   if (!state.config) state.config = {};
+  // 永远以 DOM 为准，不依赖可能被 refresh 冲掉的 base
   const template = readTemplate(state.config.messageTemplate || { version: 1, segments: [] });
   const settings = readSettingsPatch(state.config.settings || {});
   await api(MSG.SAVE_TEMPLATE, template);
   await api(MSG.SAVE_SETTINGS, settings);
   state.config.messageTemplate = template;
   state.config.settings = { ...(state.config.settings || {}), ...settings };
-  state.formDirty = false;
-  renderSegments(template);
-  await refresh({ soft: true });
+  if (opts.refresh !== false) {
+    state.formDirty = false;
+    renderSegments(template);
+    await refresh({ soft: true });
+  }
   return true;
 }
 
-async function saveSettings() {
-  const settings = readSettingsPatch(state.config.settings);
+async function saveSettings(opts = {}) {
+  const settings = readSettingsPatch(state.config?.settings || {});
   await api(MSG.SAVE_SETTINGS, settings);
-  state.formDirty = false;
-  await refresh({ soft: false });
+  if (state.config) state.config.settings = { ...(state.config.settings || {}), ...settings };
+  if (opts.refresh !== false) {
+    state.formDirty = false;
+    await refresh({ soft: true });
   }
+}
 
-async function saveResume() {
+async function saveResume(opts = {}) {
   const resumes = structuredClone(state.config.resumes);
   if (!resumes.profiles?.length) {
     resumes.profiles = [{ id: 'default', name: '默认方案', images: [], attachment: null }];
@@ -690,7 +703,7 @@ async function saveResume() {
   await refresh({ soft: false });
   }
 
-async function saveBindings() {
+async function saveBindings(opts = {}) {
   const rules = readBindingsFromDom()
     .filter((r) => (r.keywords || []).length && r.profileId)
     .sort((a, b) => (a.priority || 0) - (b.priority || 0));
@@ -707,13 +720,19 @@ async function flushAutosave() {
   if (!chrome?.runtime?.id) return;
   autosaving = true;
   try {
+    // 关键：先读齐草稿再写，中间禁止 refresh，避免新消息段被旧 storage 覆盖
     const ok = [];
-    try { await saveFilters(); ok.push('筛选'); } catch (e) { console.warn('autosave filters', e); }
-    try { await saveMessage(); ok.push('消息'); } catch (e) { console.warn('autosave message', e); }
-    try { await saveSettings(); ok.push('设置'); } catch (e) { console.warn('autosave settings', e); }
-    try { await saveResume(); ok.push('简历'); } catch (e) { console.warn('autosave resume', e); }
-    try { await saveBindings(); ok.push('绑定'); } catch (e) { console.warn('autosave bind', e); }
+    try { await saveMessage({ refresh: false }); ok.push('消息'); } catch (e) { console.warn('autosave message', e); }
+    try { await saveFilters({ refresh: false }); ok.push('筛选'); } catch (e) { console.warn('autosave filters', e); }
+    try { await saveSettings({ refresh: false }); ok.push('设置'); } catch (e) { console.warn('autosave settings', e); }
+    try { await saveResume({ refresh: false }); ok.push('简历'); } catch (e) { console.warn('autosave resume', e); }
+    try { await saveBindings({ refresh: false }); ok.push('绑定'); } catch (e) { console.warn('autosave bind', e); }
     state.formDirty = false;
+    // 保存后用本地草稿重绘消息段，再 soft refresh 同步任务状态
+    try {
+      if (state.config?.messageTemplate) renderSegments(state.config.messageTemplate);
+    } catch (_) {}
+    try { await refresh({ soft: true }); } catch (_) {}
     if (ok.length) toast('已自动保存', 'success', 900);
   } finally {
     autosaving = false;

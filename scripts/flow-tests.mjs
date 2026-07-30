@@ -32,7 +32,7 @@ test("background force-injects content on critical ops", () => {
 test("background ensures list before chat and returns after job", () => {
   const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
   assert.ok(s.includes("列表恢复交给 START_CHAT") || s.includes("START_CHAT"));
-  assert.ok(s.includes("RETURN_TO_LIST after job"));
+  assert.ok(s.includes("RETURN_TO_LIST") && (s.includes("返回列表统一由 runTaskLoop") || s.includes("每岗结束后只回列表一次")));
   assert.ok(s.includes("RETURN_TO_LIST after fail"));
   assert.ok(s.includes("RETURN_TO_LIST after send fail"));
   assert.ok(s.includes("retryCurrent"));
@@ -42,7 +42,7 @@ test("background ensures list before chat and returns after job", () => {
 
 test("content startChat is href-first and versioned", () => {
   const s = fs.readFileSync("extension/content/content-main.js", "utf8");
-  assert.ok(s.includes('BHT_CONTENT_VERSION = "1.3.8"'));
+  assert.ok(s.includes('BHT_CONTENT_VERSION = "1.3.9"'));
   assert.ok(s.includes("matchedVia"));
   assert.ok(s.includes("tryPickVisible"));
   assert.ok(s.includes("JOB_CARD_NOT_FOUND"));

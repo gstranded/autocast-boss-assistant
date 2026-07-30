@@ -862,46 +862,7 @@ async function processOneJob(task, resultRow, config) {
     return 'skipped';
   }
 
-  // RETURN_TO_LIST after job — 回到原筛选列表
-  {
-    const listHref = job.listHref || task.listHref || '';
-    const back = await sendToBoss(MSG.RETURN_TO_LIST, { listHref });
-    if (back?.navigating || back?.via === 'scheduled-assign' || back?.via === 'scheduled-assign-fallback') {
-      for (let i = 0; i < 45; i++) {
-        await sleep(400);
-        try {
-          const pong = await sendToBoss(MSG.PING, {});
-          if ((pong?.page?.cardCount || 0) >= 3) break;
-        } catch (_) {}
-      }
-      await sleep(500);
-    } else if (!back?.ok) {
-      if (listHref) {
-        try {
-          const tab = await getActiveBossTab({ allowInactiveBossTab: true });
-          if (tab?.id) {
-            await chrome.tabs.update(tab.id, { url: listHref });
-            await log('info', '已导航回原筛选列表页', { jobId: job.jobId });
-            for (let i = 0; i < 40; i++) {
-              await sleep(400);
-              try {
-                const pong = await sendToBoss(MSG.PING, {});
-                if ((pong?.page?.cardCount || 0) >= 3) break;
-              } catch (_) {}
-            }
-          }
-        } catch (e) {
-          await log('warn', '返回列表导航失败：' + String(e?.message || e), { jobId: job.jobId });
-        }
-      } else {
-        await log('warn', back?.message || '返回职位列表失败，尝试继续', { jobId: job.jobId });
-        await sleep(800);
-      }
-    } else {
-      await sleep(randomBetween(config.settings.jobIntervalMs || [1200, 2200]));
-    }
-  }
-
+  // 返回列表统一由 runTaskLoop 负责（避免双重 RETURN 打乱列表）
   item.state = 'COMPLETED';
   item.reasons = [reasonText(REASON.OK_ITEM_COMPLETED)];
   task.counters.success += 1;
@@ -984,33 +945,29 @@ async function runTaskLoop(taskId) {
       task = config.task;
       if (!task) break;
 
-      const item = task.items.find((x) => x.jobId === row.job.jobId);
-      if (item && (item.state === 'COMPLETED' || item.state === 'SKIPPED')) {
+      // 持久化游标：queue 状态优先（SW 重启后仍能续跑）
+      const qMeta = (task.queue || [])[qi] || (task.queue || []).find((x) => x.jobId === row.job?.jobId);
+      if (qMeta && (qMeta.status === 'done' || qMeta.status === 'skipped' || qMeta.status === 'failed' && qMeta.skipOnResume)) {
         continue;
       }
+      const item = task.items.find((x) => x.jobId === row.job.jobId);
+      if (item && (item.state === 'COMPLETED' || item.state === 'SKIPPED')) {
+        if (qMeta && qMeta.status === 'pending') {
+          qMeta.status = item.state === 'COMPLETED' ? 'done' : 'skipped';
+          await publishTask(task);
+        }
+        continue;
+      }
+      // 写入 nextJobId 便于恢复
+      task.nextJobId = row.job?.jobId || null;
+      task.currentJobId = row.job?.jobId || null;
 
       task.queueCursor = qi;
       await publishTask(task);
       await log('info', '队列进度 ' + (qi + 1) + '/' + queue.length + '：' + (row.job?.title || '') + ' @ ' + (row.job?.company || ''), {
         jobId: row.job?.jobId
       });
-
-      // 回列表再投下一岗（保留筛选 URL）
-      if (qi > 0) {
-        try {
-          const listHref = task.listHref || '';
-          await sendToBoss(MSG.RETURN_TO_LIST, { listHref });
-          for (let i = 0; i < 40; i++) {
-            await sleep(400);
-            try {
-              const pong = await sendToBoss(MSG.PING, {});
-              if ((pong?.page?.cardCount || 0) >= 3) break;
-            } catch (_) {}
-          }
-        } catch (e) {
-          await log('warn', '回列表继续下一岗失败：' + String(e?.message || e));
-        }
-      }
+      // 回列表改在 processOneJob 之后统一做一次
 
       // assertBossContext before process
       {
@@ -1086,9 +1043,25 @@ async function runTaskLoop(taskId) {
       }
 
       // 成功/跳过后再回列表；失败已在上面回过
-      if (outcome === 'success' || outcome === 'skipped') {
-        try { await sendToBoss(MSG.RETURN_TO_LIST, {}); } catch (_) {}
-        await sleep(500);
+      // 每岗结束后只回列表一次（带 listHref，保住 BOSS 筛选）
+      {
+        const listHref = task.listHref || row.job?.listHref || '';
+        try {
+          const back = await sendToBoss(MSG.RETURN_TO_LIST, { listHref });
+          if (back?.navigating || listHref) {
+            for (let i = 0; i < 40; i++) {
+              await sleep(400);
+              try {
+                const pong = await sendToBoss(MSG.PING, {});
+                if ((pong?.page?.cardCount || 0) >= 3) break;
+              } catch (_) {}
+            }
+          } else {
+            await sleep(500);
+          }
+        } catch (_) {
+          await sleep(500);
+        }
       }
       task.counters.processed += 1;
       task.updatedAt = Date.now();
