@@ -16,7 +16,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.5.0";
+  const BHT_CONTENT_VERSION = "1.5.1";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -2275,6 +2275,19 @@ async function startChat(job, opts = {}) {
     }
   }
 
+  
+  const CONV_ROW_SELECTORS = [
+    ".geek-chat-list li",
+    ".chat-user-list li",
+    ".friend-list-item",
+    ".user-list li",
+    "[class*='friend-list'] li",
+    "[class*='chat-list'] li",
+    ".chat-container .user-list .user-item",
+    "div[class*='conversation'] li",
+    ".chat-left li"
+  ];
+
   function conversationKeyFromEl(el) {
     if (!el) return "";
     const a = el.closest?.("a[href]") || el.querySelector?.("a[href]") || (el.tagName === "A" ? el : null);
@@ -2283,35 +2296,59 @@ async function startChat(job, opts = {}) {
       el.getAttribute?.("data-id") ||
       el.getAttribute?.("data-uid") ||
       el.getAttribute?.("data-boss-id") ||
+      el.getAttribute?.("data-convid") ||
       el.dataset?.id ||
+      el.dataset?.uid ||
       "";
     const t = textOf(el).slice(0, 80);
-    return dataId || href || t;
+    return String(dataId || href || t);
+  }
+
+  function queryConversationRows() {
+    for (const sel of CONV_ROW_SELECTORS) {
+      try {
+        const list = Array.from(document.querySelectorAll(sel));
+        if (list.length >= 1) return { sel, nodes: list };
+      } catch (_) {}
+    }
+    const fallback = Array.from(document.querySelectorAll(".chat-left li, .chat-box li, aside li")).slice(0, 80);
+    return { sel: "fallback", nodes: fallback };
+  }
+
+  function getActiveConversationIdentity() {
+    const { nodes } = queryConversationRows();
+    const active =
+      nodes.find((el) => /active|selected|current|on/i.test(el.className || "")) ||
+      nodes.find((el) => el.getAttribute?.("aria-selected") === "true") ||
+      null;
+    const headEl =
+      document.querySelector(".chat-top, .chat-header, .conversation-header, .base-info-single, .chat-main .base-info, .chat-person, .base-info") ||
+      null;
+    const head = textOf(headEl);
+    return {
+      key: active ? conversationKeyFromEl(active) : "",
+      text: active ? textOf(active).slice(0, 120) : "",
+      head: head.slice(0, 160),
+      href: location.href
+    };
+  }
+
+  function conversationHeaderMatches(job = {}) {
+    const head = normalizeText(getActiveConversationIdentity().head || "");
+    if (!head) return false;
+    const wantCompany = normalizeText(job.company || "");
+    const wantTitle = normalizeText(job.title || "");
+    const wantHr = normalizeText(job.hrName || job.bossName || "");
+    let hits = 0;
+    if (wantCompany && head.includes(wantCompany.slice(0, Math.min(3, wantCompany.length)))) hits += 1;
+    if (wantTitle && head.includes(wantTitle.slice(0, Math.min(4, wantTitle.length)))) hits += 1;
+    if (wantHr && head.includes(wantHr)) hits += 1;
+    // 至少命中公司或岗位之一
+    return hits >= 1;
   }
 
   function getConversationSnapshot() {
-    const selectors = [
-      ".geek-chat-list li",
-      ".chat-user-list li",
-      ".friend-list-item",
-      ".user-list li",
-      "[class*='friend-list'] li",
-      "[class*='chat-list'] li",
-      ".chat-container .user-list .user-item",
-      "div[class*='conversation'] li",
-      ".chat-left li"
-    ];
-    let nodes = [];
-    for (const sel of selectors) {
-      try {
-        const list = Array.from(document.querySelectorAll(sel));
-        if (list.length >= 1) { nodes = list; break; }
-      } catch (_) {}
-    }
-    // fallback: any list item with avatar in left rail
-    if (!nodes.length) {
-      nodes = Array.from(document.querySelectorAll(".chat-left li, .chat-box li, aside li")).slice(0, 80);
-    }
+    const { sel, nodes } = queryConversationRows();
     const items = nodes.slice(0, 60).map((el, index) => {
       const text = textOf(el);
       const key = conversationKeyFromEl(el) || ("idx_" + index + "_" + text.slice(0, 24));
@@ -2320,7 +2357,8 @@ async function startChat(job, opts = {}) {
         key,
         text: text.slice(0, 120),
         name: text.split(/\s+/)[0] || "",
-        active: /active|selected|current/i.test(el.className || "")
+        active: /active|selected|current/i.test(el.className || ""),
+        selector: sel
       };
     }).filter((x) => x.text.length > 1);
     return {
@@ -2328,13 +2366,73 @@ async function startChat(job, opts = {}) {
       href: location.href,
       isChatPage: /\/chat/i.test(location.pathname),
       count: items.length,
+      selector: sel,
       keys: items.map((x) => x.key),
       items,
+      active: getActiveConversationIdentity(),
       contentVersion: BHT_CONTENT_VERSION
     };
   }
 
+  function collectEditorDiagnostic() {
+    const mapEl = (el) => {
+      let rect = { width: 0, height: 0 };
+      try { const r = el.getBoundingClientRect(); rect = { width: Math.round(r.width), height: Math.round(r.height) }; } catch (_) {}
+      return {
+        tag: el.tagName,
+        className: String(el.className || "").slice(0, 120),
+        id: el.id || "",
+        role: el.getAttribute?.("role") || "",
+        placeholder:
+          el.getAttribute?.("data-placeholder") ||
+          el.getAttribute?.("placeholder") ||
+          el.getAttribute?.("aria-label") ||
+          "",
+        rect
+      };
+    };
+    return {
+      href: location.href,
+      title: document.title,
+      activeConversation: getActiveConversationIdentity(),
+      contenteditables: Array.from(document.querySelectorAll("[contenteditable='true']")).slice(0, 20).map(mapEl),
+      textareas: Array.from(document.querySelectorAll("textarea, input")).slice(0, 20).map((el) => ({
+        tag: el.tagName,
+        type: el.type || "",
+        className: String(el.className || "").slice(0, 80),
+        id: el.id || "",
+        placeholder: el.placeholder || ""
+      })),
+      iframes: Array.from(document.querySelectorAll("iframe")).slice(0, 10).map((el) => ({
+        src: (el.src || "").slice(0, 160),
+        title: el.title || "",
+        className: String(el.className || "").slice(0, 80)
+      })),
+      hasUsable: hasUsableChatInput(),
+      contentVersion: BHT_CONTENT_VERSION
+    };
+  }
+
+  function resolveConversationElement(pick) {
+    if (!pick) return null;
+    const { nodes } = queryConversationRows();
+    // 只用同一套 nodes，禁止 index 跨集合
+    let el = nodes.find((n) => conversationKeyFromEl(n) === pick.key);
+    if (!el && pick.text) {
+      el = nodes.find((n) => textOf(n).includes(String(pick.text).slice(0, 12)));
+    }
+    if (!el && Number.isInteger(pick.index) && nodes[pick.index]) {
+      // 仅当 key 也大致吻合时才用 index
+      const cand = nodes[pick.index];
+      if (!pick.key || conversationKeyFromEl(cand) === pick.key || textOf(cand).includes(String(pick.text || "").slice(0, 8))) {
+        el = cand;
+      }
+    }
+    return el || null;
+  }
+
   async function waitAndOpenConversation(payload = {}) {
+    // 阶段一：只负责找到并确认打开目标会话（不把输入框失败当成未找到会话）
     const job = payload.job || {};
     const beforeKeys = new Set(payload.beforeKeys || []);
     const wantTitle = normalizeText(job.title || "");
@@ -2344,16 +2442,11 @@ async function startChat(job, opts = {}) {
 
     let lastSnap = null;
     while (Date.now() < deadline) {
-      if (!/\/chat/i.test(location.pathname)) {
-        // 若误在列表，不强制跳转（由后台打开消息页）
-      }
       dismissCommonDialogs();
       lastSnap = getConversationSnapshot();
       const items = lastSnap.items || [];
+      const candidates = items.filter((it) => it.key && !beforeKeys.has(it.key));
 
-      // 1) 新增会话
-      let candidates = items.filter((it) => it.key && !beforeKeys.has(it.key));
-      // 2) 全文匹配公司/岗位
       const scored = items.map((it) => {
         const t = normalizeText(it.text);
         let score = 0;
@@ -2362,14 +2455,13 @@ async function startChat(job, opts = {}) {
         if (wantTitle && t.includes(wantTitle.slice(0, Math.min(6, wantTitle.length)))) score += 35;
         if (wantTitle && t.includes(wantTitle)) score += 40;
         if (wantHr && t.includes(wantHr)) score += 25;
-        if (candidates.some((c) => c.key === it.key)) score += 20; // 新增加权
+        if (candidates.some((c) => c.key === it.key)) score += 20;
         return { it, score };
       }).filter((x) => x.score >= 40).sort((a, b) => b.score - a.score);
 
       let pick = null;
       let via = "";
       if (scored[0] && scored[0].score >= 55) {
-        // 避免歧义
         if (scored[1] && scored[1].score >= scored[0].score - 5 && scored[0].score < 90) {
           return {
             ok: false,
@@ -2386,41 +2478,91 @@ async function startChat(job, opts = {}) {
         via = "new-single";
       } else if (candidates.length > 1 && wantCompany) {
         const byCo = candidates.filter((it) => normalizeText(it.text).includes(wantCompany.slice(0, 4)));
-        if (byCo.length === 1) { pick = byCo[0]; via = "new+company"; }
+        if (byCo.length === 1) {
+          pick = byCo[0];
+          via = "new+company";
+        }
       }
 
       if (pick) {
-        // 点击会话
-        const nodes = Array.from(document.querySelectorAll(
-          ".geek-chat-list li, .chat-user-list li, .friend-list-item, .user-list li, [class*='friend-list'] li, [class*='chat-list'] li, .chat-left li, aside li"
-        ));
-        const el =
-          nodes.find((n) => conversationKeyFromEl(n) === pick.key) ||
-          nodes[pick.index] ||
-          nodes.find((n) => textOf(n).includes((pick.text || "").slice(0, 10)));
-        if (el) {
-          clickLikeHuman(el);
-          await sleep(700);
-          // 头部校验（宽松）
-          const head = textOf(document.querySelector(".chat-top, .chat-header, .conversation-header, .base-info-single, .chat-main .base-info") || document.body).slice(0, 200);
-          const headN = normalizeText(head);
-          const okHead =
-            (!wantCompany || headN.includes(wantCompany.slice(0, 3))) ||
-            (!wantTitle || headN.includes(wantTitle.slice(0, 4))) ||
-            true; // 打开后仍允许发送，匹配信息记日志
-          await waitForChat(10000);
-          const ready = hasUsableChatInput();
+        const before = getActiveConversationIdentity();
+        log("msg open candidate", { via, key: pick.key, text: pick.text, beforeKey: before.key });
+        const row = resolveConversationElement(pick);
+        if (!row) {
           return {
-            ok: ready,
-            error: ready ? "" : "CHAT_TIMEOUT",
-            message: ready ? "" : "已打开会话但输入框未就绪",
-            matchedVia: via,
-            conversationText: pick.text,
-            head: head.slice(0, 120),
-            headOk: okHead,
+            ok: false,
+            error: "CONVERSATION_ELEMENT_NOT_FOUND",
+            message: "匹配到会话但 DOM 节点已变化，无法点击",
+            pick,
             contentVersion: BHT_CONTENT_VERSION
           };
         }
+        const clickable =
+          row.querySelector("a[href], [role='button'], .user-item, .friend-item, .conversation-item, .geek-info-card") ||
+          row;
+        try { clickable.scrollIntoView({ block: "center", behavior: "instant" }); } catch (_) {}
+        clickLikeHuman(clickable);
+        await sleep(500);
+
+        // 等待会话切换确认
+        let switched = false;
+        let after = before;
+        for (let i = 0; i < 16; i++) {
+          await sleep(350);
+          after = getActiveConversationIdentity();
+          const keyChanged = after.key && before.key && after.key !== before.key;
+          const keyIsPick = after.key && pick.key && after.key === pick.key;
+          const headOk = conversationHeaderMatches(job);
+          if (keyChanged || keyIsPick || headOk) {
+            switched = true;
+            break;
+          }
+          // 二次点击内部链接
+          if (i === 4) {
+            const a = row.querySelector("a[href]");
+            if (a) clickLikeHuman(a);
+          }
+        }
+
+        if (!switched) {
+          return {
+            ok: false,
+            error: "CONVERSATION_OPEN_NOT_CONFIRMED",
+            message: "已点击会话，但未确认切换成功",
+            before,
+            after,
+            pickText: pick.text,
+            contentVersion: BHT_CONTENT_VERSION
+          };
+        }
+
+        // 头部强校验：公司/岗位至少一个命中（有信息时）
+        const headOk = conversationHeaderMatches(job);
+        if ((wantCompany || wantTitle) && !headOk) {
+          // 给一点时间头部渲染
+          await sleep(600);
+        }
+        const headOk2 = conversationHeaderMatches(job);
+        if ((wantCompany || wantTitle) && !headOk2) {
+          return {
+            ok: false,
+            error: "CONVERSATION_IDENTITY_MISMATCH",
+            message: "打开的会话头部与目标岗位/公司不匹配，已停止发送",
+            head: getActiveConversationIdentity().head,
+            wantCompany: job.company,
+            wantTitle: job.title,
+            contentVersion: BHT_CONTENT_VERSION
+          };
+        }
+
+        return {
+          ok: true,
+          opened: true,
+          matchedVia: via,
+          conversationText: pick.text,
+          active: getActiveConversationIdentity(),
+          contentVersion: BHT_CONTENT_VERSION
+        };
       }
       await sleep(450);
     }
@@ -2428,9 +2570,40 @@ async function startChat(job, opts = {}) {
     return {
       ok: false,
       error: "CONVERSATION_NOT_FOUND",
-      message: "消息页未找到对应会话（已等待）。公司=" + (job.company || "") + " 岗位=" + (job.title || ""),
+      message: "消息页未找到对应会话。公司=" + (job.company || "") + " 岗位=" + (job.title || ""),
       snapshotCount: lastSnap?.count || 0,
       sample: (lastSnap?.items || []).slice(0, 5).map((x) => x.text),
+      contentVersion: BHT_CONTENT_VERSION
+    };
+  }
+
+  async function waitChatEditor(payload = {}) {
+    const timeoutMs = payload.timeoutMs || 30000;
+    const start = Date.now();
+    let lastDiagnostic = null;
+    while (Date.now() - start < timeoutMs) {
+      dismissCommonDialogs();
+      if (hasUsableChatInput()) {
+        return {
+          ok: true,
+          inputFound: true,
+          diagnostic: collectEditorDiagnostic(),
+          contentVersion: BHT_CONTENT_VERSION
+        };
+      }
+      lastDiagnostic = collectEditorDiagnostic();
+      // 尝试聚焦聊天主区域
+      try {
+        const root = getChatRoot();
+        root?.click?.();
+      } catch (_) {}
+      await sleep(320);
+    }
+    return {
+      ok: false,
+      error: "CHAT_EDITOR_NOT_READY",
+      message: "会话已打开，但未识别到消息输入框",
+      diagnostic: lastDiagnostic,
       contentVersion: BHT_CONTENT_VERSION
     };
   }
@@ -2470,6 +2643,9 @@ async function runOpByType(type, payload = {}) {
       case "BHT_WAIT_OPEN_CONVERSATION":
       case MSG.WAIT_OPEN_CONVERSATION:
         return await waitAndOpenConversation(payload || {});
+      case "BHT_WAIT_CHAT_EDITOR":
+      case MSG.WAIT_CHAT_EDITOR:
+        return await waitChatEditor(payload || {});
       case MSG.START_CHAT:
       case "BHT_START_CHAT":
         return await startChat(payload?.job || payload, payload || {});

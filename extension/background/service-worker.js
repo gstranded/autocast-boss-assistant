@@ -250,9 +250,11 @@ async function ensureMessageTab(task) {
       if (t && isBossUrl(t.url || t.pendingUrl || "")) {
         // 确保在消息中心
         if (!/\/chat/i.test(t.url || "")) {
-          await chrome.tabs.update(oldId, { url: "https://www.zhipin.com/web/geek/chat", active: false });
+          await chrome.tabs.update(oldId, { url: "https://www.zhipin.com/web/geek/chat", active: true });
           await waitTabComplete(oldId, 25000);
           await forceInjectContent(oldId);
+        } else {
+          try { await chrome.tabs.update(oldId, { active: true }); } catch (_) {}
         }
         await log("info", "[消息页] 复用 tab=" + oldId + " url=" + String(t.url || "").slice(0, 120));
         return t;
@@ -1019,18 +1021,20 @@ async function processOneJob(task, resultRow, config) {
     return 'failed';
   }
 
-  // 消息页：等待并打开会话
-  await sleep(800);
+  // 消息页阶段一：解析并打开会话（不含输入框门禁）
+  await sleep(600);
+  try { await chrome.tabs.update(msgTabId, { active: true }); } catch (_) {}
+  await sleep(400);
   await log('info', '[消息页] 等待并匹配会话…', { jobId: job.jobId, company: job.company, title: job.title });
   let conv = await sendToBoss(
     MSG.WAIT_OPEN_CONVERSATION || 'BHT_WAIT_OPEN_CONVERSATION',
     { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 18000 },
     msgOpt
   );
-  // 再试一次：刷新快照差异
   if (!conv?.ok && conv?.error === 'CONVERSATION_NOT_FOUND') {
     await sleep(1000);
     await forceInjectContent(msgTabId);
+    try { await chrome.tabs.update(msgTabId, { active: true }); } catch (_) {}
     conv = await sendToBoss(
       MSG.WAIT_OPEN_CONVERSATION || 'BHT_WAIT_OPEN_CONVERSATION',
       { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 12000 },
@@ -1040,38 +1044,71 @@ async function processOneJob(task, resultRow, config) {
   await log(
     conv?.ok ? 'success' : 'error',
     conv?.ok
-      ? ('[消息页] 会话已打开 via=' + (conv.matchedVia || '') + ' · ' + String(conv.conversationText || '').slice(0, 60))
-      : ('[消息页] 会话匹配失败：' + (conv?.message || conv?.error || '')),
-    { jobId: job.jobId, sample: conv?.sample, head: conv?.head }
+      ? ('[消息页] 会话打开确认 via=' + (conv.matchedVia || '') + ' · ' + String(conv.conversationText || conv.active?.text || '').slice(0, 60))
+      : ('[消息页] 会话打开失败：' + (conv?.error || '') + ' · ' + (conv?.message || '')),
+    { jobId: job.jobId, sample: conv?.sample, head: conv?.active?.head || conv?.head, before: conv?.before, after: conv?.after }
   );
 
   if (!conv?.ok) {
-    if (conv?.error === 'CONVERSATION_AMBIGUOUS') {
+    if (conv?.error === 'CONVERSATION_AMBIGUOUS' || conv?.error === 'CONVERSATION_IDENTITY_MISMATCH' || conv?.error === 'CONVERSATION_OPEN_NOT_CONFIRMED') {
       item.state = 'FAILED';
-      item.reasons = [conv.message || '会话歧义'];
+      item.reasons = [conv.message || conv.error];
       task.counters.failed += 1;
       task.pauseReason = item.reasons[0];
       task.awaitingUserRetry = true;
       runner.pause = true;
       task.status = TASK_STATUS.PAUSED;
       await publishTask(task);
-      await log('error', '[消息页] 会话不唯一，已暂停避免发错', { jobId: job.jobId, top: conv.top });
+      await log('error', '[消息页] 会话不安全，已暂停：' + (conv.error || ''), { jobId: job.jobId, top: conv.top });
       return 'failed';
     }
+    // 真没找到会话才 skip
     item.state = 'SKIPPED';
     item.reasons = [conv?.message || '未找到会话'];
     task.counters.skipped += 1;
-    await appendHistory({ jobId: job.jobId, title: job.title, company: job.company, status: 'conversation_not_found', taskId: task.id });
-    await log('warn', '[任务] 跳过：消息页未找到会话 · ' + (job.title || ''), { jobId: job.jobId });
+    await appendHistory({ jobId: job.jobId, title: job.title, company: job.company, status: 'conversation_not_found', taskId: task.id, phase: 'CHAT_TRIGGERED' });
+    await log('warn', '[任务] 跳过：消息页未找到会话 · ' + (job.title || '') + '（列表侧可能已点过沟通）', { jobId: job.jobId });
     return 'skipped';
   }
 
-  // 兼容后续逻辑：视为 chat 已就绪
+  // 消息页阶段二：等待输入框（失败=暂停，绝不当成未找到会话）
+  await log('info', '[消息页] 等待聊天输入框…', { jobId: job.jobId });
+  try { await chrome.tabs.update(msgTabId, { active: true }); } catch (_) {}
+  let editor = await sendToBoss(
+    MSG.WAIT_CHAT_EDITOR || 'BHT_WAIT_CHAT_EDITOR',
+    { timeoutMs: 30000 },
+    msgOpt
+  );
+  await log(
+    editor?.ok ? 'success' : 'error',
+    editor?.ok
+      ? '[消息页] 输入框已就绪'
+      : ('[消息页] 编辑器未就绪：' + (editor?.message || editor?.error || '')),
+    { jobId: job.jobId, diagnostic: editor?.diagnostic }
+  );
+  if (!editor?.ok) {
+    item.state = 'FAILED';
+    item.reasons = [editor?.message || 'CHAT_EDITOR_NOT_READY'];
+    item.phase = 'CONVERSATION_OPENED_EDITOR_PENDING';
+    task.counters.failed += 1;
+    task.pauseReason = '会话已打开，但消息输入框未识别，请检查消息页后点重试';
+    task.awaitingUserRetry = true;
+    task.lastErrorDetail = JSON.stringify(editor?.diagnostic || {}, null, 0).slice(0, 800);
+    runner.pause = true;
+    task.status = TASK_STATUS.PAUSED;
+    await publishTask(task);
+    await log('error', '[消息页] 会话已打开但编辑器未就绪，任务已暂停（不会跳过该岗位）', {
+      jobId: job.jobId,
+      diagnostic: editor?.diagnostic
+    });
+    return 'failed';
+  }
+
   const chatRes = {
     ok: true,
     already: Boolean(trig.already),
     matchedVia: 'list-trigger+' + (conv.matchedVia || 'msg'),
-    contentVersion: conv.contentVersion || trig.contentVersion,
+    contentVersion: conv.contentVersion || editor.contentVersion || trig.contentVersion,
     job
   };
   const tabOpt = msgOpt;
