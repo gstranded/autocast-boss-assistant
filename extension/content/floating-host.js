@@ -1,5 +1,5 @@
 (() => {
-  const BHT_FLOAT_HOST_VERSION = "1.3.9";
+  const BHT_FLOAT_HOST_VERSION = "1.4.0";
   if (window.__BHT_FLOAT_HOST_VERSION__ === BHT_FLOAT_HOST_VERSION && window.__BHT_FLOAT_HOST__) return;
   window.__BHT_FLOAT_HOST_VERSION__ = BHT_FLOAT_HOST_VERSION;
   window.__BHT_FLOAT_HOST__ = true;
@@ -81,8 +81,8 @@
       const frame = document.getElementById("bht-frame");
       if (frame) {
         // FORCE_IFRAME_RELOAD: 每次打开都带版本号，避免浮窗卡在旧 UI
-        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=1.3.9");
-        if (!frame.src || !frame.src.includes("v=1.3.9")) {
+        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=1.4.0");
+        if (!frame.src || !frame.src.includes("v=1.4.0")) {
           frame.src = next;
         }
       }

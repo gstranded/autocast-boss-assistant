@@ -4,7 +4,7 @@ import { reasonText } from '../shared/reason-codes.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
-const BHT_UI_VERSION = "1.3.9";
+const BHT_UI_VERSION = "1.4.0";
 // FLOAT_MODE_FORCE_BOSS: floating host only injects on BOSS pages
 const state = {
   modalDismissed: false,
@@ -31,6 +31,13 @@ async function api(type, payload) {
     const res = await chrome.runtime.sendMessage({ type, payload });
     if (chrome.runtime.lastError?.message) {
       throw new Error(chrome.runtime.lastError.message);
+    }
+    if (res == null) {
+      throw new Error(type + ' 未收到后台响应');
+    }
+    // 后台用 {ok:false,error} 表达业务失败；必须向上抛，避免假成功
+    if (res && res.ok === false) {
+      throw new Error(res.message || res.error || (type + ' 执行失败'));
     }
     return res;
   } catch (e) {
@@ -645,8 +652,78 @@ async function saveSettings(opts = {}) {
   }
 }
 
+
+function getJsonBytes(value) {
+  try { return new Blob([JSON.stringify(value)]).size; } catch (_) {
+    return JSON.stringify(value || {}).length;
+  }
+}
+
+async function assertResumeStorageCapacity(resumes) {
+  // unlimitedStorage 下仍做友好提示，避免一次塞入过大对象
+  try {
+    const resumeBytes = getJsonBytes(resumes);
+    const maxSoft = 40 * 1024 * 1024; // soft limit 40MB serialized
+    if (resumeBytes > maxSoft) {
+      throw new Error(
+        '简历数据过大（约 ' + (resumeBytes / 1024 / 1024).toFixed(2) +
+        ' MB）。请减少图片数量/压缩图片后再保存'
+      );
+    }
+    if (chrome?.storage?.local?.getBytesInUse) {
+      const totalUsed = await chrome.storage.local.getBytesInUse(null);
+      let oldResume = 0;
+      try { oldResume = await chrome.storage.local.getBytesInUse('bht_resumes'); } catch (_) {}
+      const projected = totalUsed - oldResume + resumeBytes;
+      const quota = chrome.storage.local.QUOTA_BYTES || (10 * 1024 * 1024);
+      // 有 unlimitedStorage 时 QUOTA 可能很大；仍警告超大 projected
+      if (quota < 50 * 1024 * 1024 && projected > quota * 0.92) {
+        throw new Error(
+          '扩展存储空间不足：简历约 ' + (resumeBytes / 1024 / 1024).toFixed(2) +
+          ' MB，当前已用 ' + (totalUsed / 1024 / 1024).toFixed(2) +
+          ' MB / 限额 ' + (quota / 1024 / 1024).toFixed(0) +
+          ' MB。请删减图片或清理历史后重试'
+        );
+      }
+    }
+  } catch (e) {
+    if (String(e?.message || e).includes('简历') || String(e?.message || e).includes('存储')) throw e;
+    // getBytesInUse 不可用时忽略
+  }
+}
+
+async function fileToCompressedDataUrl(file, maxEdge = 1280, quality = 0.72) {
+  if (!file || !String(file.type || '').startsWith('image/')) {
+    return fileToDataUrl(file);
+  }
+  // 小图不压
+  if (file.size <= 350 * 1024) return fileToDataUrl(file);
+  try {
+    const bitmap = await createImageBitmap(file);
+    let w = bitmap.width;
+    let h = bitmap.height;
+    const scale = Math.min(1, maxEdge / Math.max(w, h));
+    w = Math.max(1, Math.round(w * scale));
+    h = Math.max(1, Math.round(h * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    try { bitmap.close && bitmap.close(); } catch (_) {}
+    const q = file.size > 1.5 * 1024 * 1024 ? 0.62 : quality;
+    return canvas.toDataURL('image/jpeg', q);
+  } catch (_) {
+    return fileToDataUrl(file);
+  }
+}
+
 async function saveResume(opts = {}) {
-  const resumes = structuredClone(state.config.resumes);
+  const refresh = opts.refresh !== false;
+  const clearInputs = opts.clearInputs !== false;
+  const appendImages = opts.append !== false; // 默认追加，不覆盖已有图
+
+  const resumes = structuredClone(state.config?.resumes || { profiles: [], defaultProfileId: null });
   if (!resumes.profiles?.length) {
     resumes.profiles = [{ id: 'default', name: '默认方案', images: [], attachment: null }];
     resumes.defaultProfileId = 'default';
@@ -656,52 +733,73 @@ async function saveResume(opts = {}) {
     profile = resumes.profiles[0];
     state.activeProfileId = profile.id;
   }
-  profile.name = $('profileName').value || profile.name || '未命名方案';
+  profile.name = ($('profileName')?.value) || profile.name || '未命名方案';
+  if (!Array.isArray(profile.images)) profile.images = [];
 
-  const imageFiles = $('imageFiles').files;
+  const imageFiles = $('imageFiles')?.files;
+  let added = 0;
+  let skipped = 0;
   if (imageFiles?.length) {
-    const images = [];
+    const images = appendImages ? profile.images.slice() : [];
     for (const f of Array.from(imageFiles)) {
       if (f.size > 2.5 * 1024 * 1024) {
-        toast(`图片过大已跳过：${f.name}`);
+        skipped += 1;
+        toast('图片过大已跳过（单张 ≤ 2.5MB）：' + f.name, 'error', 3500);
         continue;
       }
+      const dataUrl = await fileToCompressedDataUrl(f);
       images.push({
         name: f.name,
         size: f.size,
-        dataUrl: await fileToDataUrl(f),
-        type: f.type
+        dataUrl,
+        type: (dataUrl || '').startsWith('data:image/jpeg') ? 'image/jpeg' : (f.type || 'image/png')
       });
+      added += 1;
     }
-    if (images.length) profile.images = images;
+    if (added === 0 && imageFiles.length > 0) {
+      throw new Error('没有成功导入任何图片（可能全部超限）。请压缩后重试');
+    }
+    if (added > 0) profile.images = images;
   }
 
-  const attach = $('attachFile').files?.[0];
+  const attach = $('attachFile')?.files?.[0];
   if (attach) {
     if (attach.size > 4.5 * 1024 * 1024) {
-      toast('附件过大（建议 < 4.5MB）', 'success');
-    } else {
-      profile.attachment = {
-        name: attach.name,
-        size: attach.size,
-        type: attach.type,
-        dataUrl: await fileToDataUrl(attach)
-      };
+      throw new Error('附件过大（建议 < 4.5MB）：' + attach.name);
     }
+    profile.attachment = {
+      name: attach.name,
+      size: attach.size,
+      type: attach.type,
+      dataUrl: await fileToDataUrl(attach)
+    };
   }
 
-  // write back
   const idx = resumes.profiles.findIndex((p) => p.id === profile.id);
   if (idx >= 0) resumes.profiles[idx] = profile;
+  else resumes.profiles.push(profile);
 
-  const settings = readSettingsPatch(state.config.settings);
+  await assertResumeStorageCapacity(resumes);
+
+  const settings = readSettingsPatch(state.config?.settings || {});
+  // 仅当后台 ok 时继续（api 会抛错）
   await api(MSG.SAVE_RESUMES, resumes);
   await api(MSG.SAVE_SETTINGS, settings);
-  $('imageFiles').value = '';
-  $('attachFile').value = '';
-  state.formDirty = false;
-  await refresh({ soft: false });
+
+  // 成功后才改本地状态/清输入
+  if (state.config) {
+    state.config.resumes = resumes;
+    state.config.settings = { ...(state.config.settings || {}), ...settings };
   }
+  state.formDirty = false;
+  if (clearInputs) {
+    if ($('imageFiles')) $('imageFiles').value = '';
+    if ($('attachFile')) $('attachFile').value = '';
+  }
+  try { renderResumeEditor(); } catch (_) {}
+  if (refresh) await refresh({ soft: true });
+  return { resumes, added, skipped };
+}
 
 async function saveBindings(opts = {}) {
   const rules = readBindingsFromDom()
@@ -725,7 +823,7 @@ async function flushAutosave() {
     try { await saveMessage({ refresh: false }); ok.push('消息'); } catch (e) { console.warn('autosave message', e); }
     try { await saveFilters({ refresh: false }); ok.push('筛选'); } catch (e) { console.warn('autosave filters', e); }
     try { await saveSettings({ refresh: false }); ok.push('设置'); } catch (e) { console.warn('autosave settings', e); }
-    try { await saveResume({ refresh: false }); ok.push('简历'); } catch (e) { console.warn('autosave resume', e); }
+    try { await saveResume({ refresh: false, clearInputs: false }); ok.push('简历'); } catch (e) { console.warn('autosave resume', e); }
     try { await saveBindings({ refresh: false }); ok.push('绑定'); } catch (e) { console.warn('autosave bind', e); }
     state.formDirty = false;
     // 保存后用本地草稿重绘消息段，再 soft refresh 同步任务状态
@@ -742,6 +840,35 @@ function scheduleAutosave() {
   state.formDirty = true;
   clearTimeout(autosaveTimer);
   autosaveTimer = setTimeout(() => { flushAutosave(); }, 650);
+}
+
+function wireResumeFilePreview() {
+  const input = $('imageFiles');
+  if (!input || input.__bhtPreview) return;
+  input.__bhtPreview = true;
+  input.addEventListener('change', () => {
+    const box = $('imagePreview');
+    if (!box) return;
+    const files = Array.from(input.files || []);
+    if (!files.length) return;
+    // 临时预览本次选择（不覆盖已保存图，追加显示）
+    const frag = document.createDocumentFragment();
+    const tip = document.createElement('div');
+    tip.className = 'hint';
+    tip.textContent = '本次待保存：' + files.length + ' 张（保存成功后写入方案）';
+    frag.appendChild(tip);
+    for (const f of files.slice(0, 8)) {
+      const url = URL.createObjectURL(f);
+      const img = document.createElement('img');
+      img.src = url;
+      img.alt = f.name;
+      img.title = f.name + ' (' + Math.round(f.size / 1024) + 'KB)';
+      img.style.cssText = 'max-width:72px;max-height:72px;object-fit:cover;border-radius:6px;border:1px solid #ddd;margin:4px';
+      frag.appendChild(img);
+    }
+    box.prepend(frag);
+    try { scheduleAutosave(); } catch (_) {}
+  });
 }
 function wireAutosave() {
   const root = document.querySelector('main') || document.body;
@@ -841,10 +968,12 @@ function bindEvents() {
   });
   $('btnSaveResume').addEventListener('click', async () => {
     try {
-      await saveResume();
-      toast('当前方案已保存', 'success');
+      const r = await saveResume({ refresh: true, clearInputs: true, append: true });
+      const n = r?.added || 0;
+      toast(n > 0 ? ('当前方案已保存（新增图片 ' + n + ' 张）') : '当前方案已保存', 'success', 2800);
     } catch (e) {
-      toast(String(e.message || e), 'error', /扩展上下文|F5|失效/.test(String(e.message || e)) ? 6000 : 3500);
+      console.error('saveResume', e);
+      toast(String(e?.message || e || '保存失败'), 'error', 6000);
     }
   });
   $('btnSaveBindings').addEventListener('click', async () => {
@@ -1265,7 +1394,8 @@ document.addEventListener('click', (e) => {
 bindEvents();
 forceEnableControls();
 wireControlButtons();
-try { wireAutosave(); } catch (_) {}
+try { wireAutosave();
+try { wireResumeFilePreview(); } catch (_) {} } catch (_) {}
 refresh();
 setInterval(() => {
   forceEnableControls();

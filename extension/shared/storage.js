@@ -78,7 +78,15 @@ export async function saveMessageTemplate(template) {
 }
 
 export async function saveResumes(resumes) {
-  await set({ [STORAGE_KEYS.RESUMES]: resumes });
+  try {
+    await set({ [STORAGE_KEYS.RESUMES]: resumes });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (/QUOTA|quota|exceed/i.test(msg)) {
+      throw new Error('存储空间不足，无法保存简历图片（' + msg + '）。请减少图片或安装含 unlimitedStorage 的版本');
+    }
+    throw err;
+  }
 }
 
 export async function saveBindings(bindings) {
