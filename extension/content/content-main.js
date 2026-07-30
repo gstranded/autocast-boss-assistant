@@ -16,7 +16,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.5.1";
+  const BHT_CONTENT_VERSION = "1.5.2";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -2455,9 +2455,13 @@ async function startChat(job, opts = {}) {
         if (wantTitle && t.includes(wantTitle.slice(0, Math.min(6, wantTitle.length)))) score += 35;
         if (wantTitle && t.includes(wantTitle)) score += 40;
         if (wantHr && t.includes(wantHr)) score += 25;
-        if (candidates.some((c) => c.key === it.key)) score += 20;
+        if (candidates.some((c) => c.key === it.key)) {
+          score += 35;
+          // 列表越靠前（越新）加分越多
+          score += Math.max(0, 15 - (it.index || 0));
+        }
         return { it, score };
-      }).filter((x) => x.score >= 40).sort((a, b) => b.score - a.score);
+      }).filter((x) => x.score >= 40).sort((a, b) => (b.score - a.score) || ((a.it.index || 0) - (b.it.index || 0)));
 
       let pick = null;
       let via = "";
@@ -2504,23 +2508,47 @@ async function startChat(job, opts = {}) {
         clickLikeHuman(clickable);
         await sleep(500);
 
-        // 等待会话切换确认
+        // 等待会话切换确认（多种信号，避免“点了但 active class 不变”）
         let switched = false;
         let after = before;
-        for (let i = 0; i < 16; i++) {
-          await sleep(350);
+        let switchVia = "";
+        for (let i = 0; i < 20; i++) {
+          await sleep(300);
           after = getActiveConversationIdentity();
           const keyChanged = after.key && before.key && after.key !== before.key;
-          const keyIsPick = after.key && pick.key && after.key === pick.key;
+          const keyIsPick = after.key && pick.key && (after.key === pick.key || after.key.includes(String(pick.key).slice(0, 12)));
           const headOk = conversationHeaderMatches(job);
-          if (keyChanged || keyIsPick || headOk) {
-            switched = true;
-            break;
+          const textOnHead = pick.text && normalizeText(after.head || "").includes(normalizeText(pick.text).slice(0, 6));
+          // 列表项自身变 active
+          const rowActive = /active|selected|current/i.test(row.className || "") || row.getAttribute?.("aria-selected") === "true";
+          // 输入框出现也算打开成功的强信号（但还要头部/公司校验）
+          const inputReady = hasUsableChatInput();
+
+          if (keyChanged) { switched = true; switchVia = "key-changed"; break; }
+          if (keyIsPick) { switched = true; switchVia = "key-is-pick"; break; }
+          if (headOk) { switched = true; switchVia = "header-match"; break; }
+          if (rowActive && (headOk || textOnHead || inputReady)) { switched = true; switchVia = "row-active"; break; }
+          if (inputReady && (headOk || textOnHead || (wantCompany && normalizeText(after.head + pick.text).includes(wantCompany.slice(0, 3))))) {
+            switched = true; switchVia = "input+context"; break;
           }
-          // 二次点击内部链接
-          if (i === 4) {
-            const a = row.querySelector("a[href]");
-            if (a) clickLikeHuman(a);
+
+          if (i === 3 || i === 8 || i === 14) {
+            const a = row.querySelector("a[href], [role='button'], .user-item, .friend-item") || row;
+            clickLikeHuman(a);
+          }
+        }
+
+        if (!switched) {
+          // 最后兜底：候选文本已含公司+岗位，且输入框可用，允许继续但记 weak
+          const pickN = normalizeText(pick.text || "");
+          const weakOk =
+            hasUsableChatInput() &&
+            wantCompany && pickN.includes(wantCompany.slice(0, 3)) &&
+            (!wantTitle || pickN.includes(wantTitle.slice(0, 4)));
+          if (weakOk) {
+            switched = true;
+            switchVia = "weak-pick-text+input";
+            log("msg open weak accept", { pick: pick.text, head: getActiveConversationIdentity().head });
           }
         }
 
@@ -2530,25 +2558,31 @@ async function startChat(job, opts = {}) {
             error: "CONVERSATION_OPEN_NOT_CONFIRMED",
             message: "已点击会话，但未确认切换成功",
             before,
-            after,
+            after: getActiveConversationIdentity(),
             pickText: pick.text,
+            diagnostic: collectEditorDiagnostic(),
             contentVersion: BHT_CONTENT_VERSION
           };
         }
 
-        // 头部强校验：公司/岗位至少一个命中（有信息时）
-        const headOk = conversationHeaderMatches(job);
-        if ((wantCompany || wantTitle) && !headOk) {
-          // 给一点时间头部渲染
-          await sleep(600);
+        // 身份：优先头部；头部空则用候选列表文本
+        const activeNow = getActiveConversationIdentity();
+        const headN = normalizeText(activeNow.head || "");
+        const pickN = normalizeText(pick.text || "");
+        const contextN = headN || pickN;
+        let idOk = true;
+        if (wantCompany && contextN && !contextN.includes(wantCompany.slice(0, 3))) idOk = false;
+        if (wantTitle && contextN && !contextN.includes(wantTitle.slice(0, 4)) && !pickN.includes(wantTitle.slice(0, 4))) {
+          // 岗位名在列表预览里常被截断，仅公司命中也可
+          if (!(wantCompany && contextN.includes(wantCompany.slice(0, 3)))) idOk = false;
         }
-        const headOk2 = conversationHeaderMatches(job);
-        if ((wantCompany || wantTitle) && !headOk2) {
+        if (!idOk) {
           return {
             ok: false,
             error: "CONVERSATION_IDENTITY_MISMATCH",
-            message: "打开的会话头部与目标岗位/公司不匹配，已停止发送",
-            head: getActiveConversationIdentity().head,
+            message: "打开的会话与目标公司/岗位不匹配，已停止发送",
+            head: activeNow.head,
+            pickText: pick.text,
             wantCompany: job.company,
             wantTitle: job.title,
             contentVersion: BHT_CONTENT_VERSION
@@ -2558,9 +2592,9 @@ async function startChat(job, opts = {}) {
         return {
           ok: true,
           opened: true,
-          matchedVia: via,
+          matchedVia: via + "|" + switchVia,
           conversationText: pick.text,
-          active: getActiveConversationIdentity(),
+          active: activeNow,
           contentVersion: BHT_CONTENT_VERSION
         };
       }

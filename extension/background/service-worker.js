@@ -766,6 +766,35 @@ function ensureItem(task, job) {
   return item;
 }
 
+
+function buildDeliveryQueue(results = [], { selectedOnly = true } = {}) {
+  const rows = (results || []).filter((r) => r.decision === 'pass' && (selectedOnly ? r.selected !== false : true));
+  const seen = new Set();
+  const queue = [];
+  for (const r of rows) {
+    const job = r.job || {};
+    const id = String(job.jobId || '');
+    const title = normalizeText(job.title || '');
+    const company = normalizeText(job.company || '');
+    const key = id && !id.startsWith('name_') && !id.startsWith('dom_')
+      ? 'id:' + id
+      : 'tc:' + company + '|' + title;
+    if (seen.has(key)) continue;
+    if (!title && !id) continue;
+    seen.add(key);
+    queue.push({
+      index: queue.length,
+      jobId: job.jobId,
+      title: job.title,
+      company: job.company,
+      href: job.href || '',
+      securityId: job.securityId || '',
+      status: 'pending'
+    });
+  }
+  return queue;
+}
+
 async function runPreview(payload = {}) {
   await log('info', '开始扫描预览…');
   const config = await getAllConfig();
@@ -1050,16 +1079,25 @@ async function processOneJob(task, resultRow, config) {
   );
 
   if (!conv?.ok) {
-    if (conv?.error === 'CONVERSATION_AMBIGUOUS' || conv?.error === 'CONVERSATION_IDENTITY_MISMATCH' || conv?.error === 'CONVERSATION_OPEN_NOT_CONFIRMED') {
+    const convErr = String(conv?.error || '');
+    const convMsg = String(conv?.message || '');
+    const unsafe =
+      /AMBIGUOUS|IDENTITY_MISMATCH|OPEN_NOT_CONFIRMED|ELEMENT_NOT_FOUND/i.test(convErr) ||
+      /未确认切换|不匹配|多个相似会话/.test(convMsg);
+    if (unsafe) {
       item.state = 'FAILED';
-      item.reasons = [conv.message || conv.error];
+      item.reasons = [conv.message || conv.error || '会话打开未确认'];
       task.counters.failed += 1;
       task.pauseReason = item.reasons[0];
       task.awaitingUserRetry = true;
       runner.pause = true;
       task.status = TASK_STATUS.PAUSED;
       await publishTask(task);
-      await log('error', '[消息页] 会话不安全，已暂停：' + (conv.error || ''), { jobId: job.jobId, top: conv.top });
+      await log('error', '[消息页] 会话未可靠打开，已暂停（不会当未找到会话跳过）：' + (conv.error || conv.message || ''), {
+        jobId: job.jobId,
+        top: conv.top,
+        diagnostic: conv.diagnostic
+      });
       return 'failed';
     }
     // 真没找到会话才 skip
@@ -1067,7 +1105,7 @@ async function processOneJob(task, resultRow, config) {
     item.reasons = [conv?.message || '未找到会话'];
     task.counters.skipped += 1;
     await appendHistory({ jobId: job.jobId, title: job.title, company: job.company, status: 'conversation_not_found', taskId: task.id, phase: 'CHAT_TRIGGERED' });
-    await log('warn', '[任务] 跳过：消息页未找到会话 · ' + (job.title || '') + '（列表侧可能已点过沟通）', { jobId: job.jobId });
+    await log('warn', '[任务] 跳过：' + (conv?.error || 'CONVERSATION_NOT_FOUND') + ' · ' + (job.title || '') + '（列表侧可能已点过沟通）', { jobId: job.jobId });
     return 'skipped';
   }
 
@@ -1171,7 +1209,12 @@ async function processOneJob(task, resultRow, config) {
 
   item.state = 'COMMUNICATION_CREATED';
   await bumpDailyStat('communicate', 1, normalizeText(job.company || ''));
-  await log('success', '已进入沟通，开始发送消息', { jobId: job.jobId });
+  await log('success', '已进入沟通，开始发送消息', {
+    jobId: job.jobId,
+    matchedVia: chatRes?.matchedVia,
+    conversation: conv?.conversationText || conv?.active?.text || '',
+    head: conv?.active?.head || ''
+  });
 
   // messages
   const selfRes = await sendToBoss(MSG.GET_CHAT_SELF_MESSAGES, { limit: 8 }, tabOpt);
@@ -1369,19 +1412,20 @@ async function runTaskLoop(taskId) {
     await publishTask(task);
 
     // 队列以预览快照为准（不是回页后再猜）
-    if (!task.queue || !task.queue.length) {
-      task.queue = (task.results || [])
-        .filter((r) => r.selected && r.decision === 'pass')
-        .map((r, idx) => ({
-          index: idx,
-          jobId: r.job?.jobId,
-          title: r.job?.title,
-          company: r.job?.company,
-          href: r.job?.href || '',
-          securityId: r.job?.securityId || '',
-          status: 'pending'
-        }));
-      task.queueCursor = 0;
+    // 始终按 selected 重建 pending 视图，并去重
+    {
+      const rebuilt = buildDeliveryQueue(task.results || [], { selectedOnly: true });
+      // 保留已完成状态
+      const prev = new Map((task.queue || []).map((q) => [String(q.jobId || '') + '|' + normalizeText(q.title || ''), q]));
+      task.queue = rebuilt.map((q) => {
+        const old = prev.get(String(q.jobId || '') + '|' + normalizeText(q.title || '')) ||
+          (task.queue || []).find((x) => x.jobId && x.jobId === q.jobId);
+        if (old && (old.status === 'done' || old.status === 'skipped' || old.status === 'failed')) {
+          return { ...q, status: old.status, outcome: old.outcome, finishedAt: old.finishedAt };
+        }
+        return q;
+      });
+      if (task.queueCursor == null) task.queueCursor = 0;
       await publishTask(task);
     }
     const queue = task.queue.map((q) => {
