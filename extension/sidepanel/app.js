@@ -4,7 +4,7 @@ import { reasonText } from '../shared/reason-codes.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
-const BHT_UI_VERSION = "1.3.5";
+const BHT_UI_VERSION = "1.3.6";
 // FLOAT_MODE_FORCE_BOSS: floating host only injects on BOSS pages
 const state = {
   modalDismissed: false,
@@ -15,8 +15,49 @@ const state = {
   draftBindings: []
 };
 
+function isExtContextDead(err) {
+  const msg = String(err?.message || err || "");
+  if (!chrome?.runtime?.id) return true;
+  return /Extension context invalidated|context invalidated|Receiving end does not exist|message port closed|Could not establish connection/i.test(msg);
+}
+
+function extContextHint() {
+  return "扩展上下文已失效（常见于刚重载/更新扩展）。请 F5 刷新 BOSS 页面，再打开面板后重新保存。";
+}
+
 async function api(type, payload) {
-  return chrome.runtime.sendMessage({ type, payload });
+  try {
+    if (!chrome?.runtime?.id) throw new Error(extContextHint());
+    const res = await chrome.runtime.sendMessage({ type, payload });
+    if (chrome.runtime.lastError?.message) {
+      throw new Error(chrome.runtime.lastError.message);
+    }
+    return res;
+  } catch (e) {
+    if (isExtContextDead(e)) {
+      showContextDeadBanner();
+      throw new Error(extContextHint());
+    }
+    throw e;
+  }
+}
+
+function showContextDeadBanner() {
+  try {
+    let el = document.getElementById("bhtContextDead");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "bhtContextDead";
+      el.style.cssText = "position:sticky;top:0;z-index:9999;background:#7f1d1d;color:#fff;padding:10px 12px;font-size:12px;line-height:1.45;border-bottom:1px solid #991b1b";
+      el.innerHTML = '<div style="font-weight:700;margin-bottom:4px">扩展已失效，无法保存</div><div>请回到 BOSS 页面按 <b>F5</b> 刷新，再点开海投面板重试。不要只关面板重开。</div><button id="bhtReloadPanel" type="button" style="margin-top:8px;padding:4px 10px;border:0;border-radius:6px;cursor:pointer">尝试重载面板</button>';
+      document.body.prepend(el);
+      el.querySelector("#bhtReloadPanel")?.addEventListener("click", () => {
+        try { location.reload(); } catch (_) {
+          toast(extContextHint(), "error", 5000);
+        }
+      });
+    }
+  } catch (_) {}
 }
 
 function showTab(name) {
@@ -673,7 +714,7 @@ function bindEvents() {
       await saveFilters();
       toast('筛选已保存', 'success');
     } catch (e) {
-      toast(String(e.message || e), 'error');
+      toast(String(e.message || e), 'error', /扩展上下文|F5|失效/.test(String(e.message || e)) ? 6000 : 3500);
     }
   });
   $('btnSaveMessage').addEventListener('click', async () => {
@@ -681,7 +722,7 @@ function bindEvents() {
       await saveMessage();
       toast('消息模板已保存', 'success');
     } catch (e) {
-      toast(String(e.message || e), 'error');
+      toast(String(e.message || e), 'error', /扩展上下文|F5|失效/.test(String(e.message || e)) ? 6000 : 3500);
     }
   });
   $('btnSaveSettings').addEventListener('click', async () => {
@@ -689,7 +730,7 @@ function bindEvents() {
       await saveSettings();
       toast('设置已保存', 'success');
     } catch (e) {
-      toast(String(e.message || e), 'error');
+      toast(String(e.message || e), 'error', /扩展上下文|F5|失效/.test(String(e.message || e)) ? 6000 : 3500);
     }
   });
   $('btnSaveResume').addEventListener('click', async () => {
@@ -697,7 +738,7 @@ function bindEvents() {
       await saveResume();
       toast('当前方案已保存', 'success');
     } catch (e) {
-      toast(String(e.message || e), 'error');
+      toast(String(e.message || e), 'error', /扩展上下文|F5|失效/.test(String(e.message || e)) ? 6000 : 3500);
     }
   });
   $('btnSaveBindings').addEventListener('click', async () => {
@@ -705,7 +746,7 @@ function bindEvents() {
       await saveBindings();
       toast('绑定规则已保存', 'success');
     } catch (e) {
-      toast(String(e.message || e), 'error');
+      toast(String(e.message || e), 'error', /扩展上下文|F5|失效/.test(String(e.message || e)) ? 6000 : 3500);
     }
   });
 
@@ -960,7 +1001,7 @@ function bindEvents() {
       await refresh({ soft: false });
       toast('导入成功', 'success');
     } catch (e) {
-      toast(String(e.message || e), 'error');
+      toast(String(e.message || e), 'error', /扩展上下文|F5|失效/.test(String(e.message || e)) ? 6000 : 3500);
     } finally {
       $('importFile').value = '';
     }

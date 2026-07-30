@@ -1,5 +1,5 @@
 (() => {
-  const BHT_FLOAT_HOST_VERSION = "1.3.5";
+  const BHT_FLOAT_HOST_VERSION = "1.3.6";
   if (window.__BHT_FLOAT_HOST_VERSION__ === BHT_FLOAT_HOST_VERSION && window.__BHT_FLOAT_HOST__) return;
   window.__BHT_FLOAT_HOST_VERSION__ = BHT_FLOAT_HOST_VERSION;
   window.__BHT_FLOAT_HOST__ = true;
@@ -81,8 +81,8 @@
       const frame = document.getElementById("bht-frame");
       if (frame) {
         // FORCE_IFRAME_RELOAD: 每次打开都带版本号，避免浮窗卡在旧 UI
-        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=1.3.5");
-        if (!frame.src || !frame.src.includes("v=1.3.5")) {
+        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=1.3.6");
+        if (!frame.src || !frame.src.includes("v=1.3.6")) {
           frame.src = next;
         }
       }
@@ -302,4 +302,45 @@
   } else {
     init();
   }
+
+  function markContextDead(reason) {
+    try {
+      let tip = document.getElementById("bht-context-dead");
+      if (!tip) {
+        tip = document.createElement("div");
+        tip.id = "bht-context-dead";
+        tip.style.cssText = "position:fixed;right:16px;bottom:86px;z-index:2147483647;max-width:260px;background:#7f1d1d;color:#fff;padding:10px 12px;border-radius:10px;font:12px/1.45 sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.25)";
+        tip.innerHTML = "<b>海投助手需刷新</b><div style=\"margin-top:4px\">扩展已重载，当前页面脚本失效。请 F5 刷新本页后再使用。</div>";
+        document.documentElement.appendChild(tip);
+      }
+      const fab = document.getElementById("bht-fab");
+      if (fab) fab.title = "请先 F5 刷新页面";
+      console.warn("[BHT float] context dead:", reason || "");
+    } catch (_) {}
+  }
+
+  function probeRuntime() {
+    try {
+      if (!chrome?.runtime?.id) {
+        markContextDead("no runtime id");
+        return;
+      }
+      chrome.runtime.sendMessage({ type: "BHT_PING", payload: {} }, () => {
+        const err = chrome.runtime.lastError?.message || "";
+        if (/invalidated|Receiving end does not exist|message port closed/i.test(err)) {
+          // Receiving end 可能只是 SW 休眠，不一律当失效
+          if (/invalidated/i.test(err)) markContextDead(err);
+        }
+      });
+    } catch (e) {
+      markContextDead(String(e?.message || e));
+    }
+  }
+
+  setInterval(probeRuntime, 20000);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") probeRuntime();
+  });
+  setTimeout(probeRuntime, 3000);
+
 })();
