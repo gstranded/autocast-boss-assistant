@@ -196,7 +196,14 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
         const row = bag && bag['bht_op_' + opId];
         if (row && row.status === 'done') {
           try { await chrome.storage.local.remove('bht_op_' + opId); } catch (_) {}
-          return row.result || { ok: false, error: 'EMPTY_OP_RESULT' };
+          const result = row.result || { ok: false, error: 'EMPTY_OP_RESULT' };
+          // 页面跳转中断：对发消息/开聊自动重试一次
+          if (result && result.error === 'NAVIGATED' && (type === MSG.SEND_TEXT || type === MSG.START_CHAT) && !payload.__navRetried) {
+            await forceInjectContent(tab.id);
+            await sleep(350);
+            return await sendToBoss(type, { ...payload, __navRetried: true }, { retries, forceInject: true });
+          }
+          return result;
         }
         // START_CHAT：若已进入聊天页且输入框可用，直接视为成功（SPA 跳转会杀死原 content）
         if (type === MSG.START_CHAT && Date.now() - started > 2500) {
@@ -231,9 +238,9 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
             }
           } catch (_) {}
         }
-        // 超时前若仍 pending：可能 content 被导航销毁，重注入并重发一次同 opId（幂等由 content 覆盖写）
-        if (Date.now() > reinjectAt && type === MSG.START_CHAT) {
-          reinjectAt = Date.now() + 8000;
+        // 超时前若仍 pending：content 被导航销毁时重注入并重发
+        if (Date.now() > reinjectAt && longOps.includes(type)) {
+          reinjectAt = Date.now() + 7000;
           try {
             const latest = await chrome.tabs.get(tab.id);
             if (!isBossUrl(latest?.url || '')) continue;
@@ -243,7 +250,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
               pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
               alive = Boolean(pong?.ok);
             } catch (_) { alive = false; }
-            if (alive && pong?.page?.hasChatInput) {
+            if (type === MSG.START_CHAT && alive && pong?.page?.hasChatInput) {
               try { await chrome.storage.local.remove('bht_op_' + opId); } catch (_) {}
               return {
                 ok: true,
@@ -253,7 +260,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
                 contentVersion: pong?.contentVersion
               };
             }
-            // 重注入并重发：聊天页上 startChat 会走 already-in-chat
+            // 重注入并重发同 opId（content 覆盖写结果）
             await forceInjectContent(tab.id);
             await sleep(280);
             await fireOp();
@@ -714,15 +721,29 @@ async function processOneJob(task, resultRow, config) {
   // resume
   const profile = pickResumeProfile(job, config.resumes, config.bindings);
   const timing = config.settings.resumeSendTiming || 'on_request';
-  const wantAutoImage = Boolean(config.settings.autoSendImageResume && profile?.images?.length);
-  const wantAutoFile = Boolean(config.settings.autoSendAttachmentResume && profile?.attachment?.dataUrl);
-  // 仅 after_text 自动发；勾选自动发但时机不对时给明确提示
+  const hasImages = Boolean(profile?.images?.length);
+  const hasFile = Boolean(profile?.attachment?.dataUrl);
+  const flagImage = Boolean(config.settings.autoSendImageResume);
+  const flagFile = Boolean(config.settings.autoSendAttachmentResume);
+  const wantAutoImage = Boolean(flagImage && hasImages);
+  const wantAutoFile = Boolean(flagFile && hasFile);
+  // 仅 after_text 自动发；其余情况写清原因，避免「发了文字没发简历」困惑
   const doResume = timing === 'after_text' && profile && (wantAutoImage || wantAutoFile);
-  if (timing === 'after_text' && profile && !wantAutoImage && !wantAutoFile) {
-    await log('info', '文本后发送简历已开启，但未勾选自动发图/附件或未上传简历文件', { jobId: job.jobId });
-  }
-  if ((wantAutoImage || wantAutoFile) && timing !== 'after_text') {
-    await log('warn', '已勾选自动发简历，但发送时机不是「文本发送完成后」。请到设置改为「文本发送完成后立即发送」', { jobId: job.jobId });
+  if (!doResume) {
+    let why = '';
+    if (!profile) why = '未匹配到简历方案（请到「简历」页添加方案并设为默认/绑定规则）';
+    else if (timing !== 'after_text') why = '发送时机为「' + (timing === 'on_request' ? 'HR请求后再发' : timing) + '」，自动任务不会强制发简历。请改为「文本发送完成后立即发送」';
+    else if (!flagImage && !flagFile) why = '未勾选「自动发送图片简历/附件简历」';
+    else if (!hasImages && !hasFile) why = '简历方案里还没有上传图片/附件';
+    else if (flagImage && !hasImages) why = '已勾选自动发图片，但方案中无图片';
+    else if (flagFile && !hasFile) why = '已勾选自动发附件，但方案中无附件';
+    else why = '当前配置不满足自动发简历条件';
+    await log('info', '本次不自动发送简历：' + why, { jobId: job.jobId, timing, flagImage, flagFile, hasImages, hasFile, profileId: profile?.id || null });
+  } else {
+    await log('info', '将自动发送简历：' + [
+      wantAutoImage ? ('图片' + (profile.images?.length || 0) + '张') : '',
+      wantAutoFile ? '附件1份' : ''
+    ].filter(Boolean).join(' + '), { jobId: job.jobId, profileId: profile.id });
   }
 
   if (doResume) {
@@ -1029,6 +1050,57 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         runTaskLoop(task.id);
         return { ok: true, taskId: task.id };
       }
+      case MSG.RUN_TEST_DELIVERY:
+      case 'BHT_RUN_TEST_DELIVERY': {
+        {
+          const guard = await assertBossContext();
+          if (!guard.ok) {
+            await log('warn', guard.message);
+            return guard;
+          }
+        }
+        const all = await getAllConfig();
+        let task = all.task;
+        if (!task || !(task.results || []).length) {
+          return { ok: false, error: 'NO_PREVIEW', message: '请先扫描预览，再使用「投递一份测试」' };
+        }
+        const passRows = (task.results || []).filter((r) => r.decision === 'pass');
+        if (!passRows.length) {
+          return { ok: false, error: 'NO_PASS', message: '预览结果中没有通过筛选的岗位，无法测试投递' };
+        }
+        let pick = null;
+        const wantId = payload?.jobId || (payload?.selectedJobIds && payload.selectedJobIds[0]) || null;
+        if (wantId) pick = passRows.find((r) => r.job?.jobId === wantId) || null;
+        if (!pick) {
+          // prefer currently selected pass
+          pick = passRows.find((r) => r.selected) || passRows[0];
+        }
+        const onlyId = pick.job.jobId;
+        task.results = (task.results || []).map((r) => ({
+          ...r,
+          selected: r.job?.jobId === onlyId && r.decision === 'pass'
+        }));
+        task.items = (task.items || []).map((it) => ({
+          ...it,
+          selected: it.jobId === onlyId
+        }));
+        // force one-shot limit for this task instance
+        task.testDelivery = true;
+        task.testJobId = onlyId;
+        task.status = TASK_STATUS.RUNNING;
+        task.pauseReason = '';
+        task.awaitingUserRetry = false;
+        await publishTask(task);
+        await log(
+          'info',
+          '测试投递启动：仅处理 1 个岗位「' + (pick.job?.title || '') + '」@ ' + (pick.job?.company || ''),
+          { jobId: onlyId }
+        );
+        // temporary settings override for this run only (in-memory via task flags; limits still apply normally but queue size=1)
+        runTaskLoop(task.id);
+        return { ok: true, testJobId: onlyId, job: pick.job };
+      }
+
       case MSG.PAUSE_TASK:
         runner.pause = true;
         {

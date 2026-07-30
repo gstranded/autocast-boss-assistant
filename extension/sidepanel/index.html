@@ -33,6 +33,7 @@
               <button id="btnPreview" class="btn primary">扫描预览</button>
               <button id="btnDiagnose" class="btn">页面诊断</button>
               <button id="btnStart" class="btn success" disabled>确认投递</button>
+              <button id="btnTestOne" class="btn" title="只投递当前选中的 1 个通过岗位（用于验证消息/简历）">投递一份测试</button>
               <button id="btnPause" class="btn">暂停</button>
               <button id="btnResume" class="btn">继续</button>
               <button id="btnSkip" class="btn">跳过当前</button>
@@ -155,6 +156,7 @@
         <section class="panel" id="tab-resume">
           <div class="card">
             <div class="card-title">发送策略</div>
+            <div class="hint auto-resume-hint">自动发图片简历需同时满足：①勾选本项 ②上传图片 ③发送时机选「文本发送完成后立即发送」</div>
             <label class="check"><input type="checkbox" id="autoSendImageResume" />自动发送图片简历</label>
             <label class="check"><input type="checkbox" id="autoSendAttachmentResume" />自动发送附件简历</label>
             <label>发送时机</label>

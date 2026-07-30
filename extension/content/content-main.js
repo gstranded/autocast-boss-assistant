@@ -15,7 +15,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.3.3";
+  const BHT_CONTENT_VERSION = "1.3.5";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -723,10 +723,46 @@ function firstEl(selectors, root = document) {
   }
 
   function getChatRoot() {
+    const input = (() => {
+      try { return document.querySelector("#bht-mock-chat #chat-input, #chat-input, .chat-input [contenteditable='true']"); } catch (_) { return null; }
+    })();
+    if (input) {
+      const near = input.closest?.(".chat-conversation, .chat-box, .conversation-box, .chat-container, .dialog-chat, #bht-mock-chat, .message-input, .chat-input");
+      if (near) return near;
+    }
+    for (const sel of SELECTORS.chatRoot) {
+      try {
+        for (const el of Array.from(document.querySelectorAll(sel))) {
+          try {
+            const st = getComputedStyle(el);
+            if (st.display === "none" || st.visibility === "hidden") continue;
+            const r = el.getBoundingClientRect();
+            if (r.width > 40 && r.height > 40) return el;
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
     return firstEl(SELECTORS.chatRoot);
   }
 
   function getChatInput() {
+    // 优先可见且像聊天输入的节点
+    for (const sel of SELECTORS.chatInput) {
+      try {
+        const list = Array.from(document.querySelectorAll(sel));
+        for (const el of list) {
+          try {
+            const st = getComputedStyle(el);
+            if (st.display === "none" || st.visibility === "hidden") continue;
+            const r = el.getBoundingClientRect();
+            if (r.width < 20 || r.height < 10) continue;
+            const ph = el.getAttribute("data-placeholder") || el.getAttribute("placeholder") || el.getAttribute("aria-label") || "";
+            const nearChat = el.closest?.(".chat-conversation, .chat-box, .conversation-box, .chat-container, .dialog-chat, .chat-input, .message-input, #bht-mock-chat");
+            if (nearChat || /发送|Enter|消息|沟通|聊/.test(ph) || /chat-input|#chat-input/.test(sel)) return el;
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
     return firstEl(SELECTORS.chatInput);
   }
 
@@ -788,41 +824,45 @@ function firstEl(selectors, root = document) {
 
   
   function detectLoginModal() {
-    const bodyText = (document.body?.innerText || "").replace(/\s+/g, " ");
+    // 避免频繁读 body.innerText（BOSS 大页极慢，会导致发消息循环卡死）
+    const modalRoots = Array.from(
+      document.querySelectorAll(
+        ".dialog-wrap, .dialog-container, .boss-dialog, .login-dialog, .login-container, .geetest_panel, [class*='login'], [class*='dialog'], [class*='modal'], [role='dialog']"
+      )
+    ).filter((el) => {
+      try {
+        const st = getComputedStyle(el);
+        if (st.display === "none" || st.visibility === "hidden") return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 80 && r.height > 80;
+      } catch (_) {
+        return false;
+      }
+    }).slice(0, 8);
+
+    const chunks = modalRoots.map((el) => (el.innerText || el.textContent || "").replace(/\s+/g, " ").slice(0, 500));
+    // 轻量补充：标题/固定登录入口，不做全 body 扫描
+    try {
+      const loginEntry = document.querySelector(".nav-login, .btn-login, a[href*='login'], .header-login");
+      if (loginEntry) chunks.push(textOf(loginEntry));
+    } catch (_) {}
+    const text = chunks.join(" | ");
     const markers = [
       "登录立即与BOSS沟通",
       "APP扫码登录",
       "登录/注册",
       "短信验证码",
-      "发送验证码",
-      "微信登录/注册",
+      "登录立即沟通",
       "扫码登录",
-      "请先登录",
-      "手机号登录"
+      "安全验证"
     ];
-    const hit = markers.some((m) => bodyText.includes(m));
-    // dialog-ish containers
-    const dialog = Array.from(document.querySelectorAll("div,section,form")).find((el) => {
-      const t = textOf(el);
-      if (!t || t.length > 800) return false;
-      return /登录\/注册|APP扫码登录|登录立即与BOSS沟通|短信验证码/.test(t);
-    });
-    if (hit || dialog) {
-      return {
-        ok: true,
-        message: "检测到登录弹窗，请先登录 BOSS 直聘后再使用海投功能"
-      };
+    const hit = markers.find((m) => text.includes(m));
+    if (hit) {
+      return { ok: true, message: "检测到登录/验证弹窗，请先登录 BOSS 直聘后再使用海投功能", marker: hit };
     }
-    // buttons
-    const loginBtn = Array.from(document.querySelectorAll("button,a,div")).find((el) => {
-      const t = textOf(el);
-      return t === "登录/注册" || t === "登录" || t === "APP扫码登录";
-    });
-    if (loginBtn && /登录/.test(bodyText.slice(0, 2000))) {
-      return {
-        ok: true,
-        message: "检测到未登录状态，请先登录 BOSS 直聘后再投递"
-      };
+    // 路径级未登录
+    if (/\/web\/user\/?$|passport|\/login/i.test(location.pathname + location.href)) {
+      return { ok: true, message: "当前未登录或处于登录页，请先登录 BOSS 直聘后再使用海投功能", marker: "path" };
     }
     return { ok: false };
   }
@@ -1651,10 +1691,29 @@ async function startChat(job, opts = {}) {
   }
 
   function findSendButton() {
-    // 优先明确的发送按钮，避开「发简历/换电话」
-    const nodes = Array.from(
-      document.querySelectorAll("button, a, div[role='button'], span.btn, .submit-button, .btn-send")
-    );
+    // 优先明确的发送按钮，避开「发简历/换电话」，且必须靠近聊天输入
+    const input = getChatInput();
+    const chatRoot =
+      document.getElementById("bht-mock-chat") ||
+      input?.closest?.(".chat-conversation, .chat-box, .conversation-box, .chat-container, .dialog-chat, .chat-input, .message-input, #chat-input") ||
+      getChatRoot() ||
+      null;
+    const searchRoots = chatRoot ? [chatRoot, chatRoot.parentElement].filter(Boolean) : [];
+    const collect = (root) =>
+      Array.from(
+        (root || document).querySelectorAll("button, a, div[role='button'], span.btn, .submit-button, .btn-send")
+      );
+    let nodes = [];
+    for (const r of searchRoots) nodes.push(...collect(r));
+    if (!nodes.length && input) {
+      // 向上找一截容器
+      let p = input.parentElement;
+      for (let i = 0; i < 5 && p; i++) {
+        nodes.push(...collect(p));
+        p = p.parentElement;
+      }
+    }
+    if (!nodes.length) nodes = collect(document);
     const visible = nodes.filter((el) => {
       try {
         const st = getComputedStyle(el);
@@ -1665,19 +1724,17 @@ async function startChat(job, opts = {}) {
         return true;
       }
     });
-    const exact = visible.find((el) => {
+    const isSend = (el) => {
       const t = textOf(el);
-      return t === "发送" || t === "发送消息";
-    });
-    if (exact) return exact;
-    const byClass = firstEl(SELECTORS.sendBtn);
+      if (!/^(发送|发送消息|Send)$/i.test(t) && !/btn-send|submit-button/.test(el.className || "")) return false;
+      if (/简历|电话|微信|表情|图片/.test(t)) return false;
+      return true;
+    };
+    const exact = visible.find((el) => textOf(el) === "发送" || textOf(el) === "发送消息");
+    if (exact && (chatRoot ? chatRoot.contains(exact) || !document.body.contains(chatRoot) : true)) return exact;
+    const byClass = firstEl(SELECTORS.sendBtn, chatRoot || document);
     if (byClass) return byClass;
-    return (
-      visible.find((el) => {
-        const t = textOf(el);
-        return /^(发送|发送消息|Send)$/i.test(t) && !/简历|电话|微信|表情/.test(t);
-      }) || null
-    );
+    return visible.find(isSend) || null;
   }
 
   async function setInputText(input, text) {
@@ -1733,11 +1790,11 @@ async function startChat(job, opts = {}) {
   async function sendText(text) {
     if (!text || !String(text).trim()) return { ok: false, error: "EMPTY_TEXT" };
     dismissCommonDialogs();
-    let ready = await waitForChat(14000);
+    let ready = await waitForChat(10000);
     if (!ready) {
       dismissCommonDialogs();
-      await sleep(500);
-      ready = await waitForChat(8000);
+      await sleep(300);
+      ready = await waitForChat(6000);
     }
     if (!ready) return { ok: false, error: "CHAT_TIMEOUT", message: "聊天输入框未就绪" };
     const input = getChatInput();
@@ -1773,8 +1830,8 @@ async function startChat(job, opts = {}) {
     const needle = needleFull.slice(0, 18);
     let confirmed = false;
     let selfTail = [];
-    for (let i = 0; i < 18; i++) {
-      await sleep(300);
+    for (let i = 0; i < 12; i++) {
+      await sleep(220);
       if (typeof detectLoginModal === "function") {
         const loginHit = detectLoginModal();
         if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
@@ -1793,7 +1850,7 @@ async function startChat(job, opts = {}) {
         confirmed = true;
       }
       if (confirmed) break;
-      if (i === 4 || i === 9 || i === 14) {
+      if (i === 3 || i === 7 || i === 10) {
         const btn2 = findSendButton();
         if (btn2) clickLikeHuman(btn2);
         else {
@@ -1975,11 +2032,24 @@ async function startChat(job, opts = {}) {
           });
         } catch (_) {}
         let result;
+        const opTimeoutMs = /SEND_TEXT|START_CHAT|SEND_IMAGE|SCAN_JOBS/.test(String(opType || "")) ? 20000 : 15000;
         try {
-          result = await runOpByType(opType, opPayload);
+          result = await Promise.race([
+            runOpByType(opType, opPayload),
+            sleep(opTimeoutMs).then(() => ({
+              ok: false,
+              error: "OP_INNER_TIMEOUT",
+              message: "页面内操作超时",
+              contentVersion: BHT_CONTENT_VERSION
+            }))
+          ]);
         } catch (err) {
           result = { ok: false, error: String(err?.message || err), contentVersion: BHT_CONTENT_VERSION };
         }
+        if (!result) {
+          result = { ok: false, error: "EMPTY_RESULT", contentVersion: BHT_CONTENT_VERSION };
+        }
+        try { window.__BHT_OP_LOCK__ = null; } catch (_) {}
         try {
           await chrome.storage.local.set({
             ["bht_op_" + opId]: {
@@ -2040,6 +2110,33 @@ async function startChat(job, opts = {}) {
   }
 
   // 若上次 START_CHAT 因跳转被杀，聊天页加载后自动收尾
+  // pagehide flush: 尽量把进行中的 op 标记完成，避免后台永久 pending
+  window.addEventListener("pagehide", () => {
+    try {
+      // best-effort; may not complete if context dies instantly
+      chrome.storage.local.get(null, (all) => {
+        try {
+          const entries = Object.entries(all || {}).filter(([k, v]) => k.startsWith("bht_op_") && v && v.status === "pending");
+          for (const [k, v] of entries) {
+            // 若当前已有可用聊天输入，START_CHAT 直接成功；其它写 NAVIGATED 让后台重试
+            const isStart = !v.opType || /START_CHAT/i.test(String(v.opType));
+            const okChat = typeof hasUsableChatInput === "function" && hasUsableChatInput();
+            chrome.storage.local.set({
+              [k]: {
+                status: "done",
+                opType: v.opType,
+                result: isStart && okChat
+                  ? { ok: true, already: true, matchedVia: "pagehide-chat", contentVersion: BHT_CONTENT_VERSION }
+                  : { ok: false, error: "NAVIGATED", message: "页面跳转，操作中断", contentVersion: BHT_CONTENT_VERSION },
+                at: Date.now()
+              }
+            });
+          }
+        } catch (_) {}
+      });
+    } catch (_) {}
+  });
+
   (async function resumePendingOps() {
     try {
       const deadline = Date.now() + 25000;

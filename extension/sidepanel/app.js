@@ -4,7 +4,7 @@ import { reasonText } from '../shared/reason-codes.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
-const BHT_UI_VERSION = "1.3.3";
+const BHT_UI_VERSION = "1.3.5";
 // FLOAT_MODE_FORCE_BOSS: floating host only injects on BOSS pages
 const state = {
   modalDismissed: false,
@@ -39,7 +39,7 @@ function setBossMode(isBoss, reason = '') {
   const effectiveBoss = FLOAT_MODE ? true : Boolean(isBoss);
   state.isBoss = effectiveBoss;
   state.bossBlockReason = effectiveBoss ? '' : (reason || '');
-  ['btnPreview', 'btnDiagnose', 'btnStart', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
+  ['btnPreview', 'btnDiagnose', 'btnStart', 'btnTestOne', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
     const el = $(id);
     if (!el) return;
     // 控制按钮在 BOSS/浮窗下始终可点
@@ -372,6 +372,12 @@ function updateTaskUI(task, runner = {}) {
     el.title = '';
   });
   if ($('btnStart')) $('btnStart').disabled = !(onBoss && status === 'awaiting_confirm');
+  if ($('btnTestOne')) {
+    const hasPassSelected = Array.from(state.selected || []).length > 0
+      || (state.config?.task?.results || []).some((r) => r.decision === 'pass');
+    const idleLike = !status || status === 'idle' || status === 'awaiting_confirm' || status === 'completed' || status === 'stopped' || status === 'failed' || status === 'paused';
+    $('btnTestOne').disabled = !(onBoss && hasPassSelected && idleLike && !['running'].includes(status));
+  }
   if ($('btnPreview')) $('btnPreview').disabled = !(onBoss && status !== 'running');
   if ($('btnDiagnose')) $('btnDiagnose').disabled = !onBoss;
 }
@@ -845,7 +851,48 @@ function bindEvents() {
     await refresh({ soft: true });
   });
 
-  // controls wired in wireControlButtons()
+  
+  $('btnTestOne')?.addEventListener('click', async () => {
+    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
+    // save settings first so resume flags apply
+    try { await saveSettings(); await saveResume(); await saveMessage(); } catch (_) {}
+    let selectedJobIds = Array.from(state.selected || []);
+    if (!selectedJobIds.length) {
+      const pass = (state.config?.task?.results || []).filter((r) => r.decision === 'pass');
+      if (pass[0]?.job?.jobId) selectedJobIds = [pass[0].job.jobId];
+    }
+    if (!selectedJobIds.length) {
+      toast('请先扫描预览并至少有一个通过岗位', 'error');
+      return;
+    }
+    // only first for test
+    selectedJobIds = selectedJobIds.slice(0, 1);
+    const settings = {
+      ...(state.config?.settings || {}),
+      autoSendImageResume: !!$('autoSendImageResume')?.checked,
+      autoSendAttachmentResume: !!$('autoSendAttachmentResume')?.checked,
+      resumeSendTiming: $('resumeSendTiming')?.value || 'on_request'
+    };
+    if (settings.autoSendImageResume && settings.resumeSendTiming !== 'after_text') {
+      toast('提示：已勾选自动发图，但时机不是「文本发送完成后」。测试将按当前设置执行', 'warn', 3500);
+    } else if (!settings.autoSendImageResume) {
+      toast('提示：未勾选自动发图片简历，本次测试通常只发文字', 'warn', 2800);
+    }
+    toast('正在启动测试投递（仅 1 岗）…', 'warn', 1500);
+    const res = await api(MSG.RUN_TEST_DELIVERY || 'BHT_RUN_TEST_DELIVERY', {
+      jobId: selectedJobIds[0],
+      selectedJobIds
+    });
+    if (!res?.ok) {
+      toast(res?.message || res?.error || '测试投递启动失败', 'error', 3500);
+      showErrorModal('测试投递失败', res?.message || res?.error || '无法启动', { showRetry: false });
+    } else {
+      toast('测试投递已开始：' + (res.job?.title || selectedJobIds[0]), 'success');
+    }
+    await refresh({ soft: true });
+  });
+
+// controls wired in wireControlButtons()
 
   $('btnCopyLogs')?.addEventListener('click', async () => {
     const logs = state.config?.logs || [];
