@@ -3,9 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Boss 海投助手</title>
-    <link rel="stylesheet" href="./styles.css" />
-    <link rel="stylesheet" href="./onboarding.css" />
+    <title>Boss 海投助手 - 新手引导预览</title>
+    <link rel="stylesheet" href="../extension/sidepanel/styles.css" />
+    <link rel="stylesheet" href="../extension/sidepanel/onboarding.css" />
   </head>
   <body>
     <div class="app">
@@ -292,7 +292,32 @@
       </div>
     </div>
     <script>if (new URLSearchParams(location.search).get('mode') === 'float') document.documentElement.classList.add('float-mode');</script>
-    <script type="module" src="./app.js"></script>
-    <script type="module" src="./onboarding.js"></script>
-  </body>
+  
+<!-- ===== preview-only: chrome.storage stub + minimal showTab so the real onboarding module works outside the extension ===== -->
+<script>
+window.chrome = window.chrome || {};
+chrome.storage = chrome.storage || {};
+var _bhtStore = {};
+chrome.storage.local = {
+  get: function (keys) {
+    return Promise.resolve((function () {
+      var out = {};
+      var ks = Array.isArray(keys) ? keys : (typeof keys === 'string' ? [keys] : (keys && typeof keys === 'object' ? Object.keys(keys) : []));
+      ks.forEach(function (k) {
+        if (k in _bhtStore) out[k] = _bhtStore[k];
+        else if (keys && typeof keys === 'object' && keys[k] !== undefined) out[k] = keys[k];
+      });
+      return out;
+    })());
+  },
+  set: function (obj) { Object.assign(_bhtStore, obj || {}); return Promise.resolve(); }
+};
+function showTab(name) {
+  document.querySelectorAll('.tabs button').forEach(function (b) { b.classList.toggle('active', b.dataset.tab === name); });
+  document.querySelectorAll('main .panel').forEach(function (p) { p.classList.toggle('active', p.id === 'tab-' + name); });
+}
+document.querySelectorAll('.tabs button').forEach(function (b) { b.addEventListener('click', function () { showTab(b.dataset.tab); }); });
+</script>
+<script type="module" src="../extension/sidepanel/onboarding.js"></script>
+</body>
 </html>

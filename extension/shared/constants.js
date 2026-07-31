@@ -11,7 +11,8 @@ export const STORAGE_KEYS = {
   IDEMPOTENCY: 'bht_idempotency',
   TASK: 'bht_current_task',
   LOGS: 'bht_logs',
-  DAILY_STATS: 'bht_daily_stats'
+  DAILY_STATS: 'bht_daily_stats',
+  ONBOARDING: 'bht_onboarding'
 };
 
 export const MESSAGE_MODES = {

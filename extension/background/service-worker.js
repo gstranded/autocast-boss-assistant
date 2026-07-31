@@ -3,6 +3,7 @@ import {
   appendHistory,
   appendLog,
   bumpDailyStat,
+  clearHistory,
   clearLogs,
   clearTask,
   exportAll,
@@ -1965,6 +1966,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { ok: true, logs: await getLogs(payload?.limit || 200) };
       case MSG.CLEAR_LOGS:
         await clearLogs();
+        return { ok: true };
+      case MSG.CLEAR_HISTORY:
+        await clearHistory();
         return { ok: true };
       case MSG.DIAGNOSE:
         return await sendToBoss(MSG.DIAGNOSE, payload || {});

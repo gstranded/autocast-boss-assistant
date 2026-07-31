@@ -128,6 +128,10 @@ export async function clearLogs() {
   await set({ [STORAGE_KEYS.LOGS]: [] });
 }
 
+export async function clearHistory() {
+  await set({ [STORAGE_KEYS.HISTORY]: [] });
+}
+
 export async function appendHistory(record) {
   const { [STORAGE_KEYS.HISTORY]: history = [] } = await get(STORAGE_KEYS.HISTORY);
   const next = [{ id: uid('hist'), ts: Date.now(), ...record }, ...history].slice(0, 5000);

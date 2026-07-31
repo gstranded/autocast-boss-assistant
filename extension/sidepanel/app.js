@@ -555,6 +555,52 @@ function renderLogs(logs = []) {
 }
 
 
+const HISTORY_STATUS_MAP = {
+  success: { label: '成功', cls: 'success' },
+  skipped_list: { label: '跳过', cls: 'skipped' },
+  conversation_not_found: { label: '跳过', cls: 'skipped' },
+  skipped_missing: { label: '跳过', cls: 'skipped' },
+  failed: { label: '失败', cls: 'failed' }
+};
+
+function renderHistory(history = []) {
+  const box = $('historyList');
+  if (!box) return;
+  const filter = $('historyFilter')?.value || 'all';
+  const filtered = history.filter((h) => {
+    if (filter === 'all') return true;
+    const info = HISTORY_STATUS_MAP[h.status] || { cls: 'skipped' };
+    return info.cls === filter;
+  });
+
+  const total = history.length;
+  const successCount = history.filter((h) => h.status === 'success').length;
+  const skipCount = history.filter((h) => (HISTORY_STATUS_MAP[h.status] || {}).cls === 'skipped').length;
+  const failCount = total - successCount - skipCount;
+  const statsEl = $('historyStats');
+  if (statsEl) {
+    statsEl.textContent = total
+      ? `共 ${total} 条 · 成功 ${successCount} · 跳过 ${skipCount} · 失败 ${failCount}`
+      : '尚无记录';
+  }
+
+  box.innerHTML = '';
+  filtered.slice(0, 200).forEach((h) => {
+    const info = HISTORY_STATUS_MAP[h.status] || { label: h.status, cls: 'skipped' };
+    const div = document.createElement('div');
+    div.className = 'history-item ' + info.cls;
+    const time = new Date(h.ts || Date.now()).toLocaleString();
+    const title = h.title || '未知岗位';
+    const company = h.company || '';
+    div.innerHTML =
+      '<span class="hist-badge ' + info.cls + '">' + info.label + '</span>' +
+      '<span class="hist-title">' + title + '</span>' +
+      (company ? '<span class="hist-company">' + company + '</span>' : '') +
+      '<span class="hist-time">' + time + '</span>';
+    box.appendChild(div);
+  });
+}
+
 function isFormField(el) {
   if (!el || !el.tagName) return false;
   const tag = el.tagName.toUpperCase();
@@ -617,6 +663,7 @@ async function refresh(options = {}) {
   updateTaskUI(res.task, res.runner);
   announceTaskCompletion(res.task);
   renderLogs(res.logs || []);
+  renderHistory(res.history || []);
 
   const isBoss = Boolean(res.activeIsBoss || res.activeTab);
   if (isBoss) {
@@ -1229,6 +1276,33 @@ function bindEvents() {
     await api(MSG.CLEAR_LOGS);
     toast('日志已清空', 'success');
     await refresh({ soft: true });
+
+  $('historyFilter')?.addEventListener('change', () => {
+    renderHistory(state.config?.history || []);
+  });
+
+  $('btnClearHistory')?.addEventListener('click', async () => {
+    try {
+      await api(MSG.CLEAR_HISTORY);
+      if (state.config) state.config.history = [];
+      renderHistory([]);
+      toast('投递记录已清空', 'success');
+    } catch (e) {
+      toast(String(e.message || e), 'error');
+    }
+  });
+
+  $('btnExportHistory')?.addEventListener('click', () => {
+    const history = state.config?.history || [];
+    if (!history.length) { toast('暂无记录可导出', 'warn'); return; }
+    const blob = new Blob([JSON.stringify(history, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'boss-haitou-history-' + new Date().toISOString().slice(0, 10) + '.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast('已导出 ' + history.length + ' 条记录', 'success');
+  });
   });
 
   $('selectAllPass').addEventListener('change', () => {

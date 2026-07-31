@@ -1,0 +1,651 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Boss 海投助手 — 使用教程</title>
+<style>
+  :root {
+    --primary: #2563eb;
+    --primary-light: #dbeafe;
+    --bg: #f8fafc;
+    --card: #ffffff;
+    --text: #1e293b;
+    --text-secondary: #64748b;
+    --border: #e2e8f0;
+    --success: #16a34a;
+    --warning: #f59e0b;
+    --accent: #7c3aed;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+  }
+
+  /* Header */
+  .header {
+    background: linear-gradient(135deg, #1e40af 0%, #7c3aed 100%);
+    color: white;
+    padding: 48px 24px 40px;
+    text-align: center;
+  }
+  .header img { width: 80px; height: 80px; margin-bottom: 16px; border-radius: 16px; }
+  .header h1 { font-size: 2rem; font-weight: 700; margin-bottom: 8px; }
+  .header p { font-size: 1.1rem; opacity: 0.9; }
+
+  /* Progress bar */
+  .progress-bar {
+    position: sticky; top: 0; z-index: 100;
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex; align-items: center; gap: 12px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  }
+  .progress-bar .step-indicator {
+    font-size: 0.85rem; color: var(--text-secondary); white-space: nowrap;
+  }
+  .progress-track {
+    flex: 1; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%; background: var(--primary); border-radius: 3px;
+    transition: width 0.4s ease;
+  }
+
+  /* Navigation */
+  .nav-buttons {
+    display: flex; justify-content: center; gap: 12px;
+    padding: 16px 24px;
+    position: sticky; top: 52px; z-index: 99;
+    background: var(--bg);
+  }
+  .nav-btn {
+    padding: 10px 24px; border: none; border-radius: 8px;
+    font-size: 0.95rem; font-weight: 600; cursor: pointer;
+    transition: all 0.2s;
+  }
+  .nav-btn.prev { background: var(--border); color: var(--text); }
+  .nav-btn.prev:hover { background: #cbd5e1; }
+  .nav-btn.next { background: var(--primary); color: white; }
+  .nav-btn.next:hover { background: #1d4ed8; }
+  .nav-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Steps container */
+  .steps-container { max-width: 900px; margin: 0 auto; padding: 0 24px 80px; }
+
+  /* Step card */
+  .step-card {
+    display: none;
+    background: var(--card);
+    border-radius: 16px;
+    border: 1px solid var(--border);
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    animation: fadeIn 0.3s ease;
+  }
+  .step-card.active { display: block; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+  .step-header {
+    padding: 24px 28px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px;
+  }
+  .step-number {
+    width: 44px; height: 44px; border-radius: 12px;
+    background: var(--primary); color: white;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.2rem; font-weight: 700; flex-shrink: 0;
+  }
+  .step-header h2 { font-size: 1.3rem; font-weight: 700; }
+  .step-header .duration {
+    margin-left: auto; font-size: 0.8rem; color: var(--text-secondary);
+    background: var(--primary-light); padding: 4px 10px; border-radius: 20px;
+    white-space: nowrap;
+  }
+
+  .step-body { padding: 24px 28px; }
+
+  /* Screenshot */
+  .screenshot-wrap {
+    margin: 0 0 24px;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: #f1f5f9;
+  }
+  .screenshot-wrap img {
+    width: 100%; display: block;
+  }
+  .screenshot-caption {
+    padding: 8px 16px;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    background: #f8fafc;
+    border-top: 1px solid var(--border);
+    text-align: center;
+  }
+
+  /* Action list */
+  .action-section { margin-bottom: 24px; }
+  .action-section h3 {
+    font-size: 0.9rem; font-weight: 700; color: var(--primary);
+    text-transform: uppercase; letter-spacing: 0.5px;
+    margin-bottom: 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .action-section h3::before {
+    content: ""; display: inline-block; width: 4px; height: 16px;
+    background: var(--primary); border-radius: 2px;
+  }
+  .action-list {
+    list-style: none; counter-reset: action;
+  }
+  .action-list li {
+    counter-increment: action;
+    padding: 8px 0 8px 36px;
+    position: relative;
+    font-size: 0.95rem;
+  }
+  .action-list li::before {
+    content: counter(action);
+    position: absolute; left: 0; top: 8px;
+    width: 24px; height: 24px; border-radius: 50%;
+    background: var(--primary-light); color: var(--primary);
+    font-size: 0.75rem; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .action-list li code {
+    background: #f1f5f9; padding: 2px 6px; border-radius: 4px;
+    font-size: 0.85rem; color: var(--accent);
+  }
+
+  /* Narration box */
+  .narration-box {
+    background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%);
+    border: 1px solid #fde68a;
+    border-radius: 12px;
+    padding: 20px 24px;
+    position: relative;
+  }
+  .narration-box::before {
+    content: "🎙 旁白";
+    position: absolute; top: -12px; left: 20px;
+    background: #fbbf24; color: #78350f;
+    font-size: 0.75rem; font-weight: 700;
+    padding: 2px 12px; border-radius: 20px;
+  }
+  .narration-box p {
+    font-size: 0.95rem;
+    color: #92400e;
+    margin-top: 4px;
+  }
+  .narration-box p + p { margin-top: 12px; }
+
+  /* Tips */
+  .tip-box {
+    background: #f0fdf4;
+    border: 1px solid #bbf7d0;
+    border-radius: 12px;
+    padding: 16px 20px;
+    margin-top: 16px;
+    font-size: 0.9rem;
+    color: #166534;
+  }
+  .tip-box strong { color: #15803d; }
+
+  /* Step dots */
+  .step-dots {
+    display: flex; justify-content: center; gap: 8px;
+    padding: 20px 0;
+  }
+  .step-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--border); cursor: pointer;
+    transition: all 0.2s;
+  }
+  .step-dot.active { background: var(--primary); transform: scale(1.3); }
+  .step-dot:hover { background: #94a3b8; }
+
+  /* Keyboard hint */
+  .keyboard-hint {
+    text-align: center; padding: 8px;
+    font-size: 0.8rem; color: var(--text-secondary);
+  }
+  .keyboard-hint kbd {
+    background: var(--card); border: 1px solid var(--border);
+    padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;
+    box-shadow: 0 1px 0 var(--border);
+  }
+
+  /* Responsive */
+  @media (max-width: 640px) {
+    .header h1 { font-size: 1.5rem; }
+    .step-header { flex-wrap: wrap; }
+    .step-header .duration { margin-left: 0; margin-top: 4px; }
+    .step-body { padding: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <img src="assets/logo.svg" alt="Logo" onerror="this.style.display='none'">
+  <h1>Boss 海投助手 — 使用教程</h1>
+  <p>BOSS 直聘网页端的职位筛选、投递确认、分段消息和简历发送助手</p>
+</div>
+
+<div class="progress-bar">
+  <span class="step-indicator" id="stepIndicator">第 1 / 13 步</span>
+  <div class="progress-track"><div class="progress-fill" id="progressFill" style="width:7.7%"></div></div>
+</div>
+
+<div class="nav-buttons">
+  <button class="nav-btn prev" id="prevBtn" onclick="go(-1)" disabled>← 上一步</button>
+  <button class="nav-btn next" id="nextBtn" onclick="go(1)">下一步 →</button>
+</div>
+
+<div class="steps-container">
+
+<!-- Step 0 -->
+<div class="step-card active" data-step="0">
+  <div class="step-header">
+    <div class="step-number">0</div>
+    <h2>片头</h2>
+    <span class="duration">~5 秒</span>
+  </div>
+  <div class="step-body">
+    <div class="action-section">
+      <h3>画面操作</h3>
+      <ul class="action-list">
+        <li>显示项目 Logo + 标题 "Boss 海投助手 — 使用教程"</li>
+        <li>可加一行副标题："BOSS 直聘批量沟通助手"</li>
+      </ul>
+    </div>
+    <div class="narration-box">
+      <p>大家好，今天带大家快速上手 Boss 海投助手。这是一款 BOSS 直聘网页端的职位筛选、批量沟通和简历发送助手。看完这个教程，你就能在 3 分钟内完成配置并开始使用。</p>
+    </div>
+  </div>
+</div>
+
+<!-- Step 1 -->
+<div class="step-card" data-step="1">
+  <div class="step-header">
+    <div class="step-number">1</div>
+    <h2>下载与安装</h2>
+    <span class="duration">~40 秒</span>
+  </div>
+  <div class="step-body">
+    <div class="action-section">
+      <h3>画面操作</h3>
+      <ul class="action-list">
+        <li>打开浏览器，访问 <code>github.com/gstranded/boss-haitou-assistant</code></li>
+        <li>点击右侧 <strong>Releases</strong> 链接</li>
+        <li>下载最新的 <code>boss-haitou-assistant-vX.Y.Z.zip</code></li>
+        <li>解压 ZIP 文件到本地文件夹</li>
+        <li>打开 Chrome，地址栏输入 <code>chrome://extensions</code> 回车</li>
+        <li>打开右上角 <strong>开发者模式</strong> 开关</li>
+        <li>点击 <strong>加载已解压的扩展程序</strong></li>
+        <li>选择解压后的 <code>extension</code> 文件夹</li>
+      </ul>
+    </div>
+    <div class="narration-box">
+      <p>首先，打开 GitHub 仓库，点击 Releases，下载最新版本的压缩包。下载完成后解压到任意文件夹。</p>
+      <p>接着打开 Chrome 浏览器，在地址栏输入 chrome://extensions 回车。打开右上角的"开发者模式"开关，然后点击"加载已解压的扩展程序"，选择刚才解压出来的 extension 文件夹。</p>
+      <p>看到扩展列表中出现 Boss 海投助手的图标，就说明安装成功了。</p>
+    </div>
+    <div class="tip-box">
+      <strong>提示：</strong>Edge 用户打开 <code>edge://extensions</code>，操作完全相同。
+    </div>
+  </div>
+</div>
+
+<!-- Step 2 -->
+<div class="step-card" data-step="2">
+  <div class="step-header">
+    <div class="step-number">2</div>
+    <h2>打开面板</h2>
+    <span class="duration">~15 秒</span>
+  </div>
+  <div class="step-body">
+    <div class="action-section">
+      <h3>画面操作</h3>
+      <ul class="action-list">
+        <li>打开 BOSS 直聘职位列表页 <code>www.zhipin.com/web/geek/jobs</code></li>
+        <li>确保已登录账号</li>
+        <li>按 <code>F5</code> 刷新页面</li>
+        <li>点击页面右侧出现的 <strong>蓝色悬浮按钮</strong></li>
+        <li>侧边面板滑出，显示"任务"标签页</li>
+      </ul>
+    </div>
+    <div class="narration-box">
+      <p>安装好之后，打开 BOSS 直聘的职位列表页，确保你已经登录。刷新一下页面，你会看到页面右侧出现一个蓝色的悬浮按钮。点击它，侧边面板就会滑出来，这就是我们的操作界面。</p>
+    </div>
+    <div class="tip-box">
+      <strong>提示：</strong>如果面板显示"未连接页面"，确认网址属于 zhipin.com，然后按 F5 刷新。
+    </div>
+  </div>
+</div>
+
+<!-- Step 3 -->
+<div class="step-card" data-step="3">
+  <div class="step-header">
+    <div class="step-number">3</div>
+    <h2>配置筛选条件</h2>
+    <span class="duration">~60 秒</span>
+  </div>
+  <div class="step-body">
+    <div class="screenshot-wrap">
+      <img src="assets/screenshots/02-filter.png" alt="筛选页截图">
+      <div class="screenshot-caption">筛选页 — 配置职位、地点、薪资等过滤条件</div>
+    </div>
+    <div class="action-section">
+      <h3>画面操作</h3>
+      <ul class="action-list">
+        <li>点击面板顶部的 <strong>筛选</strong> 标签页</li>
+        <li>"职位名称：包含任意"填写 <code>Java, Go, 后端</code></li>
+        <li>"职位名称：排除任意"填写 <code>外包, 驻场, 代招</code></li>
+        <li>"地点包含"填写 <code>广州, 深圳</code></li>
+        <li>"最低月薪"填写 <code>15000</code></li>
+        <li>勾选 <strong>排除猎头</strong> 和 <strong>排除外包/驻场</strong></li>
+        <li>（可选）"公司排除"填写不想投的公司关键词</li>
+      </ul>
+    </div>
+    <div class="narration-box">
+      <p>第一步，我们来配置筛选条件。点击顶部的"筛选"标签。</p>
+      <p>在"职位名称：包含任意"里填上你想找的职位关键词，多个关键词用逗号隔开，比如 Java、Go、后端，命中任意一个就会通过。</p>
+      <p>在"排除任意"里填上你不想看到的词，比如外包、驻场、代招，包含这些词的岗位会被自动跳过。</p>
+      <p>接着设置目标城市，在"地点包含"里填写，比如广州、深圳。再设一个最低月薪，比如 15000，薪资低于这个数的岗位也会被过滤掉。</p>
+      <p>建议勾选"排除猎头"和"排除外包/驻场"，这两个默认是开启的。如果你还有特别不想投的公司，可以在"公司排除"里加上关键词。</p>
+    </div>
+  </div>
+</div>
+
+<!-- Step 4 -->
+<div class="step-card" data-step="4">
+  <div class="step-header">
+    <div class="step-number">4</div>
+    <h2>配置消息模板</h2>
+    <span class="duration">~45 秒</span>
+  </div>
+  <div class="step-body">
+    <div class="screenshot-wrap">
+      <img src="assets/screenshots/03-message.png" alt="消息页截图">
+      <div class="screenshot-caption">消息页 — 配置分段消息和发送模式</div>
+    </div>
+    <div class="action-section">
+      <h3>画面操作</h3>
+      <ul class="action-list">
+        <li>点击 <strong>消息</strong> 标签页</li>
+        <li>发送模式选择 <strong>自动识别（推荐）</strong></li>
+        <li>第 1 段填写：<code>您好，我对贵司的这个岗位很感兴趣，方便进一步沟通吗？</code></li>
+        <li>第 2 段填写：<code>我有多年的相关经验，期待与您详聊。</code></li>
+        <li>段间等待时间设为 <code>3</code> 秒</li>
+      </ul>
+    </div>
+    <div class="narration-box">
+      <p>第二步，配置消息模板。点击"消息"标签。</p>
+      <p>发送模式建议选择"自动识别"，它会自动检查当前对话是否已经发过第一段消息，避免重复发送。</p>
+      <p>在第 1 段里写上你的打招呼语，比如"您好，我对贵司的这个岗位很感兴趣，方便进一步沟通吗？"</p>
+      <p>第 2 段可以写一句跟进语，比如"我有多年的相关经验，期待与您详聊。"</p>
+      <p>段间等待时间建议设 3 秒左右，让消息发送看起来更自然。</p>
+    </div>
+  </div>
+</div>
+
+<!-- Step 5 -->
+<div class="step-card" data-step="5">
+  <div class="step-header">
+    <div class="step-number">5</div>
+    <h2>配置简历方案</h2>
+    <span class="duration">~30 秒</span>
+  </div>
+  <div class="step-body">
+    <div class="screenshot-wrap">
+      <img src="assets/screenshots/04-resume.png" alt="简历页截图">
+      <div class="screenshot-caption">简历页 — 选择图片简历或 BOSS 发简历</div>
+    </div>
+    <div class="action-section">
+      <h3>画面操作</h3>
+      <ul class="action-list">
+        <li>点击 <strong>简历</strong> 标签页</li>
+        <li>方式 A：点击上传区域，选择简历截图作为 <strong>图片简历</strong></li>
+        <li>方式 B：勾选 <strong>自动点击 BOSS"发简历"</strong></li>
+        <li>发送时机选择 <strong>文本发送完成后立即发送</strong></li>
+      </ul>
+    </div>
+    <div class="narration-box">
+      <p>第三步，配置简历。点击"简历"标签。</p>
+      <p>你有两种选择：一是上传一张图片简历，插件会在沟通时自动发送这张图片；二是勾选"自动点击 BOSS 发简历"，插件会帮你点击 BOSS 直聘自带的发简历按钮。</p>
+      <p>发送时机建议选择"文本发送完成后立即发送"，这样消息和简历会连贯地发出去。</p>
+    </div>
+  </div>
+</div>
+
+<!-- Step 6 -->
+<div class="step-card" data-step="6">
+  <div class="step-header">
+    <div class="step-number">6</div>
+    <h2>调整安全设置</h2>
+    <span class="duration">~30 秒</span>
+  </div>
+  <div class="step-body">
+    <div class="screenshot-wrap">
+      <img src="assets/screenshots/05-settings.png" alt="设置页截图">
+      <div class="screenshot-caption">设置页 — 配置沟通上限和安全参数</div>
+    </div>
+    <div class="action-section">
+      <h3>画面操作</h3>
+      <ul class="action-list">
+        <li>点击 <strong>设置</strong> 标签页</li>
+        <li>将"本次最多沟通"改为 <code>1</code>（首次测试用）</li>
+        <li>确认"每日最多沟通"为 <code>80</code></li>
+        <li>确认"同公司每天最多"为 <code>3</code></li>
+        <li>确认"连续失败暂停"为 <code>3</code></li>
+      </ul>
+    </div>
+    <div class="narration-box">
+      <p>第四步，调整安全设置。点击"设置"标签。</p>
+      <p>第一次使用，强烈建议把"本次最多沟通"改成 1，先测试一份，确认一切正常后再提高上限。</p>
+      <p>其他参数保持默认就好：每日最多 80 个沟通，同公司每天最多 3 个，连续失败 3 次自动暂停。这些限制都是为了保护你的账号安全。</p>
+    </div>
+  </div>
+</div>
+
+<!-- Step 7 -->
+<div class="step-card" data-step="7">
+  <div class="step-header">
+    <div class="step-number">7</div>
+    <h2>扫描预览</h2>
+    <span class="duration">~30 秒</span>
+  </div>
+  <div class="step-body">
+    <div class="screenshot-wrap">
+      <img src="assets/screenshots/01-task.png" alt="任务页截图">
+      <div class="screenshot-caption">任务页 — 扫描预览结果，勾选目标岗位</div>
+    </div>
+    <div class="action-section">
+      <h3>画面操作</h3>
+      <ul class="action-list">
+        <li>点击 <strong>任务</strong> 标签页，回到主界面</li>
+        <li>确保 BOSS 直聘职位列表页已打开</li>
+        <li>点击 <strong>扫描预览</strong> 按钮</li>
+        <li>等待扫描完成，查看结果列表</li>
+        <li>绿色 = 通过，红色 = 排除（附原因）</li>
+        <li>用复选框勾选你想投递的岗位</li>
+      </ul>
+    </div>
+    <div class="narration-box">
+      <p>配置完成后，回到"任务"标签页。确保你的 BOSS 直聘职位列表页是打开的，然后点击"扫描预览"。</p>
+      <p>插件会读取当前页面的职位信息，按照你设置的筛选条件逐个检查。通过的岗位会显示为绿色，被排除的会显示红色并标注原因，比如"职位名称不匹配"或"薪资低于下限"。</p>
+      <p>仔细看一下结果，用复选框勾选你确认要投递的岗位。</p>
+    </div>
+  </div>
+</div>
+
+<!-- Step 8 -->
+<div class="step-card" data-step="8">
+  <div class="step-header">
+    <div class="step-number">8</div>
+    <h2>投递一份测试</h2>
+    <span class="duration">~30 秒</span>
+  </div>
+  <div class="step-body">
+    <div class="action-section">
+      <h3>画面操作</h3>
+      <ul class="action-list">
+        <li>勾选一个通过的岗位</li>
+        <li>点击 <strong>投递一份测试</strong> 按钮</li>
+        <li>观察插件自动打开聊天窗口</li>
+        <li>观察消息是否成功发送</li>
+        <li>观察简历是否正确发出</li>
+        <li>查看面板底部的状态汇报：<code>成功 / 跳过 / 失败</code></li>
+      </ul>
+    </div>
+    <div class="narration-box">
+      <p>现在我们来测试一下。勾选一个通过的岗位，然后点击"投递一份测试"。</p>
+      <p>插件会自动打开对应的聊天窗口，发送你配置的消息，然后发送简历。你在旁边看着就好，不需要手动操作。</p>
+      <p>发送完成后，面板底部会汇报结果：成功、跳过、失败各几个。如果显示成功 1，说明整个流程没问题。</p>
+    </div>
+    <div class="tip-box">
+      <strong>重要：</strong>首次使用务必先测试一份！确认消息内容、收件人和简历都正确后，再进行批量操作。
+    </div>
+  </div>
+</div>
+
+<!-- Step 9 -->
+<div class="step-card" data-step="9">
+  <div class="step-header">
+    <div class="step-number">9</div>
+    <h2>正式批量投递</h2>
+    <span class="duration">~20 秒</span>
+  </div>
+  <div class="step-body">
+    <div class="action-section">
+      <h3>画面操作</h3>
+      <ul class="action-list">
+        <li>回到 <strong>设置</strong> 页，将"本次最多沟通"改为 <code>10</code></li>
+        <li>回到 <strong>任务</strong> 页，点击 <strong>扫描预览</strong> 重新扫描</li>
+        <li>勾选要投递的岗位，或点击 <strong>全选通过项</strong></li>
+        <li>点击 <strong>确认投递</strong></li>
+      </ul>
+    </div>
+    <div class="narration-box">
+      <p>测试通过后，回到设置页，把"本次最多沟通"改成你想要的数量，比如 10 个。</p>
+      <p>然后回到任务页，重新扫描预览，勾选要投递的岗位，也可以直接点"全选通过项"一键全选。确认无误后，点击"确认投递"，插件就会开始批量处理了。</p>
+    </div>
+  </div>
+</div>
+
+<!-- Step 10 -->
+<div class="step-card" data-step="10">
+  <div class="step-header">
+    <div class="step-number">10</div>
+    <h2>任务控制与监控</h2>
+    <span class="duration">~20 秒</span>
+  </div>
+  <div class="step-body">
+    <div class="action-section">
+      <h3>画面操作</h3>
+      <ul class="action-list">
+        <li>展示任务运行中的面板状态</li>
+        <li>依次指出 <strong>暂停</strong>、<strong>继续</strong>、<strong>跳过当前</strong>、<strong>停止</strong> 按钮</li>
+        <li>展示下方日志区域的实时输出</li>
+      </ul>
+    </div>
+    <div class="narration-box">
+      <p>任务运行过程中，你可以随时控制。点"暂停"会在当前安全步骤结束后停下来；点"继续"从暂停处恢复；"跳过当前"会跳过正在处理的岗位；"停止"会完全结束任务并汇报统计。</p>
+      <p>下方的日志区域会实时显示每一步的操作详情，方便你排查问题。</p>
+    </div>
+  </div>
+</div>
+
+<!-- Step 11 -->
+<div class="step-card" data-step="11">
+  <div class="step-header">
+    <div class="step-number">11</div>
+    <h2>导入导出配置</h2>
+    <span class="duration">~15 秒</span>
+  </div>
+  <div class="step-body">
+    <div class="action-section">
+      <h3>画面操作</h3>
+      <ul class="action-list">
+        <li>在 <strong>设置</strong> 页点击 <strong>导出 JSON</strong></li>
+        <li>展示下载的 JSON 文件</li>
+        <li>点击 <strong>导入 JSON</strong> 选择文件恢复配置</li>
+      </ul>
+    </div>
+    <div class="narration-box">
+      <p>最后一个小技巧：在设置页可以导出和导入配置。导出会把你所有的筛选、消息、简历和设置保存成一个 JSON 文件，下次使用时导入就能一键恢复，非常方便。注意导出文件可能包含图片简历数据，不要公开上传。</p>
+    </div>
+  </div>
+</div>
+
+<!-- Step 12 -->
+<div class="step-card" data-step="12">
+  <div class="step-header">
+    <div class="step-number">12</div>
+    <h2>片尾</h2>
+    <span class="duration">~10 秒</span>
+  </div>
+  <div class="step-body">
+    <div class="action-section">
+      <h3>画面操作</h3>
+      <ul class="action-list">
+        <li>显示项目 Logo + GitHub 仓库地址</li>
+        <li>加上 "Star 支持一下" 的提示</li>
+      </ul>
+    </div>
+    <div class="narration-box">
+      <p>以上就是 Boss 海投助手的完整使用教程。记住三个原则：先测试再批量、保持保守上限、不要无人看管运行。如果觉得好用，欢迎到 GitHub 给个 Star。有问题可以提 Issue，我们下期见！</p>
+    </div>
+  </div>
+</div>
+
+</div><!-- /steps-container -->
+
+<div class="step-dots" id="stepDots"></div>
+<div class="keyboard-hint">使用 <kbd>←</kbd> <kbd>→</kbd> 方向键切换步骤</div>
+
+<script>
+const totalSteps = 13;
+let current = 0;
+
+// Build dots
+const dotsEl = document.getElementById('stepDots');
+for (let i = 0; i < totalSteps; i++) {
+  const dot = document.createElement('div');
+  dot.className = 'step-dot' + (i === 0 ? ' active' : '');
+  dot.onclick = () => goTo(i);
+  dotsEl.appendChild(dot);
+}
+
+function goTo(n) {
+  if (n < 0 || n >= totalSteps) return;
+  document.querySelectorAll('.step-card')[current].classList.remove('active');
+  document.querySelectorAll('.step-dot')[current].classList.remove('active');
+  current = n;
+  document.querySelectorAll('.step-card')[current].classList.add('active');
+  document.querySelectorAll('.step-dot')[current].classList.add('active');
+  document.getElementById('stepIndicator').textContent = `第 ${current + 1} / ${totalSteps} 步`;
+  document.getElementById('progressFill').style.width = ((current + 1) / totalSteps * 100) + '%';
+  document.getElementById('prevBtn').disabled = current === 0;
+  document.getElementById('nextBtn').disabled = current === totalSteps - 1;
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function go(dir) { goTo(current + dir); }
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); go(1); }
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); go(-1); }
+});
+</script>
+
+</body>
+</html>

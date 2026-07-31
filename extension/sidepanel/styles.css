@@ -1,4 +1,4 @@
-:root {
+﻿:root {
   --bg: #0b1220;
   --panel: #111a2e;
   --card: #16233d;
@@ -158,6 +158,65 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
 .log.warn { border-left-color: #f59e0b; }
 .log.error { border-left-color: #ef4444; }
 
+/* History / delivery records */
+.history-list {
+  max-height: 420px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--card, #fff);
+  border: 1px solid var(--line, #e2e8f0);
+  font-size: 12px;
+}
+.hist-badge {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+}
+.hist-badge.success { background: #22c55e; }
+.hist-badge.skipped { background: #f59e0b; }
+.hist-badge.failed { background: #ef4444; }
+.hist-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.hist-company {
+  flex-shrink: 0;
+  max-width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted, #64748b);
+}
+.hist-time {
+  flex-shrink: 0;
+  color: var(--muted, #94a3b8);
+  font-size: 11px;
+}
+.tiny-select {
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line, #e2e8f0);
+  font-size: 12px;
+  background: var(--card, #fff);
+}
+
+
 .segments { display: flex; flex-direction: column; gap: 8px; }
 .seg {
   border: 1px solid var(--line);
@@ -242,7 +301,7 @@ html.float-mode main {
 /* modal */
 .bht-modal {
   position: fixed;
-  /* bht-modal-leave-controls: 顶部控制条可点 */
+  /* bht-modal-leave-controls: 椤堕儴鎺у埗鏉″彲鐐?*/
   top: 96px;
   left: 0;
   right: 0;
