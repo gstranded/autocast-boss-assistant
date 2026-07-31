@@ -10,6 +10,7 @@ import { reasonText, REASON } from "../extension/shared/reason-codes.js";
 import { computeSideBySideBounds } from "../extension/shared/window-layout.js";
 import "../extension/shared/conversation-match.js";
 import fs from "fs";
+import vm from "vm";
 
 const {
   hasActiveState,
@@ -279,6 +280,37 @@ test("task start prepares split workspace with fallback", () => {
   assert.ok(background.includes("computeSideBySideBounds"));
   assert.ok(background.includes("splitViewActive"));
   assert.ok(background.includes("普通消息标签页"));
+});
+test("floating controls stay fully visible after a split-window resize", () => {
+  const source = fs.readFileSync("extension/content/floating-host.js", "utf8");
+  const context = {
+    window: {},
+    document: { readyState: "loading", addEventListener() {} },
+    chrome: { runtime: { onMessage: { addListener() {} } } },
+    console,
+    setInterval() {},
+    setTimeout() {},
+    cancelAnimationFrame() {},
+    requestAnimationFrame() { return 1; }
+  };
+  vm.runInNewContext(source, context);
+  const fit = context.window.__BHT_FLOAT_LAYOUT__.fitRectToViewport;
+  const panel = fit(
+    { left: 1400, top: 100, width: 420, height: 700 },
+    { width: 960, height: 900 },
+    8
+  );
+  const fab = fit(
+    { left: 1800, top: 1000, width: 58, height: 58 },
+    { width: 960, height: 900 },
+    0
+  );
+  assert.equal(panel.left, 532);
+  assert.equal(panel.top, 100);
+  assert.equal(fab.left, 902);
+  assert.equal(fab.top, 842);
+  assert.ok(source.includes('window.addEventListener("resize", schedule)'));
+  assert.ok(!source.includes("window.innerWidth - 80"));
 });
 
 console.log("8) conversation selection + delivery receipt");

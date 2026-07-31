@@ -8,6 +8,7 @@
   const STORAGE_POS = "bht_float_pos_v1";
   const STORAGE_OPEN = "bht_float_open_v1";
   const STORAGE_FAB = "bht_float_fab_v1";
+  const VIEWPORT_MARGIN = 8;
 
   function loadCss() {
     if (document.getElementById("bht-float-css")) return;
@@ -20,6 +21,38 @@
 
   function clamp(n, min, max) {
     return Math.max(min, Math.min(max, n));
+  }
+
+  function fitRectToViewport(rect = {}, viewport = {}, margin = VIEWPORT_MARGIN) {
+    const viewportWidth = Math.max(0, Number(viewport.width) || 0);
+    const viewportHeight = Math.max(0, Number(viewport.height) || 0);
+    const width = Math.max(0, Number(rect.width) || 0);
+    const height = Math.max(0, Number(rect.height) || 0);
+    const safeMargin = Math.max(0, Number(margin) || 0);
+    const minLeft = Math.min(safeMargin, Math.max(0, viewportWidth - width));
+    const minTop = Math.min(safeMargin, Math.max(0, viewportHeight - height));
+    const maxLeft = Math.max(minLeft, viewportWidth - width - safeMargin);
+    const maxTop = Math.max(minTop, viewportHeight - height - safeMargin);
+    return {
+      left: clamp(Number(rect.left) || 0, minLeft, maxLeft),
+      top: clamp(Number(rect.top) || 0, minTop, maxTop)
+    };
+  }
+
+  window.__BHT_FLOAT_LAYOUT__ = Object.freeze({ fitRectToViewport });
+
+  function fitElementToViewport(element, margin = VIEWPORT_MARGIN) {
+    if (!element) return null;
+    const rect = element.getBoundingClientRect();
+    const next = fitRectToViewport(rect, {
+      width: window.innerWidth,
+      height: window.innerHeight
+    }, margin);
+    element.style.left = next.left + "px";
+    element.style.top = next.top + "px";
+    element.style.right = "auto";
+    element.style.bottom = "auto";
+    return next;
   }
 
   function getRoot() {
@@ -63,8 +96,18 @@
       if (!raw) return;
       const pos = JSON.parse(raw);
       if (typeof pos.left === "number" && typeof pos.top === "number") {
-        panel.style.left = clamp(pos.left, 8, window.innerWidth - 80) + "px";
-        panel.style.top = clamp(pos.top, 8, window.innerHeight - 80) + "px";
+        const rect = panel.getBoundingClientRect();
+        const next = fitRectToViewport({
+          left: pos.left,
+          top: pos.top,
+          width: rect.width,
+          height: rect.height
+        }, {
+          width: window.innerWidth,
+          height: window.innerHeight
+        });
+        panel.style.left = next.left + "px";
+        panel.style.top = next.top + "px";
         panel.style.right = "auto";
         panel.style.bottom = "auto";
       }
@@ -114,8 +157,18 @@
       if (raw) {
         const pos = JSON.parse(raw);
         if (typeof pos.left === "number" && typeof pos.top === "number") {
-          fab.style.left = pos.left + "px";
-          fab.style.top = pos.top + "px";
+          const rect = fab.getBoundingClientRect();
+          const next = fitRectToViewport({
+            left: pos.left,
+            top: pos.top,
+            width: rect.width,
+            height: rect.height
+          }, {
+            width: window.innerWidth,
+            height: window.innerHeight
+          }, 0);
+          fab.style.left = next.left + "px";
+          fab.style.top = next.top + "px";
           fab.style.right = "auto";
           fab.style.bottom = "auto";
         }
@@ -147,10 +200,18 @@
       const dy = point.clientY - startY;
       if (Math.abs(dx) + Math.abs(dy) > 4) moved = true;
       if (e.cancelable && moved) e.preventDefault();
-      const left = Math.max(0, Math.min(window.innerWidth - 48, origL + dx));
-      const top = Math.max(0, Math.min(window.innerHeight - 48, origT + dy));
-      fab.style.left = left + "px";
-      fab.style.top = top + "px";
+      const rect = fab.getBoundingClientRect();
+      const next = fitRectToViewport({
+        left: origL + dx,
+        top: origT + dy,
+        width: rect.width,
+        height: rect.height
+      }, {
+        width: window.innerWidth,
+        height: window.innerHeight
+      }, 0);
+      fab.style.left = next.left + "px";
+      fab.style.top = next.top + "px";
     };
     const onUp = () => {
       if (!dragging) return;
@@ -209,10 +270,17 @@
       const dy = point.clientY - startY;
       const w = panel.offsetWidth;
       const h = panel.offsetHeight;
-      const left = clamp(origL + dx, 0, window.innerWidth - Math.min(w, 80));
-      const top = clamp(origT + dy, 0, window.innerHeight - 48);
-      panel.style.left = left + "px";
-      panel.style.top = top + "px";
+      const next = fitRectToViewport({
+        left: origL + dx,
+        top: origT + dy,
+        width: w,
+        height: h
+      }, {
+        width: window.innerWidth,
+        height: window.innerHeight
+      });
+      panel.style.left = next.left + "px";
+      panel.style.top = next.top + "px";
     };
 
     const onUp = () => {
@@ -227,6 +295,21 @@
 
     handle.addEventListener("mousedown", onDown);
     handle.addEventListener("touchstart", onDown, { passive: true });
+  }
+
+  function enableViewportFit(root, panel, fab) {
+    if (!root || root.dataset.viewportFitBound === "1") return;
+    root.dataset.viewportFitBound = "1";
+    let frame = 0;
+    const schedule = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        if (panel && !panel.hidden) fitElementToViewport(panel);
+        if (fab && getComputedStyle(fab).display !== "none") fitElementToViewport(fab, 0);
+      });
+    };
+    window.addEventListener("resize", schedule);
+    window.visualViewport?.addEventListener("resize", schedule);
   }
 
   function init() {
@@ -250,6 +333,7 @@
     btnMin.addEventListener("click", () => setOpen(false));
     btnClose.addEventListener("click", () => setOpen(false));
     enableDrag(panel, drag);
+    enableViewportFit(root, panel, fab);
 
     let fabVisible = true;
     try {
