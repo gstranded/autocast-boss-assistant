@@ -42,7 +42,7 @@ test("background ensures list before chat and returns after job", () => {
 
 test("content startChat is href-first and versioned", () => {
   const s = fs.readFileSync("extension/content/content-main.js", "utf8");
-  assert.ok(s.includes('BHT_CONTENT_VERSION = "1.6.0"'));
+  assert.ok(s.includes('BHT_CONTENT_VERSION = "1.6.1"'));
   assert.ok(s.includes("matchedVia"));
   assert.ok(s.includes("tryPickVisible"));
   assert.ok(s.includes("JOB_CARD_NOT_FOUND"));
@@ -117,4 +117,15 @@ test("non boss url blocked by helper", () => {
   assert.equal(isBossUrl("https://example.com/chat"), false);
 });
 
+test("delivery hardening contracts", () => {
+  const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const a = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const c = fs.readFileSync("extension/content/content-main.js", "utf8");
+  assert.ok(s.includes("reconcileStaleRunningTask"));
+  assert.ok(s.includes("error: 'ALREADY_RUNNING'"));
+  assert.ok(a.includes("ensureConfigSavedBeforeDelivery"));
+  assert.ok(c.includes("waitForImageSendConfirm"));
+});
+
 if (!process.exitCode) console.log("flow contract tests ok");
+

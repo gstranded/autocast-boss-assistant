@@ -7,7 +7,7 @@ import { mergeResumeImages } from '../shared/resume-images.js';
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.6.0";
+const BHT_UI_VERSION = "1.6.1";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -432,7 +432,17 @@ function renderSegments(template) {
   });
 }
 
-function readTemplate(base) {
+function templateSegmentsSignature(segments = []) {
+  return (segments || [])
+    .map((seg) => [
+      String(seg?.id || ''),
+      seg?.enabled === false ? '0' : '1',
+      String(seg?.text || '')
+    ].join('\t'))
+    .join('\n');
+}
+
+function readTemplate(base = {}, opts = {}) {
   const map = new Map();
   for (const seg of base?.segments || []) {
     const en = document.querySelector('[data-en="' + seg.id + '"]');
@@ -462,8 +472,12 @@ function readTemplate(base) {
   } else {
     segments = Array.from(map.values());
   }
+  const prevVersion = ((base && base.version) || 1);
+  const changed = templateSegmentsSignature(base?.segments) !== templateSegmentsSignature(segments);
+  // 仅内容变化时抬升版本，避免自动保存/软刷新破坏消息幂等键
+  const shouldBump = opts.bumpVersion !== false && changed;
   return {
-    version: ((base && base.version) || 1) + 1,
+    version: shouldBump ? prevVersion + 1 : prevVersion,
     segments
   };
 }
@@ -827,7 +841,12 @@ async function refresh(options = {}) {
 
   state.config = res;
   if ((wasDirty || editingNow || soft) && prevTemplate) {
-    try { state.config.messageTemplate = readTemplate(prevTemplate); } catch (_) { state.config.messageTemplate = prevTemplate; }
+    try {
+      // soft/dirty 路径只同步 DOM 草稿，不抬升版本（真正保存时再按内容决定）
+      state.config.messageTemplate = readTemplate(prevTemplate, { bumpVersion: false });
+    } catch (_) {
+      state.config.messageTemplate = prevTemplate;
+    }
   }
   if ((wasDirty || editingNow) && prevSettings) {
     try { state.config.settings = { ...prevSettings, ...readSettingsPatch(prevSettings) }; } catch (_) { state.config.settings = prevSettings; }
@@ -1098,9 +1117,12 @@ async function saveBindings(opts = {}) {
     .filter((r) => (r.keywords || []).length && r.profileId)
     .sort((a, b) => (a.priority || 0) - (b.priority || 0));
   await api(MSG.SAVE_BINDINGS, { rules });
-  state.formDirty = false;
-  await refresh({ soft: false });
+  if (state.config) state.config.bindings = { rules };
+  if (opts.refresh !== false) {
+    state.formDirty = false;
+    await refresh({ soft: true });
   }
+}
 
 
 let autosaveTimer = null;
@@ -1135,6 +1157,29 @@ function scheduleAutosave() {
   state.formDirty = true;
   clearTimeout(autosaveTimer);
   autosaveTimer = setTimeout(() => { flushAutosave(); }, 650);
+}
+
+async function ensureConfigSavedBeforeDelivery() {
+  clearTimeout(autosaveTimer);
+  autosaveTimer = null;
+  // 等进行中的 autosave 结束，再强制落盘，避免投递读到旧 storage
+  for (let i = 0; i < 40 && autosaving; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const errors = [];
+  try { await saveMessage({ refresh: false }); } catch (e) { errors.push('消息：' + (e?.message || e)); }
+  try { await saveSettings({ refresh: false }); } catch (e) { errors.push('设置：' + (e?.message || e)); }
+  try {
+    await saveResume({ refresh: false, clearInputs: false, includePendingFiles: false });
+  } catch (e) {
+    errors.push('简历：' + (e?.message || e));
+  }
+  try { await saveFilters({ refresh: false }); } catch (e) { errors.push('筛选：' + (e?.message || e)); }
+  try { await saveBindings({ refresh: false }); } catch (e) { errors.push('绑定：' + (e?.message || e)); }
+  if (errors.length) {
+    throw new Error(errors.join('；'));
+  }
+  state.formDirty = false;
 }
 
 function wireResumeFilePreview() {
@@ -1385,21 +1430,33 @@ function bindEvents() {
   $('btnPreview').addEventListener('click', async () => {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
     toast('开始扫描预览…', 'warn', 1500);
-    await saveFilters();
     $('btnPreview').disabled = true;
     $('taskStatus').textContent = '状态：扫描中…';
-    const res = await api(MSG.RUN_PREVIEW, { scroll: true });
-    if (!res?.ok) {
-      toast(res?.message || res?.error || '扫描失败，请打开职位列表页', 'error', 3500);
+    try {
+      await saveFilters();
+      const res = await api(MSG.RUN_PREVIEW, { scroll: true });
+      if (!res?.ok) {
+        toast(res?.message || res?.error || '扫描失败，请打开职位列表页', 'error', 3500);
+        setConn(false, '页面未就绪');
+        showErrorModal('扫描失败', res?.message || res?.error || '请打开 BOSS 职位列表页后重试', { showRetry: false });
+      } else if (res.summary) {
+        toast(`扫描完成：通过 ${res.summary.pass} / 共 ${res.summary.scanned}`, 'success');
+      } else {
+        toast('预览完成', 'success');
+      }
+      await refresh({ soft: false });
+    } catch (e) {
+      const msg = String(e?.message || e || '扫描失败');
+      toast(msg, 'error', 3500);
       setConn(false, '页面未就绪');
-      showErrorModal('扫描失败', res?.message || res?.error || '请打开 BOSS 职位列表页后重试', { showRetry: false });
-    } else if (res.summary) {
-      toast(`扫描完成：通过 ${res.summary.pass} / 共 ${res.summary.scanned}`, 'success');
-    } else {
-      toast('预览完成', 'success');
+      showErrorModal('扫描失败', msg, { showRetry: false });
+      try { await refresh({ soft: true }); } catch (_) {}
+    } finally {
+      $('btnPreview').disabled = false;
+      if ($('taskStatus') && /扫描中/.test($('taskStatus').textContent || '')) {
+        updateTaskUI(state.config?.task, state.config?.runner);
+      }
     }
-    await refresh({ soft: false });
-    $('btnPreview').disabled = false;
   });
 
   $('btnDiagnose')?.addEventListener('click', async () => {
@@ -1430,7 +1487,14 @@ function bindEvents() {
       toast('请至少选择一个通过岗位', 'error');
       return;
     }
-    toast('正在启动投递…', 'warn', 1500);
+    toast('正在保存配置并启动投递…', 'warn', 1500);
+    try {
+      await ensureConfigSavedBeforeDelivery();
+    } catch (e) {
+      toast('保存配置失败，已取消投递：' + (e?.message || e), 'error', 4000);
+      showErrorModal('保存失败', String(e?.message || e || '无法保存当前配置'), { showRetry: false });
+      return;
+    }
     const res = await api(MSG.CONFIRM_AND_START, { selectedJobIds });
     if (!res?.ok) {
       toast(res?.message || res?.error || '启动失败', 'error', 3500);
@@ -1448,8 +1512,13 @@ function bindEvents() {
   
   $('btnTestOne')?.addEventListener('click', async () => {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
-    // save settings first so resume flags apply
-    try { await saveSettings(); await saveResume(); await saveMessage(); } catch (_) {}
+    try {
+      await ensureConfigSavedBeforeDelivery();
+    } catch (e) {
+      toast('保存配置失败，已取消测试投递：' + (e?.message || e), 'error', 4000);
+      showErrorModal('保存失败', String(e?.message || e || '无法保存当前配置'), { showRetry: false });
+      return;
+    }
     let selectedJobIds = Array.from(state.selected || []);
     if (!selectedJobIds.length) {
       const pass = (state.config?.task?.results || []).filter((r) => r.decision === 'pass');

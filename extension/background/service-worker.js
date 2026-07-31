@@ -44,8 +44,31 @@ let runner = {
   pauseLogged: false
 };
 
+async function reconcileStaleRunningTask(reason = '扩展后台已重启') {
+  try {
+    const all = await getAllConfig();
+    const task = all.task;
+    if (!task) return;
+    if (task.status === TASK_STATUS.RUNNING) {
+      task.status = TASK_STATUS.PAUSED;
+      task.pauseReason = reason + '，任务已安全暂停。请确认页面后点「继续」恢复队列。';
+      task.updatedAt = Date.now();
+      await publishTask(task);
+      await log('warn', task.pauseReason, { taskId: task.id || null });
+    }
+  } catch (_) {}
+}
+
+// MV3 service worker 冷启动时内存 runner 为空；避免 storage 仍显示 running 造成假运行
+reconcileStaleRunningTask().catch(() => {});
+
+chrome.runtime.onStartup?.addListener(() => {
+  reconcileStaleRunningTask('浏览器启动后扩展后台已重建').catch(() => {});
+});
+
 chrome.runtime.onInstalled.addListener(async () => {
   await getAllConfig();
+  await reconcileStaleRunningTask('扩展更新/重载后后台已重建');
   try {
     // 一次性：若已上传图片但未开自动发，升级默认以符合「文本后发图」预期
     const all = await chrome.storage.local.get(['bht_settings', 'bht_resumes', 'bht_migrated_137']);
@@ -1538,6 +1561,19 @@ async function processOneJob(task, resultRow, config) {
     await sleep(randomBetween(config.settings.segmentIntervalMs));
   }
 
+  // resume: re-check controls after last text segment
+  await waitWhilePaused(task);
+  if (runner.abort) return 'aborted';
+  if (runner.skipCurrent) {
+    runner.skipCurrent = false;
+    item.state = 'SKIPPED';
+    item.reasons = [reasonText(REASON.EXEC_USER_SKIP)];
+    task.counters.skipped += 1;
+    await bumpDailyStat('skip');
+    await log('warn', `跳过：${job.title}`, { jobId: job.jobId, reason: REASON.EXEC_USER_SKIP });
+    return 'skipped';
+  }
+
   // resume
   const profile = pickResumeProfile(job, config.resumes, config.bindings);
   const resumeImages = dedupeResumeImages(profile?.images);
@@ -1581,13 +1617,33 @@ async function processOneJob(task, resultRow, config) {
           dataUrl: img.dataUrl,
           fileName: img.name || `resume_${i + 1}.png`
         }, tabOpt);
-        if (!imgRes?.ok) {
-          await log('warn', `图片简历发送失败：${imgRes?.message || imgRes?.error || ''}`, { jobId: job.jobId });
-          break;
+        const imageConfirmed =
+          imgRes?.ok === true &&
+          imgRes?.confirmed === true &&
+          imgRes?.receipt?.type === 'IMAGE_SENT' &&
+          imgRes?.receipt?.status === 'confirmed';
+        if (!imageConfirmed) {
+          item.state = 'FAILED';
+          item.reasons = [reasonText(REASON.EXEC_SEND_FILE_FAIL, imgRes?.message || imgRes?.error || '图片发送未确认')];
+          task.pauseReason = item.reasons[0];
+          task.lastErrorDetail = '岗位：' + (job.title || '') + ' @ ' + (job.company || '') + '\n图片简历发送未确认';
+          task.counters.failed += 1;
+          task.consecutiveFails += 1;
+          await bumpDailyStat('fail');
+          await log('error', `图片简历发送失败：${imgRes?.message || imgRes?.error || '未确认'}`, { jobId: job.jobId });
+          return 'failed';
         }
         await markIdempotent(key, { jobId: job.jobId });
         item.state = 'IMAGE_RESUME_SENT';
-        await log('success', `图片简历已发送 ${i + 1}/${resumeImages.length}`, { jobId: job.jobId });
+        item.receipts = Array.isArray(item.receipts) ? item.receipts : [];
+        item.receipts.push(imgRes.receipt);
+        item.lastReceipt = imgRes.receipt;
+        task.lastReceipt = imgRes.receipt;
+        await log('success', `图片简历已发送 ${i + 1}/${resumeImages.length}`, {
+          jobId: job.jobId,
+          receiptId: imgRes.receipt.receiptId,
+          confirmedVia: imgRes.receipt.confirmedVia
+        });
         await sleep(randomBetween(config.settings.segmentIntervalMs));
       }
     }
@@ -1942,6 +1998,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return guard;
           }
         }
+        if (runner.running) {
+          return {
+            ok: false,
+            error: 'ALREADY_RUNNING',
+            message: '当前已有任务在执行（含暂停中），请先停止或点继续完成后再启动'
+          };
+        }
         const all = await getAllConfig();
         let task = all.task;
         if (!task) return { ok: false, error: 'NO_TASK' };
@@ -1979,6 +2042,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             await log('warn', guard.message);
             return guard;
           }
+        }
+        if (runner.running) {
+          return {
+            ok: false,
+            error: 'ALREADY_RUNNING',
+            message: '当前已有任务在执行（含暂停中），请先停止或点继续完成后再测试投递'
+          };
         }
         const all = await getAllConfig();
         let task = all.task;
@@ -2121,24 +2191,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await log('warn', '用户停止任务：当前没有可汇报的任务');
         return { ok: true, task: null };
       case MSG.SKIP_CURRENT: {
-        runner.skipCurrent = true;
-        // 若在等待用户重试的暂停中，允许跳过后继续
+        // 若在等待用户重试的暂停中：直接标记当前岗位跳过，并清掉 skip 标志，避免下一岗被连带跳过
         if (runner.pause) {
           const all = await getAllConfig();
           if (all.task) {
             all.task.awaitingUserRetry = false;
-            // mark current failed/paused item skipped if possible
             if (all.task.currentJobId && all.task.items) {
               all.task.items = all.task.items.map((it) =>
-                it.jobId === all.task.currentJobId && (it.state === 'FAILED' || it.state === 'NOT_STARTED' || it.state === 'COMMUNICATION_CREATED')
+                it.jobId === all.task.currentJobId && (it.state === 'FAILED' || it.state === 'NOT_STARTED' || it.state === 'COMMUNICATION_CREATED' || it.state === 'PAUSED')
                   ? { ...it, state: 'SKIPPED', reasons: ['用户跳过'] }
                   : it
               );
+              const q = (all.task.queue || []).find((x) => x.jobId === all.task.currentJobId);
+              if (q) {
+                q.status = 'skipped';
+                q.finishedAt = Date.now();
+                q.outcome = 'skipped';
+              }
+              all.task.counters = all.task.counters || {};
+              all.task.counters.skipped = (all.task.counters.skipped || 0) + 1;
             }
             await publishTask(all.task);
           }
+          runner.skipCurrent = false;
           runner.pause = false;
+          await bumpDailyStat('skip');
+          await log('warn', '已跳过当前岗位，继续下一岗');
+          return { ok: true };
         }
+        runner.skipCurrent = true;
         await log('warn', '将跳过当前岗位');
         return { ok: true };
       }

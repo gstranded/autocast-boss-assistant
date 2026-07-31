@@ -432,6 +432,67 @@ test("content script requires rendered own-message receipt", () => {
   assert.ok(messaging.includes("BHT_SEND_RESUME"));
 });
 
+
+console.log("8b) delivery control & image receipt contracts");
+test("image send requires confirmed IMAGE_SENT receipt", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(content.includes("waitForImageSendConfirm"));
+  assert.ok(content.includes("IMAGE_SEND_NOT_CONFIRMED"));
+  assert.ok(content.includes('type: "IMAGE_SENT"'));
+  assert.ok(background.includes("imgRes?.receipt?.type === 'IMAGE_SENT'"));
+  assert.ok(background.includes("return 'failed'"));
+  assert.ok(background.includes("图片简历发送失败"));
+});
+
+test("skip while paused does not leave skipCurrent sticky", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(background.includes("runner.skipCurrent = false"));
+  assert.ok(background.includes("已跳过当前岗位，继续下一岗"));
+  // paused skip path clears flag before resuming loop
+  assert.ok(background.includes("若在等待用户重试的暂停中：直接标记当前岗位跳过"));
+});
+
+test("resume stage rechecks pause/abort/skip controls", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(background.includes("resume: re-check controls after last text segment"));
+  assert.ok(background.includes("await waitWhilePaused(task);"));
+});
+
+test("template version only bumps when message content changes", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(app.includes("templateSegmentsSignature"));
+  assert.ok(app.includes("shouldBump = opts.bumpVersion !== false && changed"));
+  assert.ok(app.includes("readTemplate(prevTemplate, { bumpVersion: false })"));
+  assert.ok(app.includes("ensureConfigSavedBeforeDelivery"));
+});
+
+test("start/test delivery refuses ALREADY_RUNNING and requires pre-save", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(background.includes("error: 'ALREADY_RUNNING'"));
+  assert.ok(background.includes("当前已有任务在执行（含暂停中）"));
+  assert.ok(app.includes("await ensureConfigSavedBeforeDelivery()"));
+  assert.ok(!app.includes("try { await saveSettings(); await saveResume(); await saveMessage(); } catch (_) {}"));
+});
+
+test("service worker reconciles stale running tasks after restart", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(background.includes("async function reconcileStaleRunningTask"));
+  assert.ok(background.includes("chrome.runtime.onStartup"));
+  assert.ok(background.includes("任务已安全暂停"));
+});
+
+test("preview scan uses try/finally to restore button", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const start = app.indexOf("$('btnPreview').addEventListener('click'");
+  assert.ok(start > 0);
+  const chunk = app.slice(start, start + 1200);
+  assert.ok(chunk.includes("try {"));
+  assert.ok(chunk.includes("} finally {"));
+  assert.ok(chunk.includes("$('btnPreview').disabled = false"));
+});
+
 console.log("9) split workspace integration");
 try {
   const listTab = {

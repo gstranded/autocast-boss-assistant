@@ -17,7 +17,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.6.0";
+  const BHT_CONTENT_VERSION = "1.6.1";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -2199,11 +2199,102 @@ async function startChat(job, opts = {}) {
     };
   }
 
+  function getSelfMediaSignature(limit = 30) {
+    const texts = getSelfMessages(limit).map((message) => String(message).replace(/\s+/g, " "));
+    const roots = [
+      document.getElementById("bht-mock-chat"),
+      getChatRoot(),
+      document
+    ].filter(Boolean);
+    let imgCount = 0;
+    const imgHints = [];
+    for (const root of roots) {
+      try {
+        const imgs = Array.from(
+          root.querySelectorAll(
+            ".item-myself img, .message-item.item-myself img, [class*='myself'] img, .chat-message.mine img, .message-mine img, .message-item.mine img"
+          )
+        );
+        if (imgs.length > imgCount) {
+          imgCount = imgs.length;
+          imgHints.length = 0;
+          imgs.slice(-8).forEach((img) => {
+            const hint = img.currentSrc || img.src || img.getAttribute("src") || img.getAttribute("data-src") || "";
+            if (hint) imgHints.push(hint.slice(-120));
+          });
+        }
+      } catch (_) {}
+    }
+    return {
+      textSignature: texts.join("\n"),
+      textCount: texts.length,
+      imgCount,
+      imgHints: imgHints.join("|")
+    };
+  }
+
+  function confirmImageSent(before, after) {
+    if (!before || !after) return false;
+    if (Number(after.imgCount || 0) > Number(before.imgCount || 0)) return "self-image-count";
+    if ((after.imgHints || "") && after.imgHints !== (before.imgHints || "")) return "self-image-src";
+    if ((after.textSignature || "") !== (before.textSignature || "")) {
+      const beforeLines = new Set(String(before.textSignature || "").split("\n").filter(Boolean));
+      const added = String(after.textSignature || "")
+        .split("\n")
+        .filter((line) => line && !beforeLines.has(line));
+      if (added.some((line) => /图片|简历|\[图片\]|image|photo/i.test(line))) return "self-message-image-text";
+      if (added.length > 0 && Number(after.textCount || 0) > Number(before.textCount || 0)) {
+        return "self-message-added";
+      }
+    }
+    return "";
+  }
+
+  async function waitForImageSendConfirm(before, via) {
+    let after = before;
+    let confirmedVia = "";
+    for (let i = 0; i < 24; i++) {
+      await sleep(250);
+      after = getSelfMediaSignature(30);
+      confirmedVia = confirmImageSent(before, after);
+      if (confirmedVia) break;
+    }
+    if (!confirmedVia) {
+      return {
+        ok: false,
+        error: "IMAGE_SEND_NOT_CONFIRMED",
+        message: "已触发图片上传，但聊天区未出现可验证的新图片消息",
+        via,
+        contentVersion: BHT_CONTENT_VERSION
+      };
+    }
+    const sentAt = Date.now();
+    const activeConversation = getActiveConversationIdentity();
+    return {
+      ok: true,
+      confirmed: true,
+      via,
+      confirmedVia,
+      receipt: {
+        type: "IMAGE_SENT",
+        status: "confirmed",
+        receiptId: "image_" + sentAt + "_" + Math.random().toString(36).slice(2, 10),
+        confirmedVia,
+        via,
+        sentAt,
+        contentVersion: BHT_CONTENT_VERSION,
+        conversationKey: activeConversation.key || ""
+      },
+      contentVersion: BHT_CONTENT_VERSION
+    };
+  }
+
   async function sendImageFromDataUrl(dataUrl, fileName = "resume.png") {
     if (!dataUrl) return { ok: false, error: "EMPTY_IMAGE" };
     dismissCommonDialogs();
     await waitForChat(8000);
     const chatRoot = getChatRoot() || document.getElementById("bht-mock-chat") || document;
+    const before = getSelfMediaSignature(30);
 
     const findFileInput = () => {
       const roots = [chatRoot, document];
@@ -2264,8 +2355,7 @@ async function startChat(job, opts = {}) {
           await sleep(700);
           const sendBtn = findSendButton();
           if (sendBtn) clickLikeHuman(sendBtn);
-          await sleep(600);
-          return { ok: true, via: "paste", contentVersion: BHT_CONTENT_VERSION };
+          return await waitForImageSendConfirm(before, "paste");
         }
       } catch (e) {
         log("image paste fail", e);
@@ -2297,8 +2387,7 @@ async function startChat(job, opts = {}) {
         await sleep(300);
         clickLikeHuman(confirm);
       }
-      await sleep(700);
-      return { ok: true, via: "file-input", contentVersion: BHT_CONTENT_VERSION };
+      return await waitForImageSendConfirm(before, "file-input");
     } catch (err) {
       return { ok: false, error: String(err?.message || err), contentVersion: BHT_CONTENT_VERSION };
     }
