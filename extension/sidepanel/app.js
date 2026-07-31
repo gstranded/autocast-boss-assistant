@@ -2,6 +2,7 @@ import { MSG } from '../shared/messaging.js';
 import { parseKeywords, uid } from '../shared/text-utils.js';
 import { reasonText } from '../shared/reason-codes.js';
 import { STORAGE_KEYS } from '../shared/constants.js';
+import { mergeResumeImages } from '../shared/resume-images.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
@@ -992,10 +993,19 @@ async function fileToCompressedDataUrl(file, maxEdge = 1280, quality = 0.72) {
   }
 }
 
-async function saveResume(opts = {}) {
-  const refresh = opts.refresh !== false;
+let resumeSaveChain = Promise.resolve();
+
+function saveResume(opts = {}) {
+  const run = resumeSaveChain.then(() => saveResumeNow(opts));
+  resumeSaveChain = run.catch(() => {});
+  return run;
+}
+
+async function saveResumeNow(opts = {}) {
+  const shouldRefresh = opts.refresh !== false;
   const clearInputs = opts.clearInputs !== false;
   const appendImages = opts.append !== false; // 默认追加，不覆盖已有图
+  const includePendingFiles = opts.includePendingFiles !== false;
 
   const resumes = structuredClone(state.config?.resumes || { profiles: [], defaultProfileId: null });
   if (!resumes.profiles?.length) {
@@ -1013,8 +1023,13 @@ async function saveResume(opts = {}) {
   const imageFiles = $('imageFiles')?.files;
   let added = 0;
   let skipped = 0;
-  if (imageFiles?.length) {
-    const images = appendImages ? profile.images.slice() : [];
+  let duplicates = 0;
+  const existingImages = appendImages ? profile.images : [];
+  const initialMerge = mergeResumeImages(existingImages, []);
+  profile.images = initialMerge.images;
+  duplicates += initialMerge.duplicates;
+  if (includePendingFiles && imageFiles?.length) {
+    const incomingImages = [];
     for (const f of Array.from(imageFiles)) {
       if (f.size > MAX_SOURCE_IMAGE_BYTES) {
         skipped += 1;
@@ -1022,21 +1037,23 @@ async function saveResume(opts = {}) {
         continue;
       }
       const dataUrl = await fileToCompressedDataUrl(f);
-      images.push({
+      incomingImages.push({
         name: f.name,
         size: f.size,
         dataUrl,
         type: (dataUrl || '').startsWith('data:image/jpeg') ? 'image/jpeg' : (f.type || 'image/png')
       });
-      added += 1;
     }
-    if (added === 0 && imageFiles.length > 0) {
+    if (incomingImages.length === 0 && imageFiles.length > 0) {
       throw new Error('没有成功导入任何图片（源文件需 ≤ 8MB）。请压缩后重试');
     }
-    if (added > 0) profile.images = images;
+    const merged = mergeResumeImages(profile.images, incomingImages);
+    profile.images = merged.images;
+    added = merged.added;
+    duplicates += merged.duplicates;
   }
 
-  const attach = $('attachFile')?.files?.[0];
+  const attach = includePendingFiles ? $('attachFile')?.files?.[0] : null;
   if (attach) {
     if (attach.size > 4.5 * 1024 * 1024) {
       throw new Error('附件过大（建议 < 4.5MB）：' + attach.name);
@@ -1071,8 +1088,9 @@ async function saveResume(opts = {}) {
     if ($('attachFile')) $('attachFile').value = '';
   }
   try { renderResumeEditor(); } catch (_) {}
-  if (refresh) await refresh({ soft: true });
-  return { resumes, added, skipped };
+  try { renderProfileList(); } catch (_) {}
+  if (shouldRefresh) await refresh({ soft: true });
+  return { resumes, added, skipped, duplicates };
 }
 
 async function saveBindings(opts = {}) {
@@ -1097,7 +1115,10 @@ async function flushAutosave() {
     try { await saveMessage({ refresh: false }); ok.push('消息'); } catch (e) { console.warn('autosave message', e); }
     try { await saveFilters({ refresh: false }); ok.push('筛选'); } catch (e) { console.warn('autosave filters', e); }
     try { await saveSettings({ refresh: false }); ok.push('设置'); } catch (e) { console.warn('autosave settings', e); }
-    try { await saveResume({ refresh: false, clearInputs: false }); ok.push('简历'); } catch (e) { console.warn('autosave resume', e); }
+    try {
+      await saveResume({ refresh: false, clearInputs: false, includePendingFiles: false });
+      ok.push('简历');
+    } catch (e) { console.warn('autosave resume', e); }
     try { await saveBindings({ refresh: false }); ok.push('绑定'); } catch (e) { console.warn('autosave bind', e); }
     state.formDirty = false;
     // 保存后用本地草稿重绘消息段，再 soft refresh 同步任务状态
@@ -1141,18 +1162,23 @@ function wireResumeFilePreview() {
       frag.appendChild(img);
     }
     box.prepend(frag);
-    try { scheduleAutosave(); } catch (_) {}
   });
+}
+function shouldAutosaveTarget(target) {
+  return Boolean(
+    target?.matches?.('input, textarea, select') &&
+    String(target.type || '').toLowerCase() !== 'file'
+  );
 }
 function wireAutosave() {
   const root = document.querySelector('main') || document.body;
   if (!root || root.__bhtAutosave) return;
   root.__bhtAutosave = true;
   root.addEventListener('input', (e) => {
-    if (e.target && e.target.matches && e.target.matches('input, textarea, select')) scheduleAutosave();
+    if (shouldAutosaveTarget(e.target)) scheduleAutosave();
   }, true);
   root.addEventListener('change', (e) => {
-    if (e.target && e.target.matches && e.target.matches('input, textarea, select')) scheduleAutosave();
+    if (shouldAutosaveTarget(e.target)) scheduleAutosave();
   }, true);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') flushAutosave();
@@ -1244,7 +1270,16 @@ function bindEvents() {
     try {
       const r = await saveResume({ refresh: true, clearInputs: true, append: true });
       const n = r?.added || 0;
-      toast(n > 0 ? ('当前方案已保存（新增图片 ' + n + ' 张）') : '当前方案已保存', 'success', 2800);
+      const duplicates = r?.duplicates || 0;
+      toast(
+        n > 0
+          ? ('当前方案已保存（新增图片 ' + n + ' 张）')
+          : duplicates > 0
+            ? ('当前方案已保存（已移除重复图片 ' + duplicates + ' 张）')
+            : '当前方案已保存',
+        'success',
+        2800
+      );
     } catch (e) {
       console.error('saveResume', e);
       toast(String(e?.message || e || '保存失败'), 'error', 6000);

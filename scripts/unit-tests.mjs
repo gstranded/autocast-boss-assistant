@@ -8,6 +8,11 @@ import { renderTemplate, pickResumeProfile } from "../extension/shared/template.
 import { isBossUrl, isBossHostname, isBossTab, bossUrlGuardMessage } from "../extension/shared/boss-url.js";
 import { reasonText, REASON } from "../extension/shared/reason-codes.js";
 import { computeSideBySideBounds } from "../extension/shared/window-layout.js";
+import {
+  dedupeResumeImages,
+  mergeResumeImages,
+  normalizeResumes
+} from "../extension/shared/resume-images.js";
 import "../extension/shared/conversation-match.js";
 import fs from "fs";
 import vm from "vm";
@@ -160,6 +165,18 @@ test("auto detect skips first segment", () => {
   assert.equal(plan.plan.length, 1);
 });
 
+test("resume images are deduplicated by content", () => {
+  const imageA = { name: "resume.png", dataUrl: "data:image/png;base64,AAA" };
+  const imageB = { name: "resume-2.png", dataUrl: "data:image/png;base64,BBB" };
+  assert.deepEqual(dedupeResumeImages([imageA, { ...imageA }, imageB]), [imageA, imageB]);
+  const merged = mergeResumeImages([imageA, { ...imageA }], [{ ...imageA }]);
+  assert.equal(merged.images.length, 1);
+  assert.equal(merged.added, 0);
+  assert.equal(merged.duplicates, 2);
+  const resumes = normalizeResumes({ profiles: [{ id: "default", images: [imageA, { ...imageA }] }] });
+  assert.equal(resumes.profiles[0].images.length, 1);
+});
+
 console.log("5) dedup + limits");
 test("task max limit", () => {
   assert.equal(
@@ -267,6 +284,16 @@ test("UI exposes themes, help tips and filter switches", () => {
     "locIncludeEnabled",
     "locExcludeEnabled"
   ]) assert.ok(html.includes(`id="${id}"`), `missing ${id}`);
+});
+test("resume files are only imported by an explicit save", () => {
+  const sidepanel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(sidepanel.includes("includePendingFiles: false"));
+  assert.ok(sidepanel.includes("String(target.type || '').toLowerCase() !== 'file'"));
+  assert.ok(sidepanel.includes("resumeSaveChain.then"));
+  assert.ok(sidepanel.includes("const shouldRefresh = opts.refresh !== false"));
+  assert.ok(!sidepanel.includes("const refresh = opts.refresh !== false"));
+  assert.ok(background.includes("dedupeResumeImages(profile?.images)"));
 });
 test("side-by-side layout fills the available display", () => {
   const layout = computeSideBySideBounds({ left: 0, top: 24, width: 1920, height: 1056 });

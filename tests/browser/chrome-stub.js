@@ -12,6 +12,13 @@
   };
   const listeners = [];
   const calls = [];
+  const duplicateResumeFixture = new URLSearchParams(location.search).get("duplicateResume") === "1";
+  const resumeFixtureImage = {
+    name: "resume.png",
+    size: 68,
+    type: "image/png",
+    dataUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl6sAAAAASUVORK5CYII="
+  };
 
   const state = {
     activeIsBoss: true,
@@ -65,7 +72,14 @@
       ]
     },
     resumes: {
-      profiles: [{ id: "default", name: "默认简历", images: [], attachment: null }],
+      profiles: [{
+        id: "default",
+        name: "默认简历",
+        images: duplicateResumeFixture
+          ? [{ ...resumeFixtureImage }, { ...resumeFixtureImage }]
+          : [],
+        attachment: null
+      }],
       defaultProfileId: "default"
     },
     bindings: { rules: [] },

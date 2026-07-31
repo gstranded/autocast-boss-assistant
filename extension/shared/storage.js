@@ -6,6 +6,7 @@ import {
   STORAGE_KEYS
 } from './constants.js';
 import { deepClone, todayKey, uid } from './text-utils.js';
+import { countResumeImages, normalizeResumes } from './resume-images.js';
 
 async function get(keys) {
   return chrome.storage.local.get(keys);
@@ -50,11 +51,15 @@ export async function ensureDefaults() {
 export async function getAllConfig() {
   await ensureDefaults();
   const data = await get(Object.values(STORAGE_KEYS));
+  const resumes = normalizeResumes(data[STORAGE_KEYS.RESUMES]);
+  if (countResumeImages(resumes) < countResumeImages(data[STORAGE_KEYS.RESUMES])) {
+    await set({ [STORAGE_KEYS.RESUMES]: resumes });
+  }
   return {
     settings: data[STORAGE_KEYS.SETTINGS],
     filters: data[STORAGE_KEYS.FILTERS],
     messageTemplate: data[STORAGE_KEYS.MESSAGE_TEMPLATE],
-    resumes: data[STORAGE_KEYS.RESUMES],
+    resumes,
     bindings: data[STORAGE_KEYS.BINDINGS],
     lists: data[STORAGE_KEYS.LISTS],
     history: data[STORAGE_KEYS.HISTORY] || [],
@@ -79,7 +84,7 @@ export async function saveMessageTemplate(template) {
 
 export async function saveResumes(resumes) {
   try {
-    await set({ [STORAGE_KEYS.RESUMES]: resumes });
+    await set({ [STORAGE_KEYS.RESUMES]: normalizeResumes(resumes) });
   } catch (err) {
     const msg = String(err?.message || err);
     if (/QUOTA|quota|exceed/i.test(msg)) {

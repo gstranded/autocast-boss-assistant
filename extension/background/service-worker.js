@@ -32,6 +32,7 @@ import { TASK_STATUS } from '../shared/constants.js';
 import { isBossUrl, isBossTab, bossUrlGuardMessage, BOSS_MATCH_PATTERNS } from '../shared/boss-url.js';
 import { normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
 import { computeSideBySideBounds } from '../shared/window-layout.js';
+import { dedupeResumeImages } from '../shared/resume-images.js';
 
 const SPLIT_ZOOM_FACTOR = 0.8;
 
@@ -1539,8 +1540,9 @@ async function processOneJob(task, resultRow, config) {
 
   // resume
   const profile = pickResumeProfile(job, config.resumes, config.bindings);
+  const resumeImages = dedupeResumeImages(profile?.images);
   const timing = config.settings.resumeSendTiming || 'on_request';
-  const hasImages = Boolean(profile?.images?.length);
+  const hasImages = resumeImages.length > 0;
   const flagImage = Boolean(config.settings.autoSendImageResume);
   // 兼容旧设置字段：现在表示点击 BOSS 聊天页「发简历」，不再上传本地附件。
   const flagPlatformResume = Boolean(config.settings.autoSendAttachmentResume);
@@ -1564,15 +1566,15 @@ async function processOneJob(task, resultRow, config) {
     });
   } else {
     await log('info', '将自动发送简历：' + [
-      wantAutoImage ? ('图片' + (profile.images?.length || 0) + '张') : '',
+      wantAutoImage ? ('图片' + resumeImages.length + '张') : '',
       wantPlatformResume ? 'BOSS 在线简历' : ''
     ].filter(Boolean).join(' + '), { jobId: job.jobId, profileId: profile?.id || null });
   }
 
   if (doResume) {
     if (wantAutoImage) {
-      for (let i = 0; i < profile.images.length; i++) {
-        const img = profile.images[i];
+      for (let i = 0; i < resumeImages.length; i++) {
+        const img = resumeImages[i];
         const key = resumeIdempotencyKey(job, `image_${i}`, profile.id);
         if (await hasIdempotent(key)) continue;
         const imgRes = await sendToBoss(MSG.SEND_IMAGE, {
@@ -1585,7 +1587,7 @@ async function processOneJob(task, resultRow, config) {
         }
         await markIdempotent(key, { jobId: job.jobId });
         item.state = 'IMAGE_RESUME_SENT';
-        await log('success', `图片简历已发送 ${i + 1}/${profile.images.length}`, { jobId: job.jobId });
+        await log('success', `图片简历已发送 ${i + 1}/${resumeImages.length}`, { jobId: job.jobId });
         await sleep(randomBetween(config.settings.segmentIntervalMs));
       }
     }
