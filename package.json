@@ -6,6 +6,7 @@
   "description": "Boss 海投助手 Chrome 扩展",
   "scripts": {
     "test": "node scripts/unit-tests.mjs",
+    "test:panel:serve": "node scripts/panel-harness-server.mjs",
     "smoke": "node scripts/smoke-test.mjs",
     "release:check": "node scripts/sync-release-notes.mjs",
     "release:sync": "node scripts/sync-release-notes.mjs --apply"
