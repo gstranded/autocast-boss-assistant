@@ -1,11 +1,25 @@
 import { MSG } from '../shared/messaging.js';
 import { parseKeywords, uid } from '../shared/text-utils.js';
 import { reasonText } from '../shared/reason-codes.js';
+import { STORAGE_KEYS } from '../shared/constants.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
-const BHT_UI_VERSION = "1.5.4";
+if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
+const BHT_UI_VERSION = "1.6.0";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
+const FILTER_TOGGLE_FIELDS = {
+  titleOr: 'titleOrEnabled',
+  titleAnd: 'titleAndEnabled',
+  titleNot: 'titleNotEnabled',
+  companyOr: 'companyOrEnabled',
+  companyNot: 'companyNotEnabled',
+  jdOr: 'jdOrEnabled',
+  jdAnd: 'jdAndEnabled',
+  jdNot: 'jdNotEnabled',
+  locInclude: 'locIncludeEnabled',
+  locExclude: 'locExcludeEnabled'
+};
 // FLOAT_MODE_FORCE_BOSS: floating host only injects on BOSS pages
 const state = {
   modalDismissed: false,
@@ -14,12 +28,166 @@ const state = {
   selected: new Set(),
   activeProfileId: null,
   draftBindings: [],
-  lastCompletionSignalId: ''
+  lastCompletionSignalId: '',
+  theme: 'dark'
 };
+
+function applyTheme(theme) {
+  const next = theme === 'light' ? 'light' : 'dark';
+  state.theme = next;
+  document.documentElement.dataset.theme = next;
+  document.querySelectorAll('[data-theme-value]').forEach((button) => {
+    const active = button.dataset.themeValue === next;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
+}
+
+async function loadInitialTheme() {
+  try {
+    if (!globalThis.chrome?.storage?.local) return applyTheme('dark');
+    const bag = await globalThis.chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
+    applyTheme(bag?.[STORAGE_KEYS.SETTINGS]?.theme || 'dark');
+  } catch (_) {
+    applyTheme('dark');
+  }
+}
+
+function wireThemeSwitch() {
+  document.querySelectorAll('[data-theme-value]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const theme = button.dataset.themeValue === 'light' ? 'light' : 'dark';
+      applyTheme(theme);
+      try {
+        let base = state.config?.settings;
+        if (!base) {
+          const bag = await globalThis.chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
+          base = bag?.[STORAGE_KEYS.SETTINGS] || {};
+        }
+        const settings = { ...base, theme };
+        await api(MSG.SAVE_SETTINGS, settings);
+        if (state.config) state.config.settings = settings;
+      } catch (e) {
+        toast('主题保存失败：' + String(e?.message || e), 'error');
+      }
+    });
+  });
+}
+
+function enhanceHelpTips() {
+  const popover = $('bht-help-popover');
+  const title = $('bht-help-title');
+  const body = $('bht-help-body');
+  if (!popover || !title || !body) return;
+  let activeButton = null;
+  let pinned = false;
+  let hideTimer = null;
+
+  const position = (button) => {
+    const rect = button.getBoundingClientRect();
+    const width = Math.min(310, window.innerWidth - 20);
+    popover.style.width = width + 'px';
+    const height = popover.offsetHeight;
+    const below = rect.bottom + 8;
+    const top = below + height <= window.innerHeight - 8
+      ? below
+      : Math.max(8, rect.top - height - 8);
+    const left = Math.max(10, Math.min(rect.left + rect.width / 2 - width / 2, window.innerWidth - width - 10));
+    popover.style.top = top + 'px';
+    popover.style.left = left + 'px';
+  };
+
+  const show = (button, shouldPin = false) => {
+    clearTimeout(hideTimer);
+    if (activeButton && activeButton !== button) activeButton.classList.remove('active');
+    activeButton = button;
+    pinned = shouldPin;
+    title.textContent = button.dataset.helpTitle || '功能说明';
+    body.textContent = button.dataset.help || '';
+    popover.hidden = false;
+    button.classList.toggle('active', pinned);
+    requestAnimationFrame(() => position(button));
+  };
+
+  const hide = (force = false) => {
+    if (pinned && !force) return;
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {
+      if (activeButton) activeButton.classList.remove('active');
+      activeButton = null;
+      pinned = false;
+      popover.hidden = true;
+    }, force ? 0 : 120);
+  };
+
+  document.querySelectorAll('[data-help]').forEach((owner, index) => {
+    if (owner.dataset.helpEnhanced === 'true') return;
+    owner.dataset.helpEnhanced = 'true';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'info-button';
+    button.textContent = 'i';
+    button.setAttribute('aria-label', `查看${owner.dataset.helpTitle || '功能'}说明`);
+    button.dataset.helpTitle = owner.dataset.helpTitle || owner.textContent.trim();
+    button.dataset.help = owner.dataset.help;
+    button.dataset.helpIndex = String(index);
+    button.addEventListener('mouseenter', () => show(button, false));
+    button.addEventListener('mouseleave', () => hide(false));
+    button.addEventListener('focus', () => show(button, false));
+    button.addEventListener('blur', () => hide(false));
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const wasPinned = pinned && activeButton === button;
+      if (wasPinned) hide(true);
+      else show(button, true);
+    });
+    if (owner.tagName === 'LABEL') {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'label-help-row';
+      owner.before(wrapper);
+      wrapper.append(owner, button);
+    } else {
+      owner.appendChild(button);
+    }
+  });
+
+  popover.addEventListener('mouseenter', () => clearTimeout(hideTimer));
+  popover.addEventListener('mouseleave', () => hide(false));
+  document.addEventListener('pointerdown', (event) => {
+    if (!pinned) return;
+    if (popover.contains(event.target) || activeButton?.contains(event.target)) return;
+    hide(true);
+  });
+  window.addEventListener('resize', () => activeButton && !popover.hidden && position(activeButton));
+  document.addEventListener('scroll', () => activeButton && !popover.hidden && position(activeButton), true);
+}
+
+function setFilterToggle(fieldId, enabled) {
+  const switchId = FILTER_TOGGLE_FIELDS[fieldId];
+  const toggle = $(switchId);
+  const field = $(fieldId);
+  if (!toggle || !field) return;
+  toggle.checked = enabled !== false;
+  field.disabled = !toggle.checked;
+  field.closest('[data-filter-field]')?.classList.toggle('is-disabled', !toggle.checked);
+}
+
+function syncFilterToggle(fieldId) {
+  const toggle = $(FILTER_TOGGLE_FIELDS[fieldId]);
+  if (!toggle) return;
+  setFilterToggle(fieldId, toggle.checked);
+}
+
+function wireFilterToggles() {
+  Object.keys(FILTER_TOGGLE_FIELDS).forEach((fieldId) => {
+    $(FILTER_TOGGLE_FIELDS[fieldId])?.addEventListener('change', () => syncFilterToggle(fieldId));
+  });
+}
 
 function isExtContextDead(err) {
   const msg = String(err?.message || err || "");
-  if (!chrome?.runtime?.id) return true;
+  if (!globalThis.chrome?.runtime?.id) return true;
   return /Extension context invalidated|context invalidated|Receiving end does not exist|message port closed|Could not establish connection/i.test(msg);
 }
 
@@ -29,10 +197,10 @@ function extContextHint() {
 
 async function api(type, payload) {
   try {
-    if (!chrome?.runtime?.id) throw new Error(extContextHint());
-    const res = await chrome.runtime.sendMessage({ type, payload });
-    if (chrome.runtime.lastError?.message) {
-      throw new Error(chrome.runtime.lastError.message);
+    if (!globalThis.chrome?.runtime?.id) throw new Error(extContextHint());
+    const res = await globalThis.chrome.runtime.sendMessage({ type, payload });
+    if (globalThis.chrome.runtime.lastError?.message) {
+      throw new Error(globalThis.chrome.runtime.lastError.message);
     }
     if (res == null) {
       throw new Error(type + ' 未收到后台响应');
@@ -137,6 +305,16 @@ function fillFilters(filters, lists, settings) {
   $('blacklist').value = (lists.companyBlacklist || []).join('\n');
   $('whitelist').value = (lists.companyWhitelist || []).join('\n');
   $('whitelistOnly').checked = Boolean(settings.whitelistOnly);
+  setFilterToggle('titleOr', filters.title?.enabled?.or !== false);
+  setFilterToggle('titleAnd', filters.title?.enabled?.and !== false);
+  setFilterToggle('titleNot', filters.title?.enabled?.not !== false);
+  setFilterToggle('companyOr', filters.company?.enabled?.or !== false);
+  setFilterToggle('companyNot', filters.company?.enabled?.not !== false);
+  setFilterToggle('jdOr', filters.jd?.enabled?.or !== false);
+  setFilterToggle('jdAnd', filters.jd?.enabled?.and !== false);
+  setFilterToggle('jdNot', filters.jd?.enabled?.not !== false);
+  setFilterToggle('locInclude', filters.location?.enabled?.include !== false);
+  setFilterToggle('locExclude', filters.location?.enabled?.exclude !== false);
 }
 
 function readFilters() {
@@ -144,22 +322,41 @@ function readFilters() {
     title: {
       or: parseKeywords($('titleOr').value),
       and: parseKeywords($('titleAnd').value),
-      not: parseKeywords($('titleNot').value)
+      not: parseKeywords($('titleNot').value),
+      enabled: {
+        or: $('titleOrEnabled').checked,
+        and: $('titleAndEnabled').checked,
+        not: $('titleNotEnabled').checked
+      }
     },
     company: {
       or: parseKeywords($('companyOr').value),
       and: [],
-      not: parseKeywords($('companyNot').value)
+      not: parseKeywords($('companyNot').value),
+      enabled: {
+        or: $('companyOrEnabled').checked,
+        and: true,
+        not: $('companyNotEnabled').checked
+      }
     },
     jd: {
       or: parseKeywords($('jdOr').value),
       and: parseKeywords($('jdAnd').value),
-      not: parseKeywords($('jdNot').value)
+      not: parseKeywords($('jdNot').value),
+      enabled: {
+        or: $('jdOrEnabled').checked,
+        and: $('jdAndEnabled').checked,
+        not: $('jdNotEnabled').checked
+      }
     },
     location: {
       include: parseKeywords($('locInclude').value),
       exclude: parseKeywords($('locExclude').value),
-      mode: $('locMode').value
+      mode: $('locMode').value,
+      enabled: {
+        include: $('locIncludeEnabled').checked,
+        exclude: $('locExcludeEnabled').checked
+      }
     },
     salaryMin: $('salaryMin').value === '' ? null : Number($('salaryMin').value),
     salaryMax: $('salaryMax').value === '' ? null : Number($('salaryMax').value),
@@ -173,6 +370,7 @@ function readFilters() {
 }
 
 function fillSettings(settings) {
+  applyTheme(settings.theme || 'dark');
   $('messageMode').value = settings.messageMode;
   $('similarityThreshold').value = settings.similarityThreshold;
   $('autoSendImageResume').checked = Boolean(settings.autoSendImageResume);
@@ -184,11 +382,13 @@ function fillSettings(settings) {
   $('bossCooldownDays').value = settings.bossCooldownDays;
   $('consecutiveFailPause').value = settings.consecutiveFailPause;
   $('neverRepeatJob').checked = settings.neverRepeatJob !== false;
+  $('splitViewEnabled').checked = settings.splitViewEnabled !== false;
 }
 
 function readSettingsPatch(base) {
   return {
     ...base,
+    theme: state.theme,
     messageMode: $('messageMode').value,
     similarityThreshold: Number($('similarityThreshold').value || 0.85),
     autoSendImageResume: $('autoSendImageResume').checked,
@@ -200,6 +400,7 @@ function readSettingsPatch(base) {
     bossCooldownDays: Number($('bossCooldownDays').value || 30),
     consecutiveFailPause: Number($('consecutiveFailPause').value || 3),
     neverRepeatJob: $('neverRepeatJob').checked,
+    splitViewEnabled: $('splitViewEnabled').checked,
     whitelistOnly: $('whitelistOnly').checked
   };
 }
@@ -743,8 +944,8 @@ async function assertResumeStorageCapacity(resumes) {
         ' MB）。请减少图片数量/压缩图片后再保存'
       );
     }
-    if (chrome?.storage?.local?.getBytesInUse) {
-      const totalUsed = await chrome.storage.local.getBytesInUse(null);
+    if (globalThis.chrome?.storage?.local?.getBytesInUse) {
+      const totalUsed = await globalThis.chrome.storage.local.getBytesInUse(null);
       let oldResume = 0;
       try { oldResume = await chrome.storage.local.getBytesInUse('bht_resumes'); } catch (_) {}
       const projected = totalUsed - oldResume + resumeBytes;
@@ -888,7 +1089,7 @@ let autosaveTimer = null;
 let autosaving = false;
 async function flushAutosave() {
   if (autosaving) return;
-  if (!chrome?.runtime?.id) return;
+  if (!globalThis.chrome?.runtime?.id) return;
   autosaving = true;
   try {
     // 关键：先读齐草稿再写，中间禁止 refresh，避免新消息段被旧 storage 覆盖
@@ -1200,7 +1401,11 @@ function bindEvents() {
       toast(res?.message || res?.error || '启动失败', 'error', 3500);
       showErrorModal('启动失败', res?.message || res?.error || '无法开始任务', { showRetry: false });
     } else {
-      toast('已开始投递', 'success');
+      toast(
+        res.splitView?.ok ? '已开始投递 · 已打开左右分屏' : '已开始投递 · 消息页使用普通标签',
+        res.splitView?.ok ? 'success' : 'warn',
+        2600
+      );
     }
     await refresh({ soft: true });
   });
@@ -1241,7 +1446,8 @@ function bindEvents() {
       toast(res?.message || res?.error || '测试投递启动失败', 'error', 3500);
       showErrorModal('测试投递失败', res?.message || res?.error || '无法启动', { showRetry: false });
     } else {
-      toast('测试投递已开始：' + (res.job?.title || selectedJobIds[0]), 'success');
+      const suffix = res.splitView?.ok ? ' · 已左右分屏' : ' · 普通标签模式';
+      toast('测试投递已开始：' + (res.job?.title || selectedJobIds[0]) + suffix, res.splitView?.ok ? 'success' : 'warn', 3000);
     }
     await refresh({ soft: true });
   });
@@ -1349,7 +1555,7 @@ function bindEvents() {
 }
 
 
-chrome.runtime.onMessage.addListener((msg) => {
+globalThis.chrome?.runtime?.onMessage?.addListener((msg) => {
   if (msg?.type === MSG.TASK_EVENT) {
     if (state.config) state.config.task = msg.payload;
     updateTaskUI(msg.payload, state.config?.runner || {});
@@ -1496,13 +1702,18 @@ document.addEventListener('click', (e) => {
   }
 }, true);
 
+applyTheme('dark');
+loadInitialTheme();
+enhanceHelpTips();
+wireThemeSwitch();
+wireFilterToggles();
 bindEvents();
 forceEnableControls();
 wireControlButtons();
 try { wireAutosave();
 try { wireResumeFilePreview(); } catch (_) {} } catch (_) {}
-refresh();
+refresh().catch(() => {});
 setInterval(() => {
   forceEnableControls();
-  refresh({ soft: true });
+  refresh({ soft: true }).catch(() => {});
 }, 3000);

@@ -45,8 +45,8 @@
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.04em;
-  color: #93c5fd;
-  background: rgba(59, 130, 246, 0.16);
+  color: var(--primary, #3b82f6);
+  background: var(--primary-soft, rgba(59, 130, 246, 0.16));
   padding: 2px 8px;
   border-radius: 999px;
 }
@@ -65,7 +65,7 @@
 .bht-tour-title { font-size: 15px; font-weight: 800; margin: 2px 0 6px; }
 .bht-tour-body {
   font-size: 13px;
-  color: #cbd5e1;
+  color: var(--muted, #93a4c3);
   line-height: 1.55;
   margin-bottom: 12px;
   white-space: pre-wrap;
@@ -83,7 +83,7 @@
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #33415c;
+  background: var(--line-strong, #33415c);
   display: block;
   transition: all 0.2s ease;
 }

@@ -31,6 +31,7 @@ import { REASON, reasonText } from '../shared/reason-codes.js';
 import { TASK_STATUS } from '../shared/constants.js';
 import { isBossUrl, isBossTab, bossUrlGuardMessage, BOSS_MATCH_PATTERNS } from '../shared/boss-url.js';
 import { normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
+import { computeSideBySideBounds } from '../shared/window-layout.js';
 
 let runner = {
   running: false,
@@ -241,6 +242,137 @@ async function ensureWorkerTab(task) {
   return tab;
 }
 
+async function getDisplayMetrics(tabId) {
+  try {
+    const rows = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({
+        left: window.screen.availLeft,
+        top: window.screen.availTop,
+        width: window.screen.availWidth,
+        height: window.screen.availHeight
+      })
+    });
+    return rows?.[0]?.result || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function setNormalWindowBounds(windowId, bounds) {
+  await chrome.windows.update(windowId, { state: 'normal' });
+  return chrome.windows.update(windowId, {
+    left: bounds.left,
+    top: bounds.top,
+    width: bounds.width,
+    height: bounds.height
+  });
+}
+
+export async function prepareSplitWorkspace(task, settings = {}) {
+  if (!task.execution) task.execution = {};
+  if (settings.splitViewEnabled === false) {
+    task.execution.splitViewActive = false;
+    return { ok: false, skipped: true, reason: 'disabled' };
+  }
+
+  const listTab = task.execution.listTabId
+    ? await chrome.tabs.get(task.execution.listTabId).catch(() => null)
+    : await getActiveBossTab({ allowInactiveBossTab: false });
+  if (!listTab?.id || !isBossTab(listTab)) {
+    task.execution.splitViewActive = false;
+    return { ok: false, error: 'LIST_TAB_NOT_FOUND', message: '未找到当前职位列表页，无法自动分屏' };
+  }
+
+  task.execution.listTabId = listTab.id;
+  task.execution.listWindowId = listTab.windowId;
+  const display = await getDisplayMetrics(listTab.id);
+  const bounds = computeSideBySideBounds(display || {}, { minWidth: 520, minHeight: 600 });
+  if (!bounds) {
+    task.execution.splitViewActive = false;
+    return { ok: false, error: 'DISPLAY_TOO_SMALL', message: '当前屏幕空间不足，已回退为普通消息标签页' };
+  }
+
+  let originalWindow = null;
+  try { originalWindow = await chrome.windows.get(listTab.windowId); } catch (_) {}
+  try {
+    await setNormalWindowBounds(listTab.windowId, bounds.left);
+
+    let messageTab = null;
+    if (task.execution.messageTabId) {
+      messageTab = await chrome.tabs.get(task.execution.messageTabId).catch(() => null);
+    }
+    if (!messageTab?.id) {
+      const bossTabs = await chrome.tabs.query({ url: BOSS_MATCH_PATTERNS });
+      messageTab = bossTabs.find((tab) => tab.id !== listTab.id && /\/chat/i.test(tab.url || tab.pendingUrl || '')) || null;
+    }
+
+    let messageWindow;
+    const existingWindowTabs = messageTab?.windowId != null
+      ? await chrome.tabs.query({ windowId: messageTab.windowId })
+      : [];
+    if (messageTab?.id && (messageTab.windowId === listTab.windowId || existingWindowTabs.length > 1)) {
+      messageWindow = await chrome.windows.create({
+        tabId: messageTab.id,
+        type: 'normal',
+        focused: false,
+        ...bounds.right
+      });
+      messageTab = messageWindow.tabs?.[0] || await chrome.tabs.get(messageTab.id);
+    } else if (messageTab?.id) {
+      await setNormalWindowBounds(messageTab.windowId, bounds.right);
+      messageWindow = await chrome.windows.get(messageTab.windowId, { populate: true });
+    } else {
+      messageWindow = await chrome.windows.create({
+        url: 'https://www.zhipin.com/web/geek/chat',
+        type: 'normal',
+        focused: false,
+        ...bounds.right
+      });
+      messageTab = messageWindow.tabs?.[0] || (await chrome.tabs.query({ windowId: messageWindow.id }))[0] || null;
+    }
+
+    if (!messageTab?.id) throw new Error('消息窗口已创建，但未获得标签页');
+    task.execution.messageTabId = messageTab.id;
+    task.execution.messageWindowId = messageWindow.id;
+    await setNormalWindowBounds(messageWindow.id, bounds.right);
+    if (!/\/chat/i.test(messageTab.url || messageTab.pendingUrl || '')) {
+      messageTab = await chrome.tabs.update(messageTab.id, {
+        url: 'https://www.zhipin.com/web/geek/chat',
+        active: true
+      });
+    }
+    await waitTabComplete(messageTab.id, 25000);
+    await forceInjectContent(messageTab.id);
+
+    task.execution.splitViewActive = true;
+    task.execution.splitBounds = bounds;
+    task.execution.phase = 'SPLIT_WORKSPACE_READY';
+
+    await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
+    await chrome.windows.update(listTab.windowId, { focused: true }).catch(() => {});
+    return { ok: true, listTabId: listTab.id, messageTabId: messageTab.id, bounds };
+  } catch (error) {
+    task.execution.splitViewActive = false;
+    task.execution.splitViewError = String(error?.message || error);
+    if (originalWindow?.width && originalWindow?.height) {
+      await setNormalWindowBounds(listTab.windowId, {
+        left: originalWindow.left || 0,
+        top: originalWindow.top || 0,
+        width: originalWindow.width,
+        height: originalWindow.height
+      }).catch(() => {});
+    }
+    await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
+    await chrome.windows.update(listTab.windowId, { focused: true }).catch(() => {});
+    return {
+      ok: false,
+      error: 'SPLIT_VIEW_FAILED',
+      message: '浏览器未允许自动分屏，已回退为普通消息标签页：' + task.execution.splitViewError
+    };
+  }
+}
+
 
 async function ensureMessageTab(task) {
   if (!task.execution) task.execution = {};
@@ -262,11 +394,23 @@ async function ensureMessageTab(task) {
       }
     } catch (_) {}
   }
-  const tab = await chrome.tabs.create({
-    url: "https://www.zhipin.com/web/geek/chat",
-    active: true,
-    openerTabId: task.execution.listTabId || undefined
-  });
+  let tab;
+  if (task.execution.splitViewActive && task.execution.splitBounds?.right) {
+    const win = await chrome.windows.create({
+      url: "https://www.zhipin.com/web/geek/chat",
+      type: 'normal',
+      focused: true,
+      ...task.execution.splitBounds.right
+    });
+    tab = win.tabs?.[0] || (await chrome.tabs.query({ windowId: win.id }))[0];
+    if (!tab?.id) throw new Error('无法在右侧重建消息窗口');
+  } else {
+    tab = await chrome.tabs.create({
+      url: "https://www.zhipin.com/web/geek/chat",
+      active: true,
+      openerTabId: task.execution.listTabId || undefined
+    });
+  }
   task.execution.messageTabId = tab.id;
   task.execution.messageWindowId = tab.windowId;
   task.execution.phase = "MESSAGE_TAB_READY";
@@ -830,6 +974,7 @@ function buildDeliveryQueue(results = [], { selectedOnly = true } = {}) {
 async function runPreview(payload = {}) {
   await log('info', '开始扫描预览…');
   const config = await getAllConfig();
+  const previewTab = await getActiveBossTab({ allowInactiveBossTab: false });
   const scan = await sendToBoss(MSG.SCAN_JOBS, { scroll: payload.scroll !== false, maxRounds: payload.maxRounds || 6 });
   if (!scan?.ok) {
     await log('error', scan?.message || '扫描失败', { error: scan?.error });
@@ -901,7 +1046,11 @@ async function runPreview(payload = {}) {
     })),
     counters: { processed: 0, success: 0, skipped: 0, failed: 0 },
     currentJobId: null,
-    consecutiveFails: 0
+    consecutiveFails: 0,
+    execution: {
+      listTabId: previewTab?.id || null,
+      listWindowId: previewTab?.windowId || null
+    }
   };
 
   
@@ -1773,10 +1922,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }));
         }
         task.status = TASK_STATUS.RUNNING;
+        const split = await prepareSplitWorkspace(task, all.settings || {});
         await publishTask(task);
+        if (split.ok) {
+          await log('success', '[分屏] 职位列表在左侧，消息中心在右侧', {
+            listTabId: split.listTabId,
+            messageTabId: split.messageTabId
+          });
+        } else if (!split.skipped) {
+          await log('warn', '[分屏] ' + (split.message || '自动分屏不可用，已回退为普通标签页'));
+        }
         // async loop
         runTaskLoop(task.id);
-        return { ok: true, taskId: task.id };
+        return { ok: true, taskId: task.id, splitView: split };
       }
       case MSG.RUN_TEST_DELIVERY:
       case 'BHT_RUN_TEST_DELIVERY': {
@@ -1818,7 +1976,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         task.status = TASK_STATUS.RUNNING;
         task.pauseReason = '';
         task.awaitingUserRetry = false;
+        const split = await prepareSplitWorkspace(task, all.settings || {});
         await publishTask(task);
+        if (split.ok) {
+          await log('success', '[分屏] 测试投递已打开左右工作区', {
+            listTabId: split.listTabId,
+            messageTabId: split.messageTabId
+          });
+        } else if (!split.skipped) {
+          await log('warn', '[分屏] ' + (split.message || '自动分屏不可用，已回退为普通标签页'));
+        }
         await log(
           'info',
           '测试投递启动：仅处理 1 个岗位「' + (pick.job?.title || '') + '」@ ' + (pick.job?.company || ''),
@@ -1826,7 +1993,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         );
         // temporary settings override for this run only (in-memory via task flags; limits still apply normally but queue size=1)
         runTaskLoop(task.id);
-        return { ok: true, testJobId: onlyId, job: pick.job };
+        return { ok: true, testJobId: onlyId, job: pick.job, splitView: split };
       }
 
       case MSG.PAUSE_TASK:

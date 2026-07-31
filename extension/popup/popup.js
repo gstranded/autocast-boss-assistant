@@ -1,4 +1,5 @@
 import { isBossUrl } from "../shared/boss-url.js";
+import { STORAGE_KEYS } from "../shared/constants.js";
 
 const app = document.getElementById("app");
 
@@ -82,6 +83,13 @@ function renderBossReady(tab, version) {
     await sendFloat("BHT_FLOAT_TOGGLE_FAB");
     window.close();
   });
+}
+
+try {
+  const stored = await chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
+  document.documentElement.dataset.theme = stored?.[STORAGE_KEYS.SETTINGS]?.theme === 'light' ? 'light' : 'dark';
+} catch (_) {
+  document.documentElement.dataset.theme = 'dark';
 }
 
 const manifest = chrome.runtime.getManifest();

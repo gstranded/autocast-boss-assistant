@@ -3,9 +3,10 @@ import { includesKeyword, normalizeText, parseSalaryRange } from './text-utils.j
 
 function evalTextRules(text, rules = {}, codes) {
   const value = text || '';
-  const or = rules.or || [];
-  const and = rules.and || [];
-  const not = rules.not || [];
+  const enabled = rules.enabled || {};
+  const or = enabled.or === false ? [] : (rules.or || []);
+  const and = enabled.and === false ? [] : (rules.and || []);
+  const not = enabled.not === false ? [] : (rules.not || []);
 
   for (const k of not) {
     if (includesKeyword(value, k)) {
@@ -46,8 +47,9 @@ function evalTextRules(text, rules = {}, codes) {
 }
 
 function evalLocation(location, locationRules = {}) {
-  const include = locationRules.include || [];
-  const exclude = locationRules.exclude || [];
+  const enabled = locationRules.enabled || {};
+  const include = enabled.include === false ? [] : (locationRules.include || []);
+  const exclude = enabled.exclude === false ? [] : (locationRules.exclude || []);
   const mode = locationRules.mode || 'contains';
   const loc = location || '';
 
@@ -170,9 +172,11 @@ export function evaluateJob(job, filters, lists = {}, settings = {}) {
     }
   }
 
-  if (filters.title?.or?.length) passReasons.push(`职位命中包含词`);
-  if (filters.title?.and?.length) passReasons.push(`职位满足必需词`);
-  if (filters.location?.include?.length) passReasons.push(`地点匹配：${job.location || ''}`);
+  if (filters.title?.enabled?.or !== false && filters.title?.or?.length) passReasons.push(`职位命中包含词`);
+  if (filters.title?.enabled?.and !== false && filters.title?.and?.length) passReasons.push(`职位满足必需词`);
+  if (filters.location?.enabled?.include !== false && filters.location?.include?.length) {
+    passReasons.push(`地点匹配：${job.location || ''}`);
+  }
 
   const salary = parseSalaryRange(job.salary || '');
   if (filters.salaryMin != null && salary.max != null && salary.max < filters.salaryMin) {

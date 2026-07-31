@@ -43,13 +43,13 @@ Boss HaiTou Assistant optimizes for reliability and control—not reckless auto-
 
 ### 1) Task: preview gate + controllable delivery
 
-Scan first, confirm second, deliver last. Every job shows pass/skip reasons.
+Scan first, confirm second, deliver last. Every job shows pass/skip reasons. Starting a task arranges the job list and message center into left/right browser windows, with a normal-tab fallback when the display is too small.
 
 ![Task panel](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/01-task.png)
 
 ### 2) Filters: explainable AND / OR / NOT rules
 
-Separate fields for title, company, JD, and location.
+Separate fields for title, company, JD, and location. Each keyword rule has its own enable switch, so a rule can be paused without deleting its contents. Combined text rules run in `NOT → OR → AND` order.
 
 ![Filter panel](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/02-filter.png)
 
@@ -67,7 +67,7 @@ Different tracks use different resumes.
 
 ### 5) Settings: rate limits + local config
 
-Safety limits are first-class features.
+Safety limits are first-class features. The panel supports persistent light and dark themes, and the `i` controls beside features open contextual explanations on hover or click.
 
 ![Settings panel](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/05-settings.png)
 

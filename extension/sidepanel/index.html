@@ -10,11 +10,20 @@
   <body>
     <div class="app">
       <header class="header">
-        <div>
-          <div class="brand">Boss 海投助手</div>
-          <div class="tagline">预览 · 可解释 · 不重复 · 可控</div>
+        <div class="brand-lockup">
+          <img class="brand-icon" src="../assets/icons/icon48.png" alt="" />
+          <div>
+            <div class="brand">Boss 海投助手</div>
+            <div class="tagline">预览 · 可解释 · 不重复 · 可控</div>
+          </div>
         </div>
-        <div id="connBadge" class="badge">未连接页面</div>
+        <div class="header-actions">
+          <div class="theme-switch" role="group" aria-label="界面主题">
+            <button type="button" data-theme-value="light" title="白色主题" aria-label="使用白色主题">☀</button>
+            <button type="button" data-theme-value="dark" title="黑色主题" aria-label="使用黑色主题">☾</button>
+          </div>
+          <div id="connBadge" class="badge">未连接页面</div>
+        </div>
       </header>
 
       <nav class="tabs" id="tabs">
@@ -30,25 +39,33 @@
         <!-- TASK -->
         <section class="panel active" id="tab-task">
           <div class="card">
-            <div class="card-title">任务控制</div>
-            <div class="btn-row">
-              <button id="btnPreview" class="btn primary">扫描预览</button>
-              <button id="btnDiagnose" class="btn">页面诊断</button>
-              <button id="btnStart" class="btn success" disabled>确认投递</button>
-              <button id="btnTestOne" class="btn" title="只投递当前选中的 1 个通过岗位（用于验证消息/简历）">投递一份测试</button>
-              <button id="btnPause" class="btn">暂停</button>
-              <button id="btnResume" class="btn">继续</button>
-              <button id="btnSkip" class="btn">跳过当前</button>
-              <button id="btnStop" class="btn danger">停止</button>
+            <div class="card-title" data-help-title="任务控制" data-help="先扫描当前职位列表并核对预览，再确认投递。任务启动后会把职位列表与消息中心排成左右两个窗口，方便同时观察。">任务控制</div>
+            <div class="task-actions">
+              <div class="task-primary-actions">
+                <button id="btnPreview" class="btn primary command-btn">扫描预览</button>
+                <button id="btnStart" class="btn success command-btn" disabled>确认投递</button>
+              </div>
+              <div class="task-secondary-actions">
+                <button id="btnTestOne" class="btn command-btn" title="只投递当前选中的 1 个通过岗位（用于验证消息/简历）">投递一份测试</button>
+                <button id="btnDiagnose" class="btn command-btn">页面诊断</button>
+              </div>
+              <div class="task-control-strip" aria-label="运行控制">
+                <button id="btnPause" class="btn">暂停</button>
+                <button id="btnResume" class="btn">继续</button>
+                <button id="btnSkip" class="btn">跳过</button>
+                <button id="btnStop" class="btn danger-quiet">停止</button>
+              </div>
             </div>
-            <div id="taskStatus" class="status-line">状态：空闲</div>
-            <div id="taskCounters" class="counters">成功 0 · 跳过 0 · 失败 0 · 已处理 0</div>
+            <div class="task-progress">
+              <div id="taskStatus" class="status-line">状态：空闲</div>
+              <div id="taskCounters" class="counters">成功 0 · 跳过 0 · 失败 0 · 已处理 0</div>
+            </div>
             <div id="taskWarnings" class="warnings"></div>
           </div>
 
           <div class="card">
             <div class="card-title row">
-              <span>预览结果</span>
+              <span data-help-title="预览结果" data-help="扫描只读取当前列表，不会发送消息。通过项默认勾选，你可以在正式投递前逐条取消。">预览结果</span>
               <label class="check"><input type="checkbox" id="selectAllPass" checked />全选通过项</label>
             </div>
             <div id="summaryBox" class="summary">尚未扫描</div>
@@ -57,7 +74,7 @@
 
           <div class="card">
             <div class="card-title row">
-              <span>实时日志</span>
+              <span data-help-title="实时日志" data-help="记录扫描、会话匹配、消息回执、简历动作与失败原因。排查页面改版或投递暂停时优先查看这里。">实时日志</span>
               <div class="btn-row" style="gap:6px"><button id="btnCopyLogs" class="btn tiny">复制</button><button id="btnClearLogs" class="btn tiny">清空</button></div>
             </div>
             <div id="logList" class="logs"></div>
@@ -67,66 +84,116 @@
         <!-- FILTER -->
         <section class="panel" id="tab-filter">
           <div class="card">
-            <div class="card-title">职位名称</div>
+            <div class="card-title" data-help-title="OR / AND / NOT 的组合关系" data-help="三类规则同时启用时按 NOT → OR → AND 检查：先排除命中 NOT 的岗位；剩余岗位至少命中一个 OR；最后还必须命中全部 AND。关闭某一项只会暂时忽略该项，已填关键词会保留。">职位名称</div>
             <div class="hint">关键词分隔符支持：英文逗号 , ／ 中文逗号 ， ／ 顿号 、 ／ 反斜杠 \\ ／ 斜杠 / ／ 换行</div>
-            <label>包含任意 OR</label>
-            <textarea id="titleOr" rows="2" placeholder="Java, Go、后端 或 Java\Go"></textarea>
-            <label>必须同时包含 AND</label>
-            <textarea id="titleAnd" rows="2" placeholder="Agent, 大模型"></textarea>
-            <label>排除任意 NOT</label>
-            <textarea id="titleNot" rows="2" placeholder="外包,驻场、销售 可用 , ， 、 \ 分隔"></textarea>
+            <div class="filter-field" data-filter-field="titleOr">
+              <div class="field-row">
+                <label for="titleOr" class="field-label" data-help-title="包含任意 OR" data-help="只要职位名称命中 A 或 B 中任意一个就通过这一项。例如填写“Java, Go”，命中 Java 或 Go 都可以。">包含任意 <span class="logic-tag or">OR</span></label>
+                <label class="switch" title="启用或停用职位 OR 规则"><input id="titleOrEnabled" type="checkbox" checked /><span></span></label>
+              </div>
+              <textarea id="titleOr" rows="2" placeholder="Java, Go、后端 或 Java\Go"></textarea>
+            </div>
+            <div class="filter-field" data-filter-field="titleAnd">
+              <div class="field-row">
+                <label for="titleAnd" class="field-label" data-help-title="必须同时包含 AND" data-help="职位名称必须同时命中所有关键词。例如填写“Agent, 大模型”，两个词都出现才通过这一项。">必须同时包含 <span class="logic-tag and">AND</span></label>
+                <label class="switch" title="启用或停用职位 AND 规则"><input id="titleAndEnabled" type="checkbox" checked /><span></span></label>
+              </div>
+              <textarea id="titleAnd" rows="2" placeholder="Agent, 大模型"></textarea>
+            </div>
+            <div class="filter-field" data-filter-field="titleNot">
+              <div class="field-row">
+                <label for="titleNot" class="field-label" data-help-title="排除任意 NOT" data-help="只要职位名称命中任意一个排除词就直接跳过。例如填写“外包, 驻场”，命中其中任何一个都不会投递。NOT 的优先级高于 OR 和 AND。">排除任意 <span class="logic-tag not">NOT</span></label>
+                <label class="switch" title="启用或停用职位 NOT 规则"><input id="titleNotEnabled" type="checkbox" checked /><span></span></label>
+              </div>
+              <textarea id="titleNot" rows="2" placeholder="外包,驻场、销售 可用 , ， 、 \ 分隔"></textarea>
+            </div>
           </div>
           <div class="card">
-            <div class="card-title">公司 / JD</div>
-            <label>公司包含 OR</label>
-            <textarea id="companyOr" rows="2"></textarea>
-            <label>公司排除 NOT</label>
-            <textarea id="companyNot" rows="2"></textarea>
-            <label>JD 包含 OR</label>
-            <textarea id="jdOr" rows="2"></textarea>
-            <label>JD 必须 AND</label>
-            <textarea id="jdAnd" rows="2"></textarea>
-            <label>JD 排除 NOT</label>
-            <textarea id="jdNot" rows="2"></textarea>
+            <div class="card-title" data-help-title="公司与职位描述" data-help="公司规则只检查公司名称；JD 规则检查职位描述。每个开关都可以独立停用，输入内容不会被删除。">公司 / JD</div>
+            <div class="filter-field" data-filter-field="companyOr">
+              <div class="field-row">
+                <label for="companyOr" class="field-label" data-help-title="公司包含 OR" data-help="公司名称命中任意一个关键词才通过；留空表示不限公司。">公司包含 <span class="logic-tag or">OR</span></label>
+                <label class="switch" title="启用或停用公司 OR 规则"><input id="companyOrEnabled" type="checkbox" checked /><span></span></label>
+              </div>
+              <textarea id="companyOr" rows="2"></textarea>
+            </div>
+            <div class="filter-field" data-filter-field="companyNot">
+              <div class="field-row">
+                <label for="companyNot" class="field-label" data-help-title="公司排除 NOT" data-help="公司名称命中任意排除词就跳过，适合排除人力、咨询或特定公司。">公司排除 <span class="logic-tag not">NOT</span></label>
+                <label class="switch" title="启用或停用公司 NOT 规则"><input id="companyNotEnabled" type="checkbox" checked /><span></span></label>
+              </div>
+              <textarea id="companyNot" rows="2"></textarea>
+            </div>
+            <div class="filter-field" data-filter-field="jdOr">
+              <div class="field-row">
+                <label for="jdOr" class="field-label" data-help-title="JD 包含 OR" data-help="职位描述命中任意一个关键词即可通过这一项，适合多个可接受技能方向。">JD 包含 <span class="logic-tag or">OR</span></label>
+                <label class="switch" title="启用或停用 JD OR 规则"><input id="jdOrEnabled" type="checkbox" checked /><span></span></label>
+              </div>
+              <textarea id="jdOr" rows="2"></textarea>
+            </div>
+            <div class="filter-field" data-filter-field="jdAnd">
+              <div class="field-row">
+                <label for="jdAnd" class="field-label" data-help-title="JD 必须 AND" data-help="职位描述必须同时出现全部关键词，适合不可缺少的技能组合。">JD 必须 <span class="logic-tag and">AND</span></label>
+                <label class="switch" title="启用或停用 JD AND 规则"><input id="jdAndEnabled" type="checkbox" checked /><span></span></label>
+              </div>
+              <textarea id="jdAnd" rows="2"></textarea>
+            </div>
+            <div class="filter-field" data-filter-field="jdNot">
+              <div class="field-row">
+                <label for="jdNot" class="field-label" data-help-title="JD 排除 NOT" data-help="职位描述命中任意排除词就跳过，适合排除培训、驻场等风险描述。">JD 排除 <span class="logic-tag not">NOT</span></label>
+                <label class="switch" title="启用或停用 JD NOT 规则"><input id="jdNotEnabled" type="checkbox" checked /><span></span></label>
+              </div>
+              <textarea id="jdNot" rows="2"></textarea>
+            </div>
           </div>
           <div class="card">
-            <div class="card-title">地点与条件</div>
-            <label>地点包含</label>
-            <input id="locInclude" placeholder="广州, 深圳" />
-            <label>地点排除</label>
-            <input id="locExclude" placeholder="南沙, 坪山" />
-            <label>地点匹配</label>
+            <div class="card-title" data-help-title="地点与条件" data-help="地点包含和地点排除可独立启停；薪资、活跃度和风险条件继续按各自设置判断。">地点与条件</div>
+            <div class="filter-field" data-filter-field="locInclude">
+              <div class="field-row">
+                <label for="locInclude" class="field-label" data-help-title="地点包含" data-help="岗位地点至少命中一个目标地点才通过。包含模式下“广州”可匹配“广州·天河区”。">地点包含</label>
+                <label class="switch" title="启用或停用地点包含规则"><input id="locIncludeEnabled" type="checkbox" checked /><span></span></label>
+              </div>
+              <input id="locInclude" placeholder="广州, 深圳" />
+            </div>
+            <div class="filter-field" data-filter-field="locExclude">
+              <div class="field-row">
+                <label for="locExclude" class="field-label" data-help-title="地点排除" data-help="岗位地点命中任意排除地点就跳过，例如排除通勤不便的区域。">地点排除</label>
+                <label class="switch" title="启用或停用地点排除规则"><input id="locExcludeEnabled" type="checkbox" checked /><span></span></label>
+              </div>
+              <input id="locExclude" placeholder="南沙, 坪山" />
+            </div>
+            <label data-help-title="地点匹配方式" data-help="包含匹配适合城市或区域关键词；精确匹配要求规范化后的地点文本完全相同。">地点匹配</label>
             <select id="locMode">
               <option value="contains">包含匹配</option>
               <option value="exact">精确匹配</option>
             </select>
             <div class="grid-2">
               <div>
-                <label>最低月薪（元）</label>
+                <label data-help-title="最低月薪" data-help="如果岗位薪资上限仍低于这个金额，就排除该岗位。填写月薪金额，例如 15000。">最低月薪（元）</label>
                 <input id="salaryMin" type="number" placeholder="例如 15000" />
               </div>
               <div>
-                <label>最高月薪（元）</label>
+                <label data-help-title="最高月薪" data-help="如果岗位薪资下限高于这个金额，就排除该岗位。留空表示不设上限。">最高月薪（元）</label>
                 <input id="salaryMax" type="number" placeholder="例如 40000" />
               </div>
             </div>
-            <label>HR 活跃</label>
+            <label data-help-title="HR 活跃" data-help="只保留最近活跃时间符合条件的 HR；页面没有可靠活跃信息时可能被排除。">HR 活跃</label>
             <select id="activeWithin">
               <option value="">不限</option>
               <option value="today">今日活跃</option>
               <option value="3d">3 日内</option>
               <option value="week">一周内</option>
             </select>
-            <label class="check"><input type="checkbox" id="excludeHunter" />排除猎头</label>
-            <label class="check"><input type="checkbox" id="excludeOutsource" />排除外包/驻场</label>
+            <label class="check" data-help-title="排除猎头" data-help="根据职位、公司、HR 和 JD 中的猎头或人力中介特征进行排除。"><input type="checkbox" id="excludeHunter" />排除猎头</label>
+            <label class="check" data-help-title="排除外包或驻场" data-help="根据职位、公司和 JD 中的外包、驻场、外派等特征进行排除。"><input type="checkbox" id="excludeOutsource" />排除外包/驻场</label>
           </div>
           <div class="card">
-            <div class="card-title">黑白名单</div>
-            <label>公司黑名单（逗号/换行分隔）</label>
+            <div class="card-title" data-help-title="黑白名单" data-help="黑名单始终优先排除；开启“仅投白名单公司”后，未命中白名单的公司也会跳过。">黑白名单</div>
+            <label data-help-title="公司黑名单" data-help="公司名称命中任意黑名单词就直接跳过。支持逗号或换行分隔。">公司黑名单（逗号/换行分隔）</label>
             <textarea id="blacklist" rows="3"></textarea>
-            <label>公司白名单</label>
+            <label data-help-title="公司白名单" data-help="记录优先允许的公司；只有开启“仅投白名单公司”后才会限制其他公司。">公司白名单</label>
             <textarea id="whitelist" rows="3"></textarea>
-            <label class="check"><input type="checkbox" id="whitelistOnly" />仅投白名单公司</label>
+            <label class="check" data-help-title="仅投白名单公司" data-help="开启后，只投递命中白名单的公司；白名单为空时不会错误地排除全部岗位。"><input type="checkbox" id="whitelistOnly" />仅投白名单公司</label>
             <button id="btnSaveFilter" class="btn primary block">保存筛选</button>
           </div>
         </section>
@@ -134,19 +201,19 @@
         <!-- MESSAGE -->
         <section class="panel" id="tab-message">
           <div class="card">
-            <div class="card-title">发送模式</div>
+            <div class="card-title" data-help-title="发送模式" data-help="自动识别会检查最近本人消息，避免重复发送第一段；原生打招呼模式固定跳过第一段；插件模式发送全部启用段落。">发送模式</div>
             <select id="messageMode">
               <option value="auto_detect">C. 自动识别（推荐）</option>
               <option value="native_plus">A. 使用原生打招呼 + 插件补充</option>
               <option value="plugin_only">B. 完全由插件发送</option>
             </select>
-            <label>相似度阈值（0.5-1）</label>
+            <label data-help-title="相似度阈值" data-help="越低越容易把两段文字判定为相似并跳过首段；越高要求越接近。默认 0.85。">相似度阈值（0.5-1）</label>
             <input id="similarityThreshold" type="number" min="0.5" max="1" step="0.01" />
             <div class="hint">变量：{HR称呼} {职位名称} {公司名称} {匹配技能} {工作城市}</div>
           </div>
           <div class="card">
             <div class="card-title row">
-              <span>消息段落</span>
+              <span data-help-title="消息段落" data-help="按页面顺序逐段发送；每段可以独立启用或删除，成功发送后会记录幂等状态，避免刷新后重复。">消息段落</span>
               <button id="btnAddSeg" class="btn tiny">新增一段</button>
             </div>
             <div id="segments" class="segments"></div>
@@ -158,11 +225,11 @@
         <!-- RESUME -->
         <section class="panel" id="tab-resume">
           <div class="card">
-            <div class="card-title">发送策略</div>
+            <div class="card-title" data-help-title="简历发送策略" data-help="图片简历与 BOSS 在线简历是两个独立动作。只有选择“文本发送完成后立即发送”时才会自动执行。">发送策略</div>
             <div class="hint auto-resume-hint">图片简历支持 ≤ 8 MB 源文件并自动压缩；BOSS 在线简历无需上传文件，直接点击聊天页「发简历」。</div>
-            <label class="check"><input type="checkbox" id="autoSendImageResume" />自动发送图片简历</label>
-            <label class="check"><input type="checkbox" id="autoSendAttachmentResume" />自动点击 BOSS「发简历」</label>
-            <label>发送时机</label>
+            <label class="check" data-help-title="自动发送图片简历" data-help="按当前求职方案中的图片顺序发送；图片会在导入时压缩并保存在扩展本地。"><input type="checkbox" id="autoSendImageResume" />自动发送图片简历</label>
+            <label class="check" data-help-title="自动点击发简历" data-help="点击 BOSS 聊天页自带的“发简历”按钮，不会上传本地 PDF 或文档附件。"><input type="checkbox" id="autoSendAttachmentResume" />自动点击 BOSS「发简历」</label>
+            <label data-help-title="简历发送时机" data-help="推荐文本发送成功后立即发送；手动模式不会自动发送任何简历。">发送时机</label>
             <select id="resumeSendTiming">
               <option value="on_request">文本后发送（兼容旧配置）</option>
               <option value="after_text">文本发送完成后立即发送（推荐）</option>
@@ -172,7 +239,7 @@
 
           <div class="card">
             <div class="card-title row">
-              <span>求职方案 / 简历档案</span>
+              <span data-help-title="求职方案" data-help="为不同岗位方向保存不同的图片简历。星标方案是没有绑定规则命中时使用的默认方案。">求职方案 / 简历档案</span>
               <button id="btnAddProfile" class="btn tiny">新建方案</button>
             </div>
             <div id="profileList" class="profile-list"></div>
@@ -180,14 +247,14 @@
           </div>
 
           <div class="card">
-            <div class="card-title">当前方案内容</div>
-            <label>方案名称</label>
+            <div class="card-title" data-help-title="当前方案内容" data-help="编辑当前选中的简历方案。新增图片默认追加，不会覆盖已保存的图片。">当前方案内容</div>
+            <label data-help-title="方案名称" data-help="用于区分城市或岗位方向，例如“广州 AI 岗”。">方案名称</label>
             <input id="profileName" placeholder="例如：广州 AI 岗" />
-            <label>图片简历（源文件单张 ≤ 8 MB，导入后自动压缩）</label>
+            <label data-help-title="图片简历" data-help="可一次选择多张，按预览顺序发送。单张源文件不能超过 8 MB，导入后会自动压缩。">图片简历（源文件单张 ≤ 8 MB，导入后自动压缩）</label>
             <input id="imageFiles" type="file" accept="image/*" multiple />
             <div id="imagePreview" class="thumbs"></div>
             <button id="btnClearImages" class="btn tiny">清空图片</button>
-            <label>BOSS 在线简历</label>
+            <label data-help-title="BOSS 在线简历" data-help="无需选择本地文件；启用发送策略后，插件只点击聊天页中平台自带的“发简历”。">BOSS 在线简历</label>
             <div id="attachInfo" class="hint">无需上传本地附件；启用上方开关后，插件会在聊天页点击「发简历」。</div>
             <div class="btn-row" style="margin-top:10px">
               <button id="btnSaveResume" class="btn primary">保存当前方案</button>
@@ -198,7 +265,7 @@
 
           <div class="card">
             <div class="card-title row">
-              <span>岗位 → 方案绑定规则</span>
+              <span data-help-title="岗位到方案绑定" data-help="按优先级从小到大检查职位名与 JD，第一条命中的规则决定发送哪份简历。">岗位 → 方案绑定规则</span>
               <button id="btnAddBinding" class="btn tiny">新增规则</button>
             </div>
             <div class="hint">按优先级从小到大匹配职位名/JD 关键词，命中则使用对应简历方案。</div>
@@ -212,7 +279,7 @@
         <section class="panel" id="tab-history">
           <div class="card">
             <div class="card-title row">
-              <span>投递记录</span>
+              <span data-help-title="投递记录" data-help="保存在浏览器本地，可按成功、跳过、失败筛选，也可以导出或清空。">投递记录</span>
               <div class="btn-row" style="gap:6px">
                 <select id="historyFilter" class="tiny-select">
                   <option value="all">全部</option>
@@ -232,34 +299,35 @@
         <!-- SETTINGS -->
         <section class="panel" id="tab-settings">
           <div class="card">
-            <div class="card-title">频率与上限</div>
+            <div class="card-title" data-help-title="频率与上限" data-help="这些限制用于控制单次、每日、公司和 HR 维度的沟通数量。达到限制时任务会暂停。">频率与上限</div>
             <div class="grid-2">
               <div>
-                <label>本次最多沟通</label>
+                <label data-help-title="本次最多沟通" data-help="当前任务允许成功创建沟通的最大岗位数。首次使用建议设为 1。">本次最多沟通</label>
                 <input id="taskMaxCommunicate" type="number" min="1" />
               </div>
               <div>
-                <label>每日最多沟通</label>
+                <label data-help-title="每日最多沟通" data-help="当天累计沟通上限，达到后任务暂停。">每日最多沟通</label>
                 <input id="dailyMaxCommunicate" type="number" min="1" />
               </div>
               <div>
-                <label>同公司每天最多</label>
+                <label data-help-title="同公司每天最多" data-help="限制同一天向同一公司沟通的岗位数量。">同公司每天最多</label>
                 <input id="companyDailyMax" type="number" min="1" />
               </div>
               <div>
-                <label>同 HR 冷却天数</label>
+                <label data-help-title="同 HR 冷却天数" data-help="冷却期内不再联系同一 HR；设置为 0 表示关闭冷却。">同 HR 冷却天数</label>
                 <input id="bossCooldownDays" type="number" min="0" />
               </div>
               <div>
-                <label>连续失败暂停</label>
+                <label data-help-title="连续失败暂停" data-help="连续失败达到这个次数后自动暂停，避免页面变化时继续误操作。">连续失败暂停</label>
                 <input id="consecutiveFailPause" type="number" min="1" />
               </div>
             </div>
-            <label class="check"><input type="checkbox" id="neverRepeatJob" />同一职位永不重复</label>
+            <label class="check" data-help-title="同一职位永不重复" data-help="开启后，历史中已经沟通过的职位不会再次进入投递队列。"><input type="checkbox" id="neverRepeatJob" />同一职位永不重复</label>
+            <label class="check" data-help-title="自动左右分屏" data-help="开始正式或测试投递时，将当前职位列表窗口放到屏幕左半边，并在右半边打开消息中心。屏幕过窄或浏览器拒绝调整时会自动回退为普通标签页。"><input type="checkbox" id="splitViewEnabled" />开始投递时自动左右分屏</label>
             <button id="btnSaveSettings" class="btn primary block">保存设置</button>
           </div>
           <div class="card">
-            <div class="card-title">导入 / 导出</div>
+            <div class="card-title" data-help-title="导入与导出" data-help="导出筛选、消息、设置和简历方案到 JSON；文件可能包含图片简历数据，请勿公开分享。">导入 / 导出</div>
             <div class="btn-row">
               <button id="btnExport" class="btn">导出 JSON</button>
               <label class="btn file-btn">导入 JSON<input id="importFile" type="file" accept="application/json,.json" hidden /></label>
@@ -267,7 +335,7 @@
             <div class="hint">配置默认保存在本地。导出文件可能包含简历数据，请妥善保管。</div>
           </div>
           <div class="card">
-            <div class="card-title">使用说明</div>
+            <div class="card-title" data-help-title="使用说明" data-help="推荐按配置、扫描、核对、测试一份、正式投递的顺序使用。任何异常都可以暂停或停止。">使用说明</div>
             <ol class="help">
               <li>打开 BOSS 直聘推荐/搜索职位列表页</li>
               <li>在侧栏配置筛选与消息，先点「扫描预览」</li>
@@ -291,7 +359,10 @@
         </div>
       </div>
     </div>
-    <script>if (new URLSearchParams(location.search).get('mode') === 'float') document.documentElement.classList.add('float-mode');</script>
+    <div id="bht-help-popover" class="help-popover" role="tooltip" hidden>
+      <div id="bht-help-title" class="help-popover-title"></div>
+      <div id="bht-help-body" class="help-popover-body"></div>
+    </div>
     <script type="module" src="./app.js"></script>
     <script type="module" src="./onboarding.js"></script>
   </body>

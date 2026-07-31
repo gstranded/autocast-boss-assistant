@@ -46,6 +46,7 @@ export const ITEM_STATE = {
 };
 
 export const DEFAULT_SETTINGS = {
+  theme: 'dark',
   messageMode: MESSAGE_MODES.AUTO_DETECT,
   similarityThreshold: 0.85,
   segmentIntervalMs: [1800, 3200],
@@ -61,17 +62,34 @@ export const DEFAULT_SETTINGS = {
   autoSendAttachmentResume: false, // 兼容旧字段名：现在表示点击 BOSS「发简历」
   resumeSendTiming: 'after_text', // on_request | after_text | manual
   previewRequired: true,
+  splitViewEnabled: true,
   whitelistOnly: false
 };
 
 export const DEFAULT_FILTERS = {
-  title: { or: [], and: [], not: ['外包', '驻场', '代招'] },
-  company: { or: [], and: [], not: [] },
-  jd: { or: [], and: [], not: ['外包', '驻场', '培训'] },
+  title: {
+    or: [],
+    and: [],
+    not: ['外包', '驻场', '代招'],
+    enabled: { or: true, and: true, not: true }
+  },
+  company: {
+    or: [],
+    and: [],
+    not: [],
+    enabled: { or: true, and: true, not: true }
+  },
+  jd: {
+    or: [],
+    and: [],
+    not: ['外包', '驻场', '培训'],
+    enabled: { or: true, and: true, not: true }
+  },
   location: {
     include: [],
     exclude: [],
-    mode: 'contains' // exact | contains
+    mode: 'contains', // exact | contains
+    enabled: { include: true, exclude: true }
   },
   salaryMin: null,
   salaryMax: null,

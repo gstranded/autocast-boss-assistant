@@ -7,6 +7,7 @@ import { checkDedup, checkLimits, segmentIdempotencyKey, jobIdempotencyKey } fro
 import { renderTemplate, pickResumeProfile } from "../extension/shared/template.js";
 import { isBossUrl, isBossHostname, isBossTab, bossUrlGuardMessage } from "../extension/shared/boss-url.js";
 import { reasonText, REASON } from "../extension/shared/reason-codes.js";
+import { computeSideBySideBounds } from "../extension/shared/window-layout.js";
 import "../extension/shared/conversation-match.js";
 import fs from "fs";
 
@@ -88,6 +89,25 @@ test("summary counts", () => {
   const s = summarizePreview([{ decision: "pass" }, { decision: "reject", reasonCodes: ["X"] }]);
   assert.equal(s.pass, 1);
   assert.equal(s.reject, 1);
+});
+test("disabled OR keeps keywords but ignores the rule", () => {
+  const disabled = structuredClone(filters);
+  disabled.title.enabled = { or: false, and: true, not: true };
+  const r = evaluateJob({ ...passJob, title: "Python Agent 开发" }, disabled, {}, {});
+  assert.equal(r.decision, "pass");
+});
+test("disabled NOT allows a stored exclusion keyword", () => {
+  const disabled = structuredClone(filters);
+  disabled.title.enabled = { or: true, and: true, not: false };
+  disabled.excludeOutsource = false;
+  const r = evaluateJob({ ...passJob, title: "Java Agent 外包开发" }, disabled, {}, {});
+  assert.equal(r.decision, "pass");
+});
+test("disabled location include ignores stored locations", () => {
+  const disabled = structuredClone(filters);
+  disabled.location.enabled = { include: false, exclude: true };
+  const r = evaluateJob({ ...passJob, location: "佛山" }, disabled, {}, {});
+  assert.equal(r.decision, "pass");
 });
 
 console.log("3) template + resume bind");
@@ -223,10 +243,42 @@ test("screenshots valid png", () => {
 });
 test("manifest version + hosts", () => {
   const m = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
-  assert.equal(m.version, "1.5.4");
+  const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+  assert.equal(m.version, pkg.version);
   assert.ok(m.host_permissions.some((h) => h.includes("zhipin.com")));
   assert.ok(m.content_scripts[0].matches.every((h) => h.includes("zhipin.com") || h.includes("bosszhipin.com")));
   assert.equal(m.content_scripts[0].js[0], "shared/conversation-match.js");
+});
+test("UI exposes themes, help tips and filter switches", () => {
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  assert.ok(html.includes('data-theme-value="light"'));
+  assert.ok(html.includes('data-theme-value="dark"'));
+  assert.ok((html.match(/data-help=/g) || []).length >= 25);
+  for (const id of [
+    "titleOrEnabled",
+    "titleAndEnabled",
+    "titleNotEnabled",
+    "companyOrEnabled",
+    "companyNotEnabled",
+    "jdOrEnabled",
+    "jdAndEnabled",
+    "jdNotEnabled",
+    "locIncludeEnabled",
+    "locExcludeEnabled"
+  ]) assert.ok(html.includes(`id="${id}"`), `missing ${id}`);
+});
+test("side-by-side layout fills the available display", () => {
+  const layout = computeSideBySideBounds({ left: 0, top: 24, width: 1920, height: 1056 });
+  assert.deepEqual(layout.left, { left: 0, top: 24, width: 960, height: 1056 });
+  assert.deepEqual(layout.right, { left: 960, top: 24, width: 960, height: 1056 });
+  assert.equal(computeSideBySideBounds({ left: 0, top: 0, width: 900, height: 800 }), null);
+});
+test("task start prepares split workspace with fallback", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(background.includes("prepareSplitWorkspace"));
+  assert.ok(background.includes("computeSideBySideBounds"));
+  assert.ok(background.includes("splitViewActive"));
+  assert.ok(background.includes("普通消息标签页"));
 });
 
 console.log("8) conversation selection + delivery receipt");
@@ -307,6 +359,99 @@ test("content script requires rendered own-message receipt", () => {
   assert.ok(sidepanel.includes("MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024"));
   assert.ok(messaging.includes("BHT_SEND_RESUME"));
 });
+
+console.log("9) split workspace integration");
+try {
+  const listTab = {
+    id: 10,
+    windowId: 1,
+    url: "https://www.zhipin.com/web/geek/jobs",
+    status: "complete"
+  };
+  const messageTab = {
+    id: 20,
+    windowId: 2,
+    url: "https://www.zhipin.com/web/geek/chat",
+    status: "complete"
+  };
+  const windowCalls = [];
+  let displayWidth = 1920;
+  globalThis.chrome = {
+    runtime: {
+      onInstalled: { addListener() {} },
+      onMessage: { addListener() {} },
+      sendMessage() { return Promise.resolve({ ok: true }); }
+    },
+    action: { onClicked: { addListener() {} } },
+    tabs: {
+      onUpdated: { addListener() {} },
+      onActivated: { addListener() {} },
+      async query(query) {
+        if (query?.active) return [listTab];
+        if (query?.url) return [listTab];
+        if (query?.windowId === 2) return [messageTab];
+        return [];
+      },
+      async get(tabId) {
+        if (tabId === listTab.id) return listTab;
+        if (tabId === messageTab.id) return messageTab;
+        throw new Error("unknown tab " + tabId);
+      },
+      async update(tabId, patch) {
+        windowCalls.push({ api: "tabs.update", tabId, patch });
+        return tabId === messageTab.id ? { ...messageTab, ...patch } : { ...listTab, ...patch };
+      }
+    },
+    scripting: {
+      async executeScript(options) {
+        if (options?.func) {
+          return [{ result: { left: 0, top: 24, width: displayWidth, height: 1056 } }];
+        }
+        windowCalls.push({ api: "scripting.executeScript", tabId: options?.target?.tabId });
+        return [];
+      }
+    },
+    windows: {
+      async get(windowId) {
+        return { id: windowId, left: 80, top: 60, width: 1280, height: 900, tabs: [] };
+      },
+      async update(windowId, patch) {
+        windowCalls.push({ api: "windows.update", windowId, patch });
+        return { id: windowId, ...patch };
+      },
+      async create(options) {
+        windowCalls.push({ api: "windows.create", options });
+        return { id: 2, tabs: [messageTab] };
+      }
+    }
+  };
+
+  const { prepareSplitWorkspace } = await import("../extension/background/service-worker.js");
+  const task = { execution: { listTabId: listTab.id, listWindowId: listTab.windowId } };
+  const split = await prepareSplitWorkspace(task, { splitViewEnabled: true });
+  assert.equal(split.ok, true);
+  assert.equal(task.execution.splitViewActive, true);
+  assert.equal(task.execution.messageTabId, messageTab.id);
+  assert.deepEqual(split.bounds.left, { left: 0, top: 24, width: 960, height: 1056 });
+  assert.deepEqual(split.bounds.right, { left: 960, top: 24, width: 960, height: 1056 });
+  assert.ok(windowCalls.some((call) => call.api === "windows.create" && call.options.left === 960));
+  assert.ok(windowCalls.some((call) => call.api === "windows.update" && call.windowId === 1 && call.patch.width === 960));
+  assert.ok(windowCalls.some((call) => call.api === "windows.update" && call.windowId === 1 && call.patch.focused === true));
+
+  const createsBeforeFallback = windowCalls.filter((call) => call.api === "windows.create").length;
+  displayWidth = 900;
+  const fallbackTask = { execution: { listTabId: listTab.id, listWindowId: listTab.windowId } };
+  const fallback = await prepareSplitWorkspace(fallbackTask, { splitViewEnabled: true });
+  assert.equal(fallback.ok, false);
+  assert.equal(fallback.error, "DISPLAY_TOO_SMALL");
+  assert.equal(fallbackTask.execution.splitViewActive, false);
+  assert.equal(windowCalls.filter((call) => call.api === "windows.create").length, createsBeforeFallback);
+  passed++;
+  console.log("  PASS browser windows split and narrow-display fallback");
+} catch (e) {
+  console.error("  FAIL browser windows split and narrow-display fallback -", e.message);
+  process.exitCode = 1;
+}
 
 if (process.exitCode) {
   console.error("\nSome tests failed");
