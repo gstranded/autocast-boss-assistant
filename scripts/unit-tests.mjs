@@ -283,9 +283,17 @@ test("task start prepares split workspace with fallback", () => {
 });
 test("floating controls stay fully visible after a split-window resize", () => {
   const source = fs.readFileSync("extension/content/floating-host.js", "utf8");
+  let domLookups = 0;
   const context = {
-    window: {},
-    document: { readyState: "loading", addEventListener() {} },
+    window: { location: { href: "https://www.zhipin.com/web/geek/chat" } },
+    document: {
+      readyState: "complete",
+      addEventListener() {},
+      getElementById() {
+        domLookups++;
+        return null;
+      }
+    },
     chrome: { runtime: { onMessage: { addListener() {} } } },
     console,
     setInterval() {},
@@ -295,6 +303,7 @@ test("floating controls stay fully visible after a split-window resize", () => {
   };
   vm.runInNewContext(source, context);
   const fit = context.window.__BHT_FLOAT_LAYOUT__.fitRectToViewport;
+  const isMessagePage = context.window.__BHT_FLOAT_LAYOUT__.isMessagePage;
   const panel = fit(
     { left: 1400, top: 100, width: 420, height: 700 },
     { width: 960, height: 900 },
@@ -309,7 +318,11 @@ test("floating controls stay fully visible after a split-window resize", () => {
   assert.equal(panel.top, 100);
   assert.equal(fab.left, 902);
   assert.equal(fab.top, 842);
+  assert.equal(isMessagePage("https://www.zhipin.com/web/geek/chat"), true);
+  assert.equal(isMessagePage("https://www.zhipin.com/web/geek/jobs"), false);
+  assert.equal(domLookups, 0, "message pages must not mount the floating host");
   assert.ok(source.includes('window.addEventListener("resize", schedule)'));
+  assert.ok(source.includes('root.style.display = "none"'));
   assert.ok(!source.includes("window.innerWidth - 80"));
 });
 
@@ -432,6 +445,12 @@ try {
       async update(tabId, patch) {
         windowCalls.push({ api: "tabs.update", tabId, patch });
         return tabId === messageTab.id ? { ...messageTab, ...patch } : { ...listTab, ...patch };
+      },
+      async setZoomSettings(tabId, settings) {
+        windowCalls.push({ api: "tabs.setZoomSettings", tabId, settings });
+      },
+      async setZoom(tabId, zoomFactor) {
+        windowCalls.push({ api: "tabs.setZoom", tabId, zoomFactor });
       }
     },
     scripting: {
@@ -466,6 +485,16 @@ try {
   assert.equal(task.execution.messageTabId, messageTab.id);
   assert.deepEqual(split.bounds.left, { left: 0, top: 24, width: 960, height: 1056 });
   assert.deepEqual(split.bounds.right, { left: 960, top: 24, width: 960, height: 1056 });
+  assert.equal(split.zoomFactor, 0.8);
+  assert.equal(split.zoomApplied, true);
+  assert.equal(task.execution.splitZoomFactor, 0.8);
+  assert.deepEqual(
+    windowCalls.filter((call) => call.api === "tabs.setZoom").map((call) => [call.tabId, call.zoomFactor]),
+    [[listTab.id, 0.8], [messageTab.id, 0.8]]
+  );
+  assert.ok(windowCalls
+    .filter((call) => call.api === "tabs.setZoomSettings")
+    .every((call) => call.settings.mode === "automatic" && call.settings.scope === "per-tab"));
   assert.ok(windowCalls.some((call) => call.api === "windows.create" && call.options.left === 960));
   assert.ok(windowCalls.some((call) => call.api === "windows.update" && call.windowId === 1 && call.patch.width === 960));
   assert.ok(windowCalls.some((call) => call.api === "windows.update" && call.windowId === 1 && call.patch.focused === true));

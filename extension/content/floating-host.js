@@ -10,6 +10,10 @@
   const STORAGE_FAB = "bht_float_fab_v1";
   const VIEWPORT_MARGIN = 8;
 
+  function isMessagePage(url = window.location?.href || "") {
+    return /\/chat(?:[/?#]|$)/i.test(String(url));
+  }
+
   function loadCss() {
     if (document.getElementById("bht-float-css")) return;
     const link = document.createElement("link");
@@ -39,7 +43,7 @@
     };
   }
 
-  window.__BHT_FLOAT_LAYOUT__ = Object.freeze({ fitRectToViewport });
+  window.__BHT_FLOAT_LAYOUT__ = Object.freeze({ fitRectToViewport, isMessagePage });
 
   function fitElementToViewport(element, margin = VIEWPORT_MARGIN) {
     if (!element) return null;
@@ -313,8 +317,11 @@
   }
 
   function init() {
+    if (isMessagePage()) return false;
     loadCss();
     const root = getRoot();
+    root.hidden = false;
+    root.style.display = "";
     const fab = root.querySelector("#bht-fab");
     const panel = root.querySelector("#bht-panel");
     const drag = root.querySelector("#bht-drag");
@@ -346,12 +353,33 @@
       shouldOpen = localStorage.getItem(STORAGE_OPEN) === "1";
     } catch (_) {}
     if (shouldOpen) setOpen(true);
+    return true;
+  }
+
+  function syncHostForPage() {
+    const root = document.getElementById(ROOT_ID);
+    if (isMessagePage()) {
+      if (root) {
+        root.hidden = true;
+        root.style.display = "none";
+      }
+      return;
+    }
+    if (root) {
+      root.hidden = false;
+      root.style.display = "";
+      return;
+    }
+    init();
   }
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     const type = msg?.type;
     if (type === "BHT_FLOAT_OPEN") {
-      init();
+      if (!init()) {
+        sendResponse({ ok: false, hiddenOnMessagePage: true });
+        return true;
+      }
       setFabVisible(true);
       setOpen(true);
       sendResponse({ ok: true });
@@ -363,7 +391,10 @@
       return true;
     }
     if (type === "BHT_FLOAT_TOGGLE_FAB") {
-      init();
+      if (!init()) {
+        sendResponse({ ok: false, hiddenOnMessagePage: true });
+        return true;
+      }
       const fab = document.getElementById("bht-fab");
       const visible = fab && fab.style.display === "none" ? true : false;
       // if currently shown, hide; if hidden, show
@@ -374,7 +405,7 @@
       return true;
     }
     if (type === "BHT_FLOAT_PING") {
-      sendResponse({ ok: true, ready: true });
+      sendResponse({ ok: true, ready: !isMessagePage(), hiddenOnMessagePage: isMessagePage() });
       return true;
     }
     return false;
@@ -386,6 +417,14 @@
   } else {
     init();
   }
+
+  let lastPageUrl = window.location?.href || "";
+  setInterval(() => {
+    const nextPageUrl = window.location?.href || "";
+    if (nextPageUrl === lastPageUrl) return;
+    lastPageUrl = nextPageUrl;
+    syncHostForPage();
+  }, 500);
 
   function markContextDead(reason) {
     try {

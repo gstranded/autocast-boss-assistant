@@ -33,6 +33,8 @@ import { isBossUrl, isBossTab, bossUrlGuardMessage, BOSS_MATCH_PATTERNS } from '
 import { normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
 import { computeSideBySideBounds } from '../shared/window-layout.js';
 
+const SPLIT_ZOOM_FACTOR = 0.8;
+
 let runner = {
   running: false,
   abort: false,
@@ -269,6 +271,22 @@ async function setNormalWindowBounds(windowId, bounds) {
   });
 }
 
+async function setSplitTabZoom(tabId) {
+  if (tabId == null || !chrome.tabs?.setZoom) return false;
+  try {
+    if (chrome.tabs.setZoomSettings) {
+      await chrome.tabs.setZoomSettings(tabId, {
+        mode: 'automatic',
+        scope: 'per-tab'
+      });
+    }
+    await chrome.tabs.setZoom(tabId, SPLIT_ZOOM_FACTOR);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 export async function prepareSplitWorkspace(task, settings = {}) {
   if (!task.execution) task.execution = {};
   if (settings.splitViewEnabled === false) {
@@ -343,15 +361,28 @@ export async function prepareSplitWorkspace(task, settings = {}) {
       });
     }
     await waitTabComplete(messageTab.id, 25000);
+    const zoomApplied = await Promise.all([
+      setSplitTabZoom(listTab.id),
+      setSplitTabZoom(messageTab.id)
+    ]);
     await forceInjectContent(messageTab.id);
 
     task.execution.splitViewActive = true;
     task.execution.splitBounds = bounds;
+    task.execution.splitZoomFactor = SPLIT_ZOOM_FACTOR;
+    task.execution.splitZoomApplied = zoomApplied.every(Boolean);
     task.execution.phase = 'SPLIT_WORKSPACE_READY';
 
     await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
     await chrome.windows.update(listTab.windowId, { focused: true }).catch(() => {});
-    return { ok: true, listTabId: listTab.id, messageTabId: messageTab.id, bounds };
+    return {
+      ok: true,
+      listTabId: listTab.id,
+      messageTabId: messageTab.id,
+      bounds,
+      zoomFactor: SPLIT_ZOOM_FACTOR,
+      zoomApplied: zoomApplied.every(Boolean)
+    };
   } catch (error) {
     task.execution.splitViewActive = false;
     task.execution.splitViewError = String(error?.message || error);
@@ -389,6 +420,7 @@ async function ensureMessageTab(task) {
         } else {
           try { await chrome.tabs.update(oldId, { active: true }); } catch (_) {}
         }
+        if (task.execution.splitViewActive) await setSplitTabZoom(oldId);
         await log("info", "[消息页] 复用 tab=" + oldId + " url=" + String(t.url || "").slice(0, 120));
         return t;
       }
@@ -416,6 +448,7 @@ async function ensureMessageTab(task) {
   task.execution.phase = "MESSAGE_TAB_READY";
   await publishTask(task);
   await waitTabComplete(tab.id, 30000);
+  if (task.execution.splitViewActive) await setSplitTabZoom(tab.id);
   await forceInjectContent(tab.id);
   await sleep(400);
   await log("info", "[消息页] 已创建 tab=" + tab.id);
