@@ -7,7 +7,7 @@ import { mergeResumeImages } from '../shared/resume-images.js';
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.6.4";
+const BHT_UI_VERSION = "1.6.5";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -575,14 +575,14 @@ function renderBindings() {
       .join('');
     div.innerHTML = `
       <div class="row">
-        <strong>规则 ${index + 1}</strong>
+        <strong>规则 ${index + 1}：职位出现这些词 → 发这套简历</strong>
         <button class="btn tiny" data-del-bind="${rule.id}">删除</button>
       </div>
-      <label>关键词（逗号分隔，匹配职位名/JD）</label>
-      <input data-bind-kw="${rule.id}" value="${escapeAttr((rule.keywords || []).join(','))}" placeholder="算法,LLM,Agent" />
-      <label>绑定方案</label>
+      <label>职位关键词（逗号分隔；匹配职位名或 JD）</label>
+      <input data-bind-kw="${rule.id}" value="${escapeAttr((rule.keywords || []).join(','))}" placeholder="例如：大模型,算法,LLM" />
+      <label>就发这套简历方案</label>
       <select data-bind-profile="${rule.id}">${options}</select>
-      <label>优先级（数字越小越先匹配）</label>
+      <label>匹配顺序（数字越小越先判断，命中即停）</label>
       <input type="number" data-bind-priority="${rule.id}" value="${rule.priority ?? index}" />
     `;
     box.appendChild(div);
@@ -1489,7 +1489,7 @@ function bindEvents() {
   $('btnSaveBindings').addEventListener('click', async () => {
     try {
       await saveBindings();
-      toast('绑定规则已保存', 'success');
+      toast('自动选简历规则已保存', 'success');
     } catch (e) {
       toast(String(e.message || e), 'error', /扩展上下文|F5|失效/.test(String(e.message || e)) ? 6000 : 3500);
     }
@@ -1580,7 +1580,7 @@ function bindEvents() {
     state.draftBindings.push({ id: uid('rule'), keywords: [], profileId, priority: state.draftBindings.length });
     state.formDirty = true;
     renderBindings();
-    toast('已新增绑定规则', 'success');
+    toast('已新增一条自动选简历规则', 'success');
   });
 
   $('btnPreview').addEventListener('click', async () => {

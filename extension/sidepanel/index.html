@@ -244,7 +244,7 @@
               <button id="btnAddProfile" class="btn tiny">新建方案</button>
             </div>
             <div id="profileList" class="profile-list"></div>
-            <div class="hint">点击方案可切换编辑；星标为默认方案（筛选未命中绑定规则时使用）。</div>
+            <div class="hint">这里是多套「图片简历方案」。点方案可编辑；标星的是默认方案（没有匹配到下面规则时就用它）。</div>
           </div>
 
           <div class="card">
@@ -266,12 +266,16 @@
 
           <div class="card">
             <div class="card-title row">
-              <span data-help-title="岗位到方案绑定" data-help="按优先级从小到大检查职位名与 JD，第一条命中的规则决定发送哪份简历。">岗位 → 方案绑定规则</span>
+              <span data-help-title="自动选简历" data-help="投递时根据岗位名自动决定发哪一套图片简历。只有一套简历时可以不填。">自动选简历（可选）</span>
               <button id="btnAddBinding" class="btn tiny">新增规则</button>
             </div>
-            <div class="hint">按优先级从小到大匹配职位名/JD 关键词，命中则使用对应简历方案。</div>
+            <div class="hint">
+              <strong>作用：</strong>投递时自动决定「发哪一套图片简历」。<br/>
+              <strong>怎么用：</strong>填关键词 + 选方案。职位名/JD 里出现关键词，就用对应方案；都没命中，用上面星标的默认方案。<br/>
+              <strong>例子：</strong>关键词「大模型,算法」→ 方案「算法简历」。只有 1 套简历时，这里可以空着。
+            </div>
             <div id="bindingList" class="binding-list"></div>
-            <button id="btnSaveBindings" class="btn primary block">保存绑定规则</button>
+            <button id="btnSaveBindings" class="btn primary block">保存自动选简历规则</button>
           </div>
         </section>
 
