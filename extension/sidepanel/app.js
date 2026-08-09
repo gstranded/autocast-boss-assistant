@@ -7,7 +7,7 @@ import { mergeResumeImages } from '../shared/resume-images.js';
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.6.3";
+const BHT_UI_VERSION = "1.6.4";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -816,6 +816,24 @@ function announceTaskCompletion(task) {
   );
 }
 
+function formatPreviewReasonLine(code, count, settings = {}) {
+  const n = Number(count || 0);
+  const base = reasonText(code) || code || '其他原因';
+  // 避免把「被排除岗位数」误读成「上限设置值」
+  if (code === 'DEDUP_COMPANY_DAILY') {
+    const lim = settings.companyDailyMax ?? '—';
+    return `- ${base}：${n} 岗（当前设置：同公司每天最多 ${lim}；这里的数字是岗位数，不是上限）`;
+  }
+  if (code === 'DEDUP_BOSS') {
+    const d = settings.bossCooldownDays ?? '—';
+    return `- ${base}：${n} 岗（当前设置：同 HR 冷却 ${d} 天）`;
+  }
+  if (code === 'DEDUP_JOB') {
+    return `- ${base}：${n} 岗（当前设置：同一职位永不重复 ${settings.neverRepeatJob ? '开' : '关'}）`;
+  }
+  return `- ${base}：${n} 岗`;
+}
+
 function renderPreview(task) {
   if (!task?.summary) {
     $('summaryBox').textContent = '尚未扫描';
@@ -823,15 +841,30 @@ function renderPreview(task) {
     return;
   }
   const s = task.summary;
-  const lines = [`扫描岗位：${s.scanned}`, `符合规则：${s.pass}`, `将被排除：${s.reject}`];
-  if (s.byReason) {
+  const settings = state.config?.settings || {};
+  const lines = [
+    `扫描岗位：${s.scanned}`,
+    `符合规则：${s.pass}`,
+    `将被排除：${s.reject}`,
+    '',
+    '排除原因（冒号后数字 = 被排除岗位数，不是设置上限）：'
+  ];
+  if (s.byReason && Object.keys(s.byReason).length) {
     Object.entries(s.byReason)
-      .slice(0, 8)
-      .forEach(([code, n]) => lines.push(`- ${reasonText(code)}：${n}`));
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+      .slice(0, 10)
+      .forEach(([code, n]) => lines.push(formatPreviewReasonLine(code, n, settings)));
+  } else {
+    lines.push('- 无');
   }
+  lines.push('');
+  lines.push(
+    `生效设置：同公司每天最多 ${settings.companyDailyMax ?? '—'} · 每日最多 ${settings.dailyMaxCommunicate ?? '—'} · 本次最多 ${settings.taskMaxCommunicate ?? '—'} · 同HR冷却 ${settings.bossCooldownDays ?? '—'} 天 · 永不重复 ${settings.neverRepeatJob ? '开' : '关'}`
+  );
+  lines.push('说明：「本次/每日最多沟通」在正式投递时拦截，预览阶段主要做筛选词、永不重复、同公司已达今日上限等判断。');
   $('summaryBox').textContent = lines.join('\n');
 
-  const list = $('previewList');
+const list = $('previewList');
   list.innerHTML = '';
   state.selected = new Set(
     (task.results || []).filter((r) => r.selected && r.decision === 'pass').map((r) => r.job.jobId)

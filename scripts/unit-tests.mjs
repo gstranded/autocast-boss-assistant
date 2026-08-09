@@ -604,6 +604,15 @@ try {
 }
 
 
+console.log("11a) preview reason wording");
+test("preview reason count wording", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(app.includes("formatPreviewReasonLine"), "has formatPreviewReasonLine");
+  assert.ok(app.includes("被排除岗位数"), "explains count is job count");
+  assert.ok(app.includes("生效设置"), "shows effective settings snapshot");
+  assert.ok(app.includes("companyDailyMax"), "mentions companyDailyMax in preview");
+});
+
 console.log("11b) batch button after single delivery");
 test("batch delivery not limited to awaiting_confirm", () => {
   const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
