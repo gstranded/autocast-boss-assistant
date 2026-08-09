@@ -33,6 +33,7 @@ import { isBossUrl, isBossTab, bossUrlGuardMessage, BOSS_MATCH_PATTERNS } from '
 import { normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
 import { computeSideBySideBounds } from '../shared/window-layout.js';
 import { dedupeResumeImages } from '../shared/resume-images.js';
+import { pickNextTestDeliveryJob } from '../shared/test-delivery.js';
 
 const SPLIT_ZOOM_FACTOR = 0.8;
 
@@ -1101,6 +1102,7 @@ async function runPreview(payload = {}) {
       selected: r.selected,
       decision: r.decision
     })),
+    testedJobIds: [],
     counters: { processed: 0, success: 0, skipped: 0, failed: 0 },
     currentJobId: null,
     consecutiveFails: 0,
@@ -1837,6 +1839,12 @@ async function runTaskLoop(taskId) {
             q.finishedAt = Date.now();
             q.outcome = outcome;
           }
+          // 一份一份投：成功/跳过/失败都记入已投，避免下一轮又点回同一岗
+          if (row.job?.jobId && (outcome === 'success' || outcome === 'skipped' || outcome === 'failed')) {
+            const id = String(row.job.jobId);
+            const prev = Array.isArray(task.testedJobIds) ? task.testedJobIds.map(String) : [];
+            if (!prev.includes(id)) task.testedJobIds = [...prev, id];
+          }
           await publishTask(task);
         }
         await log('info', '队列项结果：' + (row.job?.title || '') + ' → ' + outcome + '（' + (qi + 1) + '/' + queue.length + '）', { jobId: row.job?.jobId });
@@ -2047,44 +2055,96 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return {
             ok: false,
             error: 'ALREADY_RUNNING',
-            message: '当前已有任务在执行（含暂停中），请先停止或点继续完成后再测试投递'
+            message: '当前已有任务在执行（含暂停中），请先停止或点继续完成后再「投递一份」'
           };
         }
         const all = await getAllConfig();
         let task = all.task;
         if (!task || !(task.results || []).length) {
-          return { ok: false, error: 'NO_PREVIEW', message: '请先扫描预览，再使用「投递一份测试」' };
+          return { ok: false, error: 'NO_PREVIEW', message: '请先扫描预览，再使用「投递一份」' };
         }
-        const passRows = (task.results || []).filter((r) => r.decision === 'pass');
-        if (!passRows.length) {
-          return { ok: false, error: 'NO_PASS', message: '预览结果中没有通过筛选的岗位，无法测试投递' };
-        }
-        let pick = null;
         const wantId = payload?.jobId || (payload?.selectedJobIds && payload.selectedJobIds[0]) || null;
-        if (wantId) pick = passRows.find((r) => r.job?.jobId === wantId) || null;
-        if (!pick) {
-          // prefer currently selected pass
-          pick = passRows.find((r) => r.selected) || passRows[0];
+        // 单岗队列每次重建会丢掉旧 queue done，靠 testedJobIds / items 推进到下一岗
+        const extraForPick = [...new Set((task.testedJobIds || []).map(String).filter(Boolean))];
+        const picked = pickNextTestDeliveryJob({
+          results: task.results || [],
+          items: task.items || [],
+          queue: task.queue || [],
+          wantId,
+          extraDoneIds: extraForPick
+        });
+        if (!picked.ok) {
+          if (picked.error === 'ALL_TESTED') {
+            await log('warn', '投递一份：通过岗位都已投过，请重新扫描预览或换一批岗位');
+          }
+          return picked;
         }
+        const pick = picked.pick;
         const onlyId = pick.job.jobId;
+        const remain = picked.remain;
+
         task.results = (task.results || []).map((r) => ({
           ...r,
           selected: r.job?.jobId === onlyId && r.decision === 'pass'
         }));
-        task.items = (task.items || []).map((it) => ({
-          ...it,
-          selected: it.jobId === onlyId
-        }));
-        // force one-shot limit for this task instance
+
+        // 只投这一岗：目标岗强制可跑；其它岗位取消 selected，已投状态保留
+        {
+          const hasItem = (task.items || []).some((it) => it.jobId === onlyId);
+          if (hasItem) {
+            task.items = (task.items || []).map((it) => {
+              if (it.jobId !== onlyId) return { ...it, selected: false };
+              return {
+                ...it,
+                selected: true,
+                state: 'NOT_STARTED',
+                reasons: [],
+                lastError: '',
+                completedAt: null
+              };
+            });
+          } else {
+            task.items = [
+              ...(task.items || []).map((it) => ({ ...it, selected: false })),
+              {
+                jobId: onlyId,
+                company: pick.job?.company || '',
+                title: pick.job?.title || '',
+                state: 'NOT_STARTED',
+                reasons: [],
+                selected: true
+              }
+            ];
+          }
+
+          task.queue = [
+            {
+              index: 0,
+              jobId: pick.job.jobId,
+              title: pick.job.title,
+              company: pick.job.company,
+              href: pick.job.href || '',
+              securityId: pick.job.securityId || '',
+              status: 'pending'
+            }
+          ];
+          task.queueCursor = 0;
+          task.currentJobId = onlyId;
+          task.nextJobId = onlyId;
+          task.consecutiveFails = 0;
+          task.completionSignal = null;
+        }
+
         task.testDelivery = true;
         task.testJobId = onlyId;
+        task.testedJobIds = Array.from(new Set([...(task.testedJobIds || []).map(String), ...extraForPick]));
         task.status = TASK_STATUS.RUNNING;
         task.pauseReason = '';
         task.awaitingUserRetry = false;
         const split = await prepareSplitWorkspace(task, all.settings || {});
         await publishTask(task);
         if (split.ok) {
-          await log('success', '[分屏] 测试投递已打开左右工作区', {
+          await log('success', '[分屏] 投递一份已打开左右工作区', {
             listTabId: split.listTabId,
             messageTabId: split.messageTabId
           });
@@ -2093,12 +2153,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         await log(
           'info',
-          '测试投递启动：仅处理 1 个岗位「' + (pick.job?.title || '') + '」@ ' + (pick.job?.company || ''),
-          { jobId: onlyId }
+          '投递一份启动：本轮只投 1 岗「' +
+            (pick.job?.title || '') +
+            '」@ ' +
+            (pick.job?.company || '') +
+            '；剩余未投 ' +
+            remain +
+            ' 岗（再点将自动投下一个）',
+          { jobId: onlyId, remain }
         );
-        // temporary settings override for this run only (in-memory via task flags; limits still apply normally but queue size=1)
         runTaskLoop(task.id);
-        return { ok: true, testJobId: onlyId, job: pick.job, splitView: split };
+        return {
+          ok: true,
+          testJobId: onlyId,
+          job: pick.job,
+          remain,
+          splitView: split
+        };
       }
 
       case MSG.PAUSE_TASK:

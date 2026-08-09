@@ -39,14 +39,14 @@
         <!-- TASK -->
         <section class="panel active" id="tab-task">
           <div class="card">
-            <div class="card-title" data-help-title="任务控制" data-help="先扫描当前职位列表并核对预览，再确认投递。任务启动后会把职位列表与消息中心排成左右两个窗口，方便同时观察。">任务控制</div>
+            <div class="card-title" data-help-title="任务控制" data-help="先扫描当前职位列表并核对预览，再批量投递。任务启动后会把职位列表与消息中心排成左右两个窗口，方便同时观察。">任务控制</div>
             <div class="task-actions">
               <div class="task-primary-actions">
                 <button id="btnPreview" class="btn primary command-btn">扫描预览</button>
-                <button id="btnStart" class="btn success command-btn" disabled>确认投递</button>
+                <button id="btnStart" class="btn success command-btn" disabled>批量投递</button>
               </div>
               <div class="task-secondary-actions">
-                <button id="btnTestOne" class="btn command-btn" title="只投递当前选中的 1 个通过岗位（用于验证消息/简历）">投递一份测试</button>
+                <button id="btnTestOne" class="btn command-btn" title="每次只投 1 个尚未投过的通过岗位；可反复点击，一份一份往下投">投递一份</button>
                 <button id="btnDiagnose" class="btn command-btn">页面诊断</button>
               </div>
               <div class="task-control-strip" aria-label="运行控制">
@@ -339,7 +339,7 @@
             <ol class="help">
               <li>打开 BOSS 直聘推荐/搜索职位列表页</li>
               <li>在侧栏配置筛选与消息，先点「扫描预览」</li>
-              <li>核对将投递岗位与跳过原因后，再「确认投递」</li>
+              <li>核对将投递岗位与跳过原因后，再「批量投递」；也可反复点「投递一份」逐个投</li>
               <li>可随时暂停 / 停止；刷新后可继续未完成任务</li>
             </ol>
             <button id="btnReplayTour" class="btn block" style="margin-top:10px">重看新手引导</button>

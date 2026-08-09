@@ -22,7 +22,7 @@ function renderGuide(version) {
         <li>打开插件后，点击页面右下角 <b>悬浮球</b></li>
         <li>配置筛选、打招呼消息与简历方案</li>
         <li>先点「扫描预览」，核对通过/跳过原因</li>
-        <li>确认投递；发送自定义消息后会自动继续下一岗</li>
+        <li>批量投递；发送自定义消息后会自动继续下一岗</li>
       </ol>
     </div>
     <div class="actions">

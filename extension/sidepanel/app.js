@@ -7,7 +7,7 @@ import { mergeResumeImages } from '../shared/resume-images.js';
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.6.1";
+const BHT_UI_VERSION = "1.6.2";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -626,7 +626,7 @@ function statusLabel(status) {
   const map = {
     idle: '空闲',
     previewing: '扫描中',
-    awaiting_confirm: '待确认投递',
+    awaiting_confirm: '待批量投递',
     running: '运行中',
     paused: '已暂停',
     stopped: '已停止',
@@ -1515,21 +1515,38 @@ function bindEvents() {
     try {
       await ensureConfigSavedBeforeDelivery();
     } catch (e) {
-      toast('保存配置失败，已取消测试投递：' + (e?.message || e), 'error', 4000);
+      toast('保存配置失败，已取消投递一份：' + (e?.message || e), 'error', 4000);
       showErrorModal('保存失败', String(e?.message || e || '无法保存当前配置'), { showRetry: false });
       return;
     }
-    let selectedJobIds = Array.from(state.selected || []);
-    if (!selectedJobIds.length) {
-      const pass = (state.config?.task?.results || []).filter((r) => r.decision === 'pass');
-      if (pass[0]?.job?.jobId) selectedJobIds = [pass[0].job.jobId];
-    }
-    if (!selectedJobIds.length) {
+    const pass = (state.config?.task?.results || []).filter((r) => r.decision === 'pass' && r.job?.jobId);
+    if (!pass.length) {
       toast('请先扫描预览并至少有一个通过岗位', 'error');
       return;
     }
-    // only first for test
-    selectedJobIds = selectedJobIds.slice(0, 1);
+    const doneIds = new Set();
+    for (const it of state.config?.task?.items || []) {
+      if (['COMPLETED', 'SKIPPED', 'FAILED'].includes(String(it.state || '')) && it.jobId) {
+        doneIds.add(String(it.jobId));
+      }
+    }
+    for (const q of state.config?.task?.queue || []) {
+      if (['done', 'skipped', 'failed'].includes(String(q.status || '')) && q.jobId) {
+        doneIds.add(String(q.jobId));
+      }
+    }
+    for (const id of state.config?.task?.testedJobIds || []) {
+      if (id) doneIds.add(String(id));
+    }
+    const pending = pass.filter((r) => !doneIds.has(String(r.job.jobId)));
+    if (!pending.length) {
+      toast('通过岗位都已投过了，请重新扫描或勾选新岗位', 'warn', 3500);
+      return;
+    }
+    // 优先：当前勾选且未投 → 否则列表下一个未投
+    const selectedSet = state.selected || new Set();
+    const pick = pending.find((r) => selectedSet.has(r.job.jobId)) || pending[0];
+    const selectedJobIds = [pick.job.jobId];
     const settings = {
       ...(state.config?.settings || {}),
       autoSendImageResume: !!$('autoSendImageResume')?.checked,
@@ -1541,17 +1558,18 @@ function bindEvents() {
     } else if (!settings.autoSendImageResume && !settings.autoSendAttachmentResume) {
       toast('提示：未启用图片或 BOSS 在线简历，本次只发文字', 'warn', 2800);
     }
-    toast('正在启动测试投递（仅 1 岗）…', 'warn', 1500);
+    toast('正在启动投递一份…', 'warn', 1500);
     const res = await api(MSG.RUN_TEST_DELIVERY || 'BHT_RUN_TEST_DELIVERY', {
       jobId: selectedJobIds[0],
       selectedJobIds
     });
     if (!res?.ok) {
-      toast(res?.message || res?.error || '测试投递启动失败', 'error', 3500);
-      showErrorModal('测试投递失败', res?.message || res?.error || '无法启动', { showRetry: false });
+      toast(res?.message || res?.error || '投递一份启动失败', 'error', 3500);
+      showErrorModal('投递一份失败', res?.message || res?.error || '无法启动', { showRetry: false });
     } else {
       const suffix = res.splitView?.ok ? ' · 已左右分屏' : ' · 普通标签模式';
-      toast('测试投递已开始：' + (res.job?.title || selectedJobIds[0]) + suffix, res.splitView?.ok ? 'success' : 'warn', 3000);
+      const remainTxt = typeof res.remain === 'number' ? (' · 还剩 ' + res.remain + ' 个未投') : '';
+      toast('投递一份已开始：' + (res.job?.title || selectedJobIds[0]) + suffix + remainTxt, res.splitView?.ok ? 'success' : 'warn', 3200);
     }
     await refresh({ soft: true });
   });

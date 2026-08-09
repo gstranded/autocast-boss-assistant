@@ -16,6 +16,7 @@ import {
 import "../extension/shared/conversation-match.js";
 import fs from "fs";
 import vm from "vm";
+import { pickNextTestDeliveryJob, collectDoneJobIds } from "../extension/shared/test-delivery.js";
 
 const {
   hasActiveState,
@@ -601,6 +602,75 @@ try {
   console.error("  FAIL browser windows split and narrow-display fallback -", e.message);
   process.exitCode = 1;
 }
+
+
+console.log("12) test-delivery next job");
+const sampleResults = [
+  { decision: "pass", selected: true, job: { jobId: "a", title: "岗A", company: "公司A" } },
+  { decision: "pass", selected: true, job: { jobId: "b", title: "岗B", company: "公司B" } },
+  { decision: "pass", selected: false, job: { jobId: "c", title: "岗C", company: "公司C" } },
+  { decision: "reject", job: { jobId: "d", title: "岗D", company: "公司D" } }
+];
+
+test("first click picks first pass", () => {
+  const r = pickNextTestDeliveryJob({ results: sampleResults });
+  assert.equal(r.ok, true);
+  assert.equal(r.onlyId, "a");
+  assert.equal(r.remain, 2);
+});
+
+test("second click after a completed picks b", () => {
+  const r = pickNextTestDeliveryJob({
+    results: sampleResults,
+    items: [{ jobId: "a", state: "COMPLETED" }]
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.onlyId, "b");
+  assert.equal(r.remain, 1);
+});
+
+test("wantId ignores already done and falls through", () => {
+  const r = pickNextTestDeliveryJob({
+    results: sampleResults,
+    items: [{ jobId: "a", state: "COMPLETED" }],
+    wantId: "a"
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.onlyId, "b");
+});
+
+test("extraDoneIds / testedJobIds advances even if queue wiped", () => {
+  const r = pickNextTestDeliveryJob({
+    results: sampleResults,
+    queue: [{ jobId: "b", status: "pending" }],
+    extraDoneIds: ["a"]
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.onlyId, "b");
+});
+
+test("all tested returns ALL_TESTED", () => {
+  const r = pickNextTestDeliveryJob({
+    results: sampleResults,
+    items: [
+      { jobId: "a", state: "COMPLETED" },
+      { jobId: "b", state: "SKIPPED" },
+      { jobId: "c", state: "COMPLETED" }
+    ]
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, "ALL_TESTED");
+});
+
+test("collectDoneJobIds merges items queue and extra", () => {
+  const s = collectDoneJobIds(
+    [{ jobId: "x", state: "COMPLETED" }],
+    [{ jobId: "y", status: "skipped" }],
+    ["z"]
+  );
+  assert.ok(s.has("x") && s.has("y") && s.has("z"));
+});
+
 
 if (process.exitCode) {
   console.error("\nSome tests failed");
