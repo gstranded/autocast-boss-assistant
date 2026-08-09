@@ -7,7 +7,7 @@ import { mergeResumeImages } from '../shared/resume-images.js';
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.6.2";
+const BHT_UI_VERSION = "1.6.3";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -258,26 +258,24 @@ function setBossMode(isBoss, reason = '') {
   const effectiveBoss = FLOAT_MODE ? true : Boolean(isBoss);
   state.isBoss = effectiveBoss;
   state.bossBlockReason = effectiveBoss ? '' : (reason || '');
-  ['btnPreview', 'btnDiagnose', 'btnStart', 'btnTestOne', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
-    const el = $(id);
-    if (!el) return;
-    // 控制按钮在 BOSS/浮窗下始终可点
-    if (['btnPause', 'btnResume', 'btnSkip', 'btnStop'].includes(id)) {
-      el.disabled = false;
-      el.removeAttribute('disabled');
-      el.title = '';
-      el.style.pointerEvents = 'auto';
-      el.style.opacity = '1';
-      return;
-    }
-    el.disabled = !effectiveBoss;
-    el.title = effectiveBoss ? '' : (reason || '仅在 BOSS 直聘页面可用');
-    el.style.opacity = effectiveBoss ? '1' : '0.45';
-  });
   if (!effectiveBoss) {
-    if ($('taskStatus')) $('taskStatus').textContent = '状态：未在 BOSS 页面（功能已锁定）';
+    ['btnPreview', 'btnDiagnose', 'btnStart', 'btnTestOne', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
+      const el = $(id);
+      if (!el) return;
+      el.disabled = true;
+      el.classList.remove('is-armed');
+      el.classList.add('is-dimmed');
+      el.title = reason || '仅在 BOSS 直聘页面可用';
+      el.style.pointerEvents = 'none';
+    });
+    if ($('taskStatus')) {
+      $('taskStatus').textContent = '状态：未在 BOSS 页面（功能已锁定）';
+      $('taskStatus').dataset.status = 'idle';
+    }
+    if ($('taskHint')) $('taskHint').textContent = '请打开 BOSS 直聘职位列表页后再操作。';
     if (reason && $('taskWarnings')) $('taskWarnings').textContent = reason;
   } else {
+    // 按任务状态点亮按钮（运行中亮停止，暂停亮继续等）
     updateTaskUI(state.config?.task, state.config?.runner);
   }
 }
@@ -636,33 +634,158 @@ function statusLabel(status) {
   return map[status] || status || '空闲';
 }
 
+function getDoneJobIdSet(task) {
+  const done = new Set();
+  for (const it of task?.items || []) {
+    if (['COMPLETED', 'SKIPPED', 'FAILED'].includes(String(it?.state || '')) && it?.jobId) {
+      done.add(String(it.jobId));
+    }
+  }
+  for (const q of task?.queue || []) {
+    if (['done', 'skipped', 'failed'].includes(String(q?.status || '')) && q?.jobId) {
+      done.add(String(q.jobId));
+    }
+  }
+  for (const id of task?.testedJobIds || []) {
+    if (id) done.add(String(id));
+  }
+  return done;
+}
+
+function countPassJobs(task) {
+  return (task?.results || []).filter((r) => r?.decision === 'pass' && r?.job?.jobId).length;
+}
+
+function countPendingPassJobs(task) {
+  const done = getDoneJobIdSet(task);
+  return (task?.results || []).filter(
+    (r) => r?.decision === 'pass' && r?.job?.jobId && !done.has(String(r.job.jobId))
+  ).length;
+}
+
+function describeTaskPhase(task, status) {
+  const pass = countPassJobs(task);
+  const pending = countPendingPassJobs(task);
+  const done = Math.max(0, pass - pending);
+  const mode = task?.testDelivery ? '单份模式' : (status === 'awaiting_confirm' ? '待批量确认' : '批量/队列');
+  const curTitle = task?.currentJobId
+    ? ((task.items || []).find((x) => x.jobId === task.currentJobId)?.title ||
+      (task.results || []).find((r) => r.job?.jobId === task.currentJobId)?.job?.title ||
+      task.currentJobId)
+    : '';
+  const qLen = Array.isArray(task?.queue) ? task.queue.length : 0;
+  const qCur = Number.isFinite(task?.queueCursor) ? Number(task.queueCursor) + 1 : 0;
+
+  if (status === 'running') {
+    const prog = qLen ? `第 ${Math.min(qCur || 1, qLen)}/${qLen} 岗` : (pass ? `进度 ${done}/${pass}` : '运行中');
+    return curTitle ? `${prog} · 当前：${curTitle}` : prog;
+  }
+  if (status === 'paused') {
+    return (task?.pauseReason || '已暂停') + (curTitle ? ` · 当前：${curTitle}` : '');
+  }
+  if (status === 'awaiting_confirm') {
+    const selected = Array.from(state.selected || []).length;
+    return selected ? `已勾选 ${selected} 岗，可批量投递` : (pass ? `通过 ${pass} 岗，请勾选后批量投递` : '请先扫描预览');
+  }
+  if (status === 'completed' || status === 'stopped' || status === 'failed') {
+    if (pending > 0) return `还剩 ${pending} 个未投 · 可继续「投递一份」或「批量投递」`;
+    return pass ? '本轮通过岗都已处理完，可重新扫描' : '可重新扫描预览';
+  }
+  if (task?.testDelivery) return mode;
+  return pass ? `通过 ${pass} · 未投 ${pending}` : '';
+}
+
+function setControlArmed(id, { enabled, armed, title }) {
+  const el = $(id);
+  if (!el) return;
+  el.disabled = !enabled;
+  if (enabled) el.removeAttribute('disabled');
+  else el.setAttribute('disabled', 'disabled');
+  el.classList.toggle('is-armed', !!armed && !!enabled);
+  el.classList.toggle('is-dimmed', !enabled);
+  el.style.pointerEvents = enabled ? 'auto' : 'none';
+  el.style.opacity = '';
+  el.title = title || '';
+}
+
 function updateTaskUI(task, runner = {}) {
   const status = task?.status || 'idle';
+  const phase = describeTaskPhase(task, status);
   if ($('taskStatus')) {
-    $('taskStatus').textContent = `状态：${statusLabel(status)}${task?.pauseReason ? `（${task.pauseReason}）` : ''}`;
+    const pauseBit = status === 'paused' && task?.pauseReason ? '' : (task?.pauseReason && status !== 'paused' ? `（${task.pauseReason}）` : '');
+    $('taskStatus').textContent = `状态：${statusLabel(status)}${phase ? ` · ${phase}` : ''}${pauseBit}`;
+    $('taskStatus').dataset.status = status;
   }
   const c = task?.counters || { success: 0, skipped: 0, failed: 0, processed: 0 };
+  const pending = countPendingPassJobs(task);
   if ($('taskCounters')) {
-    $('taskCounters').textContent = `成功 ${c.success || 0} · 跳过 ${c.skipped || 0} · 失败 ${c.failed || 0} · 已处理 ${c.processed || 0}`;
+    $('taskCounters').textContent =
+      `成功 ${c.success || 0} · 跳过 ${c.skipped || 0} · 失败 ${c.failed || 0} · 已处理 ${c.processed || 0}` +
+      (pending ? ` · 未投 ${pending}` : '');
+  }
+  if ($('taskHint')) {
+    let hint = '';
+    if (status === 'running') hint = '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
+    else if (status === 'paused') hint = '已暂停：点「继续」恢复当前队列；或「停止」后重新批量投递。';
+    else if (status === 'awaiting_confirm') hint = '预览已就绪：可「投递一份」试投，或「批量投递」勾选岗位。';
+    else if (status === 'completed' || status === 'stopped') {
+      hint = pending > 0
+        ? '上一轮已结束，但仍有未投岗位：「投递一份」逐个投，或「批量投递」一次投剩余。'
+        : '本轮已结束。重新「扫描预览」后再投。';
+    } else if (status === 'failed') hint = '任务失败。可停止后重新扫描，或对剩余岗位批量投递。';
+    else hint = '先扫描预览，再投递一份或批量投递。';
+    $('taskHint').textContent = hint;
   }
 
   const onBoss = FLOAT_MODE || state.isBoss !== false;
-  // 暂停/继续/跳过/停止：始终可点（浮窗/BOSS）
-  ['btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
-    const el = $(id);
-    if (!el) return;
-    el.disabled = false;
-    el.removeAttribute('disabled');
-    el.style.pointerEvents = 'auto';
-    el.style.opacity = '1';
-    el.title = '';
+  const isRunning = status === 'running';
+  const isPaused = status === 'paused';
+  const activeRun = isRunning || isPaused;
+  // 控制条：按状态点亮当前可操作按钮，其它变暗
+  setControlArmed('btnPause', {
+    enabled: onBoss && isRunning,
+    armed: isRunning,
+    title: isRunning ? '暂停当前任务' : '仅在运行中可暂停'
   });
-  if ($('btnStart')) $('btnStart').disabled = !(onBoss && status === 'awaiting_confirm');
+  setControlArmed('btnResume', {
+    enabled: onBoss && isPaused,
+    armed: isPaused,
+    title: isPaused ? '继续当前任务' : '仅在暂停后可继续'
+  });
+  setControlArmed('btnSkip', {
+    enabled: onBoss && activeRun,
+    armed: activeRun,
+    title: activeRun ? '跳过当前岗位，进入下一岗' : '仅在运行/暂停时可跳过'
+  });
+  setControlArmed('btnStop', {
+    enabled: onBoss && activeRun,
+    armed: activeRun && isRunning,
+    title: activeRun ? '停止任务（可之后批量投剩余）' : '当前没有运行中的任务'
+  });
+
+  const hasPass = countPassJobs(task) > 0 || Array.from(state.selected || []).length > 0;
+  const hasPending = countPendingPassJobs(task) > 0 || Array.from(state.selected || []).length > 0;
+  // 批量投递：不限 awaiting_confirm；单份投完(completed/stopped)后也应可点
+  const canBatch =
+    onBoss &&
+    hasPass &&
+    !isRunning &&
+    status !== 'previewing' &&
+    // 暂停中应走「继续」，避免和队列冲突
+    !isPaused;
+  if ($('btnStart')) {
+    $('btnStart').disabled = !canBatch;
+    $('btnStart').classList.toggle('is-armed', canBatch && (status === 'awaiting_confirm' || status === 'completed' || status === 'stopped'));
+    $('btnStart').title = canBatch
+      ? (hasPending ? '批量投递当前勾选/剩余通过岗位' : '批量投递勾选岗位')
+      : (isRunning ? '任务运行中，请先停止' : isPaused ? '任务已暂停，请点继续或先停止' : '请先扫描预览');
+  }
   if ($('btnTestOne')) {
-    const hasPassSelected = Array.from(state.selected || []).length > 0
-      || (state.config?.task?.results || []).some((r) => r.decision === 'pass');
-    const idleLike = !status || status === 'idle' || status === 'awaiting_confirm' || status === 'completed' || status === 'stopped' || status === 'failed' || status === 'paused';
-    $('btnTestOne').disabled = !(onBoss && hasPassSelected && idleLike && !['running'].includes(status));
+    const idleLike = !status || status === 'idle' || status === 'awaiting_confirm' || status === 'completed' || status === 'stopped' || status === 'failed';
+    const canOne = onBoss && hasPass && idleLike && !isRunning && !isPaused;
+    $('btnTestOne').disabled = !canOne;
+    $('btnTestOne').classList.toggle('is-armed', canOne && (status === 'completed' || status === 'stopped' || status === 'awaiting_confirm'));
+    $('btnTestOne').title = canOne ? '每次只投 1 个尚未投过的通过岗位' : (isPaused ? '请先停止或继续当前任务' : '请先扫描预览');
   }
   if ($('btnPreview')) $('btnPreview').disabled = !(onBoss && status !== 'running');
   if ($('btnDiagnose')) $('btnDiagnose').disabled = !onBoss;
@@ -1482,12 +1605,26 @@ function bindEvents() {
 
   $('btnStart').addEventListener('click', async () => {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
-    const selectedJobIds = Array.from(state.selected);
+    let selectedJobIds = Array.from(state.selected || []);
+    const task = state.config?.task;
+    const doneIds = getDoneJobIdSet(task);
+    // 若没勾选，或勾选的都已投完：自动改选剩余未投通过岗
+    const pendingPassIds = (task?.results || [])
+      .filter((r) => r.decision === 'pass' && r.job?.jobId && !doneIds.has(String(r.job.jobId)))
+      .map((r) => r.job.jobId);
+    const selectedPending = selectedJobIds.filter((id) => !doneIds.has(String(id)));
+    if (!selectedPending.length) {
+      selectedJobIds = pendingPassIds;
+    } else {
+      selectedJobIds = selectedPending;
+    }
     if (!selectedJobIds.length) {
-      toast('请至少选择一个通过岗位', 'error');
+      toast('没有可批量投递的岗位：请重新扫描，或勾选尚未投过的通过岗位', 'error', 4000);
       return;
     }
-    toast('正在保存配置并启动投递…', 'warn', 1500);
+    // 同步勾选 UI
+    state.selected = new Set(selectedJobIds);
+    toast('正在保存配置并启动批量投递…', 'warn', 1500);
     try {
       await ensureConfigSavedBeforeDelivery();
     } catch (e) {
@@ -1495,7 +1632,7 @@ function bindEvents() {
       showErrorModal('保存失败', String(e?.message || e || '无法保存当前配置'), { showRetry: false });
       return;
     }
-    const res = await api(MSG.CONFIRM_AND_START, { selectedJobIds });
+    const res = await api(MSG.CONFIRM_AND_START, { selectedJobIds, mode: 'batch' });
     if (!res?.ok) {
       toast(res?.message || res?.error || '启动失败', 'error', 3500);
       showErrorModal('启动失败', res?.message || res?.error || '无法开始任务', { showRetry: false });
@@ -1721,7 +1858,7 @@ $('bht-modal-close')?.addEventListener('click', async () => {
     state.config.task.uiErrorDismissed = true;
   }
   toast('已关闭，任务保持暂停，不会自动重试', 'warn', 2800);
-  forceEnableControls();
+  refreshControlEnablement();
 });
 
 $('bht-modal-retry')?.addEventListener('click', async () => {
@@ -1741,18 +1878,9 @@ $('bht-modal-retry')?.addEventListener('click', async () => {
   await refresh({ soft: true });
 });
 
-// 控制按钮强制可点 + 独立绑定（防止 disabled/重复状态导致失灵）
-function forceEnableControls() {
-  ['btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
-    const el = $(id);
-    if (!el) return;
-    el.disabled = false;
-    el.removeAttribute('disabled');
-    el.style.pointerEvents = 'auto';
-    el.style.opacity = '1';
-    el.style.cursor = 'pointer';
-    el.tabIndex = 0;
-  });
+// 控制按钮按任务状态点亮；点击后刷新 UI，不再无条件强制全开
+function refreshControlEnablement() {
+  updateTaskUI(state.config?.task, state.config?.runner || {});
 }
 
 function wireControlButtons() {
@@ -1762,11 +1890,16 @@ function wireControlButtons() {
     if (el.dataset.bhtWired === '1') return;
     el.dataset.bhtWired = '1';
     el.addEventListener('click', async (ev) => {
-      forceEnableControls();
+      if (el.disabled) {
+        toast(el.title || '当前状态不可用', 'warn', 1800);
+        return;
+      }
       try {
         await handler(ev);
       } catch (err) {
         toast(String(err?.message || err), 'error');
+      } finally {
+        refreshControlEnablement();
       }
     });
   };
@@ -1814,14 +1947,11 @@ function wireControlButtons() {
   });
 }
 
-// CONTROL_CAPTURE_INVOKE: 捕获阶段解除 disabled，避免“点了没反应”
+// 控制条禁用时给出提示，不再捕获阶段强行解锁（否则会破坏状态灯逻辑）
 document.addEventListener('click', (e) => {
   const btn = e.target?.closest?.('#btnPause, #btnResume, #btnSkip, #btnStop');
-  if (!btn) return;
-  if (btn.disabled) {
-    btn.disabled = false;
-    btn.removeAttribute('disabled');
-  }
+  if (!btn || !btn.disabled) return;
+  // 让后续 click handler / 用户感知到不可用；不强制解锁
 }, true);
 
 applyTheme('dark');
@@ -1830,12 +1960,12 @@ enhanceHelpTips();
 wireThemeSwitch();
 wireFilterToggles();
 bindEvents();
-forceEnableControls();
+refreshControlEnablement();
 wireControlButtons();
 try { wireAutosave();
 try { wireResumeFilePreview(); } catch (_) {} } catch (_) {}
 refresh().catch(() => {});
 setInterval(() => {
-  forceEnableControls();
+  refreshControlEnablement();
   refresh({ soft: true }).catch(() => {});
 }, 3000);

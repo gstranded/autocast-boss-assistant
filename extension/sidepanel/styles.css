@@ -253,6 +253,36 @@ select:disabled { cursor: not-allowed; opacity: 0.46; }
   background: var(--line);
 }
 .task-control-strip .btn { min-width: 0; min-height: 32px; border: 0; border-radius: 0; padding: 6px 2px; font-size: 12px; }
+.task-control-strip .btn.is-dimmed { opacity: 0.38; filter: grayscale(0.25); }
+.task-control-strip .btn.is-armed {
+  opacity: 1;
+  font-weight: 750;
+  background: color-mix(in srgb, var(--primary) 18%, var(--surface-raised));
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 45%, transparent);
+}
+.task-control-strip .btn.is-armed#btnStop,
+.task-control-strip #btnStop.is-armed {
+  background: color-mix(in srgb, var(--danger) 16%, var(--surface-raised));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 42%, transparent);
+  color: var(--danger);
+}
+.task-control-strip .btn.is-armed#btnResume,
+.task-control-strip #btnResume.is-armed {
+  background: color-mix(in srgb, var(--success) 16%, var(--surface-raised));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--success) 42%, transparent);
+  color: var(--success);
+}
+.btn.command-btn.is-armed {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 55%, transparent), 0 0 0 3px color-mix(in srgb, var(--primary) 18%, transparent);
+}
+.task-hint { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.status-line[data-status="running"] { color: var(--primary); }
+.status-line[data-status="paused"] { color: var(--warn); }
+.status-line[data-status="completed"] { color: var(--success); }
+.status-line[data-status="stopped"] { color: var(--muted); }
+.status-line[data-status="failed"] { color: var(--danger); }
+
 .task-progress { margin-top: 10px; padding: 9px 10px; border-radius: 7px; background: var(--surface); border: 1px solid var(--line); }
 .status-line { color: var(--text); font-weight: 650; }
 .counters { margin-top: 2px; color: var(--muted); font-size: 12px; }

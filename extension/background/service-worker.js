@@ -1936,6 +1936,36 @@ async function runTaskLoop(taskId) {
         setTaskTerminalSignal(task, TASK_STATUS.COMPLETED);
         await log('success', taskSummaryText(task, TASK_STATUS.COMPLETED));
       }
+      // 单份投完后：自动勾选剩余未投通过岗，便于立刻「批量投递」
+      if (task.testDelivery || task.testJobId) {
+        const done = new Set((task.testedJobIds || []).map(String));
+        for (const it of task.items || []) {
+          if (['COMPLETED', 'SKIPPED', 'FAILED'].includes(String(it?.state || '')) && it?.jobId) {
+            done.add(String(it.jobId));
+          }
+        }
+        for (const q of task.queue || []) {
+          if (['done', 'skipped', 'failed'].includes(String(q?.status || '')) && q?.jobId) {
+            done.add(String(q.jobId));
+          }
+        }
+        task.results = (task.results || []).map((r) => ({
+          ...r,
+          selected: r?.decision === 'pass' && r?.job?.jobId && !done.has(String(r.job.jobId))
+        }));
+        const remain = new Set(
+          (task.results || [])
+            .filter((r) => r?.selected && r?.job?.jobId)
+            .map((r) => String(r.job.jobId))
+        );
+        task.items = (task.items || []).map((it) => ({
+          ...it,
+          selected: remain.has(String(it.jobId || ''))
+        }));
+        // 结束单份标记，但保留 testedJobIds 供后续去重
+        task.testDelivery = false;
+        task.testJobId = null;
+      }
       task.updatedAt = Date.now();
       task.currentJobId = null;
       await publishTask(task);
@@ -2016,17 +2046,110 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const all = await getAllConfig();
         let task = all.task;
         if (!task) return { ok: false, error: 'NO_TASK' };
-        if (payload?.selectedJobIds) {
-          const setIds = new Set(payload.selectedJobIds);
-          task.results = (task.results || []).map((r) => ({
-            ...r,
-            selected: setIds.has(r.job.jobId)
-          }));
-          task.items = (task.items || []).map((it) => ({
-            ...it,
-            selected: setIds.has(it.jobId)
-          }));
+        if (!(task.results || []).length) {
+          return { ok: false, error: 'NO_PREVIEW', message: '请先扫描预览，再批量投递' };
         }
+
+        // 单份投完后 status 可能是 completed/stopped：允许直接进入批量
+        const doneIds = new Set();
+        for (const it of task.items || []) {
+          if (['COMPLETED', 'SKIPPED', 'FAILED'].includes(String(it?.state || '')) && it?.jobId) {
+            doneIds.add(String(it.jobId));
+          }
+        }
+        for (const q of task.queue || []) {
+          if (['done', 'skipped', 'failed'].includes(String(q?.status || '')) && q?.jobId) {
+            doneIds.add(String(q.jobId));
+          }
+        }
+        for (const id of task.testedJobIds || []) {
+          if (id) doneIds.add(String(id));
+        }
+
+        let selectedIds = Array.isArray(payload?.selectedJobIds)
+          ? payload.selectedJobIds.map(String).filter(Boolean)
+          : [];
+        // 去掉已投完的勾选
+        selectedIds = selectedIds.filter((id) => !doneIds.has(id));
+        if (!selectedIds.length) {
+          // 自动勾选剩余未投通过岗（解决：投递一份后 results 只剩 1 个 selected）
+          selectedIds = (task.results || [])
+            .filter((r) => r?.decision === 'pass' && r?.job?.jobId && !doneIds.has(String(r.job.jobId)))
+            .map((r) => String(r.job.jobId));
+        }
+        if (!selectedIds.length) {
+          return {
+            ok: false,
+            error: 'NO_PENDING',
+            message: '没有可批量投递的岗位。请重新扫描预览，或先用「投递一份」未投完的岗位'
+          };
+        }
+        const setIds = new Set(selectedIds);
+        task.results = (task.results || []).map((r) => ({
+          ...r,
+          selected: setIds.has(String(r.job?.jobId || ''))
+        }));
+        task.items = (task.items || []).map((it) => {
+          const id = String(it.jobId || '');
+          const selected = setIds.has(id);
+          // 已完成的保留状态；待投的重置为可跑
+          if (selected && !doneIds.has(id)) {
+            return {
+              ...it,
+              selected: true,
+              state: 'NOT_STARTED',
+              reasons: [],
+              lastError: '',
+              completedAt: null
+            };
+          }
+          return { ...it, selected };
+        });
+        // 补齐 items 里缺失的待投岗
+        for (const id of selectedIds) {
+          if ((task.items || []).some((it) => String(it.jobId) === id)) continue;
+          const row = (task.results || []).find((r) => String(r.job?.jobId) === id);
+          task.items = [
+            ...(task.items || []),
+            {
+              jobId: id,
+              company: row?.job?.company || '',
+              title: row?.job?.title || '',
+              state: 'NOT_STARTED',
+              reasons: [],
+              selected: true
+            }
+          ];
+        }
+
+        // 重建批量队列（保留已完成标记，供 loop 跳过）
+        const rebuilt = buildDeliveryQueue(task.results || [], { selectedOnly: true });
+        const prevQ = new Map((task.queue || []).map((q) => [String(q.jobId || ''), q]));
+        task.queue = rebuilt.map((q, idx) => {
+          const old = prevQ.get(String(q.jobId || ''));
+          if (old && (old.status === 'done' || old.status === 'skipped' || old.status === 'failed')) {
+            return { ...q, index: idx, status: old.status, outcome: old.outcome, finishedAt: old.finishedAt };
+          }
+          if (doneIds.has(String(q.jobId || ''))) {
+            return { ...q, index: idx, status: 'done' };
+          }
+          return { ...q, index: idx, status: 'pending' };
+        });
+        task.queueCursor = Math.max(
+          0,
+          task.queue.findIndex((q) => q.status === 'pending')
+        );
+        if (task.queueCursor < 0) task.queueCursor = 0;
+
+        // 退出单份测试模式
+        task.testDelivery = false;
+        task.testJobId = null;
+        task.completionSignal = null;
+        task.pauseReason = '';
+        task.awaitingUserRetry = false;
+        task.uiErrorDismissed = false;
+        task.retryCurrent = false;
+        task.consecutiveFails = 0;
         task.status = TASK_STATUS.RUNNING;
         const split = await prepareSplitWorkspace(task, all.settings || {});
         await publishTask(task);
@@ -2038,9 +2161,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } else if (!split.skipped) {
           await log('warn', '[分屏] ' + (split.message || '自动分屏不可用，已回退为普通标签页'));
         }
+        await log('info', '批量投递启动：待投 ' + selectedIds.length + ' 岗（已跳过已完成 ' + doneIds.size + '）');
         // async loop
         runTaskLoop(task.id);
-        return { ok: true, taskId: task.id, splitView: split };
+        return { ok: true, taskId: task.id, splitView: split, pending: selectedIds.length };
       }
       case MSG.RUN_TEST_DELIVERY:
       case 'BHT_RUN_TEST_DELIVERY': {

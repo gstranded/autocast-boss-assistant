@@ -604,6 +604,19 @@ try {
 }
 
 
+console.log("11b) batch button after single delivery");
+test("batch delivery not limited to awaiting_confirm", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(app.includes("canBatch"), "updateTaskUI should compute canBatch");
+  assert.ok(app.includes("还剩") || app.includes("未投"), "status should mention remaining jobs");
+  assert.ok(app.includes("is-armed"), "control buttons use armed highlight");
+  assert.ok(!/btnStart'\)\.disabled = !\(onBoss && status === 'awaiting_confirm'\)/.test(app), "old awaiting_confirm-only gate must be gone");
+  const sw = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(sw.includes("NO_PENDING") || sw.includes("没有可批量投递"), "CONFIRM_AND_START handles empty pending");
+  assert.ok(sw.includes("批量投递启动"), "batch start log present");
+  assert.ok(sw.includes("自动勾选剩余未投通过岗") || sw.includes("testDelivery"), "restore selection after single delivery");
+});
+
 console.log("12) test-delivery next job");
 const sampleResults = [
   { decision: "pass", selected: true, job: { jobId: "a", title: "岗A", company: "公司A" } },
