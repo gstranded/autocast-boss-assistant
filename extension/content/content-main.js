@@ -17,7 +17,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.6.5";
+  const BHT_CONTENT_VERSION = "1.6.6";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -45,13 +45,110 @@
   const log = (...args) => console.log("[BHT content]", ...args);
 
   
+  function isListLikePage(href = location.href) {
+    try {
+      const u = String(href || "");
+      return /\/web\/geek\/jobs|recommend|search|rec-job|job-recommend|geek\/job(?!_detail)/i.test(u);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function sameListUrl(a, b) {
+    try {
+      const ua = new URL(String(a || ""), location.origin);
+      const ub = new URL(String(b || ""), location.origin);
+      return ua.origin === ub.origin && ua.pathname === ub.pathname && ua.search === ub.search;
+    } catch (_) {
+      return String(a || "").split("#")[0] === String(b || "").split("#")[0];
+    }
+  }
+
+  function detectSelectedJobExpect() {
+    try {
+      const selectors = [
+        ".expect-list .active",
+        ".expect-list .selected",
+        ".job-expect .active",
+        ".job-expect .selected",
+        ".expect-item.active",
+        ".expect-item.selected",
+        ".expect-list [class*='active']",
+        ".job-expect-list [class*='active']",
+        "[class*='expect'] [class*='active']",
+        ".recommend-job-slider .active",
+        ".job-tab .active",
+        ".expect-select .active"
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        const t = textOf(el).replace(/\s+/g, " ").trim();
+        if (t && t.length >= 1 && t.length <= 40) return t;
+      }
+      const candidates = Array.from(document.querySelectorAll("div, span, a, li, button")).filter((el) => {
+        try {
+          const r = el.getBoundingClientRect();
+          if (r.top < 0 || r.top > 220 || r.width < 20 || r.height < 16 || r.height > 60) return false;
+          const cls = String(el.className || "");
+          const t = textOf(el).replace(/\s+/g, " ").trim();
+          if (!t || t.length > 36) return false;
+          if (!/(推荐|期望|工程师|开发|产品|运营|设计|实习|全职|兼职|销售)/.test(t) && !/expect|recommend|job-tab/i.test(cls)) {
+            return false;
+          }
+          return /active|selected|current|\bon\b/i.test(cls) || el.getAttribute("aria-selected") === "true";
+        } catch (_) {
+          return false;
+        }
+      });
+      if (candidates[0]) return textOf(candidates[0]).replace(/\s+/g, " ").trim();
+    } catch (_) {}
+    return "";
+  }
+
+  function detectActiveFilterHints() {
+    try {
+      const hints = [];
+      const nodes = Array.from(
+        document.querySelectorAll(
+          ".filter-select-item.active, .condition-filter-select .active, .search-condition .active, .filter-item.active, .job-search-filter .active, [class*='filter'] [class*='active']"
+        )
+      ).slice(0, 20);
+      for (const el of nodes) {
+        const t = textOf(el).replace(/\s+/g, " ").trim();
+        if (t && t.length <= 30 && !hints.includes(t)) hints.push(t);
+      }
+      return hints.slice(0, 12);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function getSavedListCtx() {
+    try {
+      if (window.__BHT_LIST_CTX__ && typeof window.__BHT_LIST_CTX__ === "object") {
+        return window.__BHT_LIST_CTX__;
+      }
+      const raw = sessionStorage.getItem("bht_list_ctx");
+      if (raw) return JSON.parse(raw) || {};
+    } catch (_) {}
+    return {};
+  }
+
   function rememberListHref(forceHref) {
     try {
       const href = forceHref || location.href;
       const cards = getJobCards().length;
       if (forceHref || (cards >= 3 && /jobs|recommend|search|geek\/job/i.test(href))) {
+        const ctx = {
+          href,
+          expectLabel: detectSelectedJobExpect(),
+          filterHints: detectActiveFilterHints(),
+          at: Date.now()
+        };
         sessionStorage.setItem("bht_list_href", href);
+        sessionStorage.setItem("bht_list_ctx", JSON.stringify(ctx));
         window.__BHT_LIST_HREF__ = href;
+        window.__BHT_LIST_CTX__ = ctx;
         return href;
       }
     } catch (_) {}
@@ -65,6 +162,54 @@
       return window.__BHT_LIST_HREF__ || "";
     }
   }
+
+  async function restoreJobExpectIfNeeded(wantLabel) {
+    const want = String(wantLabel || getSavedListCtx()?.expectLabel || "").replace(/\s+/g, " ").trim();
+    if (!want) return { ok: true, skipped: true };
+    const current = detectSelectedJobExpect();
+    if (current && (current === want || current.includes(want) || want.includes(current))) {
+      return { ok: true, already: true, label: current };
+    }
+    try {
+      const nodes = Array.from(document.querySelectorAll("div, span, a, li, button")).filter((el) => {
+        try {
+          const r = el.getBoundingClientRect();
+          if (r.width < 12 || r.height < 12 || r.top > 280) return false;
+          const t = textOf(el).replace(/\s+/g, " ").trim();
+          if (!t) return false;
+          if (t === want || t.includes(want) || want.includes(t)) return true;
+          const core = want.split(/[·•|/｜]/)[0].trim();
+          return Boolean(core && (t === core || t.includes(core)));
+        } catch (_) {
+          return false;
+        }
+      });
+      nodes.sort((a, b) => textOf(a).length - textOf(b).length);
+      const hit = nodes[0];
+      if (!hit) return { ok: false, error: "EXPECT_TAB_NOT_FOUND", want };
+      clickLikeHuman(hit);
+      await sleep(900);
+      const after = detectSelectedJobExpect();
+      return { ok: true, clicked: textOf(hit), after, want };
+    } catch (e) {
+      return { ok: false, error: String(e?.message || e), want };
+    }
+  }
+
+  async function maybeRestoreExpectAfterLoad() {
+    try {
+      const want = sessionStorage.getItem("bht_restore_expect") || getSavedListCtx()?.expectLabel || "";
+      if (!want) return;
+      if (!isListLikePage()) return;
+      for (let i = 0; i < 20; i++) {
+        if (getJobCards().length >= 3) break;
+        await sleep(250);
+      }
+      await restoreJobExpectIfNeeded(want);
+      try { sessionStorage.removeItem("bht_restore_expect"); } catch (_) {}
+    } catch (_) {}
+  }
+  try { setTimeout(() => { maybeRestoreExpectAfterLoad().catch(() => {}); }, 600); } catch (_) {}
 
 const SELECTORS = {
     // 2026-07 真机：/web/geek/jobs
@@ -384,7 +529,8 @@ function firstEl(selectors, root = document) {
         const a = t && t.closest ? t.closest("a[href], area[href]") : null;
         if (!a) return;
         const href = a.href || a.getAttribute("href") || "";
-        if (/job_detail|geek\/job|\/job\//i.test(href)) {
+        // 拦截岗位详情整页跳转，保留列表 SPA（求职期望/筛选状态）
+        if (/job_detail|geek\/job|\/job\//i.test(href) && !/web\/geek\/jobs/i.test(href)) {
           e.preventDefault();
           e.stopPropagation();
           if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
@@ -392,12 +538,18 @@ function firstEl(selectors, root = document) {
       } catch (_) {}
     };
     document.addEventListener("click", blocker, true);
+    document.addEventListener("auxclick", blocker, true);
+    document.addEventListener("mousedown", blocker, true);
     const timer = setTimeout(() => {
       try { document.removeEventListener("click", blocker, true); } catch (_) {}
+      try { document.removeEventListener("auxclick", blocker, true); } catch (_) {}
+      try { document.removeEventListener("mousedown", blocker, true); } catch (_) {}
     }, ms);
     return () => {
       clearTimeout(timer);
       try { document.removeEventListener("click", blocker, true); } catch (_) {}
+      try { document.removeEventListener("auxclick", blocker, true); } catch (_) {}
+      try { document.removeEventListener("mousedown", blocker, true); } catch (_) {}
     };
   }
 
@@ -703,7 +855,7 @@ function firstEl(selectors, root = document) {
     if (payload.scroll) await autoScrollList(payload.maxRounds || 6);
     const cards = getJobCards();
     const jobs = cards.map((c, i) => parseJobCard(c, i));
-    try{rememberListHref();}catch(_){} return { ok: true, listHref: (typeof getSavedListHref==="function"?getSavedListHref():"")||location.href, page: pageInfo(),
+    try{rememberListHref();}catch(_){} return { ok: true, listHref: (typeof getSavedListHref==="function"?getSavedListHref():"")||location.href, listExpectLabel: (typeof detectSelectedJobExpect==="function"?detectSelectedJobExpect():"")||"", listFilterHints: (typeof detectActiveFilterHints==="function"?detectActiveFilterHints():[]), page: pageInfo(),
       jobs,
       count: jobs.length,
       diagnose: {
@@ -973,7 +1125,7 @@ function dismissCommonDialogs() {
       return { ok: true, count: readyCount(), restored: false, href: location.href };
     }
 
-    // 聊天页先返回
+    // 聊天页先返回（软返回，不硬刷新）
     if (isChatPage()) {
       try { history.back(); } catch (_) {}
       await sleep(900);
@@ -991,25 +1143,27 @@ function dismissCommonDialogs() {
       if (readyCount() > 0) {
         return { ok: true, count: readyCount(), restored: true, href: location.href };
       }
-      // 点「职位/推荐」导航
-      const jobNav = Array.from(document.querySelectorAll("a,button,span,div")).find((el) => {
-        const t = textOf(el);
-        return t === "职位" || t === "推荐" || t === "首页" || /职位列表|找工作|职位推荐/.test(t);
-      });
-      if (jobNav) clickLikeHuman(jobNav);
 
-      // 仍无卡片且路径不像列表，尝试进入 jobs（只跳一次，然后继续等）
-      if (!navTried && readyCount() === 0 && /zhipin\.com|bosszhipin\.com/i.test(location.hostname)) {
-        const path = location.pathname || "";
-        const looksList = /geek\/(jobs|job)|rec-job|recommend|search|job_detail/i.test(path + location.href);
-        if (!looksList) {
+      // 仅当当前明显不是职位列表页时，才尝试点顶部「职位」入口。
+      // 禁止点「推荐/首页」：会把用户选好的求职期望与网页筛选冲掉。
+      if (!noHomeNav && !isListLikePage() && !navTried) {
+        const jobNav = Array.from(document.querySelectorAll("a,button,span,div")).find((el) => {
+          const t = textOf(el);
+          // 只允许精确「职位」或明确职位列表入口，避免点到推荐
+          return t === "职位" || t === "职位列表" || t === "找工作";
+        });
+        if (jobNav) {
           navTried = true;
-          const target = location.origin + "/web/geek/jobs";
-          if (!location.href.startsWith(target)) {
-            /* avoid navigate in msg handler */
-            // 给 SPA 时间加载，不立刻判失败
-            await sleep(1500);
-          }
+          clickLikeHuman(jobNav);
+          await sleep(800);
+        }
+      }
+
+      // 仍无卡片且不在列表：只等待 SPA，不 location 硬跳到裸 /web/geek/jobs
+      if (!navTried && readyCount() === 0 && /zhipin\.com|bosszhipin\.com/i.test(location.hostname)) {
+        if (!isListLikePage()) {
+          navTried = true;
+          await sleep(1500);
         }
       }
       if (scroll && (Date.now() - start) > 2500) {
@@ -1069,22 +1223,84 @@ function dismissCommonDialogs() {
 
   async function returnToJobList(payload = {}) {
     const target = (payload && payload.listHref) || getSavedListHref();
+    const expectLabel = String(
+      (payload && (payload.expectLabel || payload.listExpectLabel)) ||
+      getSavedListCtx()?.expectLabel ||
+      ""
+    ).trim();
     try { await closeChatPanel(); } catch (_) {}
     await sleep(250);
 
-    if (getJobCards().length >= 3) {
+    // 1) 已在列表且有卡片：绝不硬刷新，最多软恢复求职期望
+    if (getJobCards().length >= 3 && isListLikePage()) {
       try { rememberListHref(); } catch (_) {}
+      const restored = await restoreJobExpectIfNeeded(expectLabel);
       return {
         ok: true,
         count: getJobCards().length,
         href: location.href,
         via: "still-on-list",
+        expectRestored: restored,
         contentVersion: BHT_CONTENT_VERSION
       };
     }
 
-    if (target && location.href.split("#")[0] !== String(target).split("#")[0]) {
-      try { sessionStorage.setItem("bht_list_href", target); } catch (_) {}
+    // 2) 已在列表路径但卡片暂时为 0：软等待，不 assign
+    if (isListLikePage()) {
+      let ensured = await ensureJobList({ maxWaitMs: 8000, scroll: true, noHomeNav: true });
+      if (ensured?.ok && (ensured.count || 0) > 0) {
+        const restored = await restoreJobExpectIfNeeded(expectLabel);
+        return {
+          ...ensured,
+          via: "soft-wait-list",
+          expectRestored: restored,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+      }
+    }
+
+    // 3) 聊天页/会话页：history.back 软返回
+    if (isChatPage() || (hasUsableChatInput() && getJobCards().length === 0)) {
+      try { history.back(); } catch (_) {}
+      await sleep(1100);
+      try { await closeChatPanel(); } catch (_) {}
+      if (getJobCards().length >= 1 || isListLikePage()) {
+        await ensureJobList({ maxWaitMs: 5000, scroll: true, noHomeNav: true });
+        const restored = await restoreJobExpectIfNeeded(expectLabel);
+        return {
+          ok: getJobCards().length > 0,
+          count: getJobCards().length,
+          href: location.href,
+          via: "history-back",
+          expectRestored: restored,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+      }
+    }
+
+    // 4) 再软 ensure 一次（不点推荐、不硬跳裸 jobs）
+    let ensured = await ensureJobList({ maxWaitMs: 8000, scroll: true, noHomeNav: true });
+    if (ensured?.ok && (ensured.count || 0) > 0) {
+      const restored = await restoreJobExpectIfNeeded(expectLabel);
+      return {
+        ...ensured,
+        via: "ensure-soft",
+        expectRestored: restored,
+        contentVersion: BHT_CONTENT_VERSION
+      };
+    }
+
+    // 5) 最后手段：仅当有完整 listHref 且当前不在同一 URL 时才硬导航。
+    //    硬导航会丢掉 SPA 状态；因此写入 restore 标记，加载后尽量点回求职期望。
+    if (target && !sameListUrl(location.href, target)) {
+      try {
+        sessionStorage.setItem("bht_list_href", target);
+        if (expectLabel) sessionStorage.setItem("bht_restore_expect", expectLabel);
+        const ctx = { ...(getSavedListCtx() || {}), href: target, expectLabel, at: Date.now() };
+        sessionStorage.setItem("bht_list_ctx", JSON.stringify(ctx));
+        window.__BHT_LIST_HREF__ = target;
+        window.__BHT_LIST_CTX__ = ctx;
+      } catch (_) {}
       setTimeout(() => {
         try { location.assign(target); } catch (_) {
           try { location.href = target; } catch (__) {}
@@ -1094,29 +1310,20 @@ function dismissCommonDialogs() {
         ok: true,
         navigating: true,
         href: target,
-        via: "scheduled-assign",
+        via: "hard-assign-last-resort",
+        expectLabel,
         contentVersion: BHT_CONTENT_VERSION
       };
     }
 
-    if (isChatPage() || (hasUsableChatInput() && getJobCards().length === 0)) {
-      try { history.back(); } catch (_) {}
-      await sleep(1100);
-      try { await closeChatPanel(); } catch (_) {}
-    }
-
-    let ensured = await ensureJobList({ maxWaitMs: 10000, scroll: true, noHomeNav: true });
-    if ((!ensured?.ok || (ensured.count || 0) < 1) && target) {
-      setTimeout(() => { try { location.assign(target); } catch (_) {} }, 80);
-      return {
-        ok: true,
-        navigating: true,
-        href: target,
-        via: "scheduled-assign-fallback",
-        contentVersion: BHT_CONTENT_VERSION
-      };
-    }
-    return { ...ensured, contentVersion: BHT_CONTENT_VERSION };
+    return {
+      ok: false,
+      count: getJobCards().length,
+      href: location.href,
+      error: "LIST_NOT_FOUND",
+      message: "无法恢复职位列表（已避免硬刷新清空筛选）。请回到原来的求职期望/筛选列表后重新扫描预览",
+      contentVersion: BHT_CONTENT_VERSION
+    };
   }
 
   async function findCardByScrolling(job, maxRounds = 40) {

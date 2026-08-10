@@ -480,6 +480,37 @@ async function ensureMessageTab(task) {
   return tab;
 }
 
+async function softReturnToList(task) {
+  const listTabId = task?.execution?.listTabId || null;
+  const payload = {
+    listHref: task?.listHref || "",
+    expectLabel: task?.listExpectLabel || "",
+    listExpectLabel: task?.listExpectLabel || ""
+  };
+  const opt = listTabId
+    ? { tabId: listTabId, forceInject: true }
+    : { forceInject: true };
+  try {
+    const res = await sendToBoss(MSG.RETURN_TO_LIST, payload, opt);
+    if (res?.via === "hard-assign-last-resort" || res?.navigating) {
+      await log("warn", "列表页只能硬跳转恢复（可能短暂丢失 SPA 筛选），将尝试点回求职期望", {
+        via: res?.via,
+        href: String(res?.href || payload.listHref || "").slice(0, 160),
+        expectLabel: payload.expectLabel || ""
+      });
+    } else if (res?.ok) {
+      await log("info", "列表页软恢复完成 via=" + (res.via || "ok"), {
+        count: res.count,
+        href: String(res.href || "").slice(0, 140),
+        expect: res.expectRestored?.after || res.expectRestored?.label || payload.expectLabel || ""
+      });
+    }
+    return res;
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
 async function ensureListTab(task) {
   if (!task.execution) task.execution = {};
   if (task.execution.listTabId) {
@@ -1039,6 +1070,7 @@ async function runPreview(payload = {}) {
     return { ok: false, ...scan };
   }
   const previewListHref = scan.listHref || '';
+  const previewListExpect = scan.listExpectLabel || scan.expectLabel || '';
 
   const history = config.history || [];
   const todayStats = await getTodayStats();
@@ -1114,6 +1146,7 @@ async function runPreview(payload = {}) {
 
   
   task.listHref = previewListHref || task.listHref || '';
+  if (previewListExpect) task.listExpectLabel = previewListExpect;
   task.queue = (task.results || [])
     .filter((r) => r.selected !== false && r.decision === 'pass')
     .map((r, idx) => ({
@@ -1421,7 +1454,7 @@ async function processOneJob(task, resultRow, config) {
       return 'limited';
     }
     // RETURN_TO_LIST after fail
-    await sendToBoss(MSG.RETURN_TO_LIST, {});
+    await softReturnToList(task);
     if (/找不到该岗位|列表中找不到|JOB_NOT_FOUND|LIST_NOT_READY/i.test(String(chatRes?.error || '') + String(chatRes?.message || ''))) {
       item.state = 'SKIPPED';
       item.reasons = [chatRes?.message || '列表中找不到该岗位，已跳过并继续下一岗'];
@@ -1543,7 +1576,7 @@ async function processOneJob(task, resultRow, config) {
         return 'limited';
       }
       // RETURN_TO_LIST after send fail
-      await sendToBoss(MSG.RETURN_TO_LIST, {});
+      await softReturnToList(task);
       return 'failed';
     }
 
@@ -1780,7 +1813,7 @@ async function runTaskLoop(taskId) {
         }
       };
     });
-    await log('info', '开始队列投递：共 ' + queue.length + ' 岗；锚点 ' + String(task.listHref || '无').slice(0, 120));
+    await log('info', '开始队列投递：共 ' + queue.length + ' 岗；锚点 ' + String(task.listHref || '无').slice(0, 120) + (task.listExpectLabel ? ('；求职期望 ' + String(task.listExpectLabel).slice(0, 40)) : ''));
 
     for (let qi = 0; qi < queue.length; qi++) {
       const row = queue[qi];
@@ -1853,7 +1886,7 @@ async function runTaskLoop(taskId) {
       // 失败后等待用户：关闭=保持暂停不自动继续；重试=重置当前岗位后再跑一次
       while (outcome === 'failed') {
         // 回列表，避免卡在会话页
-        try { await sendToBoss(MSG.RETURN_TO_LIST, {}); } catch (_) {}
+        try { await softReturnToList(task); } catch (_) {}
         await sleep(400);
 
         config = await getAllConfig();
