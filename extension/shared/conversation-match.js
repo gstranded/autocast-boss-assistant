@@ -1,3 +1,6 @@
+/**
+ * Conversation matching: prefer 公司 + HR + 岗位 triple match.
+ */
 (function installConversationMatch(root) {
   "use strict";
 
@@ -18,13 +21,14 @@
   function hasActiveState(className = "", ariaSelected = "") {
     if (String(ariaSelected).toLowerCase() === "true") return true;
     const tokens = classTokens(className);
-    return tokens.some((token) =>
-      token === "active" ||
-      token === "selected" ||
-      token === "current" ||
-      token === "on" ||
-      token === "is-active" ||
-      token === "is-selected"
+    return tokens.some(
+      (token) =>
+        token === "active" ||
+        token === "selected" ||
+        token === "current" ||
+        token === "on" ||
+        token === "is-active" ||
+        token === "is-selected"
     );
   }
 
@@ -48,7 +52,12 @@
       .split(/\n+/)
       .map((line) => line.trim())
       .filter(Boolean)
-      .filter((line) => !/^(今天|昨天|前天|\d{1,2}:\d{2}|\d{1,2}月\d{1,2}日|\d{4}[./-]\d{1,2}[./-]\d{1,2})$/.test(line))
+      .filter(
+        (line) =>
+          !/^(今天|昨天|前天|\d{1,2}:\d{2}|\d{1,2}月\d{1,2}日|\d{4}[./-]\d{1,2}[./-]\d{1,2})$/.test(
+            line
+          )
+      )
       .filter((line) => !/^\d+$/.test(line))
       .slice(0, 3)
       .join("|");
@@ -58,73 +67,365 @@
 
   function containsPrefix(haystack, needle, length) {
     if (!haystack || !needle) return false;
-    return haystack.includes(needle.slice(0, Math.min(length, needle.length)));
+    const n = Math.min(length, needle.length);
+    if (n <= 0) return false;
+    return haystack.includes(needle.slice(0, n));
+  }
+
+  function softIncludes(haystack, needle) {
+    if (!haystack || !needle) return false;
+    if (haystack.includes(needle)) return true;
+    // 允许较短一边包含较长一边的前缀
+    if (needle.length >= 2 && haystack.includes(needle.slice(0, Math.min(needle.length, 4)))) return true;
+    if (haystack.length >= 2 && needle.includes(haystack.slice(0, Math.min(haystack.length, 4)))) return true;
+    return false;
+  }
+
+  function titleTokens(title = "") {
+    const parts = String(title || "")
+      .split(/[\s\-—–_/｜|·•（）()【】\[\]　]+/)
+      .map((x) => normalize(x))
+      .filter((x) => x && x.length >= 2);
+    const out = [];
+    for (const p of parts) {
+      if (!out.includes(p)) out.push(p);
+    }
+    return out.slice(0, 16);
+  }
+
+  function itemBlob(item = {}) {
+    // 结构化字段 + 原始文本
+    return normalize(
+      [
+        item.hrName || item.bossName || "",
+        item.company || "",
+        item.title || item.position || "",
+        item.identityText || "",
+        item.text || ""
+      ].join("|")
+    );
+  }
+
+  function scoreCompany(blob, job) {
+    const company = normalize(job.company || "");
+    if (!company) return { score: 0, hit: false };
+    if (blob.includes(company)) return { score: 100, hit: true };
+    if (containsPrefix(blob, company, 4)) return { score: 70, hit: true };
+    if (containsPrefix(blob, company, 2)) return { score: 30, hit: true };
+    return { score: 0, hit: false };
+  }
+
+  function scoreHr(blob, job, item) {
+    const hr = normalize(job.hrName || job.bossName || "");
+    if (!hr) return { score: 0, hit: false, hasHr: false };
+    const itemHr = normalize(item.hrName || item.bossName || "");
+    if (itemHr && (itemHr === hr || itemHr.includes(hr) || hr.includes(itemHr))) {
+      return { score: 120, hit: true, hasHr: true };
+    }
+    if (blob.includes(hr)) return { score: 110, hit: true, hasHr: true };
+    // 姓氏 + 先生/女士 宽松
+    const family = hr.slice(0, 1);
+    if (family && /(先生|女士|老师|经理|总)$/.test(hr) && blob.includes(family) && /(先生|女士|老师|经理|总)/.test(blob)) {
+      return { score: 55, hit: true, hasHr: true };
+    }
+    if (containsPrefix(blob, hr, 2)) return { score: 40, hit: true, hasHr: true };
+    return { score: 0, hit: false, hasHr: true };
+  }
+
+  function scoreTitle(blob, job, item) {
+    const title = normalize(job.title || "");
+    if (!title) return { score: 0, hit: false };
+    const itemTitle = normalize(item.title || item.position || "");
+    if (itemTitle && (itemTitle === title || itemTitle.includes(title) || title.includes(itemTitle))) {
+      return { score: 100, hit: true };
+    }
+    if (blob.includes(title)) return { score: 95, hit: true };
+    if (containsPrefix(blob, title, 8)) return { score: 70, hit: true };
+    if (containsPrefix(blob, title, 6)) return { score: 50, hit: true };
+    if (containsPrefix(blob, title, 4)) return { score: 28, hit: true };
+
+    const tokens = titleTokens(job.title || "");
+    let hit = 0;
+    for (const tok of tokens) {
+      if (tok.length >= 2 && blob.includes(tok)) hit += 1;
+    }
+    if (hit <= 0) return { score: 0, hit: false };
+    return { score: Math.min(55, 12 + hit * 10), hit: hit >= 2 };
   }
 
   function scoreConversation(item = {}, job = {}, isNew = false) {
-    const text = normalize(item.text || "");
-    const company = normalize(job.company || "");
-    const title = normalize(job.title || "");
-    const hr = normalize(job.hrName || job.bossName || "");
+    const blob = itemBlob(item);
+    const c = scoreCompany(blob, job);
+    const h = scoreHr(blob, job, item);
+    const t = scoreTitle(blob, job, item);
+
     let score = 0;
+    score += c.score;
+    score += h.score;
+    score += t.score;
 
-    if (company && text.includes(company)) score += 70;
-    else if (containsPrefix(text, company, 4)) score += 45;
+    // 三维命中强加成（用户期望的主路径）
+    if (c.hit && h.hit && t.hit) score += 80;
+    else if (c.hit && h.hit) score += 45;
+    else if (c.hit && t.hit) score += 30;
+    else if (h.hit && t.hit) score += 35;
 
-    if (title && text.includes(title)) score += 65;
-    else if (containsPrefix(text, title, 6)) score += 35;
+    // 只有公司名、没有 HR/岗位时压分，避免大厂多会话同分
+    if (c.hit && !h.hit && !t.hit) score -= 25;
 
-    if (hr && text.includes(hr)) score += 30;
     if (isNew) {
-      score += 45;
-      score += Math.max(0, 15 - Number(item.index || 0));
+      score += 50;
+      score += Math.max(0, 15 - Number(item.index || 0) * 3);
+    } else {
+      const idx = Number(item.index || 0);
+      if (idx === 0) score += 18;
+      else if (idx === 1) score += 8;
+      else if (idx === 2) score += 3;
     }
-    return score;
+    if (item.active) score += 10;
+
+    return {
+      score,
+      companyHit: c.hit,
+      hrHit: h.hit,
+      titleHit: t.hit,
+      companyScore: c.score,
+      hrScore: h.score,
+      titleScore: t.score,
+      triple: Boolean(c.hit && h.hit && t.hit),
+      duoCH: Boolean(c.hit && h.hit),
+      duoCT: Boolean(c.hit && t.hit)
+    };
   }
 
-  function selectConversationCandidate(items = [], job = {}, beforeKeys = []) {
+  function isNewItem(item, before) {
+    return Boolean(item?.key && !before.has(item.key));
+  }
+
+  function selectConversationCandidate(items = [], job = {}, beforeKeys = [], opts = {}) {
     const before = beforeKeys instanceof Set ? beforeKeys : new Set(beforeKeys || []);
-    const newItems = items.filter((item) => item?.key && !before.has(item.key));
-    const hasTargetIdentity = Boolean(normalize(job.company || job.title || job.hrName || job.bossName || ""));
+    const preferNewest = opts.preferNewest !== false;
+    const newItems = items.filter((item) => isNewItem(item, before));
+    const hasTargetIdentity = Boolean(
+      normalize(job.company || job.title || job.hrName || job.bossName || "")
+    );
+
     if (!hasTargetIdentity && newItems.length === 1) {
       return { ok: true, item: newItems[0], via: "new-single", score: 60, top: [] };
     }
-    const scored = items
-      .map((item) => ({
-        item,
-        score: scoreConversation(item, job, Boolean(item?.key && !before.has(item.key)))
-      }))
-      .filter((entry) => entry.score >= 45)
-      .sort((a, b) => (b.score - a.score) || (Number(a.item.index || 0) - Number(b.item.index || 0)));
 
-    if (scored[0] && scored[0].score >= 60) {
-      const second = scored[1];
-      if (second && second.score >= scored[0].score - 5) {
+    const scored = items
+      .map((item) => {
+        const detail = scoreConversation(item, job, isNewItem(item, before));
         return {
-          ok: false,
-          error: "CONVERSATION_AMBIGUOUS",
+          item,
+          ...detail,
+          isNew: isNewItem(item, before)
+        };
+      })
+      .filter((entry) => entry.score >= 50)
+      .sort(
+        (a, b) =>
+          b.score - a.score ||
+          Number(b.triple) - Number(a.triple) ||
+          Number(b.duoCH) - Number(a.duoCH) ||
+          b.titleScore - a.titleScore ||
+          b.hrScore - a.hrScore ||
+          Number(a.item.index || 0) - Number(b.item.index || 0)
+      );
+
+    // A. 唯一「公司+HR+岗位」三重命中
+    const triples = scored.filter((e) => e.triple);
+    if (triples.length === 1) {
+      return {
+        ok: true,
+        item: triples[0].item,
+        via: "triple:" + triples[0].score,
+        score: triples[0].score,
+        top: scored.slice(0, 3)
+      };
+    }
+    if (triples.length > 1) {
+      // 多个三重：优先新会话 / 置顶
+      const ranked = [...triples].sort(
+        (a, b) =>
+          Number(b.isNew) - Number(a.isNew) ||
+          Number(a.item.index || 0) - Number(b.item.index || 0) ||
+          b.score - a.score
+      );
+      if (ranked[0].isNew && !ranked[1].isNew) {
+        return {
+          ok: true,
+          item: ranked[0].item,
+          via: "triple-new:" + ranked[0].score,
+          score: ranked[0].score,
           top: scored.slice(0, 3)
         };
       }
+      if (ranked[0].score - ranked[1].score >= 15) {
+        return {
+          ok: true,
+          item: ranked[0].item,
+          via: "triple-gap:" + ranked[0].score,
+          score: ranked[0].score,
+          top: scored.slice(0, 3)
+        };
+      }
+    }
+
+    // B. 唯一「公司+HR」
+    const duoCH = scored.filter((e) => e.duoCH);
+    if (duoCH.length === 1) {
       return {
         ok: true,
-        item: scored[0].item,
-        via: "score:" + scored[0].score,
-        score: scored[0].score,
+        item: duoCH[0].item,
+        via: "company+hr:" + duoCH[0].score,
+        score: duoCH[0].score,
         top: scored.slice(0, 3)
+      };
+    }
+    if (duoCH.length > 1) {
+      // 同 HR 多岗位：用岗位名拆
+      const withTitle = duoCH.filter((e) => e.titleHit);
+      if (withTitle.length === 1) {
+        return {
+          ok: true,
+          item: withTitle[0].item,
+          via: "company+hr+titleHit:" + withTitle[0].score,
+          score: withTitle[0].score,
+          top: scored.slice(0, 3)
+        };
+      }
+      const ranked = [...duoCH].sort(
+        (a, b) =>
+          b.titleScore - a.titleScore ||
+          Number(b.isNew) - Number(a.isNew) ||
+          Number(a.item.index || 0) - Number(b.item.index || 0) ||
+          b.score - a.score
+      );
+      if (ranked[0].titleScore - (ranked[1]?.titleScore || 0) >= 20 || ranked[0].score - (ranked[1]?.score || 0) >= 18) {
+        return {
+          ok: true,
+          item: ranked[0].item,
+          via: "company+hr-gap:" + ranked[0].score,
+          score: ranked[0].score,
+          top: scored.slice(0, 3)
+        };
+      }
+    }
+
+    // C. 唯一新会话 + 公司命中
+    const newCompany = scored.filter((e) => e.isNew && e.companyHit);
+    if (newCompany.length === 1) {
+      return {
+        ok: true,
+        item: newCompany[0].item,
+        via: "new+company:" + newCompany[0].score,
+        score: newCompany[0].score,
+        top: scored.slice(0, 3)
+      };
+    }
+    if (newCompany.length > 1) {
+      const ranked = [...newCompany].sort(
+        (a, b) =>
+          Number(b.hrHit) - Number(a.hrHit) ||
+          b.titleScore - a.titleScore ||
+          b.score - a.score ||
+          Number(a.item.index || 0) - Number(b.item.index || 0)
+      );
+      if (ranked[0].hrHit && !ranked[1].hrHit) {
+        return {
+          ok: true,
+          item: ranked[0].item,
+          via: "new+company+hr:" + ranked[0].score,
+          score: ranked[0].score,
+          top: scored.slice(0, 3)
+        };
+      }
+      if (ranked[0].titleScore - (ranked[1]?.titleScore || 0) >= 18 || ranked[0].score - (ranked[1]?.score || 0) >= 15) {
+        return {
+          ok: true,
+          item: ranked[0].item,
+          via: "new+company-gap:" + ranked[0].score,
+          score: ranked[0].score,
+          top: scored.slice(0, 3)
+        };
+      }
+    }
+
+    // D. 常规最高分，要求拉开差距
+    if (scored[0] && scored[0].score >= 80) {
+      const top = scored[0];
+      const second = scored[1];
+      if (!second || second.score < top.score - 12) {
+        return {
+          ok: true,
+          item: top.item,
+          via: "score:" + top.score,
+          score: top.score,
+          top: scored.slice(0, 3)
+        };
+      }
+      // 贴分但 top 有 HR 命中、second 没有
+      if (top.hrHit && !second.hrHit && top.companyHit) {
+        return {
+          ok: true,
+          item: top.item,
+          via: "hr-break-tie:" + top.score,
+          score: top.score,
+          top: scored.slice(0, 3)
+        };
+      }
+      if (top.titleHit && !second.titleHit && top.companyHit) {
+        return {
+          ok: true,
+          item: top.item,
+          via: "title-break-tie:" + top.score,
+          score: top.score,
+          top: scored.slice(0, 3)
+        };
+      }
+      if (preferNewest && top.isNew && !second.isNew && top.companyHit) {
+        return {
+          ok: true,
+          item: top.item,
+          via: "new-break-tie:" + top.score,
+          score: top.score,
+          top: scored.slice(0, 3)
+        };
+      }
+      if (
+        preferNewest &&
+        Number(top.item.index || 0) === 0 &&
+        top.companyHit &&
+        (top.hrHit || top.titleHit) &&
+        top.score >= second.score
+      ) {
+        return {
+          ok: true,
+          item: top.item,
+          via: "top-recency:" + top.score,
+          score: top.score,
+          top: scored.slice(0, 3)
+        };
+      }
+
+      return {
+        ok: false,
+        error: "CONVERSATION_AMBIGUOUS",
+        top: scored.slice(0, 3),
+        message: "多个相似会话分数接近（公司/HR/岗位未能唯一确定）"
       };
     }
 
     if (newItems.length === 1) {
-      return { ok: true, item: newItems[0], via: "new-single", score: scored[0]?.score || 0, top: scored };
-    }
-
-    const company = normalize(job.company || "");
-    if (newItems.length > 1 && company) {
-      const companyMatches = newItems.filter((item) => containsPrefix(normalize(item.text || ""), company, 4));
-      if (companyMatches.length === 1) {
-        return { ok: true, item: companyMatches[0], via: "new+company", score: 45, top: scored };
-      }
+      return {
+        ok: true,
+        item: newItems[0],
+        via: "new-single",
+        score: scored[0]?.score || 0,
+        top: scored
+      };
     }
 
     return { ok: false, error: "CONVERSATION_NOT_FOUND", top: scored };
@@ -139,18 +440,33 @@
     if (beforeSignature === afterSignature) return false;
     return (afterMessages || []).slice(-5).some((message) => {
       const rendered = compact(message);
-      return rendered === expected ||
+      return (
+        rendered === expected ||
         rendered.includes(expected) ||
-        (expected.length > 12 && rendered.includes(expected.slice(0, 24)));
+        (expected.length > 12 && rendered.includes(expected.slice(0, 24)))
+      );
     });
   }
 
-  root.BHTConversationMatch = Object.freeze({
+  const api = Object.freeze({
     normalize,
+    classTokens,
     hasActiveState,
     stableConversationKey,
     scoreConversation,
     selectConversationCandidate,
     confirmRenderedOwnMessage
   });
-})(globalThis);
+
+  root.ConversationMatch = api;
+  root.BHTConversationMatch = api;
+  try {
+    if (typeof module !== "undefined" && module.exports) module.exports = api;
+  } catch (_) {}
+})(
+  typeof globalThis !== "undefined"
+    ? globalThis
+    : typeof window !== "undefined"
+      ? window
+      : this
+);

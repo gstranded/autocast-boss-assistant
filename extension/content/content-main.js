@@ -17,7 +17,7 @@
     RUN_OP: "BHT_RUN_OP"
   };
 
-  const BHT_CONTENT_VERSION = "1.6.6";
+  const BHT_CONTENT_VERSION = "1.6.7";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -224,7 +224,8 @@ const SELECTORS = {
     ],
     title: ["a.job-name", ".job-name", ".job-title a", ".job-title .job-name"],
     salary: [".job-salary", ".salary", ".job-detail-info .job-salary"],
-    company: [".company-name", ".company-info .name", ".company-text", ".boss-name"],
+    company: [".company-name", ".company-info .name", ".company-text", ".company-info a.name"],
+    hrName: [".boss-name", ".boss-info .name", ".name-box .name", ".job-boss-info .name", ".boss-info-attr .name", ".info-public .name"],
     location: [".company-location", ".job-area", ".job-area-wrapper", ".area"],
     tags: [".tag-list li", ".job-info .tag-list li", ".job-label-list li"],
     online: [".boss-online-icon", ".boss-online-tag", ".online-tag"],
@@ -783,7 +784,16 @@ function firstEl(selectors, root = document) {
       hasChat: communicated,
       canCommunicate: true,
       buttonText: btnText,
-      hrName: "",
+      hrName: (() => {
+        try {
+          let hr = "";
+          if (SELECTORS.hrName) hr = textOf(firstEl(SELECTORS.hrName, card));
+          if (!hr) hr = textOf(card.querySelector?.(".boss-name, .boss-info .name, .name-box .name"));
+          hr = String(hr || "").split(/[·|｜]/)[0].replace(/\s+/g, " ").trim();
+          if (hr && company && normalizeText(hr) === normalizeText(company)) hr = "";
+          return hr;
+        } catch (_) { return ""; }
+      })(),
       online: Boolean(firstEl(SELECTORS.online, card))
     };
   }
@@ -2648,6 +2658,45 @@ async function startChat(job, opts = {}) {
     return { ok: false };
   }
 
+  function extractDetailHrName(scope) {
+    const root =
+      scope ||
+      firstEl(SELECTORS.detailRoot) ||
+      document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+      document;
+    const sels = [
+      ...(SELECTORS.hrName || []),
+      ".boss-info .name",
+      ".boss-name",
+      ".job-boss-info .name",
+      ".boss-info-attr .name",
+      ".info-public .name",
+      ".detail-figure .name",
+      ".job-detail .name"
+    ];
+    for (const sel of sels) {
+      try {
+        const el = root.querySelector(sel);
+        const t = textOf(el).split(/[·|｜]/)[0].replace(/\s+/g, " ").trim();
+        if (t && t.length <= 20 && !/立即沟通|继续沟通|沟通/.test(t)) return t;
+      } catch (_) {}
+    }
+    return "";
+  }
+
+  function extractDetailCompany(scope) {
+    const root =
+      scope ||
+      firstEl(SELECTORS.detailRoot) ||
+      document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+      document;
+    return (
+      textOf(firstEl(SELECTORS.company, root)) ||
+      textOf(root.querySelector?.(".company-name, .company-info .name")) ||
+      ""
+    );
+  }
+
   async function triggerConversationOnList(job = {}) {
     try { rememberListHref(); } catch (_) {}
     dismissCommonDialogs();
@@ -2756,6 +2805,10 @@ async function startChat(job, opts = {}) {
         stayed: Boolean(stay.ok),
         stayText: stay.text || "",
         detailTitle: detailTitle || "",
+        hrName: (typeof extractDetailHrName === "function" ? extractDetailHrName() : "") || job.hrName || job.bossName || "",
+        bossName: (typeof extractDetailHrName === "function" ? extractDetailHrName() : "") || job.hrName || job.bossName || "",
+        company: (typeof extractDetailCompany === "function" ? extractDetailCompany() : "") || job.company || "",
+        title: detailTitle || job.title || "",
         listHref: location.href,
         contentVersion: BHT_CONTENT_VERSION
       };
@@ -2887,28 +2940,42 @@ async function startChat(job, opts = {}) {
   }
 
   function conversationHeaderMatches(job = {}) {
-    const head = normalizeText(getActiveConversationIdentity().head || "");
+    const active = getActiveConversationIdentity();
+    const head = normalizeText((active.head || "") + " " + (active.text || ""));
     if (!head) return false;
     const wantCompany = normalizeText(job.company || "");
     const wantTitle = normalizeText(job.title || "");
     const wantHr = normalizeText(job.hrName || job.bossName || "");
-    let hits = 0;
-    if (wantCompany && head.includes(wantCompany.slice(0, Math.min(3, wantCompany.length)))) hits += 1;
-    if (wantTitle && head.includes(wantTitle.slice(0, Math.min(4, wantTitle.length)))) hits += 1;
-    if (wantHr && head.includes(wantHr)) hits += 1;
-    // 至少命中公司或岗位之一
-    return hits >= 1;
+    const companyHit = Boolean(wantCompany && head.includes(wantCompany.slice(0, Math.min(3, wantCompany.length))));
+    const titleHit = Boolean(wantTitle && head.includes(wantTitle.slice(0, Math.min(4, wantTitle.length))));
+    const hrHit = Boolean(wantHr && (head.includes(wantHr) || head.includes(wantHr.slice(0, Math.min(2, wantHr.length)))));
+    // 有 HR 时：公司+HR 或 HR+岗位 才算稳
+    if (wantHr) return (companyHit && hrHit) || (hrHit && titleHit) || (companyHit && titleHit && hrHit);
+    // 无 HR：公司或岗位命中
+    return companyHit || titleHit;
   }
 
   function getConversationSnapshot() {
     const { sel, nodes } = queryConversationRows();
     const items = nodes.slice(0, 60).map((el, index) => {
       const text = textOf(el);
+      const identityText = typeof conversationIdentityText === "function" ? conversationIdentityText(el) : "";
       const key = conversationKeyFromEl(el) || ("idx_" + index + "_" + text.slice(0, 24));
+      const hrRaw =
+        textOf(el.querySelector?.(".friend-name, .user-name, .boss-name, .name-text, .name-box .name")) ||
+        (identityText.split("|")[0] || "");
+      const company = textOf(el.querySelector?.(".company-name, .company, .company-text")) || "";
+      const title = textOf(el.querySelector?.(".job-name, .position-name, .position, .source-job")) || "";
+      const hrName = String(hrRaw || "").split(/[·|｜]/)[0].trim();
       return {
         index,
         key,
-        text: text.slice(0, 120),
+        text: text.slice(0, 160),
+        identityText: String(identityText || "").slice(0, 160),
+        hrName,
+        bossName: hrName,
+        company: String(company || "").trim(),
+        title: String(title || "").trim(),
         name: text.split(/\s+/)[0] || "",
         active: ConversationMatch?.hasActiveState
           ? ConversationMatch.hasActiveState(el.className || "", el.getAttribute?.("aria-selected"))
@@ -2987,34 +3054,102 @@ async function startChat(job, opts = {}) {
   }
 
   async function waitAndOpenConversation(payload = {}) {
-    // 阶段一：只负责找到并确认打开目标会话（不把输入框失败当成未找到会话）
+    // 阶段一：找到并确认打开目标会话（输入框失败不算“未找到会话”）
     const job = payload.job || {};
     const beforeKeys = new Set(payload.beforeKeys || []);
     const wantTitle = normalizeText(job.title || "");
     const wantCompany = normalizeText(job.company || "");
     const wantHr = normalizeText(job.hrName || job.bossName || "");
-    const deadline = Date.now() + (payload.timeoutMs || 18000);
+    const deadline = Date.now() + (payload.timeoutMs || 22000);
+    const hardAmbiguousAfter = Date.now() + Math.min(12000, Math.max(5000, (payload.timeoutMs || 22000) - 4000));
 
     let lastSnap = null;
+    let lastAmbiguous = null;
+    let ambiguousRounds = 0;
+
     while (Date.now() < deadline) {
       dismissCommonDialogs();
       lastSnap = getConversationSnapshot();
       const items = lastSnap.items || [];
+
+      // 0) BOSS 已自动打开会话：头部身份匹配 + 输入框可用 → 直接成功
+      try {
+        const activeNow = getActiveConversationIdentity();
+        const headOk = conversationHeaderMatches(job);
+        const inputReady = hasUsableChatInput();
+        if (headOk && inputReady) {
+          // 公司必须至少弱命中，避免停在无关会话
+          const headN = normalizeText(activeNow.head || activeNow.text || "");
+          const companyOk = !wantCompany || headN.includes(wantCompany.slice(0, Math.min(3, wantCompany.length)));
+          if (companyOk) {
+            return {
+              ok: true,
+              matchedVia: "already-active-header",
+              conversationText: String(activeNow.text || activeNow.head || "").slice(0, 120),
+              active: activeNow,
+              head: activeNow.head,
+              contentVersion: BHT_CONTENT_VERSION
+            };
+          }
+        }
+      } catch (_) {}
+
       const selection = ConversationMatch?.selectConversationCandidate
-        ? ConversationMatch.selectConversationCandidate(items, job, beforeKeys)
+        ? ConversationMatch.selectConversationCandidate(items, job, beforeKeys, { preferNewest: true })
         : { ok: false, error: "CONVERSATION_NOT_FOUND", top: [] };
+
+      // 歧义：不要立刻失败。刚点「立即沟通」时列表可能短暂出现多个同公司会话，
+      // 新会话置顶/标题刷新需要几百毫秒～数秒。
       if (!selection.ok && selection.error === "CONVERSATION_AMBIGUOUS") {
-        return {
-          ok: false,
-          error: "CONVERSATION_AMBIGUOUS",
-          message: "消息列表中匹配到多个相似会话，已暂停避免发错人",
-          top: (selection.top || []).slice(0, 3).map((entry) => ({
-            score: entry.score,
-            text: entry.item?.text || ""
-          })),
-          contentVersion: BHT_CONTENT_VERSION
-        };
+        lastAmbiguous = selection;
+        ambiguousRounds += 1;
+        // 硬超时前继续等；超时后尝试“置顶+公司”兜底
+        if (Date.now() < hardAmbiguousAfter) {
+          await sleep(450);
+          continue;
+        }
+        // 兜底：分数最高且公司命中的置顶项
+        const top = (selection.top || [])[0];
+        const second = (selection.top || [])[1];
+        const topItem = top?.item;
+        const companyHit =
+          topItem &&
+          wantCompany &&
+          normalizeText(topItem.text || "").includes(wantCompany.slice(0, Math.min(3, wantCompany.length)));
+        const titleBetter =
+          (top?.titleScore || 0) >= (second?.titleScore || 0) ||
+          (top?.score || 0) - (second?.score || 0) >= 5;
+        if (topItem && companyHit && Number(topItem.index || 0) <= 1 && titleBetter) {
+          // 当作可点击候选继续走打开确认
+          selection.ok = true;
+          selection.item = topItem;
+          selection.via = "ambiguous-fallback-top:" + (top.score || 0);
+          selection.score = top.score || 0;
+          log("msg ambiguous fallback top", {
+            text: topItem.text,
+            score: top.score,
+            second: second?.score,
+            rounds: ambiguousRounds
+          });
+        } else if (Date.now() + 800 >= deadline) {
+          return {
+            ok: false,
+            error: "CONVERSATION_AMBIGUOUS",
+            message: "消息列表中匹配到多个相似会话，已暂停避免发错人",
+            top: (selection.top || []).slice(0, 3).map((entry) => ({
+              score: entry.score,
+              titleScore: entry.titleScore,
+              companyScore: entry.companyScore,
+              text: entry.item?.text || ""
+            })),
+            contentVersion: BHT_CONTENT_VERSION
+          };
+        } else {
+          await sleep(450);
+          continue;
+        }
       }
+
       const pick = selection.ok ? selection.item : null;
       const via = selection.ok ? selection.via : "";
 
@@ -3023,13 +3158,9 @@ async function startChat(job, opts = {}) {
         log("msg open candidate", { via, key: pick.key, text: pick.text, beforeKey: before.key });
         const row = resolveConversationElement(pick);
         if (!row) {
-          return {
-            ok: false,
-            error: "CONVERSATION_ELEMENT_NOT_FOUND",
-            message: "匹配到会话但 DOM 节点已变化，无法点击",
-            pick,
-            contentVersion: BHT_CONTENT_VERSION
-          };
+          // DOM 抖动：再等一轮
+          await sleep(350);
+          continue;
         }
         const clickable =
           row.querySelector("a[href], [role='button'], .friend-content, .user-item, .friend-item, .conversation-item, .geek-info-card") ||
@@ -3049,11 +3180,9 @@ async function startChat(job, opts = {}) {
           const keyIsPick = after.key && pick.key && (after.key === pick.key || after.key.includes(String(pick.key).slice(0, 12)));
           const headOk = conversationHeaderMatches(job);
           const textOnHead = pick.text && normalizeText(after.head || "").includes(normalizeText(pick.text).slice(0, 6));
-          // 列表项自身变 active
           const rowActive = ConversationMatch?.hasActiveState
             ? ConversationMatch.hasActiveState(row.className || "", row.getAttribute?.("aria-selected"))
             : /(^|\s)(active|selected|current|on)(\s|$)/i.test(row.className || "");
-          // 输入框出现也算打开成功的强信号（但还要头部/公司校验）
           const inputReady = hasUsableChatInput();
 
           if (keyChanged && (keyIsPick || headOk)) { switched = true; switchVia = "key-changed+identity"; break; }
@@ -3071,7 +3200,6 @@ async function startChat(job, opts = {}) {
         }
 
         if (!switched) {
-          // 最后兜底：候选文本已含公司+岗位，且输入框可用，允许继续但记 weak
           const pickN = normalizeText(pick.text || "");
           const weakOk =
             hasUsableChatInput() &&
@@ -3085,19 +3213,12 @@ async function startChat(job, opts = {}) {
         }
 
         if (!switched) {
-          return {
-            ok: false,
-            error: "CONVERSATION_OPEN_NOT_CONFIRMED",
-            message: "已点击会话，但未确认切换成功",
-            before,
-            after: getActiveConversationIdentity(),
-            pickText: pick.text,
-            diagnostic: collectEditorDiagnostic(),
-            contentVersion: BHT_CONTENT_VERSION
-          };
+          // 打开未确认：继续外层循环重试匹配，不要立刻整任务失败
+          await sleep(400);
+          continue;
         }
 
-        // 身份必须来自已打开的头部或真正处于 active 状态的候选行，不能只凭“点过的文本”放行。
+        // 身份必须来自已打开的头部或真正处于 active 状态的候选行
         const activeNow = getActiveConversationIdentity();
         const headN = normalizeText(activeNow.head || "");
         const pickN = normalizeText(pick.text || "");
@@ -3115,35 +3236,47 @@ async function startChat(job, opts = {}) {
           if (!(wantCompany && contextN.includes(wantCompany.slice(0, 3)))) idOk = false;
         }
         if (!idOk) {
-          return {
-            ok: false,
-            error: "CONVERSATION_IDENTITY_MISMATCH",
-            message: "打开的会话与目标公司/岗位不匹配，已停止发送",
-            head: activeNow.head,
-            pickText: pick.text,
-            wantCompany: job.company,
-            wantTitle: job.title,
-            contentVersion: BHT_CONTENT_VERSION
-          };
+          // 身份不匹配：继续找，不立刻 fail 整任务
+          log("msg identity mismatch, retry", { head: activeNow.head, pick: pick.text, via, switchVia });
+          await sleep(350);
+          continue;
         }
 
         return {
           ok: true,
-          opened: true,
-          matchedVia: via + "|" + switchVia,
-          conversationText: pick.text,
+          matchedVia: String(via || "") + "|" + switchVia,
+          conversationText: String(pick.text || activeNow.text || "").slice(0, 120),
           active: activeNow,
+          head: activeNow.head,
+          pick,
           contentVersion: BHT_CONTENT_VERSION
         };
       }
-      await sleep(450);
+
+      // 未命中：继续等新会话出现
+      await sleep(400);
+    }
+
+    if (lastAmbiguous) {
+      return {
+        ok: false,
+        error: "CONVERSATION_AMBIGUOUS",
+        message: "消息列表中匹配到多个相似会话，已暂停避免发错人",
+        top: (lastAmbiguous.top || []).slice(0, 3).map((entry) => ({
+          score: entry.score,
+          titleScore: entry.titleScore,
+          companyScore: entry.companyScore,
+          text: entry.item?.text || ""
+        })),
+        contentVersion: BHT_CONTENT_VERSION
+      };
     }
 
     return {
       ok: false,
       error: "CONVERSATION_NOT_FOUND",
-      message: "消息页未找到对应会话。公司=" + (job.company || "") + " 岗位=" + (job.title || ""),
-      snapshotCount: lastSnap?.count || 0,
+      message: "未在消息列表中找到与该岗位匹配的会话",
+      count: lastSnap?.count || 0,
       sample: (lastSnap?.items || []).slice(0, 5).map((x) => x.text),
       contentVersion: BHT_CONTENT_VERSION
     };

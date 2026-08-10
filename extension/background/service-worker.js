@@ -1323,6 +1323,23 @@ async function processOneJob(task, resultRow, config) {
     return 'failed';
   }
 
+  // 列表详情拿到的 HR/公司/岗位，合并进 job，供消息页「公司+HR+岗位」匹配
+  /* merge identity from list trigger */
+  if (trig?.ok) {
+    if (trig.hrName || trig.bossName) {
+      job.hrName = trig.hrName || trig.bossName;
+      job.bossName = trig.hrName || trig.bossName;
+    }
+    if (trig.company) job.company = job.company || trig.company;
+    if (trig.title || trig.detailTitle) job.title = job.title || trig.title || trig.detailTitle;
+    await log('info', '[列表页] 沟通对象身份：HR=' + (job.hrName || '未知') + ' · 公司=' + (job.company || '') + ' · 岗位=' + String(job.title || '').slice(0, 40), {
+      jobId: job.jobId,
+      hrName: job.hrName || '',
+      company: job.company || '',
+      title: job.title || ''
+    });
+  }
+
   // 消息页阶段一：解析并打开会话（不含输入框门禁）
   await sleep(600);
   try { await chrome.tabs.update(msgTabId, { active: true }); } catch (_) {}
