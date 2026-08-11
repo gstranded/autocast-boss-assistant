@@ -14,10 +14,12 @@
     RETURN_TO_LIST: "BHT_RETURN_TO_LIST",
     CLOSE_CHAT: "BHT_CLOSE_CHAT",
     DIAGNOSE: "BHT_DIAGNOSE",
-    RUN_OP: "BHT_RUN_OP"
+    RUN_OP: "BHT_RUN_OP",
+    CANCEL_OP: "BHT_CANCEL_OP",
+    DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.6.7";
+  const BHT_CONTENT_VERSION = "1.6.8";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -27,6 +29,8 @@
   }
   window.__BHT_CONTENT_VERSION__ = BHT_CONTENT_VERSION;
   window.__BHT_OP_LOCK__ = null; // boot: 导航后新脚本不继承旧锁
+  window.__BHT_OP_CANCELLED__ = Object.create(null);
+  window.__BHT_ACTIVE_OP_ID__ = null;
   window.__BHT_CONTENT_LOADED__ = true;
 
   function isBossHost(hostname) {
@@ -43,6 +47,26 @@
 
 
   const log = (...args) => console.log("[BHT content]", ...args);
+
+  function debugTrace(event, data = {}, level = "debug") {
+    if (window.__BHT_DEBUG_ENABLED__ !== true) return;
+    try {
+      chrome.runtime.sendMessage({
+        type: MSG.DEBUG_EVENT,
+        payload: {
+          ts: Date.now(),
+          level,
+          scope: "content",
+          event,
+          data: {
+            href: location.href,
+            opId: window.__BHT_ACTIVE_OP_ID__ || null,
+            ...data
+          }
+        }
+      }).catch(() => {});
+    } catch (_) {}
+  }
 
   
   function isListLikePage(href = location.href) {
@@ -224,7 +248,16 @@ const SELECTORS = {
     ],
     title: ["a.job-name", ".job-name", ".job-title a", ".job-title .job-name"],
     salary: [".job-salary", ".salary", ".job-detail-info .job-salary"],
-    company: [".company-name", ".company-info .name", ".company-text", ".company-info a.name"],
+    company: [
+      ".company-name",
+      ".company-info .name",
+      ".company-text",
+      ".company-info a.name",
+      ".company-info h3 a",
+      ".company-info .company-name",
+      ".company-card a",
+      "a[ka*='job_list_company']"
+    ],
     hrName: [".boss-name", ".boss-info .name", ".name-box .name", ".job-boss-info .name", ".boss-info-attr .name", ".info-public .name"],
     location: [".company-location", ".job-area", ".job-area-wrapper", ".area"],
     tags: [".tag-list li", ".job-info .tag-list li", ".job-label-list li"],
@@ -292,8 +325,22 @@ const SELECTORS = {
     ]
   };
 
+  function operationCancelledError(opId) {
+    const error = new Error("任务已停止，页面操作已取消");
+    error.code = "OP_CANCELLED";
+    error.opId = opId || "";
+    return error;
+  }
+
   function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
+    const opId = window.__BHT_ACTIVE_OP_ID__;
+    if (opId && window.__BHT_OP_CANCELLED__?.[opId]) {
+      return Promise.reject(operationCancelledError(opId));
+    }
+    return new Promise((resolve, reject) => setTimeout(() => {
+      if (opId && window.__BHT_OP_CANCELLED__?.[opId]) reject(operationCancelledError(opId));
+      else resolve();
+    }, ms));
   }
 
   function textOf(el) {
@@ -704,9 +751,10 @@ function firstEl(selectors, root = document) {
   }
 
   function parseJobCard(card, index) {
+    const scope = card.closest?.(".job-card-wrap, .job-card-wrapper") || card;
     const titleEl = firstEl(SELECTORS.title, card);
     const salaryEl = firstEl(SELECTORS.salary, card);
-    const companyEl = firstEl(SELECTORS.company, card);
+    const companyEl = firstEl(SELECTORS.company, scope);
     const locationEl = firstEl(SELECTORS.location, card);
     const activeEl = firstEl(SELECTORS.activeText, card);
     const tags = allEl(SELECTORS.tags, card).map(textOf).filter(Boolean).slice(0, 12);
@@ -758,7 +806,7 @@ function firstEl(selectors, root = document) {
     const title = textOf(titleEl) || textOf(card).slice(0, 40);
     const company = textOf(companyEl);
     const salary = extractSalary(card, salaryEl);
-    const location = textOf(locationEl);
+    const locationText = textOf(locationEl);
     const activeText = textOf(activeEl) || (firstEl(SELECTORS.online, card) ? "在线" : "");
     const jd = [textOf(card), tags.join(" ")].join(" ");
 
@@ -775,11 +823,11 @@ function firstEl(selectors, root = document) {
       title,
       company,
       salary,
-      location,
+      location: locationText,
       activeText,
       tags,
       jd,
-      href: href.startsWith("http") ? href : href ? new URL(href, location.origin).href : "",
+      href: href.startsWith("http") ? href : href ? new URL(href, globalThis.location.origin).href : "",
       communicated,
       hasChat: communicated,
       canCommunicate: true,
@@ -789,7 +837,9 @@ function firstEl(selectors, root = document) {
           let hr = "";
           if (SELECTORS.hrName) hr = textOf(firstEl(SELECTORS.hrName, card));
           if (!hr) hr = textOf(card.querySelector?.(".boss-name, .boss-info .name, .name-box .name"));
-          hr = String(hr || "").split(/[·|｜]/)[0].replace(/\s+/g, " ").trim();
+          hr = globalThis.BHTConversationMatch?.cleanHrIdentity
+            ? globalThis.BHTConversationMatch.cleanHrIdentity(hr)
+            : String(hr || "").split(/[·|｜]/)[0].replace(/\s+/g, " ").trim();
           if (hr && company && normalizeText(hr) === normalizeText(company)) hr = "";
           return hr;
         } catch (_) { return ""; }
@@ -865,6 +915,21 @@ function firstEl(selectors, root = document) {
     if (payload.scroll) await autoScrollList(payload.maxRounds || 6);
     const cards = getJobCards();
     const jobs = cards.map((c, i) => parseJobCard(c, i));
+    debugTrace("scan_jobs_snapshot", {
+      cardCount: cards.length,
+      parsedCount: jobs.length,
+      missingCompanyCount: jobs.filter((job) => !job.company).length,
+      page: pageInfo(),
+      jobs: jobs.slice(0, 80).map((job) => ({
+        index: job.index,
+        jobId: job.jobId,
+        title: job.title,
+        company: job.company,
+        hrName: job.hrName,
+        location: job.location,
+        href: job.href
+      }))
+    }, jobs.some((job) => !job.company) ? "warn" : "debug");
     try{rememberListHref();}catch(_){} return { ok: true, listHref: (typeof getSavedListHref==="function"?getSavedListHref():"")||location.href, listExpectLabel: (typeof detectSelectedJobExpect==="function"?detectSelectedJobExpect():"")||"", listFilterHints: (typeof detectActiveFilterHints==="function"?detectActiveFilterHints():[]), page: pageInfo(),
       jobs,
       count: jobs.length,
@@ -2677,7 +2742,10 @@ async function startChat(job, opts = {}) {
     for (const sel of sels) {
       try {
         const el = root.querySelector(sel);
-        const t = textOf(el).split(/[·|｜]/)[0].replace(/\s+/g, " ").trim();
+        const raw = textOf(el);
+        const t = ConversationMatch?.cleanHrIdentity
+          ? ConversationMatch.cleanHrIdentity(raw)
+          : raw.split(/[·|｜]/)[0].replace(/\s+/g, " ").trim();
         if (t && t.length <= 20 && !/立即沟通|继续沟通|沟通/.test(t)) return t;
       } catch (_) {}
     }
@@ -2698,6 +2766,15 @@ async function startChat(job, opts = {}) {
   }
 
   async function triggerConversationOnList(job = {}) {
+    debugTrace("trigger_conversation_begin", {
+      job: {
+        jobId: job.jobId || "",
+        title: job.title || "",
+        company: job.company || "",
+        hrName: job.hrName || job.bossName || ""
+      },
+      page: { title: document.title, cards: getJobCards().length }
+    });
     try { rememberListHref(); } catch (_) {}
     dismissCommonDialogs();
     if (typeof detectLoginModal === "function") {
@@ -2712,6 +2789,11 @@ async function startChat(job, opts = {}) {
     }
     if (!card) {
       const samples = getJobCards().slice(0, 5).map((el, i) => parseJobCard(el, i).title).filter(Boolean);
+      debugTrace("trigger_conversation_job_not_found", {
+        requested: { title: job.title || "", company: job.company || "", jobId: job.jobId || "" },
+        cardCount: getJobCards().length,
+        samples
+      }, "warn");
       return {
         ok: false,
         error: "LIST_JOB_NOT_FOUND",
@@ -2797,7 +2879,7 @@ async function startChat(job, opts = {}) {
       // 再关一次常见弹层
       dismissCommonDialogs();
 
-      return {
+      const triggerResult = {
         ok: true,
         phase: "CHAT_TRIGGERED",
         buttonText: clicked.buttonText,
@@ -2966,7 +3048,9 @@ async function startChat(job, opts = {}) {
         (identityText.split("|")[0] || "");
       const company = textOf(el.querySelector?.(".company-name, .company, .company-text")) || "";
       const title = textOf(el.querySelector?.(".job-name, .position-name, .position, .source-job")) || "";
-      const hrName = String(hrRaw || "").split(/[·|｜]/)[0].trim();
+      const hrName = ConversationMatch?.cleanHrIdentity
+        ? ConversationMatch.cleanHrIdentity(hrRaw)
+        : String(hrRaw || "").split(/[·|｜]/)[0].trim();
       return {
         index,
         key,
@@ -3066,11 +3150,42 @@ async function startChat(job, opts = {}) {
     let lastSnap = null;
     let lastAmbiguous = null;
     let ambiguousRounds = 0;
+    let lastSnapshotSignature = "";
+    const attemptedKeys = new Set();
+
+    debugTrace("conversation_wait_begin", {
+      target: {
+        title: job.title || "",
+        company: job.company || "",
+        hrName: job.hrName || job.bossName || ""
+      },
+      beforeKeyCount: beforeKeys.size,
+      timeoutMs: payload.timeoutMs || 22000
+    });
 
     while (Date.now() < deadline) {
       dismissCommonDialogs();
       lastSnap = getConversationSnapshot();
       const items = lastSnap.items || [];
+      const snapshotSignature = items.slice(0, 8).map((item) => item.key + ":" + item.text).join("|");
+      if (snapshotSignature !== lastSnapshotSignature) {
+        lastSnapshotSignature = snapshotSignature;
+        debugTrace("conversation_snapshot", {
+          count: items.length,
+          selector: lastSnap.selector,
+          active: lastSnap.active,
+          topRows: items.slice(0, 8).map((item) => ({
+            index: item.index,
+            key: item.key,
+            text: item.text,
+            hrName: item.hrName,
+            company: item.company,
+            title: item.title,
+            isNew: Boolean(item.key && !beforeKeys.has(item.key)),
+            active: item.active
+          }))
+        });
+      }
 
       // 0) BOSS 已自动打开会话：头部身份匹配 + 输入框可用 → 直接成功
       try {
@@ -3082,6 +3197,7 @@ async function startChat(job, opts = {}) {
           const headN = normalizeText(activeNow.head || activeNow.text || "");
           const companyOk = !wantCompany || headN.includes(wantCompany.slice(0, Math.min(3, wantCompany.length)));
           if (companyOk) {
+            debugTrace("conversation_already_active", { active: activeNow, headOk, inputReady, companyOk });
             return {
               ok: true,
               matchedVia: "already-active-header",
@@ -3098,66 +3214,74 @@ async function startChat(job, opts = {}) {
         ? ConversationMatch.selectConversationCandidate(items, job, beforeKeys, { preferNewest: true })
         : { ok: false, error: "CONVERSATION_NOT_FOUND", top: [] };
 
+      debugTrace("conversation_selection", {
+        ok: selection.ok,
+        error: selection.error || "",
+        via: selection.via || "",
+        score: selection.score || 0,
+        reason: selection.ok
+          ? "候选满足新会话与公司/HR/岗位身份规则"
+          : selection.error === "CONVERSATION_AMBIGUOUS"
+            ? "多个候选分数接近；仅凭置顶位置可能误发，等待列表稳定"
+            : "当前列表没有达到安全阈值的候选",
+        top: (selection.top || []).slice(0, 5).map((entry) => ({
+          index: entry.item?.index,
+          key: entry.item?.key,
+          text: entry.item?.text,
+          score: entry.score,
+          isNew: entry.isNew,
+          companyHit: entry.companyHit,
+          hrHit: entry.hrHit,
+          titleHit: entry.titleHit,
+          companyScore: entry.companyScore,
+          hrScore: entry.hrScore,
+          titleScore: entry.titleScore
+        }))
+      }, selection.ok ? "debug" : "warn");
+
       // 歧义：不要立刻失败。刚点「立即沟通」时列表可能短暂出现多个同公司会话，
       // 新会话置顶/标题刷新需要几百毫秒～数秒。
       if (!selection.ok && selection.error === "CONVERSATION_AMBIGUOUS") {
         lastAmbiguous = selection;
         ambiguousRounds += 1;
-        // 硬超时前继续等；超时后尝试“置顶+公司”兜底
+        // 只等待列表稳定，不按“置顶/最新”猜测；歧义必须暂停，避免发错人。
         if (Date.now() < hardAmbiguousAfter) {
           await sleep(450);
           continue;
         }
-        // 兜底：分数最高且公司命中的置顶项
-        const top = (selection.top || [])[0];
-        const second = (selection.top || [])[1];
-        const topItem = top?.item;
-        const companyHit =
-          topItem &&
-          wantCompany &&
-          normalizeText(topItem.text || "").includes(wantCompany.slice(0, Math.min(3, wantCompany.length)));
-        const titleBetter =
-          (top?.titleScore || 0) >= (second?.titleScore || 0) ||
-          (top?.score || 0) - (second?.score || 0) >= 5;
-        if (topItem && companyHit && Number(topItem.index || 0) <= 1 && titleBetter) {
-          // 当作可点击候选继续走打开确认
-          selection.ok = true;
-          selection.item = topItem;
-          selection.via = "ambiguous-fallback-top:" + (top.score || 0);
-          selection.score = top.score || 0;
-          log("msg ambiguous fallback top", {
-            text: topItem.text,
-            score: top.score,
-            second: second?.score,
-            rounds: ambiguousRounds
-          });
-        } else if (Date.now() + 800 >= deadline) {
-          return {
-            ok: false,
-            error: "CONVERSATION_AMBIGUOUS",
-            message: "消息列表中匹配到多个相似会话，已暂停避免发错人",
-            top: (selection.top || []).slice(0, 3).map((entry) => ({
-              score: entry.score,
-              titleScore: entry.titleScore,
-              companyScore: entry.companyScore,
-              text: entry.item?.text || ""
-            })),
-            contentVersion: BHT_CONTENT_VERSION
-          };
-        } else {
-          await sleep(450);
-          continue;
-        }
+        return {
+          ok: false,
+          error: "CONVERSATION_AMBIGUOUS",
+          message: "消息列表中匹配到多个相似会话，已暂停避免发错人",
+          top: (selection.top || []).slice(0, 3).map((entry) => ({
+            score: entry.score,
+            titleScore: entry.titleScore,
+            companyScore: entry.companyScore,
+            text: entry.item?.text || ""
+          })),
+          rounds: ambiguousRounds,
+          contentVersion: BHT_CONTENT_VERSION
+        };
       }
 
       const pick = selection.ok ? selection.item : null;
       const via = selection.ok ? selection.via : "";
 
       if (pick) {
+        if (attemptedKeys.has(pick.key)) {
+          debugTrace("conversation_candidate_already_clicked", {
+            key: pick.key,
+            text: pick.text,
+            reason: "本轮已点击过该候选，不重复点击，避免聊天界面闪烁"
+          }, "warn");
+          await sleep(400);
+          continue;
+        }
         const before = getActiveConversationIdentity();
         log("msg open candidate", { via, key: pick.key, text: pick.text, beforeKey: before.key });
         const row = resolveConversationElement(pick);
         if (!row) {
+          debugTrace("conversation_candidate_dom_missing", { key: pick.key, text: pick.text }, "warn");
           // DOM 抖动：再等一轮
           await sleep(350);
           continue;
@@ -3165,6 +3289,14 @@ async function startChat(job, opts = {}) {
         const clickable =
           row.querySelector("a[href], [role='button'], .friend-content, .user-item, .friend-item, .conversation-item, .geek-info-card") ||
           row;
+        attemptedKeys.add(pick.key);
+        debugTrace("conversation_candidate_click", {
+          via,
+          key: pick.key,
+          index: pick.index,
+          text: pick.text,
+          before
+        });
         try { clickable.scrollIntoView({ block: "center", behavior: "instant" }); } catch (_) {}
         clickLikeHuman(clickable);
         await sleep(500);
@@ -3185,6 +3317,20 @@ async function startChat(job, opts = {}) {
             : /(^|\s)(active|selected|current|on)(\s|$)/i.test(row.className || "");
           const inputReady = hasUsableChatInput();
 
+          if (i === 0 || i === 3 || i === 8 || i === 14 || headOk || keyIsPick) {
+            debugTrace("conversation_switch_probe", {
+              probe: i,
+              keyChanged,
+              keyIsPick,
+              headOk,
+              textOnHead,
+              rowActive,
+              inputReady,
+              before,
+              after
+            });
+          }
+
           if (keyChanged && (keyIsPick || headOk)) { switched = true; switchVia = "key-changed+identity"; break; }
           if (keyIsPick) { switched = true; switchVia = "key-is-pick"; break; }
           if (headOk) { switched = true; switchVia = "header-match"; break; }
@@ -3193,10 +3339,6 @@ async function startChat(job, opts = {}) {
             switched = true; switchVia = "input+context"; break;
           }
 
-          if (i === 3 || i === 8 || i === 14) {
-            const a = row.querySelector("a[href], [role='button'], .friend-content, .user-item, .friend-item") || row;
-            clickLikeHuman(a);
-          }
         }
 
         if (!switched) {
@@ -3213,6 +3355,12 @@ async function startChat(job, opts = {}) {
         }
 
         if (!switched) {
+          debugTrace("conversation_switch_unconfirmed", {
+            key: pick.key,
+            text: pick.text,
+            active: getActiveConversationIdentity(),
+            reason: "点击后没有足够的 active/header/input 身份信号；不再重复点击同一行"
+          }, "warn");
           // 打开未确认：继续外层循环重试匹配，不要立刻整任务失败
           await sleep(400);
           continue;
@@ -3238,11 +3386,18 @@ async function startChat(job, opts = {}) {
         if (!idOk) {
           // 身份不匹配：继续找，不立刻 fail 整任务
           log("msg identity mismatch, retry", { head: activeNow.head, pick: pick.text, via, switchVia });
+          debugTrace("conversation_identity_mismatch", {
+            active: activeNow,
+            pick: { key: pick.key, text: pick.text },
+            target: { title: job.title || "", company: job.company || "", hrName: job.hrName || job.bossName || "" },
+            via,
+            switchVia
+          }, "warn");
           await sleep(350);
           continue;
         }
 
-        return {
+        const opened = {
           ok: true,
           matchedVia: String(via || "") + "|" + switchVia,
           conversationText: String(pick.text || activeNow.text || "").slice(0, 120),
@@ -3251,6 +3406,8 @@ async function startChat(job, opts = {}) {
           pick,
           contentVersion: BHT_CONTENT_VERSION
         };
+        debugTrace("conversation_open_confirmed", opened);
+        return opened;
       }
 
       // 未命中：继续等新会话出现
@@ -3258,6 +3415,10 @@ async function startChat(job, opts = {}) {
     }
 
     if (lastAmbiguous) {
+      debugTrace("conversation_wait_ambiguous_timeout", {
+        rounds: ambiguousRounds,
+        top: (lastAmbiguous.top || []).slice(0, 5)
+      }, "error");
       return {
         ok: false,
         error: "CONVERSATION_AMBIGUOUS",
@@ -3270,9 +3431,11 @@ async function startChat(job, opts = {}) {
         })),
         contentVersion: BHT_CONTENT_VERSION
       };
+      debugTrace("trigger_conversation_done", triggerResult);
+      return triggerResult;
     }
 
-    return {
+    const notFound = {
       ok: false,
       error: "CONVERSATION_NOT_FOUND",
       message: "未在消息列表中找到与该岗位匹配的会话",
@@ -3280,6 +3443,8 @@ async function startChat(job, opts = {}) {
       sample: (lastSnap?.items || []).slice(0, 5).map((x) => x.text),
       contentVersion: BHT_CONTENT_VERSION
     };
+    debugTrace("conversation_wait_not_found", notFound, "error");
+    return notFound;
   }
 
   async function waitChatEditor(payload = {}) {
@@ -3315,7 +3480,7 @@ async function startChat(job, opts = {}) {
 
 async function runOpByType(type, payload = {}) {
     const lockKey = String(type || '');
-    const needLock = /START_CHAT|SEND_TEXT|SEND_IMAGE|SEND_RESUME|SCAN_JOBS/.test(lockKey) || /BHT_START_CHAT|BHT_SEND_TEXT|BHT_SEND_IMAGE|BHT_SEND_RESUME|BHT_SCAN_JOBS/.test(lockKey);
+    const needLock = /START_CHAT|TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SEND_RESUME|SCAN_JOBS/.test(lockKey);
     if (needLock) {
       if (window.__BHT_OP_LOCK__) {
         return { ok: false, error: 'OP_BUSY', message: '已有操作进行中', contentVersion: BHT_CONTENT_VERSION };
@@ -3393,11 +3558,39 @@ async function runOpByType(type, payload = {}) {
   const onBhtMessage = (message, _sender, sendResponse) => {
     const { type, payload } = message || {};
 
+    if (type === MSG.CANCEL_OP || type === "BHT_CANCEL_OP") {
+      const opId = String(payload?.opId || "");
+      debugTrace("operation_cancel_received", { opId, reason: payload?.reason || "任务已停止" }, "warn");
+      if (opId) window.__BHT_OP_CANCELLED__[opId] = true;
+      if (opId && window.__BHT_OP_INFLIGHT__?.[opId]) {
+        window.__BHT_OP_INFLIGHT__[opId].cancelled = true;
+      }
+      try {
+        chrome.storage.local.set({
+          ["bht_op_" + opId]: {
+            status: "cancelled",
+            opId,
+            reason: payload?.reason || "任务已停止",
+            at: Date.now(),
+            contentVersion: BHT_CONTENT_VERSION
+          }
+        });
+      } catch (_) {}
+      sendResponse({ ok: true, cancelled: Boolean(opId), opId });
+      return true;
+    }
+
     // storage 桥：立即 ACK，后台轮询结果，避免 SPA 点击打断 channel
     if (type === "BHT_RUN_OP" || type === MSG.RUN_OP) {
       const opId = payload?.opId;
       const opType = payload?.opType || payload?.type;
       const opPayload = payload?.opPayload || payload?.payload || {};
+      window.__BHT_DEBUG_ENABLED__ = opPayload?.__bhtDebugEnabled === true;
+      debugTrace("operation_received", {
+        opId,
+        opType,
+        page: { title: document.title, readyState: document.readyState }
+      });
       const inflight = (window.__BHT_OP_INFLIGHT__ = window.__BHT_OP_INFLIGHT__ || Object.create(null));
 
       // 同 opId 幂等：已在执行则只 ACK，不二次 run（避免 OP_BUSY 覆盖真结果）
@@ -3442,7 +3635,7 @@ async function runOpByType(type, payload = {}) {
         // START_CHAT 允许更长；超时不强制清锁抢跑，由 finally 统一释放
         const opTimeoutMs = /START_CHAT/.test(String(opType || ""))
           ? 45000
-          : /SEND_TEXT|SEND_IMAGE|SEND_RESUME|SCAN_JOBS/.test(String(opType || ""))
+          : /TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SEND_RESUME|SCAN_JOBS/.test(String(opType || ""))
             ? 30000
             : 15000;
 
@@ -3450,6 +3643,7 @@ async function runOpByType(type, payload = {}) {
         let timedOut = false;
         let workPromise;
         try {
+          window.__BHT_ACTIVE_OP_ID__ = opId || null;
           workPromise = runOpByType(opType, opPayload);
           result = await Promise.race([
             workPromise.then((r) => r),
@@ -3477,7 +3671,14 @@ async function runOpByType(type, payload = {}) {
             }
           }
         } catch (err) {
-          result = { ok: false, error: String(err?.message || err), contentVersion: BHT_CONTENT_VERSION };
+          result = {
+            ok: false,
+            error: err?.code === "OP_CANCELLED" ? "OP_CANCELLED" : String(err?.message || err),
+            message: String(err?.message || err),
+            contentVersion: BHT_CONTENT_VERSION
+          };
+        } finally {
+          if (window.__BHT_ACTIVE_OP_ID__ === opId) window.__BHT_ACTIVE_OP_ID__ = null;
         }
         if (!result) {
           result = { ok: false, error: "EMPTY_RESULT", contentVersion: BHT_CONTENT_VERSION };
@@ -3501,23 +3702,39 @@ async function runOpByType(type, payload = {}) {
           }
         } catch (_) {}
 
+        const wasCancelled = Boolean(opId && window.__BHT_OP_CANCELLED__?.[opId]);
+        if (wasCancelled) {
+          result = { ok: false, error: "OP_CANCELLED", message: "任务已停止，页面操作已取消", contentVersion: BHT_CONTENT_VERSION };
+        }
         try {
-          await chrome.storage.local.set({
-            ["bht_op_" + opId]: {
-              status: "done",
-              opType,
-              result,
-              at: Date.now(),
-              contentVersion: BHT_CONTENT_VERSION
-            }
-          });
+          if (wasCancelled) {
+            await chrome.storage.local.remove("bht_op_" + opId);
+          } else {
+            await chrome.storage.local.set({
+              ["bht_op_" + opId]: {
+                status: "done",
+                opType,
+                result,
+                at: Date.now(),
+                contentVersion: BHT_CONTENT_VERSION
+              }
+            });
+          }
         } catch (e) {
           log("storage write fail", e);
         }
+        debugTrace("operation_completed", {
+          opId,
+          opType,
+          timedOut,
+          wasCancelled,
+          result
+        }, result?.ok ? "debug" : "warn");
         try {
           chrome.runtime.sendMessage({ type: "BHT_OP_DONE", payload: { opId, result } }).catch(() => {});
         } catch (_) {}
         if (opId) delete inflight[opId];
+        if (opId) delete window.__BHT_OP_CANCELLED__[opId];
       })();
       return true;
     }
@@ -3541,46 +3758,24 @@ async function runOpByType(type, payload = {}) {
   window.__BHT_ON_MESSAGE__ = onBhtMessage;
   chrome.runtime.onMessage.addListener(onBhtMessage);
 
-  // Port 备用通道
-  if (!window.__BHT_ON_CONNECT__) {
-    const onConnect = (port) => {
-      if (!port || port.name !== "bht-op") return;
-      port.onMessage.addListener((message) => {
-        const { type, payload, reqId } = message || {};
-        (async () => {
-          try {
-            return await runOpByType(type, payload || {});
-          } catch (err) {
-            return { ok: false, error: String(err?.message || err) };
-          }
-        })().then((result) => {
-          try { port.postMessage({ reqId, result }); } catch (_) {}
-        });
-      });
-    };
-    window.__BHT_ON_CONNECT__ = onConnect;
-    chrome.runtime.onConnect.addListener(onConnect);
-  }
-
-  // 若上次 START_CHAT 因跳转被杀，聊天页加载后自动收尾
   // pagehide flush: 尽量把进行中的 op 标记完成，避免后台永久 pending
   window.addEventListener("pagehide", () => {
+    debugTrace("pagehide_pending_operations", {
+      inflight: Object.keys(window.__BHT_OP_INFLIGHT__ || {}),
+      reason: "页面导航会中断所有待执行操作，后台不会自动恢复旧动作"
+    }, "warn");
     try {
       // best-effort; may not complete if context dies instantly
       chrome.storage.local.get(null, (all) => {
         try {
           const entries = Object.entries(all || {}).filter(([k, v]) => k.startsWith("bht_op_") && v && v.status === "pending");
           for (const [k, v] of entries) {
-            // 若当前已有可用聊天输入，START_CHAT 直接成功；其它写 NAVIGATED 让后台重试
-            const isStart = !v.opType || /START_CHAT/i.test(String(v.opType));
-            const okChat = typeof hasUsableChatInput === "function" && hasUsableChatInput();
+            // 页面离开后统一中断；禁止新页面自行恢复旧操作并继续操控会话。
             chrome.storage.local.set({
               [k]: {
                 status: "done",
                 opType: v.opType,
-                result: isStart && okChat
-                  ? { ok: true, already: true, matchedVia: "pagehide-chat", contentVersion: BHT_CONTENT_VERSION }
-                  : { ok: false, error: "NAVIGATED", message: "页面跳转，操作中断", contentVersion: BHT_CONTENT_VERSION },
+                result: { ok: false, error: "NAVIGATED", message: "页面跳转，操作中断", contentVersion: BHT_CONTENT_VERSION },
                 at: Date.now()
               }
             });
@@ -3589,49 +3784,6 @@ async function runOpByType(type, payload = {}) {
       });
     } catch (_) {}
   });
-
-  (async function resumePendingOps() {
-    try {
-      const deadline = Date.now() + 25000;
-      while (Date.now() < deadline) {
-        const all = await chrome.storage.local.get(null);
-        const entries = Object.entries(all || {}).filter(([k, v]) => k.startsWith("bht_op_") && v && v.status === "pending");
-        if (!entries.length) return;
-        dismissCommonDialogs();
-        if (!hasUsableChatInput()) {
-          await sleep(400);
-          continue;
-        }
-        for (const [k, v] of entries) {
-          const opType = String(v?.opType || "");
-          const isStart =
-            !opType ||
-            /START_CHAT/i.test(opType) ||
-            opType === MSG.START_CHAT;
-          // 仅收尾开聊；SEND_TEXT 等应在当前页由后台重新下发
-          if (!isStart) continue;
-          await chrome.storage.local.set({
-            [k]: {
-              status: "done",
-              opType: opType || MSG.START_CHAT,
-              result: {
-                ok: true,
-                already: true,
-                job: {},
-                contentVersion: BHT_CONTENT_VERSION,
-                matchedVia: "pending-resume-chat"
-              },
-              at: Date.now()
-            }
-          });
-          log("resumed pending START_CHAT on chat page", k);
-        }
-        return;
-      }
-    } catch (e) {
-      log("resumePendingOps fail", e);
-    }
-  })();
 
   log("content script ready v" + BHT_CONTENT_VERSION, location.href, "cards=", getJobCards().length);
 })();

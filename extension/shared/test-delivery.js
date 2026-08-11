@@ -1,31 +1,7 @@
 // Pure helpers for "投递一份": pick next unfinished pass job.
 // Used by background RUN_TEST_DELIVERY (and unit tests).
-
-/**
- * @param {Array<{jobId?: string, state?: string}>} items
- * @param {Array<{jobId?: string, status?: string}>} queue
- * @param {Iterable<string>|null} [extraDoneIds]
- * @returns {Set<string>}
- */
-export function collectDoneJobIds(items = [], queue = [], extraDoneIds = null) {
-  const done = new Set();
-  for (const it of items || []) {
-    if (["COMPLETED", "SKIPPED", "FAILED"].includes(String(it?.state || "")) && it?.jobId) {
-      done.add(String(it.jobId));
-    }
-  }
-  for (const q of queue || []) {
-    if (["done", "skipped", "failed"].includes(String(q?.status || "")) && q?.jobId) {
-      done.add(String(q.jobId));
-    }
-  }
-  if (extraDoneIds) {
-    for (const id of extraDoneIds) {
-      if (id != null && id !== "") done.add(String(id));
-    }
-  }
-  return done;
-}
+import { collectDoneJobIds } from './task-model.js';
+export { collectDoneJobIds } from './task-model.js';
 
 /**
  * @param {object} opts

@@ -11,6 +11,14 @@
       .replace(/[，。！？、,.!?;；:：'"“”‘’（）()[\]【】<>《》\-—_]/g, "");
   }
 
+  function cleanHrIdentity(input = "") {
+    return String(input || "")
+      .split(/[·|｜]/)[0]
+      .replace(/\s*(刚刚活跃|当前在线|在线|今日活跃|本周活跃|近三日活跃|\d+分钟前活跃|\d+小时前活跃)\s*$/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   function classTokens(className = "") {
     return String(className)
       .toLowerCase()
@@ -116,9 +124,9 @@
   }
 
   function scoreHr(blob, job, item) {
-    const hr = normalize(job.hrName || job.bossName || "");
+    const hr = normalize(cleanHrIdentity(job.hrName || job.bossName || ""));
     if (!hr) return { score: 0, hit: false, hasHr: false };
-    const itemHr = normalize(item.hrName || item.bossName || "");
+    const itemHr = normalize(cleanHrIdentity(item.hrName || item.bossName || ""));
     if (itemHr && (itemHr === hr || itemHr.includes(hr) || hr.includes(itemHr))) {
       return { score: 120, hit: true, hasHr: true };
     }
@@ -351,6 +359,26 @@
           top: scored.slice(0, 3)
         };
       }
+
+      // 会话列表按新到旧排列。只有置顶行确实是本次新增，且有 HR/岗位身份优势时才自顶向下选；
+      // 仅凭“排第一”不足以安全发消息，因为未读/活跃会话也可能被平台置顶。
+      const topRow = ranked.find((entry) => Number(entry.item?.index || 0) === 0);
+      const runnerUp = ranked.find((entry) => entry !== topRow);
+      if (
+        topRow && topRow.isNew &&
+        (topRow.hrHit || topRow.titleHit) &&
+        (!runnerUp ||
+          (topRow.hrHit && !runnerUp.hrHit) ||
+          (topRow.titleScore - runnerUp.titleScore >= 12))
+      ) {
+        return {
+          ok: true,
+          item: topRow.item,
+          via: "top-down-new-identity:" + topRow.score,
+          score: topRow.score,
+          top: scored.slice(0, 3)
+        };
+      }
     }
 
     // D. 常规最高分，要求拉开差距
@@ -394,22 +422,6 @@
           top: scored.slice(0, 3)
         };
       }
-      if (
-        preferNewest &&
-        Number(top.item.index || 0) === 0 &&
-        top.companyHit &&
-        (top.hrHit || top.titleHit) &&
-        top.score >= second.score
-      ) {
-        return {
-          ok: true,
-          item: top.item,
-          via: "top-recency:" + top.score,
-          score: top.score,
-          top: scored.slice(0, 3)
-        };
-      }
-
       return {
         ok: false,
         error: "CONVERSATION_AMBIGUOUS",
@@ -450,6 +462,7 @@
 
   const api = Object.freeze({
     normalize,
+    cleanHrIdentity,
     classTokens,
     hasActiveState,
     stableConversationKey,

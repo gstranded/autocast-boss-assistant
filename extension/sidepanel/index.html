@@ -76,7 +76,7 @@
           <div class="card">
             <div class="card-title row">
               <span data-help-title="实时日志" data-help="记录扫描、会话匹配、消息回执、简历动作与失败原因。排查页面改版或投递暂停时优先查看这里。">实时日志</span>
-              <div class="btn-row" style="gap:6px"><button id="btnCopyLogs" class="btn tiny">复制</button><button id="btnClearLogs" class="btn tiny">清空</button></div>
+              <div class="btn-row" style="gap:6px"><button id="btnExportDebugLogs" class="btn tiny" hidden>导出调试日志</button><button id="btnCopyLogs" class="btn tiny">复制</button><button id="btnClearLogs" class="btn tiny">清空</button></div>
             </div>
             <div id="logList" class="logs"></div>
           </div>
@@ -329,6 +329,7 @@
             </div>
             <label class="check" data-help-title="同一职位永不重复" data-help="开启后，历史中已经沟通过的职位不会再次进入投递队列。"><input type="checkbox" id="neverRepeatJob" />同一职位永不重复</label>
             <label class="check" data-help-title="自动左右分屏" data-help="开始正式或测试投递时，将职位列表放到左侧、消息中心放到右侧，并把两个标签缩放为 80%。消息页不显示助手浮窗；屏幕过窄或浏览器拒绝调整时会自动回退为普通标签页。"><input type="checkbox" id="splitViewEnabled" />开始投递时自动左右分屏</label>
+            <label class="check" data-help-title="详细调试日志" data-help="记录页面识别、候选会话评分、点击依据、等待信号与失败原因。仅保存在本次浏览器会话中，重启浏览器后重新记录；日志可能包含当前岗位与会话文字，反馈问题前请自行检查。"><input type="checkbox" id="debugLoggingEnabled" />开启详细调试日志</label>
             <button id="btnSaveSettings" class="btn primary block">保存设置</button>
           </div>
           <div class="card">

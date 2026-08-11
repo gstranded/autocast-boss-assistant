@@ -63,6 +63,7 @@ export const DEFAULT_SETTINGS = {
   resumeSendTiming: 'after_text', // on_request | after_text | manual
   previewRequired: true,
   splitViewEnabled: true,
+  debugLoggingEnabled: false,
   whitelistOnly: false
 };
 

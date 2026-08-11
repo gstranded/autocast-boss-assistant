@@ -34,16 +34,115 @@ import { normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.j
 import { computeSideBySideBounds } from '../shared/window-layout.js';
 import { dedupeResumeImages } from '../shared/resume-images.js';
 import { pickNextTestDeliveryJob } from '../shared/test-delivery.js';
+import {
+  buildDeliveryQueue,
+  collectDoneJobIds,
+  taskCounterSnapshot
+} from '../shared/task-model.js';
+import { createOperationRegistry } from './operation-registry.js';
+import {
+  appendSessionDebugLog,
+  getSessionDebugLogs,
+  sanitizeDebugValue
+} from '../shared/debug-log.js';
 
 const SPLIT_ZOOM_FACTOR = 0.8;
 
 let runner = {
   running: false,
+  starting: false,
+  previewing: false,
   abort: false,
   pause: false,
   skipCurrent: false,
   pauseLogged: false
 };
+const operations = createOperationRegistry();
+let debugLoggingEnabled = false;
+
+async function syncDebugLoggingSetting(settings = null) {
+  try {
+    const next = settings || (await getAllConfig()).settings || {};
+    debugLoggingEnabled = next.debugLoggingEnabled === true;
+  } catch (_) {
+    debugLoggingEnabled = false;
+  }
+  return debugLoggingEnabled;
+}
+
+async function debugLog(scope, event, data = {}, level = 'debug') {
+  if (!debugLoggingEnabled) return null;
+  return appendSessionDebugLog({
+    ts: Date.now(),
+    level,
+    scope,
+    event,
+    taskId: data?.taskId || null,
+    data: sanitizeDebugValue(data)
+  });
+}
+
+function runnerIsBusy() {
+  return runner.running || runner.starting || runner.previewing;
+}
+
+async function withRunnerAdmission(kind, action) {
+  if (runnerIsBusy()) {
+    await debugLog('background.runner', 'admission_rejected', {
+      requested: kind,
+      running: runner.running,
+      starting: runner.starting,
+      previewing: runner.previewing
+    }, 'warn');
+    return {
+      ok: false,
+      error: 'ALREADY_RUNNING',
+      message: runner.previewing
+        ? '正在扫描预览，请等待扫描完成后再投递'
+        : '当前已有任务正在启动或执行，请勿重复点击'
+    };
+  }
+  runner[kind] = true;
+  await debugLog('background.runner', 'admission_acquired', { kind });
+  try {
+    return await action();
+  } finally {
+    runner[kind] = false;
+    await debugLog('background.runner', 'admission_released', { kind });
+  }
+}
+
+function cancelledResult() {
+  return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，页面操作已取消' };
+}
+
+async function cancelActiveOperations(reason = '任务已停止') {
+  const active = operations.clear();
+  await debugLog('background.operation', 'cancel_all', { reason, active });
+  await Promise.all(active.map(async ({ opId, tabId, storageKey }) => {
+    try {
+      if (storageKey) {
+        await chrome.storage.local.set({
+          [storageKey]: {
+            status: 'cancelled',
+            opId,
+            reason,
+            at: Date.now()
+          }
+        });
+      }
+    } catch (_) {}
+    try {
+      if (tabId != null) {
+        await chrome.tabs.sendMessage(tabId, {
+          type: MSG.CANCEL_OP,
+          payload: { opId, reason }
+        });
+      }
+    } catch (_) {}
+  }));
+  return active.length;
+}
 
 async function reconcileStaleRunningTask(reason = '扩展后台已重启') {
   try {
@@ -60,16 +159,33 @@ async function reconcileStaleRunningTask(reason = '扩展后台已重启') {
   } catch (_) {}
 }
 
+async function clearStaleOperationArtifacts() {
+  try {
+    const all = await chrome.storage.local.get(null);
+    const keys = Object.keys(all || {}).filter((key) => key.startsWith('bht_op_'));
+    if (keys.length) await chrome.storage.local.remove(keys);
+    return keys.length;
+  } catch (_) {
+    return 0;
+  }
+}
+
+async function recoverBackgroundState(reason) {
+  await syncDebugLoggingSetting();
+  await clearStaleOperationArtifacts();
+  await reconcileStaleRunningTask(reason);
+}
+
 // MV3 service worker 冷启动时内存 runner 为空；避免 storage 仍显示 running 造成假运行
-reconcileStaleRunningTask().catch(() => {});
+recoverBackgroundState('扩展后台已重启').catch(() => {});
 
 chrome.runtime.onStartup?.addListener(() => {
-  reconcileStaleRunningTask('浏览器启动后扩展后台已重建').catch(() => {});
+  recoverBackgroundState('浏览器启动后扩展后台已重建').catch(() => {});
 });
 
 chrome.runtime.onInstalled.addListener(async () => {
   await getAllConfig();
-  await reconcileStaleRunningTask('扩展更新/重载后后台已重建');
+  await recoverBackgroundState('扩展更新/重载后后台已重建');
   try {
     // 一次性：若已上传图片但未开自动发，升级默认以符合「文本后发图」预期
     const all = await chrome.storage.local.get(['bht_settings', 'bht_resumes', 'bht_migrated_137']);
@@ -168,52 +284,6 @@ async function forceInjectContent(tabId) {
 
 
 
-function jobHrefUsable(href) {
-  const h = String(href || "");
-  if (!h || h === "#" || /^javascript:/i.test(h)) return false;
-  // 相对路径也可
-  const abs = /zhipin\.com|bosszhipin\.com/i.test(h) || h.startsWith("/") || h.startsWith("http");
-  if (!abs) return false;
-  return /job_detail|encryptJobId|securityId=|jobId=|\/geek\/job|\/job\//i.test(h);
-}
-
-function normalizeBossJobHref(href) {
-  const h = String(href || "").trim();
-  if (!h) return "";
-  try {
-    if (h.startsWith("http")) return h;
-    return new URL(h, "https://www.zhipin.com").href;
-  } catch (_) {
-    return h;
-  }
-}
-
-function verifyQueueJob(expected, actual) {
-  if (!expected || !actual) return { ok: false, reason: "EMPTY" };
-  // 若实际还在列表页，不算打开成功
-  if (actual.isListPage) return { ok: false, reason: "STILL_ON_LIST", actual };
-  const eId = String(expected.jobId || "");
-  const aId = String(actual.jobId || "");
-  if (eId && aId && eId === aId) return { ok: true, via: "jobId" };
-  const eSec = String(expected.securityId || "");
-  const aSec = String(actual.securityId || "");
-  if (eSec && aSec && eSec === aSec) return { ok: true, via: "securityId" };
-  const et = normalizeText(expected.title || "");
-  const at = normalizeText(actual.title || "");
-  const ec = normalizeText(expected.company || "");
-  const ac = normalizeText(actual.company || "");
-  if (et && at && et === at && ec && ac && ec === ac) return { ok: true, via: "title+company" };
-  // 有 jobId 却对不上：失败，不允许弱匹配
-  if (eId && aId && eId !== aId) return { ok: false, reason: "JOBID_MISMATCH", expected: { jobId: eId, title: expected.title }, actual: { jobId: aId, title: actual.title } };
-  if (et && at && et === at) return { ok: true, via: "title-only", weak: true };
-  return {
-    ok: false,
-    reason: "IDENTITY_MISMATCH",
-    expected: { title: expected.title, company: expected.company, jobId: eId, href: expected.href },
-    actual: { title: actual.title, company: actual.company, jobId: aId, href: actual.href, isListPage: actual.isListPage }
-  };
-}
-
 async function waitTabComplete(tabId, timeoutMs = 45000) {
   const start = Date.now();
   let lastUrl = "";
@@ -238,35 +308,6 @@ async function waitTabComplete(tabId, timeoutMs = 45000) {
     await sleep(200);
   }
   try { return await chrome.tabs.get(tabId); } catch (_) { return null; }
-}
-
-async function ensureWorkerTab(task) {
-  if (!task.execution) task.execution = {};
-  const oldId = task.execution.workerTabId;
-  if (oldId) {
-    try {
-      const t = await chrome.tabs.get(oldId);
-      if (t && isBossUrl(t.url || t.pendingUrl || "")) {
-        await log("info", "复用投递工作页 tab=" + oldId + " url=" + String(t.url || "").slice(0, 160));
-        return t;
-      }
-      await log("warn", "旧工作页不可用，将重建 tab=" + oldId + " url=" + String(t?.url || ""));
-    } catch (_) {
-      await log("warn", "旧工作页已关闭，将重建 tab=" + oldId);
-    }
-  }
-  // 种子用 about:blank，避免先打开列表主页造成「在主页徘徊」的错觉
-  const createOpts = { url: "about:blank", active: true };
-  if (task.execution.listTabId) {
-    try { createOpts.openerTabId = task.execution.listTabId; } catch (_) {}
-  }
-  const tab = await chrome.tabs.create(createOpts);
-  task.execution.workerTabId = tab.id;
-  task.execution.workerWindowId = tab.windowId;
-  task.execution.phase = "WORKER_READY";
-  await publishTask(task);
-  await log("info", "新建投递工作页 tab=" + tab.id + "（将直接导航到岗位详情，不经列表主页）");
-  return tab;
 }
 
 async function getDisplayMetrics(tabId) {
@@ -431,6 +472,7 @@ export async function prepareSplitWorkspace(task, settings = {}) {
 
 
 async function ensureMessageTab(task) {
+  if (runner.running && runner.abort) throw new Error('OP_CANCELLED');
   if (!task.execution) task.execution = {};
   const oldId = task.execution.messageTabId;
   if (oldId) {
@@ -481,6 +523,7 @@ async function ensureMessageTab(task) {
 }
 
 async function softReturnToList(task) {
+  if (runner.abort) return cancelledResult();
   const listTabId = task?.execution?.listTabId || null;
   const payload = {
     listHref: task?.listHref || "",
@@ -528,126 +571,19 @@ async function ensureListTab(task) {
   return t;
 }
 
-async function openQueueJobOnWorker(task, job) {
-  const worker = await ensureWorkerTab(task);
-  const tabId = worker.id;
-  let href = normalizeBossJobHref(job.href || "");
-  if (!jobHrefUsable(href) && job.jobId && !String(job.jobId).startsWith("name_") && !String(job.jobId).startsWith("dom_")) {
-    // 尝试用 jobId 拼详情 URL
-    href = "https://www.zhipin.com/job_detail/" + job.jobId + ".html";
-    await log("info", "队列项原 href 不可用，尝试用 jobId 拼接详情 URL", {
-      jobId: job.jobId,
-      rawHref: String(job.href || "").slice(0, 160),
-      built: href
-    });
-  }
-  if (!jobHrefUsable(href)) {
-    await log("error", "队列项无可用岗位链接，无法直达", {
-      jobId: job.jobId,
-      title: job.title,
-      rawHref: String(job.href || ""),
-      company: job.company
-    });
-    return { ok: false, error: "NO_HREF", message: "队列项缺少可用岗位链接（href 为空或不是详情页）。请重新扫描预览", tabId };
-  }
-
-  task.execution.phase = "NAVIGATING_JOB";
-  task.currentJobId = job.jobId;
-  await publishTask(task);
-
-  let beforeUrl = "";
-  try { beforeUrl = (await chrome.tabs.get(tabId)).url || ""; } catch (_) {}
-  await log("info", "工作页导航→岗位详情", {
-    tabId,
-    beforeUrl: String(beforeUrl).slice(0, 160),
-    targetHref: String(href).slice(0, 200),
-    jobId: job.jobId,
-    title: job.title,
-    company: job.company
-  });
-
-  try {
-    await chrome.tabs.update(tabId, { url: href, active: true });
-  } catch (e) {
-    await log("error", "工作页 tabs.update 失败：" + String(e?.message || e), { tabId, href });
-    return { ok: false, error: "NAV_FAIL", message: String(e?.message || e), tabId };
-  }
-
-  const ready = await waitTabComplete(tabId, 45000);
-  let afterUrl = "";
-  try { afterUrl = ready?.url || (await chrome.tabs.get(tabId)).url || ""; } catch (_) {}
-  await log("info", "工作页导航完成", {
-    tabId,
-    afterUrl: String(afterUrl).slice(0, 200),
-    stillList: /\/web\/geek\/jobs/i.test(afterUrl),
-    isJobLike: /job_detail|encryptJobId|\/geek\/job/i.test(afterUrl)
-  });
-
-  if (!ready) {
-    return { ok: false, error: "TAB_LOAD_TIMEOUT", message: "岗位页加载超时 url=" + afterUrl, tabId };
-  }
-  if (/\/web\/geek\/jobs\/?($|\?)/i.test(afterUrl) && !/job_detail|encryptJobId/i.test(afterUrl)) {
-    await log("error", "导航后仍停在职位列表/主页，未进入详情。目标 href 可能无效", {
-      targetHref: href.slice(0, 200),
-      afterUrl: afterUrl.slice(0, 200)
-    });
-    return {
-      ok: false,
-      error: "STILL_ON_LIST",
-      message: "工作页仍在列表主页，未打开岗位详情。href=" + href.slice(0, 120),
-      tabId,
-      afterUrl
-    };
-  }
-
-  await forceInjectContent(tabId);
-  await sleep(600);
-
-  let detail = await sendToBoss(MSG.GET_CURRENT_JOB_DETAIL || "BHT_GET_CURRENT_JOB_DETAIL", {}, { tabId, forceInject: true });
-  await log("info", "工作页岗位详情解析", {
-    ok: Boolean(detail?.ok),
-    title: detail?.job?.title || "",
-    company: detail?.job?.company || "",
-    jobId: detail?.job?.jobId || "",
-    href: String(detail?.job?.href || afterUrl).slice(0, 160),
-    isListPage: detail?.job?.isListPage,
-    isJobPage: detail?.job?.isJobPage
-  });
-
-  if (!detail?.ok || !detail.job) {
-    return {
-      ok: false,
-      error: "DETAIL_PARSE_FAIL",
-      message: "已打开页面但无法解析岗位详情，不继续发送。url=" + String(afterUrl).slice(0, 160),
-      tabId,
-      afterUrl
-    };
-  }
-
-  const v = verifyQueueJob(job, detail.job);
-  if (!v.ok) {
-    await log("error", "岗位身份校验失败：" + (v.reason || "") , { verify: v, expectedTitle: job.title, actualTitle: detail.job.title });
-    return {
-      ok: false,
-      error: v.reason || "IDENTITY_MISMATCH",
-      message: "打开的岗位与队列不一致（" + (v.reason || "") + "），已跳过避免投错",
-      verify: v,
-      tabId,
-      detail: detail.job
-    };
-  }
-
-  await log("success", "工作页岗位就绪 · 校验通过(" + (v.via || "") + (v.weak ? ",weak" : "") + ")", {
-    tabId,
-    via: v.via,
-    url: String(detail.job.href || afterUrl).slice(0, 160),
-    title: detail.job.title,
-    company: detail.job.company
-  });
-  return { ok: true, tabId, detail: detail.job, matchedVia: v.via || "href-nav", afterUrl };
-}
-
 async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false, tabId = null } = {}) {
+  const taskBound = runner.running;
+  const isCancelled = () => taskBound && runner.abort;
+  await debugLog('background.sendToBoss', 'begin', {
+    type, tabId, retries, forceInject, taskBound,
+    job: payload?.job ? {
+      jobId: payload.job.jobId || '',
+      title: payload.job.title || '',
+      company: payload.job.company || '',
+      hrName: payload.job.hrName || payload.job.bossName || ''
+    } : null
+  });
+  if (isCancelled()) return cancelledResult();
   let tab = null;
   if (tabId != null) {
     try {
@@ -675,7 +611,9 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
   }
 
   const critical = [
-    MSG.START_CHAT,
+    MSG.TRIGGER_CONVERSATION,
+    MSG.WAIT_OPEN_CONVERSATION,
+    MSG.WAIT_CHAT_EDITOR,
     MSG.SEND_TEXT,
     MSG.SEND_IMAGE,
     MSG.SEND_RESUME,
@@ -684,7 +622,16 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     MSG.CLOSE_CHAT,
     MSG.ENSURE_JOB_LIST
   ];
-  const longOps = [MSG.START_CHAT, MSG.SEND_TEXT, MSG.SEND_IMAGE, MSG.SEND_RESUME, MSG.SCAN_JOBS, MSG.RETURN_TO_LIST];
+  const longOps = [
+    MSG.TRIGGER_CONVERSATION,
+    MSG.WAIT_OPEN_CONVERSATION,
+    MSG.WAIT_CHAT_EDITOR,
+    MSG.SEND_TEXT,
+    MSG.SEND_IMAGE,
+    MSG.SEND_RESUME,
+    MSG.SCAN_JOBS,
+    MSG.RETURN_TO_LIST
+  ];
 
   let needInject = forceInject;
   if (!needInject && critical.includes(type)) {
@@ -696,21 +643,41 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     }
   }
   if (needInject) {
+    if (isCancelled()) return cancelledResult();
     await forceInjectContent(tab.id);
     await sleep(180);
+    if (isCancelled()) return cancelledResult();
   }
 
   // 长操作优先 storage 桥（立即 ACK + 轮询结果），避免 SPA 销毁 channel
+  let bridgeOpId = '';
   if (longOps.includes(type)) {
     try {
       const opId = 'op_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
-      await chrome.storage.local.remove('bht_op_' + opId).catch(() => {});
-      await chrome.storage.local.set({ ['bht_op_' + opId]: { status: 'pending', opType: type, at: Date.now() } });
+      bridgeOpId = opId;
+      const storageKey = 'bht_op_' + opId;
+      operations.add({ opId, tabId: tab.id, type, storageKey });
+      const finishBridge = async (result, { removeStorage = true } = {}) => {
+        operations.delete(opId);
+        if (removeStorage) {
+          try { await chrome.storage.local.remove(storageKey); } catch (_) {}
+        }
+        return result;
+      };
+      await chrome.storage.local.remove(storageKey).catch(() => {});
+      await chrome.storage.local.set({ [storageKey]: { status: 'pending', opType: type, at: Date.now() } });
       const fireOp = async () => {
+        if (isCancelled()) return false;
+        await debugLog('background.sendToBoss', 'bridge_fire', { type, opId, tabId: tab.id });
         const ack = await chrome.tabs.sendMessage(tab.id, {
           type: 'BHT_RUN_OP',
-          payload: { opId, opType: type, opPayload: payload }
+          payload: {
+            opId,
+            opType: type,
+            opPayload: { ...payload, __bhtDebugEnabled: debugLoggingEnabled }
+          }
         });
+        await debugLog('background.sendToBoss', 'bridge_ack', { type, opId, ack });
         if (ack && ack.accepted) return true;
         if (ack && ack.error === 'UNKNOWN_TYPE') return false;
         // 旧 content 无 RUN_OP 时走失败，触发注入重试
@@ -723,8 +690,10 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
         fired = false;
       }
       if (!fired) {
+        if (isCancelled()) return await finishBridge(cancelledResult());
         await forceInjectContent(tab.id);
         await sleep(220);
+        if (isCancelled()) return await finishBridge(cancelledResult());
         fired = await fireOp();
       }
       if (!fired) throw new Error('RUN_OP_NOT_SUPPORTED');
@@ -732,62 +701,35 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       let reinjectAt = started + 8000;
       while (Date.now() - started < 90000) {
         await sleep(350);
-        const bag = await chrome.storage.local.get('bht_op_' + opId);
-        const row = bag && bag['bht_op_' + opId];
+        if (isCancelled()) return await finishBridge(cancelledResult());
+        const bag = await chrome.storage.local.get(storageKey);
+        const row = bag && bag[storageKey];
+        if (row?.status === 'cancelled') return await finishBridge(cancelledResult());
         if (row && row.status === 'done') {
           const result = row.result || { ok: false, error: 'EMPTY_OP_RESULT' };
+          await debugLog('background.sendToBoss', 'bridge_done', { type, opId, elapsedMs: Date.now() - started, result });
           if (result && result.error === 'OP_BUSY') {
             try {
               await chrome.storage.local.set({
-                ['bht_op_' + opId]: { status: 'pending', opType: type, at: Date.now(), note: 'ignore-op-busy' }
+                [storageKey]: { status: 'pending', opType: type, at: Date.now(), note: 'ignore-op-busy' }
               });
             } catch (_) {}
             continue;
           }
-          try { await chrome.storage.local.remove('bht_op_' + opId); } catch (_) {}
           // 页面跳转中断：对发消息/开聊自动重试一次
-          if (result && result.error === 'NAVIGATED' && (type === MSG.SEND_TEXT || type === MSG.START_CHAT) && !payload.__navRetried) {
+          if (result && result.error === 'NAVIGATED' && type === MSG.SEND_TEXT && !payload.__navRetried) {
+            if (isCancelled()) return await finishBridge(cancelledResult());
+            await finishBridge(result);
             await forceInjectContent(tab.id);
             await sleep(350);
+            if (isCancelled()) return cancelledResult();
             return await sendToBoss(type, { ...payload, __navRetried: true }, { retries, forceInject: true, tabId: tab.id });
           }
-          return result;
-        }
-        // START_CHAT：若已进入聊天页且输入框可用，直接视为成功（SPA 跳转会杀死原 content）
-        if (type === MSG.START_CHAT && Date.now() - started > 2500) {
-          try {
-            let pong = null;
-            try {
-              pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
-            } catch (_) { pong = null; }
-            if (!pong?.ok) {
-              await forceInjectContent(tab.id);
-              await sleep(260);
-              try { pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} }); } catch (_) {}
-            }
-            const page = pong?.page || {};
-            if (page.hasChatInput || (page.isChatPage && page.hasChatInput !== false && pong?.ok)) {
-              // 二次确认：请求一次 PAGE_INFO
-              let info = page;
-              try {
-                const pi = await chrome.tabs.sendMessage(tab.id, { type: MSG.GET_PAGE_INFO, payload: {} });
-                if (pi?.page) info = pi.page;
-              } catch (_) {}
-              if (info.hasChatInput) {
-                try { await chrome.storage.local.remove('bht_op_' + opId); } catch (_) {}
-                return {
-                  ok: true,
-                  already: true,
-                  job: (payload && payload.job) || {},
-                  matchedVia: 'bg-probe-chat',
-                  contentVersion: pong?.contentVersion
-                };
-              }
-            }
-          } catch (_) {}
+          return await finishBridge(result);
         }
         // 超时前若仍 pending：content 被导航销毁时重注入并重发
         if (Date.now() > reinjectAt && longOps.includes(type)) {
+          if (isCancelled()) return await finishBridge(cancelledResult());
           reinjectAt = Date.now() + 12000;
           try {
             const latest = await chrome.tabs.get(tab.id);
@@ -800,32 +742,12 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
               alive = Boolean(pong?.ok);
             } catch (_) { alive = false; }
 
-            // START_CHAT：只探测聊天是否已就绪，绝不对同一 opId 再 fireOp（防 OP_BUSY 覆盖）
-            if (type === MSG.START_CHAT) {
-              if (!alive) {
-                await forceInjectContent(tab.id);
-                await sleep(300);
-                try {
-                  pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
-                  alive = Boolean(pong?.ok);
-                } catch (_) { alive = false; }
-              }
-              if (alive && pong?.page?.hasChatInput) {
-                try { await chrome.storage.local.remove('bht_op_' + opId); } catch (_) {}
-                return {
-                  ok: true,
-                  already: true,
-                  job: (payload && payload.job) || {},
-                  matchedVia: 'bg-probe-chat-wait',
-                  contentVersion: pong?.contentVersion
-                };
-              }
-              // content 仍活着且在跑：继续等，不重复 START_CHAT
-              continue;
-            }
-
             // 其它长操作：仅当 content 已死时重注入并重发一次（content 侧 opId 幂等）
             if (!alive) {
+              await debugLog('background.sendToBoss', 'content_missing_reinject', {
+                type, opId, tabId: tab.id, url: latest?.url || ''
+              }, 'warn');
+              if (isCancelled()) return await finishBridge(cancelledResult());
               await forceInjectContent(tab.id);
               await sleep(280);
               await fireOp();
@@ -833,92 +755,33 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
           } catch (_) {}
         }
       }
-      return { ok: false, error: 'OP_TIMEOUT', message: '操作超时（岗位定位/发消息）。请保持在职位列表页并重新扫描预览' };
+      return await finishBridge({ ok: false, error: 'OP_TIMEOUT', message: '操作超时（岗位定位/发消息）。请保持在职位列表页并重新扫描预览' });
     } catch (bridgeErr) {
-      // fall through to port/message
-      console.warn('storage bridge fail', bridgeErr);
-    }
-  }
-
-  // 次选 Port
-  if (longOps.includes(type)) {
-    try {
-      const result = await new Promise((resolve, reject) => {
-        let done = false;
-        const reqId = 'r_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
-        let port;
+      await debugLog('background.sendToBoss', 'bridge_failed', {
+        type, opId: bridgeOpId, error: String(bridgeErr?.message || bridgeErr)
+      }, 'error');
+      if (bridgeOpId) {
+        operations.delete(bridgeOpId);
         try {
-          port = chrome.tabs.connect(tab.id, { name: 'bht-op' });
-        } catch (e) {
-          reject(e);
-          return;
-        }
-        const timer = setTimeout(() => {
-          if (done) return;
-          done = true;
-          try { port.disconnect(); } catch (_) {}
-          reject(new Error('PORT_TIMEOUT'));
-        }, 120000);
-        port.onMessage.addListener((msg) => {
-          if (!msg || msg.reqId !== reqId) return;
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          try { port.disconnect(); } catch (_) {}
-          resolve(msg.result);
-        });
-        port.onDisconnect.addListener(() => {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          const err = chrome.runtime.lastError?.message || 'PORT_DISCONNECTED';
-          reject(new Error(err));
-        });
-        try {
-          port.postMessage({ type, payload, reqId });
-        } catch (e) {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          reject(e);
-        }
-      });
-      if (result) return result;
-    } catch (errPort) {
-      const msgP = String(errPort?.message || errPort || '');
-      // START_CHAT_RECOVER: 点击导致脚本上下文销毁时，等页面稳定后重试
-      if (type === MSG.START_CHAT && /PORT_DISCONNECTED|Receiving end does not exist|message channel closed/i.test(msgP)) {
-        await sleep(1200);
-        try {
-          const latest = await chrome.tabs.get(tab.id);
-          if (isBossUrl(latest?.url || '')) {
-            await forceInjectContent(tab.id);
-            await sleep(350);
-            if (retries > 0) {
-              return sendToBoss(type, payload, { retries: retries - 1, forceInject: true, tabId: tab.id });
-            }
-          }
+          await chrome.tabs.sendMessage(tab.id, {
+            type: MSG.CANCEL_OP,
+            payload: { opId: bridgeOpId, reason: '存储桥失败，取消旧操作后切换备用通道' }
+          });
         } catch (_) {}
+        try { await chrome.storage.local.remove('bht_op_' + bridgeOpId); } catch (_) {}
       }
-      if (retries > 0) {
-        await forceInjectContent(tab.id);
-        await sleep(400);
-        return sendToBoss(type, payload, { retries: retries - 1, forceInject: true, tabId: tab.id });
-      }
-      // fall through to sendMessage once
-      try {
-        return await chrome.tabs.sendMessage(tab.id, { type, payload });
-      } catch (e2) {
-        return {
-          ok: false,
-          error: 'CONTENT_PORT_FAIL',
-          message: msgP + ' | ' + String(e2?.message || e2)
-        };
-      }
+      if (isCancelled()) return cancelledResult();
+      console.warn('storage bridge fail', bridgeErr);
+      return {
+        ok: false,
+        error: 'OP_BRIDGE_FAIL',
+        message: '页面操作通道不可用，已安全停止本次操作：' + String(bridgeErr?.message || bridgeErr)
+      };
     }
   }
 
   try {
+    if (isCancelled()) return cancelledResult();
     try {
       return await chrome.tabs.sendMessage(tab.id, { type, payload });
     } catch (err0) {
@@ -971,6 +834,7 @@ async function assertBossContext() {
 
 async function log(level, message, extra = {}) {
   const entry = await appendLog({ level, message, ...extra });
+  await debugLog('background.log', 'runtime_log', { message, ...extra }, level);
   try {
     chrome.runtime.sendMessage({ type: MSG.LOG_EVENT, payload: entry }).catch(() => {});
   } catch (_) {}
@@ -978,20 +842,21 @@ async function log(level, message, extra = {}) {
 }
 
 async function publishTask(task) {
+  // STOP 是不可逆终态：旧异步分支即使稍后返回，也不能把 storage 写回 running/paused。
+  if (runner.running && runner.abort && task?.status !== TASK_STATUS.STOPPED) {
+    task.status = TASK_STATUS.STOPPED;
+    task.updatedAt = Date.now();
+    setTaskTerminalSignal(task, TASK_STATUS.STOPPED);
+  }
+  task.revision = Number(task.revision || 0) + 1;
   await saveTask(task);
   try {
     chrome.runtime.sendMessage({ type: MSG.TASK_EVENT, payload: task }).catch(() => {});
   } catch (_) {}
 }
 
-function taskCounterSnapshot(task) {
-  const counters = task?.counters || {};
-  return {
-    success: Number(counters.success || 0),
-    skipped: Number(counters.skipped || 0),
-    failed: Number(counters.failed || 0),
-    processed: Number(counters.processed || 0)
-  };
+function operationAborted(result) {
+  return runner.abort || result?.error === 'OP_CANCELLED';
 }
 
 function taskSummaryText(task, status) {
@@ -1031,34 +896,6 @@ function ensureItem(task, job) {
   return item;
 }
 
-
-function buildDeliveryQueue(results = [], { selectedOnly = true } = {}) {
-  const rows = (results || []).filter((r) => r.decision === 'pass' && (selectedOnly ? r.selected !== false : true));
-  const seen = new Set();
-  const queue = [];
-  for (const r of rows) {
-    const job = r.job || {};
-    const id = String(job.jobId || '');
-    const title = normalizeText(job.title || '');
-    const company = normalizeText(job.company || '');
-    const key = id && !id.startsWith('name_') && !id.startsWith('dom_')
-      ? 'id:' + id
-      : 'tc:' + company + '|' + title;
-    if (seen.has(key)) continue;
-    if (!title && !id) continue;
-    seen.add(key);
-    queue.push({
-      index: queue.length,
-      jobId: job.jobId,
-      title: job.title,
-      company: job.company,
-      href: job.href || '',
-      securityId: job.securityId || '',
-      status: 'pending'
-    });
-  }
-  return queue;
-}
 
 async function runPreview(payload = {}) {
   await log('info', '开始扫描预览…');
@@ -1185,6 +1022,7 @@ async function waitWhilePaused(task) {
 }
 
 async function processOneJob(task, resultRow, config) {
+  if (runner.abort) return 'aborted';
   const job = { ...resultRow.job };
   if (!job.listHref && task.listHref) job.listHref = task.listHref;
   resultRow.job = job;
@@ -1252,7 +1090,7 @@ async function processOneJob(task, resultRow, config) {
 
 
 
-// 列表恢复交给 START_CHAT 原子处理，避免预先 CLOSE/ENSURE 打乱虚拟列表
+// 双页主路径直接在列表页触发沟通，避免预先 CLOSE/ENSURE 打乱虚拟列表。
     // 工作页直达岗位 href（列表页不动；正常路径不再 RETURN_TO_LIST 找下一岗）
   if (task.listHref && !job.listHref) job.listHref = task.listHref;
   let workerTabId = task.execution?.workerTabId || null;
@@ -1279,17 +1117,20 @@ async function processOneJob(task, resultRow, config) {
   try {
     messageTab = await ensureMessageTab(task);
   } catch (e) {
+    if (runner.abort || String(e?.message || e) === 'OP_CANCELLED') return 'aborted';
     item.state = 'FAILED';
     item.reasons = ['无法打开消息页：' + String(e?.message || e)];
     task.counters.failed += 1;
     await log('error', '[消息页] 创建失败：' + String(e?.message || e), { jobId: job.jobId });
     return 'failed';
   }
+  if (runner.abort) return 'aborted';
   const msgTabId = messageTab.id;
   const msgOpt = { tabId: msgTabId, forceInject: true };
 
   // 消息页快照（点击沟通前）
   let beforeSnap = await sendToBoss(MSG.GET_CONVERSATION_SNAPSHOT || 'BHT_GET_CONVERSATION_SNAPSHOT', {}, msgOpt);
+  if (operationAborted(beforeSnap)) return 'aborted';
   await log('info', '[消息页] 沟通前会话快照 count=' + (beforeSnap?.count || 0), {
     href: beforeSnap?.href,
     sample: (beforeSnap?.items || []).slice(0, 3).map((x) => x.text)
@@ -1302,6 +1143,7 @@ async function processOneJob(task, resultRow, config) {
     { job },
     listOpt
   );
+  if (operationAborted(trig)) return 'aborted';
   await log(
     trig?.ok ? 'success' : 'error',
     trig?.ok
@@ -1342,16 +1184,20 @@ async function processOneJob(task, resultRow, config) {
 
   // 消息页阶段一：解析并打开会话（不含输入框门禁）
   await sleep(600);
+  if (runner.abort) return 'aborted';
   try { await chrome.tabs.update(msgTabId, { active: true }); } catch (_) {}
   await sleep(400);
+  if (runner.abort) return 'aborted';
   await log('info', '[消息页] 等待并匹配会话…', { jobId: job.jobId, company: job.company, title: job.title });
   let conv = await sendToBoss(
     MSG.WAIT_OPEN_CONVERSATION || 'BHT_WAIT_OPEN_CONVERSATION',
     { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 18000 },
     msgOpt
   );
+  if (operationAborted(conv)) return 'aborted';
   if (!conv?.ok && conv?.error === 'CONVERSATION_NOT_FOUND') {
     await sleep(1000);
+    if (runner.abort) return 'aborted';
     await forceInjectContent(msgTabId);
     try { await chrome.tabs.update(msgTabId, { active: true }); } catch (_) {}
     conv = await sendToBoss(
@@ -1359,6 +1205,7 @@ async function processOneJob(task, resultRow, config) {
       { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 12000 },
       msgOpt
     );
+    if (operationAborted(conv)) return 'aborted';
   }
   await log(
     conv?.ok ? 'success' : 'error',
@@ -1407,6 +1254,7 @@ async function processOneJob(task, resultRow, config) {
     { timeoutMs: 30000 },
     msgOpt
   );
+  if (operationAborted(editor)) return 'aborted';
   await log(
     editor?.ok ? 'success' : 'error',
     editor?.ok
@@ -1508,6 +1356,7 @@ async function processOneJob(task, resultRow, config) {
 
   // messages
   const selfRes = await sendToBoss(MSG.GET_CHAT_SELF_MESSAGES, { limit: 8 }, tabOpt);
+  if (operationAborted(selfRes)) return 'aborted';
   const recentSelfMessages = selfRes?.messages || [];
   const plan = planMessageSegments({
     mode: config.settings.messageMode,
@@ -1556,6 +1405,7 @@ async function processOneJob(task, resultRow, config) {
       segmentIndex: step.index,
       conversationKey: conv?.active?.key || ''
     }, tabOpt);
+    if (operationAborted(sendResult)) return 'aborted';
     const receiptConfirmed =
       sendResult?.ok === true &&
       sendResult?.confirmed === true &&
@@ -1669,6 +1519,7 @@ async function processOneJob(task, resultRow, config) {
           dataUrl: img.dataUrl,
           fileName: img.name || `resume_${i + 1}.png`
         }, tabOpt);
+        if (operationAborted(imgRes)) return 'aborted';
         const imageConfirmed =
           imgRes?.ok === true &&
           imgRes?.confirmed === true &&
@@ -1706,6 +1557,7 @@ async function processOneJob(task, resultRow, config) {
           jobId: job.jobId,
           conversationKey: conv?.active?.key || ''
         }, tabOpt);
+        if (operationAborted(resumeRes)) return 'aborted';
         const resumeConfirmed =
           resumeRes?.ok === true &&
           resumeRes?.confirmed === true &&
@@ -1902,6 +1754,10 @@ async function runTaskLoop(taskId) {
 
       // 失败后等待用户：关闭=保持暂停不自动继续；重试=重置当前岗位后再跑一次
       while (outcome === 'failed') {
+        if (runner.abort) {
+          outcome = 'aborted';
+          break;
+        }
         // 回列表，避免卡在会话页
         try { await softReturnToList(task); } catch (_) {}
         await sleep(400);
@@ -1988,17 +1844,7 @@ async function runTaskLoop(taskId) {
       }
       // 单份投完后：自动勾选剩余未投通过岗，便于立刻「批量投递」
       if (task.testDelivery || task.testJobId) {
-        const done = new Set((task.testedJobIds || []).map(String));
-        for (const it of task.items || []) {
-          if (['COMPLETED', 'SKIPPED', 'FAILED'].includes(String(it?.state || '')) && it?.jobId) {
-            done.add(String(it.jobId));
-          }
-        }
-        for (const q of task.queue || []) {
-          if (['done', 'skipped', 'failed'].includes(String(q?.status || '')) && q?.jobId) {
-            done.add(String(q.jobId));
-          }
-        }
+        const done = collectDoneJobIds(task.items, task.queue, task.testedJobIds);
         task.results = (task.results || []).map((r) => ({
           ...r,
           selected: r?.decision === 'pass' && r?.job?.jobId && !done.has(String(r.job.jobId))
@@ -2048,11 +1894,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           activeTab: tab ? { id: tab.id, url: tab.url, title: tab.title } : null,
           activeIsBoss: Boolean(tab),
           bossOnly: true,
-          runner: { running: runner.running, pause: runner.pause }
+          runner: {
+            running: runner.running && !runner.abort,
+            starting: runner.starting,
+            previewing: runner.previewing,
+            pause: runner.pause && !runner.abort,
+            stopping: runner.running && runner.abort,
+            activeOperations: operations.size
+          }
         };
       }
       case MSG.SAVE_SETTINGS:
         await saveSettings(payload);
+        await syncDebugLoggingSetting(payload);
+        await debugLog('background.settings', 'saved', {
+          debugLoggingEnabled,
+          splitViewEnabled: payload?.splitViewEnabled !== false
+        });
         return { ok: true };
       case MSG.SAVE_FILTERS:
         await saveFilters(payload);
@@ -2070,14 +1928,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await saveBindings(payload);
         return { ok: true };
       case MSG.RUN_PREVIEW: {
-        const guard = await assertBossContext();
-        if (!guard.ok) {
-          await log("warn", guard.message);
-          return guard;
-        }
-        return await runPreview(payload || {});
+        return await withRunnerAdmission('previewing', async () => {
+          const guard = await assertBossContext();
+          if (!guard.ok) {
+            await log("warn", guard.message);
+            return guard;
+          }
+          return await runPreview(payload || {});
+        });
       }
       case MSG.CONFIRM_AND_START: {
+        return await withRunnerAdmission('starting', async () => {
         // CONFIRM_AND_START guard
         {
           const guard = await assertBossContext();
@@ -2085,13 +1946,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             await log("warn", guard.message);
             return guard;
           }
-        }
-        if (runner.running) {
-          return {
-            ok: false,
-            error: 'ALREADY_RUNNING',
-            message: '当前已有任务在执行（含暂停中），请先停止或点继续完成后再启动'
-          };
         }
         const all = await getAllConfig();
         let task = all.task;
@@ -2101,20 +1955,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         // 单份投完后 status 可能是 completed/stopped：允许直接进入批量
-        const doneIds = new Set();
-        for (const it of task.items || []) {
-          if (['COMPLETED', 'SKIPPED', 'FAILED'].includes(String(it?.state || '')) && it?.jobId) {
-            doneIds.add(String(it.jobId));
-          }
-        }
-        for (const q of task.queue || []) {
-          if (['done', 'skipped', 'failed'].includes(String(q?.status || '')) && q?.jobId) {
-            doneIds.add(String(q.jobId));
-          }
-        }
-        for (const id of task.testedJobIds || []) {
-          if (id) doneIds.add(String(id));
-        }
+        const doneIds = collectDoneJobIds(task.items, task.queue, task.testedJobIds);
 
         let selectedIds = Array.isArray(payload?.selectedJobIds)
           ? payload.selectedJobIds.map(String).filter(Boolean)
@@ -2215,22 +2056,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // async loop
         runTaskLoop(task.id);
         return { ok: true, taskId: task.id, splitView: split, pending: selectedIds.length };
+        });
       }
       case MSG.RUN_TEST_DELIVERY:
       case 'BHT_RUN_TEST_DELIVERY': {
+        return await withRunnerAdmission('starting', async () => {
         {
           const guard = await assertBossContext();
           if (!guard.ok) {
             await log('warn', guard.message);
             return guard;
           }
-        }
-        if (runner.running) {
-          return {
-            ok: false,
-            error: 'ALREADY_RUNNING',
-            message: '当前已有任务在执行（含暂停中），请先停止或点继续完成后再「投递一份」'
-          };
         }
         const all = await getAllConfig();
         let task = all.task;
@@ -2344,6 +2180,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           remain,
           splitView: split
         };
+        });
       }
 
       case MSG.PAUSE_TASK:
@@ -2422,6 +2259,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MSG.STOP_TASK:
         runner.abort = true;
         runner.pause = false;
+        await cancelActiveOperations('用户停止任务');
         {
           const all = await getAllConfig();
           if (all.task) {
@@ -2492,6 +2330,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { ok: true };
       case MSG.GET_LOGS:
         return { ok: true, logs: await getLogs(payload?.limit || 200) };
+      case MSG.GET_DEBUG_LOGS:
+        return {
+          ok: true,
+          enabled: debugLoggingEnabled,
+          meta: {
+            version: chrome.runtime.getManifest().version,
+            exportedAt: new Date().toISOString(),
+            sessionOnly: true
+          },
+          logs: await getSessionDebugLogs()
+        };
+      case MSG.DEBUG_EVENT:
+        if (!debugLoggingEnabled) return { ok: true, recorded: false };
+        await appendSessionDebugLog({
+          ts: Number(payload?.ts) || Date.now(),
+          level: payload?.level || 'debug',
+          scope: payload?.scope || 'content',
+          event: payload?.event || 'event',
+          taskId: payload?.taskId || null,
+          data: sanitizeDebugValue(payload?.data || {})
+        });
+        return { ok: true, recorded: true };
       case MSG.CLEAR_LOGS:
         await clearLogs();
         return { ok: true };

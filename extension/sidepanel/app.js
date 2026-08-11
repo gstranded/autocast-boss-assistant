@@ -3,11 +3,17 @@ import { parseKeywords, uid } from '../shared/text-utils.js';
 import { reasonText } from '../shared/reason-codes.js';
 import { STORAGE_KEYS } from '../shared/constants.js';
 import { mergeResumeImages } from '../shared/resume-images.js';
+import {
+  collectDoneJobIds,
+  countPassJobs,
+  countPendingPassJobs,
+  shouldAcceptTaskSnapshot
+} from '../shared/task-model.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.6.7";
+const BHT_UI_VERSION = "1.6.8";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -382,6 +388,13 @@ function fillSettings(settings) {
   $('consecutiveFailPause').value = settings.consecutiveFailPause;
   $('neverRepeatJob').checked = settings.neverRepeatJob !== false;
   $('splitViewEnabled').checked = settings.splitViewEnabled !== false;
+  $('debugLoggingEnabled').checked = settings.debugLoggingEnabled === true;
+  updateDebugUi(settings);
+}
+
+function updateDebugUi(settings = {}) {
+  const button = $('btnExportDebugLogs');
+  if (button) button.hidden = settings.debugLoggingEnabled !== true;
 }
 
 function readSettingsPatch(base) {
@@ -400,6 +413,7 @@ function readSettingsPatch(base) {
     consecutiveFailPause: Number($('consecutiveFailPause').value || 3),
     neverRepeatJob: $('neverRepeatJob').checked,
     splitViewEnabled: $('splitViewEnabled').checked,
+    debugLoggingEnabled: $('debugLoggingEnabled').checked,
     whitelistOnly: $('whitelistOnly').checked
   };
 }
@@ -634,35 +648,6 @@ function statusLabel(status) {
   return map[status] || status || '空闲';
 }
 
-function getDoneJobIdSet(task) {
-  const done = new Set();
-  for (const it of task?.items || []) {
-    if (['COMPLETED', 'SKIPPED', 'FAILED'].includes(String(it?.state || '')) && it?.jobId) {
-      done.add(String(it.jobId));
-    }
-  }
-  for (const q of task?.queue || []) {
-    if (['done', 'skipped', 'failed'].includes(String(q?.status || '')) && q?.jobId) {
-      done.add(String(q.jobId));
-    }
-  }
-  for (const id of task?.testedJobIds || []) {
-    if (id) done.add(String(id));
-  }
-  return done;
-}
-
-function countPassJobs(task) {
-  return (task?.results || []).filter((r) => r?.decision === 'pass' && r?.job?.jobId).length;
-}
-
-function countPendingPassJobs(task) {
-  const done = getDoneJobIdSet(task);
-  return (task?.results || []).filter(
-    (r) => r?.decision === 'pass' && r?.job?.jobId && !done.has(String(r.job.jobId))
-  ).length;
-}
-
 function describeTaskPhase(task, status) {
   const pass = countPassJobs(task);
   const pending = countPendingPassJobs(task);
@@ -740,6 +725,7 @@ function updateTaskUI(task, runner = {}) {
   const onBoss = FLOAT_MODE || state.isBoss !== false;
   const isRunning = status === 'running';
   const isPaused = status === 'paused';
+  const executionBusy = Boolean(runner.running || runner.starting || runner.previewing || runner.stopping);
   const activeRun = isRunning || isPaused;
   // 控制条：按状态点亮当前可操作按钮，其它变暗
   setControlArmed('btnPause', {
@@ -769,7 +755,7 @@ function updateTaskUI(task, runner = {}) {
   const canBatch =
     onBoss &&
     hasPass &&
-    !isRunning &&
+    !executionBusy &&
     status !== 'previewing' &&
     // 暂停中应走「继续」，避免和队列冲突
     !isPaused;
@@ -782,12 +768,12 @@ function updateTaskUI(task, runner = {}) {
   }
   if ($('btnTestOne')) {
     const idleLike = !status || status === 'idle' || status === 'awaiting_confirm' || status === 'completed' || status === 'stopped' || status === 'failed';
-    const canOne = onBoss && hasPass && idleLike && !isRunning && !isPaused;
+    const canOne = onBoss && hasPass && idleLike && !executionBusy && !isPaused;
     $('btnTestOne').disabled = !canOne;
     $('btnTestOne').classList.toggle('is-armed', canOne && (status === 'completed' || status === 'stopped' || status === 'awaiting_confirm'));
     $('btnTestOne').title = canOne ? '每次只投 1 个尚未投过的通过岗位' : (isPaused ? '请先停止或继续当前任务' : '请先扫描预览');
   }
-  if ($('btnPreview')) $('btnPreview').disabled = !(onBoss && status !== 'running');
+  if ($('btnPreview')) $('btnPreview').disabled = !(onBoss && !executionBusy && status !== 'running');
   if ($('btnDiagnose')) $('btnDiagnose').disabled = !onBoss;
 }
 
@@ -988,6 +974,8 @@ async function refresh(options = {}) {
   const soft = options.soft === true;
   const res = await api(MSG.GET_STATE);
   if (!res?.ok) return;
+  const currentTask = state.config?.task;
+  if (!shouldAcceptTaskSnapshot(currentTask, res.task)) res.task = currentTask;
   const prevTemplate = state.config?.messageTemplate;
   const prevSettings = state.config?.settings;
   const prevFilters = state.config?.filters;
@@ -1038,6 +1026,7 @@ async function refresh(options = {}) {
     updateTaskUI(res.task, res.runner);
   }
   updateTaskUI(res.task, res.runner);
+  updateDebugUi(res.settings || {});
   announceTaskCompletion(res.task);
   renderLogs(res.logs || []);
   renderHistory(res.history || []);
@@ -1640,7 +1629,7 @@ function bindEvents() {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
     let selectedJobIds = Array.from(state.selected || []);
     const task = state.config?.task;
-    const doneIds = getDoneJobIdSet(task);
+    const doneIds = collectDoneJobIds(task?.items, task?.queue, task?.testedJobIds);
     // 若没勾选，或勾选的都已投完：自动改选剩余未投通过岗
     const pendingPassIds = (task?.results || [])
       .filter((r) => r.decision === 'pass' && r.job?.jobId && !doneIds.has(String(r.job.jobId)))
@@ -1657,6 +1646,7 @@ function bindEvents() {
     }
     // 同步勾选 UI
     state.selected = new Set(selectedJobIds);
+    $('btnStart').disabled = true;
     toast('正在保存配置并启动批量投递…', 'warn', 1500);
     try {
       await ensureConfigSavedBeforeDelivery();
@@ -1694,20 +1684,11 @@ function bindEvents() {
       toast('请先扫描预览并至少有一个通过岗位', 'error');
       return;
     }
-    const doneIds = new Set();
-    for (const it of state.config?.task?.items || []) {
-      if (['COMPLETED', 'SKIPPED', 'FAILED'].includes(String(it.state || '')) && it.jobId) {
-        doneIds.add(String(it.jobId));
-      }
-    }
-    for (const q of state.config?.task?.queue || []) {
-      if (['done', 'skipped', 'failed'].includes(String(q.status || '')) && q.jobId) {
-        doneIds.add(String(q.jobId));
-      }
-    }
-    for (const id of state.config?.task?.testedJobIds || []) {
-      if (id) doneIds.add(String(id));
-    }
+    const doneIds = collectDoneJobIds(
+      state.config?.task?.items,
+      state.config?.task?.queue,
+      state.config?.task?.testedJobIds
+    );
     const pending = pass.filter((r) => !doneIds.has(String(r.job.jobId)));
     if (!pending.length) {
       toast('通过岗位都已投过了，请重新扫描或勾选新岗位', 'warn', 3500);
@@ -1728,6 +1709,7 @@ function bindEvents() {
     } else if (!settings.autoSendImageResume && !settings.autoSendAttachmentResume) {
       toast('提示：未启用图片或 BOSS 在线简历，本次只发文字', 'warn', 2800);
     }
+    $('btnTestOne').disabled = true;
     toast('正在启动投递一份…', 'warn', 1500);
     const res = await api(MSG.RUN_TEST_DELIVERY || 'BHT_RUN_TEST_DELIVERY', {
       jobId: selectedJobIds[0],
@@ -1745,6 +1727,37 @@ function bindEvents() {
   });
 
 // controls wired in wireControlButtons()
+
+  $('btnExportDebugLogs')?.addEventListener('click', async () => {
+    const button = $('btnExportDebugLogs');
+    button.disabled = true;
+    try {
+      const res = await api(MSG.GET_DEBUG_LOGS);
+      if (!res?.ok) throw new Error(res?.message || res?.error || '读取调试日志失败');
+      const payload = {
+        product: 'Boss海投助手',
+        version: res.meta?.version || BHT_UI_VERSION,
+        exportedAt: res.meta?.exportedAt || new Date().toISOString(),
+        sessionOnly: true,
+        count: Array.isArray(res.logs) ? res.logs.length : 0,
+        logs: Array.isArray(res.logs) ? res.logs : []
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `boss-haitou-debug-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast(`已导出 ${payload.count} 条调试记录`, 'success');
+    } catch (e) {
+      toast(String(e?.message || e || '导出调试日志失败'), 'error', 4000);
+    } finally {
+      button.disabled = false;
+    }
+  });
 
   $('btnCopyLogs')?.addEventListener('click', async () => {
     const logs = state.config?.logs || [];
@@ -1849,6 +1862,7 @@ function bindEvents() {
 
 globalThis.chrome?.runtime?.onMessage?.addListener((msg) => {
   if (msg?.type === MSG.TASK_EVENT) {
+    if (!shouldAcceptTaskSnapshot(state.config?.task, msg.payload)) return;
     if (state.config) state.config.task = msg.payload;
     updateTaskUI(msg.payload, state.config?.runner || {});
     announceTaskCompletion(msg.payload);

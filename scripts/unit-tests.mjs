@@ -17,9 +17,18 @@ import "../extension/shared/conversation-match.js";
 import fs from "fs";
 import vm from "vm";
 import { pickNextTestDeliveryJob, collectDoneJobIds } from "../extension/shared/test-delivery.js";
+import {
+  buildDeliveryQueue,
+  countPassJobs,
+  countPendingPassJobs,
+  taskCounterSnapshot,
+  shouldAcceptTaskSnapshot
+} from "../extension/shared/task-model.js";
+import { createOperationRegistry } from "../extension/background/operation-registry.js";
 
 const {
   hasActiveState,
+  cleanHrIdentity,
   stableConversationKey,
   selectConversationCandidate,
   confirmRenderedOwnMessage
@@ -371,6 +380,11 @@ test("stable conversation key ignores changing preview text", () => {
   });
   assert.equal(a, b);
 });
+test("HR activity suffix is removed before conversation matching", () => {
+  assert.equal(cleanHrIdentity("范女士 在线"), "范女士");
+  assert.equal(cleanHrIdentity("赵舒雅 本周活跃"), "赵舒雅");
+  assert.equal(cleanHrIdentity("李响 · 刚刚活跃"), "李响");
+});
 test("select exact company and title conversation", () => {
   const picked = selectConversationCandidate([
     { index: 0, key: "a", text: "李女士 其他科技 Java 开发" },
@@ -472,7 +486,8 @@ test("start/test delivery refuses ALREADY_RUNNING and requires pre-save", () => 
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
   assert.ok(background.includes("error: 'ALREADY_RUNNING'"));
-  assert.ok(background.includes("当前已有任务在执行（含暂停中）"));
+  assert.ok(background.includes("withRunnerAdmission('starting'"));
+  assert.ok(background.includes("runner.previewing"));
   assert.ok(app.includes("await ensureConfigSavedBeforeDelivery()"));
   assert.ok(!app.includes("try { await saveSettings(); await saveResume(); await saveMessage(); } catch (_) {}"));
 });
@@ -492,6 +507,30 @@ test("preview scan uses try/finally to restore button", () => {
   assert.ok(chunk.includes("try {"));
   assert.ok(chunk.includes("} finally {"));
   assert.ok(chunk.includes("$('btnPreview').disabled = false"));
+});
+
+test("debug logging is session-only, toggleable and exportable", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  const debugLog = fs.readFileSync("extension/shared/debug-log.js", "utf8");
+  assert.ok(debugLog.includes("chrome.storage.session"));
+  assert.ok(background.includes("case MSG.GET_DEBUG_LOGS"));
+  assert.ok(content.includes("conversation_selection"));
+  assert.ok(content.includes("conversation_switch_probe"));
+  assert.ok(app.includes("btnExportDebugLogs"));
+  assert.ok(html.includes('id="debugLoggingEnabled"'));
+});
+
+test("conversation opener never repeatedly clicks the same candidate", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const start = content.indexOf("async function waitAndOpenConversation");
+  const end = content.indexOf("async function waitChatEditor", start);
+  const chunk = content.slice(start, end);
+  assert.ok(chunk.includes("const attemptedKeys = new Set()"));
+  assert.ok(chunk.includes("conversation_candidate_already_clicked"));
+  assert.ok(!/i === 3[\s\S]{0,250}clickLikeHuman/.test(chunk));
 });
 
 console.log("9) split workspace integration");
@@ -691,6 +730,73 @@ test("collectDoneJobIds merges items queue and extra", () => {
     ["z"]
   );
   assert.ok(s.has("x") && s.has("y") && s.has("z"));
+});
+
+console.log("13) task model + cancellation contract");
+test("shared task model owns queue dedupe and pending counts", () => {
+  const task = {
+    results: [
+      { decision: "pass", selected: true, job: { jobId: "a", title: "Java", company: "A" } },
+      { decision: "pass", selected: true, job: { jobId: "a", title: "Java", company: "A" } },
+      { decision: "pass", selected: true, job: { jobId: "b", title: "Go", company: "B" } },
+      { decision: "reject", job: { jobId: "c", title: "Sales", company: "C" } }
+    ],
+    items: [{ jobId: "a", state: "COMPLETED" }],
+    queue: [],
+    testedJobIds: [],
+    counters: { success: 1, skipped: 2, failed: 3, processed: 6 }
+  };
+  assert.equal(buildDeliveryQueue(task.results).length, 2);
+  assert.equal(countPassJobs(task), 3);
+  assert.equal(countPendingPassJobs(task), 1);
+  assert.deepEqual(taskCounterSnapshot(task), { success: 1, skipped: 2, failed: 3, processed: 6 });
+});
+
+test("operation registry returns and clears every active content operation", () => {
+  const registry = createOperationRegistry();
+  registry.add({ opId: "one", tabId: 1 });
+  registry.add({ opId: "two", tabId: 2 });
+  assert.equal(registry.size, 2);
+  assert.deepEqual(registry.list().map((row) => row.opId), ["one", "two"]);
+  const cancelled = registry.clear();
+  assert.equal(cancelled.length, 2);
+  assert.equal(registry.size, 0);
+});
+
+test("older polling snapshots cannot overwrite a stopped task event", () => {
+  const stopped = { id: "task-1", revision: 8, updatedAt: 200, status: "stopped", createdAt: 100 };
+  const staleRunning = { id: "task-1", revision: 7, updatedAt: 190, status: "running", createdAt: 100 };
+  const restarted = { id: "task-1", revision: 9, updatedAt: 210, status: "running", createdAt: 100 };
+  assert.equal(shouldAcceptTaskSnapshot(stopped, staleRunning), false);
+  assert.equal(shouldAcceptTaskSnapshot(stopped, restarted), true);
+  assert.equal(shouldAcceptTaskSnapshot(staleRunning, stopped), true);
+});
+
+test("stop cancels page operations and protects the stopped terminal state", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const messaging = fs.readFileSync("extension/shared/messaging.js", "utf8");
+  const stop = background.slice(background.indexOf("case MSG.STOP_TASK"), background.indexOf("case MSG.SKIP_CURRENT"));
+  assert.ok(stop.includes("runner.abort = true"));
+  assert.ok(stop.includes("await cancelActiveOperations"));
+  assert.ok(background.includes("STOP 是不可逆终态"));
+  assert.ok(background.includes("row?.status === 'cancelled'"));
+  assert.ok(content.includes("operationCancelledError"));
+  assert.ok(content.includes("BHT_OP_CANCELLED"));
+  assert.ok(content.includes('status: "cancelled"'));
+  assert.ok(!content.includes("resumePendingOps"));
+  assert.ok(!background.includes("tabs.connect"));
+  assert.ok(!content.includes("runtime.onConnect"));
+  assert.ok(background.includes("clearStaleOperationArtifacts"));
+  assert.ok(messaging.includes("BHT_CANCEL_OP"));
+});
+
+test("legacy worker-tab delivery path has been removed", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(!background.includes("function ensureWorkerTab"));
+  assert.ok(!background.includes("function openQueueJobOnWorker"));
+  assert.ok(background.includes("buildDeliveryQueue"));
+  assert.ok(background.includes("collectDoneJobIds"));
 });
 
 

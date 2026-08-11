@@ -29,9 +29,9 @@ test("background force-injects content on critical ops", () => {
   assert.ok(s.includes("critical.includes"));
 });
 
-test("background ensures list before chat and returns after job", () => {
+test("background uses the two-page trigger flow and returns safely after failures", () => {
   const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
-  assert.ok(s.includes("列表恢复交给 START_CHAT") || s.includes("START_CHAT"));
+  assert.ok(s.includes("TRIGGER_CONVERSATION"));
   assert.ok(s.includes("RETURN_TO_LIST") && (s.includes("返回列表统一由 runTaskLoop") || s.includes("每岗结束后只回列表一次")));
   assert.ok(s.includes("RETURN_TO_LIST after fail"));
   assert.ok(s.includes("RETURN_TO_LIST after send fail"));
@@ -40,9 +40,10 @@ test("background ensures list before chat and returns after job", () => {
   assert.ok(s.includes("while (outcome === 'failed')"));
 });
 
-test("content startChat is href-first and versioned", () => {
+test("content operation bridge is versioned and cancellable", () => {
   const s = fs.readFileSync("extension/content/content-main.js", "utf8");
-  assert.ok(s.includes('BHT_CONTENT_VERSION = "1.6.4"'));
+  const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+  assert.ok(s.includes(`BHT_CONTENT_VERSION = "${pkg.version}"`));
   assert.ok(s.includes("matchedVia"));
   assert.ok(s.includes("tryPickVisible"));
   assert.ok(s.includes("JOB_CARD_NOT_FOUND"));
@@ -52,15 +53,18 @@ test("content startChat is href-first and versioned", () => {
   assert.ok(s.includes("getSelfMessages"));
   assert.ok(s.includes("BHT_RUN_OP") || s.includes("bht_op_"));
   assert.ok(s.includes("openJobByHrefFallback"));
-  assert.ok(s.includes("installJobNavGuard") || s.includes("bht-op"));
-  assert.ok(s.includes("bht-op"));
+  assert.ok(s.includes("operationCancelledError"));
+  assert.ok(s.includes("BHT_CANCEL_OP"));
+  assert.ok(!s.includes("runtime.onConnect"));
+  assert.ok(!s.includes("resumePendingOps"));
   assert.ok(s.includes("uiErrorDismissed") === false); // content may not have it
 });
 
-test("background modal dismiss flag + atomic startChat", () => {
+test("background modal dismiss flag + cancellable conversation trigger", () => {
   const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
   assert.ok(s.includes("uiErrorDismissed"));
-  assert.ok(s.includes("列表恢复交给 START_CHAT") || s.includes("skipScroll: false"));
+  assert.ok(s.includes("MSG.TRIGGER_CONVERSATION"));
+  assert.ok(s.includes("cancelActiveOperations"));
   assert.ok(s.includes("DISMISS_ERROR_MODAL"));
 });
 
