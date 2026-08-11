@@ -1,10 +1,12 @@
 (() => {
   const MSG = {
     PING: "BHT_PING",
-    GET_PAGE_INFO: "BHT_GET_PAGE_INFO",
     SCAN_JOBS: "BHT_SCAN_JOBS",
     START_CHAT: "BHT_START_CHAT",
-    GET_CURRENT_JOB_DETAIL: "BHT_GET_CURRENT_JOB_DETAIL",
+    TRIGGER_CONVERSATION: "BHT_TRIGGER_CONVERSATION",
+    GET_CONVERSATION_SNAPSHOT: "BHT_GET_CONVERSATION_SNAPSHOT",
+    WAIT_OPEN_CONVERSATION: "BHT_WAIT_OPEN_CONVERSATION",
+    WAIT_CHAT_EDITOR: "BHT_WAIT_CHAT_EDITOR",
     GET_CHAT_SELF_MESSAGES: "BHT_GET_CHAT_SELF_MESSAGES",
     SEND_TEXT: "BHT_SEND_TEXT",
     SEND_IMAGE: "BHT_SEND_IMAGE",
@@ -19,7 +21,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.6.9";
+  const BHT_CONTENT_VERSION = "1.7.0";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -1212,46 +1214,6 @@ function firstEl(selectors, root = document) {
 
   
 
-  async function openJobDetail(job) {
-    await ensureJobList({ maxWaitMs: 5000, scroll: true });
-    let card = findCardByJob(job);
-    if (!card && job?.title) {
-      card = getJobCards().find((c, i) => {
-        const p = parseJobCard(c, i);
-        return p.title && (p.title === job.title || p.title.includes(job.title) || job.title.includes(p.title));
-      }) || null;
-    }
-    if (!card) return { ok: false, error: "JOB_CARD_NOT_FOUND", message: "未找到岗位卡片" };
-
-    const wrap = card.closest(".job-card-wrap") || card;
-    try {
-      wrap.scrollIntoView({ block: "center", behavior: "instant" });
-    } catch (_) {}
-
-    // 阻止标题链接整页跳转，只激活右侧详情
-    preventLinkNavigation(wrap, 800);
-    clickLikeHuman(wrap);
-    await sleep(500);
-
-    // 详情未出现再点一次卡片主体（仍阻止 a 跳转）
-    if (!firstEl(SELECTORS.detailRoot) && !firstEl(SELECTORS.chatOnDetail)) {
-      preventLinkNavigation(wrap, 800);
-      clickLikeHuman(card);
-      await sleep(500);
-    }
-
-    const more = firstEl(SELECTORS.moreLink);
-    const securityId = extractSecurityId(more?.href || "");
-    const detailRoot = firstEl(SELECTORS.detailRoot) || document;
-    const detailSalary = textOf(firstEl(SELECTORS.salary, detailRoot));
-    return {
-      ok: true,
-      securityId,
-      detailSalary,
-      detailReady: Boolean(firstEl(SELECTORS.detailRoot) || firstEl(SELECTORS.chatOnDetail))
-    };
-  }
-
   async function clickChatButton() {
     let btn =
       firstEl(SELECTORS.chatOnDetail) ||
@@ -1668,58 +1630,6 @@ function dismissCommonDialogs() {
   }
 
     
-  function getCurrentJobDetail() {
-    const href = location.href;
-    const isList = /\/web\/geek\/jobs|recommend|search/i.test(location.pathname + location.search);
-    const isChat = /\/chat/i.test(location.pathname);
-    const isJob = /job_detail|encryptJobId|\/geek\/job/i.test(location.href);
-    const jobId = extractJobIdFromHref(href) || "";
-    const detailRoot = firstEl(SELECTORS.detailRoot) || document;
-    const title =
-      textOf(firstEl(SELECTORS.title, detailRoot)) ||
-      textOf(document.querySelector(".job-name, .job-title, h1")) ||
-      "";
-    const company =
-      textOf(firstEl(SELECTORS.company, detailRoot)) ||
-      textOf(document.querySelector(".company-name, .company-info .name")) ||
-      "";
-    const locationText =
-      textOf(firstEl(SELECTORS.location, detailRoot)) ||
-      textOf(document.querySelector(".job-location, .job-area, .company-location")) ||
-      "";
-    const salary =
-      textOf(firstEl(SELECTORS.salary, detailRoot)) ||
-      textOf(document.querySelector(".job-salary, .salary")) ||
-      "";
-    const jd =
-      textOf(document.querySelector(".job-detail-section, .job-sec-text, .job-detail, .detail-content")) ||
-      textOf(detailRoot).slice(0, 4000);
-    let securityId = extractSecurityId(href);
-    try {
-      const more = firstEl(SELECTORS.moreLink, detailRoot);
-      securityId = extractSecurityId(more?.href || "") || securityId;
-    } catch (_) {}
-    return {
-      ok: true,
-      job: {
-        href,
-        jobId,
-        securityId: securityId || "",
-        title,
-        company,
-        location: locationText,
-        salary,
-        jd,
-        path: location.pathname,
-        isListPage: /\/web\/geek\/jobs|recommend/i.test(location.pathname),
-        isChatPage: /\/chat/i.test(location.pathname),
-        isJobPage: /job_detail|encryptJobId|\/geek\/job/i.test(location.href)
-      },
-      page: pageInfo(),
-      contentVersion: BHT_CONTENT_VERSION
-    };
-  }
-
 async function startChatOnCurrentDetail(job = {}) {
     if (typeof detectLoginModal === "function") {
       const loginHit = detectLoginModal();
@@ -3100,6 +3010,8 @@ async function startChat(job, opts = {}) {
           href: location.href,
           contentVersion: BHT_CONTENT_VERSION
         };
+        debugTrace("trigger_chat_button_not_found", missingButton, "error");
+        return missingButton;
       }
 
       await sleep(450);
@@ -3393,7 +3305,6 @@ async function startChat(job, opts = {}) {
     const beforeKeys = new Set(payload.beforeKeys || []);
     const wantTitle = normalizeText(job.title || "");
     const wantCompany = normalizeText(job.company || "");
-    const wantHr = normalizeText(job.hrName || job.bossName || "");
     const deadline = Date.now() + (payload.timeoutMs || 22000);
     const hardAmbiguousAfter = Date.now() + Math.min(12000, Math.max(5000, (payload.timeoutMs || 22000) - 4000));
 
@@ -3740,59 +3651,37 @@ async function runOpByType(type, payload = {}) {
     try {
     switch (type) {
       case MSG.PING:
-      case "BHT_PING":
-        return { ok: true, page: pageInfo(), contentVersion: BHT_CONTENT_VERSION };
-      case MSG.GET_PAGE_INFO:
-      case "BHT_GET_PAGE_INFO":
         return { ok: true, page: pageInfo(), contentVersion: BHT_CONTENT_VERSION };
       case MSG.DIAGNOSE:
-      case "BHT_DIAGNOSE":
         return { ok: true, ...diagnose(), contentVersion: BHT_CONTENT_VERSION };
       case MSG.SCAN_JOBS:
-      case "BHT_SCAN_JOBS":
         return await scanJobs(payload || {});
-      case MSG.GET_CURRENT_JOB_DETAIL:
-      case "BHT_GET_CURRENT_JOB_DETAIL":
-        return getCurrentJobDetail();
-      case "BHT_TRIGGER_CONVERSATION":
       case MSG.TRIGGER_CONVERSATION:
         return await triggerConversationOnList((payload && payload.job) || payload || {});
-      case "BHT_GET_CONVERSATION_SNAPSHOT":
       case MSG.GET_CONVERSATION_SNAPSHOT:
         return getConversationSnapshot();
-      case "BHT_WAIT_OPEN_CONVERSATION":
       case MSG.WAIT_OPEN_CONVERSATION:
         return await waitAndOpenConversation(payload || {});
-      case "BHT_WAIT_CHAT_EDITOR":
       case MSG.WAIT_CHAT_EDITOR:
         return await waitChatEditor(payload || {});
       case MSG.START_CHAT:
-      case "BHT_START_CHAT":
         return await startChat(payload?.job || payload, payload || {});
       case MSG.GET_CHAT_SELF_MESSAGES:
-      case "BHT_GET_CHAT_SELF_MESSAGES":
         await waitForChat(8000);
         return { ok: true, messages: getSelfMessages(payload?.limit || 8) };
       case MSG.SEND_TEXT:
-      case "BHT_SEND_TEXT":
         return await sendText(payload?.text || "", payload || {});
       case MSG.SEND_IMAGE:
-      case "BHT_SEND_IMAGE":
         return await sendImageFromDataUrl(payload?.dataUrl, payload?.fileName);
       case MSG.SEND_RESUME:
-      case "BHT_SEND_RESUME":
         return await sendPlatformResume(payload || {});
       case MSG.HIGHLIGHT_JOBS:
-      case "BHT_HIGHLIGHT_JOBS":
         return highlightJobs(payload?.map || {});
       case MSG.CLOSE_CHAT:
-      case "BHT_CLOSE_CHAT":
         return await closeChatPanel();
       case MSG.ENSURE_JOB_LIST:
-      case "BHT_ENSURE_JOB_LIST":
         return await ensureJobList(payload || {});
       case MSG.RETURN_TO_LIST:
-      case "BHT_RETURN_TO_LIST":
         return await returnToJobList(payload || {});
       default:
         return { ok: false, error: "UNKNOWN_TYPE", type };
@@ -3808,7 +3697,7 @@ async function runOpByType(type, payload = {}) {
   const onBhtMessage = (message, _sender, sendResponse) => {
     const { type, payload } = message || {};
 
-    if (type === MSG.CANCEL_OP || type === "BHT_CANCEL_OP") {
+    if (type === MSG.CANCEL_OP) {
       const opId = String(payload?.opId || "");
       debugTrace("operation_cancel_received", { opId, reason: payload?.reason || "任务已停止" }, "warn");
       if (opId) window.__BHT_OP_CANCELLED__[opId] = true;
@@ -3831,7 +3720,7 @@ async function runOpByType(type, payload = {}) {
     }
 
     // storage 桥：立即 ACK，后台轮询结果，避免 SPA 点击打断 channel
-    if (type === "BHT_RUN_OP" || type === MSG.RUN_OP) {
+    if (type === MSG.RUN_OP) {
       const opId = payload?.opId;
       const opType = payload?.opType || payload?.type;
       const opPayload = payload?.opPayload || payload?.payload || {};
@@ -3916,19 +3805,27 @@ async function runOpByType(type, payload = {}) {
             debugTrace("operation_dispatch_return", { opId, opType, result: opResult }, opResult?.ok ? "debug" : "warn");
             return opResult;
           })();
-          result = await Promise.race([
-            workPromise.then((r) => r),
-            sleep(opTimeoutMs).then(() => {
+          let innerTimeoutId = null;
+          const innerTimeoutPromise = new Promise((resolve) => {
+            innerTimeoutId = setTimeout(() => {
               timedOut = true;
               debugTrace("operation_inner_timeout", { opId, opType, timeoutMs: opTimeoutMs }, "error");
-              return {
+              resolve({
                 ok: false,
                 error: "OP_INNER_TIMEOUT",
                 message: "页面内操作超时",
                 contentVersion: BHT_CONTENT_VERSION
-              };
-            })
-          ]);
+              });
+            }, opTimeoutMs);
+          });
+          try {
+            result = await Promise.race([
+              workPromise.then((r) => r),
+              innerTimeoutPromise
+            ]);
+          } finally {
+            if (innerTimeoutId != null) clearTimeout(innerTimeoutId);
+          }
           // 超时后仍等原任务收尾（最多再 15s），避免锁被提前清掉后并发
           if (timedOut && workPromise) {
             log("RUN_OP timed out, waiting work settle", opId, opType);

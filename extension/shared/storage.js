@@ -30,8 +30,7 @@ export async function ensureDefaults() {
         {
           id: 'default',
           name: '默认简历',
-          images: [],
-          attachment: null
+          images: []
         }
       ],
       defaultProfileId: 'default'
@@ -51,12 +50,17 @@ export async function ensureDefaults() {
 export async function getAllConfig() {
   await ensureDefaults();
   const data = await get(Object.values(STORAGE_KEYS));
+  const settings = { ...(data[STORAGE_KEYS.SETTINGS] || {}) };
+  if (settings.resumeSendTiming === 'on_request') {
+    settings.resumeSendTiming = 'after_text';
+    await set({ [STORAGE_KEYS.SETTINGS]: settings });
+  }
   const resumes = normalizeResumes(data[STORAGE_KEYS.RESUMES]);
   if (countResumeImages(resumes) < countResumeImages(data[STORAGE_KEYS.RESUMES])) {
     await set({ [STORAGE_KEYS.RESUMES]: resumes });
   }
   return {
-    settings: data[STORAGE_KEYS.SETTINGS],
+    settings,
     filters: data[STORAGE_KEYS.FILTERS],
     messageTemplate: data[STORAGE_KEYS.MESSAGE_TEMPLATE],
     resumes,
@@ -106,10 +110,6 @@ export async function saveTask(task) {
   await set({ [STORAGE_KEYS.TASK]: task });
 }
 
-export async function clearTask() {
-  await set({ [STORAGE_KEYS.TASK]: null });
-}
-
 export async function appendLog(entry) {
   const { [STORAGE_KEYS.LOGS]: logs = [] } = await get(STORAGE_KEYS.LOGS);
   const next = [
@@ -122,11 +122,6 @@ export async function appendLog(entry) {
   ].slice(0, 1000);
   await set({ [STORAGE_KEYS.LOGS]: next });
   return next[0];
-}
-
-export async function getLogs(limit = 200) {
-  const { [STORAGE_KEYS.LOGS]: logs = [] } = await get(STORAGE_KEYS.LOGS);
-  return logs.slice(0, limit);
 }
 
 export async function clearLogs() {
@@ -206,7 +201,7 @@ export async function exportAll() {
   };
 }
 
-export async function importAll(payload, { merge = false } = {}) {
+export async function importAll(payload) {
   if (!payload || typeof payload !== 'object') throw new Error('无效配置文件');
   const put = {};
   const map = {
@@ -220,9 +215,6 @@ export async function importAll(payload, { merge = false } = {}) {
   };
   for (const [k, sk] of Object.entries(map)) {
     if (payload[k] != null) put[sk] = payload[k];
-  }
-  if (!merge) {
-    // full replace selected domains
   }
   await set(put);
   return getAllConfig();

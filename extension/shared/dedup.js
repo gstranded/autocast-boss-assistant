@@ -1,5 +1,5 @@
 import { REASON, reasonText } from './reason-codes.js';
-import { normalizeText, todayKey } from './text-utils.js';
+import { normalizeText } from './text-utils.js';
 
 function daysBetween(ts, now = Date.now()) {
   return (now - ts) / (24 * 3600 * 1000);
@@ -114,5 +114,3 @@ export function resumeIdempotencyKey(job, kind, profileId) {
 export function jobIdempotencyKey(job) {
   return `job:${job.jobId || normalizeText(job.company || '') + '|' + normalizeText(job.title || '')}`;
 }
-
-export { todayKey };

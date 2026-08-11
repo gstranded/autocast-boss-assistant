@@ -45,7 +45,7 @@ export function charSet(s) {
   return new Set(Array.from(s));
 }
 
-export function lcsRatio(a, b) {
+function lcsRatio(a, b) {
   const m = a.length;
   const n = b.length;
   if (!m || !n) return 0;
@@ -59,7 +59,7 @@ export function lcsRatio(a, b) {
   return (2 * dp[m][n]) / (m + n);
 }
 
-export function similarity(a, b) {
+function similarity(a, b) {
   const na = normalizeText(a);
   const nb = normalizeText(b);
   if (!na && !nb) return 1;

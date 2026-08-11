@@ -79,10 +79,3 @@ export async function getSessionDebugLogs() {
   const bag = await chrome.storage.session.get(DEBUG_LOG_KEY);
   return Array.isArray(bag?.[DEBUG_LOG_KEY]) ? bag[DEBUG_LOG_KEY] : [];
 }
-
-export async function clearSessionDebugLogs() {
-  pendingEntries = [];
-  if (flushPromise) await flushPromise;
-  await writeChain;
-  if (globalThis.chrome?.storage?.session) await chrome.storage.session.remove(DEBUG_LOG_KEY);
-}

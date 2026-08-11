@@ -1,7 +1,7 @@
 import { normalizeText } from './text-utils.js';
 
-export const DONE_ITEM_STATES = Object.freeze(['COMPLETED', 'SKIPPED', 'FAILED']);
-export const DONE_QUEUE_STATES = Object.freeze(['done', 'skipped', 'failed']);
+const DONE_ITEM_STATES = Object.freeze(['COMPLETED', 'SKIPPED', 'FAILED']);
+const DONE_QUEUE_STATES = Object.freeze(['done', 'skipped', 'failed']);
 
 export function collectDoneJobIds(items = [], queue = [], extraDoneIds = null) {
   const done = new Set();

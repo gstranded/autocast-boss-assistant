@@ -80,15 +80,6 @@
     return haystack.includes(needle.slice(0, n));
   }
 
-  function softIncludes(haystack, needle) {
-    if (!haystack || !needle) return false;
-    if (haystack.includes(needle)) return true;
-    // 允许较短一边包含较长一边的前缀
-    if (needle.length >= 2 && haystack.includes(needle.slice(0, Math.min(needle.length, 4)))) return true;
-    if (haystack.length >= 2 && needle.includes(haystack.slice(0, Math.min(haystack.length, 4)))) return true;
-    return false;
-  }
-
   function titleTokens(title = "") {
     const parts = String(title || "")
       .split(/[\s\-—–_/｜|·•（）()【】\[\]　]+/)

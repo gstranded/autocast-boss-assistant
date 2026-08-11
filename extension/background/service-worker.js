@@ -5,12 +5,10 @@ import {
   bumpDailyStat,
   clearHistory,
   clearLogs,
-  clearTask,
   exportAll,
   getAllConfig,
   getHistory,
   getIdempotencyMap,
-  getLogs,
   getTodayStats,
   hasIdempotent,
   importAll,
@@ -47,6 +45,19 @@ import {
 } from '../shared/debug-log.js';
 
 const SPLIT_ZOOM_FACTOR = 0.8;
+const JOB_PHASE = Object.freeze({
+  CHAT_TRIGGERED: 'CHAT_TRIGGERED',
+  CONVERSATION_OPENED: 'CONVERSATION_OPENED',
+  CONVERSATION_OPENED_EDITOR_PENDING: 'CONVERSATION_OPENED_EDITOR_PENDING'
+});
+
+function hasChatCheckpoint(item) {
+  return [
+    JOB_PHASE.CHAT_TRIGGERED,
+    JOB_PHASE.CONVERSATION_OPENED,
+    JOB_PHASE.CONVERSATION_OPENED_EDITOR_PENDING
+  ].includes(item?.phase);
+}
 
 let runner = {
   running: false,
@@ -196,26 +207,6 @@ chrome.runtime.onStartup?.addListener(() => {
 chrome.runtime.onInstalled.addListener(async () => {
   await getAllConfig();
   await recoverBackgroundState('扩展更新/重载后后台已重建');
-  try {
-    // 一次性：若已上传图片但未开自动发，升级默认以符合「文本后发图」预期
-    const all = await chrome.storage.local.get(['bht_settings', 'bht_resumes', 'bht_migrated_137']);
-    if (!all.bht_migrated_137) {
-      const settings = all.bht_settings || {};
-      const resumes = all.bht_resumes || {};
-      const hasImg = (resumes.profiles || []).some((p) => (p.images || []).length);
-      let changed = false;
-      if (hasImg && settings.autoSendImageResume === false) {
-        settings.autoSendImageResume = true;
-        changed = true;
-      }
-      if (hasImg && settings.resumeSendTiming === 'on_request') {
-        settings.resumeSendTiming = 'after_text';
-        changed = true;
-      }
-      if (changed) await chrome.storage.local.set({ bht_settings: settings });
-      await chrome.storage.local.set({ bht_migrated_137: true });
-    }
-  } catch (_) {}
   // side panel disabled: using floating panel + action popup
   await refreshSidePanelForAllTabs();
 });
@@ -530,6 +521,48 @@ async function ensureMessageTab(task) {
   await sleep(400);
   await log("info", "[消息页] 已创建 tab=" + tab.id);
   return tab;
+}
+
+async function refreshMessageTabOnce(task, tabId, { jobId = '', resumed = false } = {}) {
+  if (runner.abort) return cancelledResult();
+  await debugLog('background.messageTab', 'reload_begin', {
+    taskId: task?.id,
+    tabId,
+    jobId,
+    resumed
+  });
+  try {
+    await chrome.tabs.reload(tabId);
+    await waitTabComplete(tabId, 30000);
+    if (runner.abort) return cancelledResult();
+    if (task?.execution?.splitViewActive) await setSplitTabZoom(tabId);
+    await forceInjectContent(tabId);
+    await sleep(350);
+    await log('info', `[消息页] 已刷新会话列表（${resumed ? '从检查点重试' : '触发沟通后'}）`, {
+      jobId,
+      tabId
+    });
+    await debugLog('background.messageTab', 'reload_complete', {
+      taskId: task?.id,
+      tabId,
+      jobId,
+      resumed
+    });
+    return { ok: true };
+  } catch (error) {
+    await log('warn', '[消息页] 刷新失败，将基于当前页面继续安全匹配：' + String(error?.message || error), {
+      jobId,
+      tabId
+    });
+    await debugLog('background.messageTab', 'reload_failed', {
+      taskId: task?.id,
+      tabId,
+      jobId,
+      resumed,
+      error: serializeError(error)
+    }, 'error');
+    return { ok: false, error: String(error?.message || error) };
+  }
 }
 
 async function softReturnToList(task) {
@@ -1035,7 +1068,7 @@ function itemErrorHint(task, row) {
   return reason || task.pauseReason || '';
 }
 
-async function waitWhilePaused(task) {
+async function waitWhilePaused() {
   // 不在此处重复 publish，避免弹窗被 TASK_EVENT 反复触发
   while (runner.pause && !runner.abort) {
     await sleep(350);
@@ -1046,8 +1079,10 @@ async function processOneJob(task, resultRow, config) {
   if (runner.abort) return 'aborted';
   const job = { ...resultRow.job };
   if (!job.listHref && task.listHref) job.listHref = task.listHref;
-  resultRow.job = job;
   const item = ensureItem(task, job);
+  const resumedFromChat = hasChatCheckpoint(item);
+  if (resumedFromChat && item.triggerIdentity) Object.assign(job, item.triggerIdentity);
+  resultRow.job = job;
   task.currentJobId = job.jobId;
   task.updatedAt = Date.now();
   await publishTask(task);
@@ -1078,33 +1113,47 @@ async function processOneJob(task, resultRow, config) {
     return 'limited';
   }
 
-  // re-check dedup
+  // 已创建沟通的重试必须从检查点继续；此时再做岗位去重会把当前岗位误判为已投。
   const history = await getHistory();
   const idempotency = await getIdempotencyMap();
-  const dedup = checkDedup(job, {
-    settings: config.settings,
-    history,
-    todayStats,
-    taskItemKeys: new Set(
-      task.items.filter((x) => x.state === 'COMPLETED' || x.state === 'SKIPPED').map((x) => x.jobId)
-    ),
-    idempotency
-  });
-  if (!dedup.ok) {
-    item.state = 'SKIPPED';
-    item.reasons = dedup.reasonTexts;
-    task.counters.skipped += 1;
-    await bumpDailyStat('skip');
-    await log('info', `${job.title} - ${dedup.reasonTexts[0]}`, { jobId: job.jobId });
-    return 'skipped';
+  if (!resumedFromChat) {
+    const dedup = checkDedup(job, {
+      settings: config.settings,
+      history,
+      todayStats,
+      taskItemKeys: new Set(
+        task.items.filter((x) => x.state === 'COMPLETED' || x.state === 'SKIPPED').map((x) => x.jobId)
+      ),
+      idempotency
+    });
+    if (!dedup.ok) {
+      item.state = 'SKIPPED';
+      item.reasons = dedup.reasonTexts;
+      task.counters.skipped += 1;
+      await bumpDailyStat('skip');
+      await log('info', `${job.title} - ${dedup.reasonTexts[0]}`, { jobId: job.jobId });
+      return 'skipped';
+    }
+  } else {
+    await log('info', `[任务] 从沟通检查点恢复：${item.phase}，不会再次点击「立即沟通」`, {
+      jobId: job.jobId,
+      triggeredAt: item.triggeredAt || null
+    });
+    await debugLog('background.task', 'chat_checkpoint_resume', {
+      taskId: task.id,
+      jobId: job.jobId,
+      phase: item.phase,
+      triggeredAt: item.triggeredAt || null,
+      beforeKeyCount: item.beforeConversationKeys?.length || 0,
+      triggerIdentity: item.triggerIdentity || null
+    });
   }
 
   await log('info', `开始沟通：${job.title} @ ${job.company || ''}`, {
     jobId: job.jobId,
     href: String(job.href || '').slice(0, 180),
     securityId: job.securityId || '',
-    listHref: String(job.listHref || task.listHref || '').slice(0, 120),
-    workerTabId: task.execution?.workerTabId || null
+    listHref: String(job.listHref || task.listHref || '').slice(0, 120)
   });
   // version stamp for support
   // (content reports its version in START_CHAT response)
@@ -1114,7 +1163,6 @@ async function processOneJob(task, resultRow, config) {
 // 双页主路径直接在列表页触发沟通，避免预先 CLOSE/ENSURE 打乱虚拟列表。
     // 工作页直达岗位 href（列表页不动；正常路径不再 RETURN_TO_LIST 找下一岗）
   if (task.listHref && !job.listHref) job.listHref = task.listHref;
-  let workerTabId = task.execution?.workerTabId || null;
   await log('info', `[任务] 开始处理：${job.title} @ ${job.company || ''}`, {
     jobId: job.jobId,
     href: String(job.href || '').slice(0, 160),
@@ -1122,17 +1170,21 @@ async function processOneJob(task, resultRow, config) {
     listHref: String(job.listHref || task.listHref || '').slice(0, 140)
   });
 
-  // ===== v1.5 主路径：列表页建会话 + 消息页发送 =====
-  const listTab = await ensureListTab(task);
-  const listTabId = listTab?.id || task.execution?.listTabId || null;
-  if (!listTabId) {
-    item.state = 'FAILED';
-    item.reasons = ['未绑定列表页，请在职位列表页重新扫描预览'];
-    task.counters.failed += 1;
-    await log('error', '[列表页] 未找到列表标签页', { jobId: job.jobId });
-    return 'failed';
+  // 双页主路径：列表页建会话 + 消息页发送
+  let listTabId = task.execution?.listTabId || null;
+  let listOpt = null;
+  if (!resumedFromChat) {
+    const listTab = await ensureListTab(task);
+    listTabId = listTab?.id || task.execution?.listTabId || null;
+    if (!listTabId) {
+      item.state = 'FAILED';
+      item.reasons = ['未绑定列表页，请在职位列表页重新扫描预览'];
+      task.counters.failed += 1;
+      await log('error', '[列表页] 未找到列表标签页', { jobId: job.jobId });
+      return 'failed';
+    }
+    listOpt = { tabId: listTabId, forceInject: true };
   }
-  const listOpt = { tabId: listTabId, forceInject: true };
 
   let messageTab;
   try {
@@ -1149,46 +1201,48 @@ async function processOneJob(task, resultRow, config) {
   const msgTabId = messageTab.id;
   const msgOpt = { tabId: msgTabId, forceInject: true };
 
-  // 消息页快照（点击沟通前）
-  let beforeSnap = await sendToBoss(MSG.GET_CONVERSATION_SNAPSHOT || 'BHT_GET_CONVERSATION_SNAPSHOT', {}, msgOpt);
+  let beforeSnap = resumedFromChat
+    ? { ok: true, keys: item.beforeConversationKeys || [], count: item.beforeConversationCount || 0 }
+    : await sendToBoss(MSG.GET_CONVERSATION_SNAPSHOT || 'BHT_GET_CONVERSATION_SNAPSHOT', {}, msgOpt);
   if (operationAborted(beforeSnap)) return 'aborted';
-  await log('info', '[消息页] 沟通前会话快照 count=' + (beforeSnap?.count || 0), {
+  await log('info', `[消息页] ${resumedFromChat ? '恢复' : '沟通前'}会话快照 count=${beforeSnap?.count || 0}`, {
     href: beforeSnap?.href,
+    beforeKeyCount: beforeSnap?.keys?.length || 0,
     sample: (beforeSnap?.items || []).slice(0, 3).map((x) => x.text)
   });
 
-  // 列表页：定位 + 立即沟通 + 留在此页
-  await log('info', '[列表页] 定位并触发沟通', { jobId: job.jobId, title: job.title, tabId: listTabId });
-  const trig = await sendToBoss(
-    MSG.TRIGGER_CONVERSATION || 'BHT_TRIGGER_CONVERSATION',
-    { job },
-    listOpt
-  );
-  if (operationAborted(trig)) return 'aborted';
-  await log(
-    trig?.ok ? 'success' : 'error',
-    trig?.ok
-      ? ('[列表页] 已触发沟通 btn=' + (trig.buttonText || '') + (trig.stayed ? ' · 已点留在此页' : ' · 未检测到留在此页弹窗') + (trig.already ? ' · 继续沟通' : ''))
-      : ('[列表页] 触发沟通失败：' + (trig?.message || trig?.error || '')),
-    { jobId: job.jobId, detailTitle: trig?.detailTitle, samples: trig?.samples }
-  );
-  if (!trig?.ok) {
-    item.state = /LIST_JOB_NOT_FOUND|找不到/.test(String(trig?.error || '')) ? 'SKIPPED' : 'FAILED';
-    item.reasons = [trig?.message || trig?.error || '列表页触发沟通失败'];
-    if (item.state === 'SKIPPED') {
-      task.counters.skipped += 1;
-      await appendHistory({ jobId: job.jobId, title: job.title, company: job.company, status: 'skipped_list', taskId: task.id });
-      return 'skipped';
+  let trig = item.triggerReceipt || { ok: true, already: true, contentVersion: '' };
+  if (!resumedFromChat) {
+    // 列表页：定位 + 立即沟通 + 留在此页
+    await log('info', '[列表页] 定位并触发沟通', { jobId: job.jobId, title: job.title, tabId: listTabId });
+    trig = await sendToBoss(
+      MSG.TRIGGER_CONVERSATION || 'BHT_TRIGGER_CONVERSATION',
+      { job },
+      listOpt
+    );
+    if (operationAborted(trig)) return 'aborted';
+    await log(
+      trig?.ok ? 'success' : 'error',
+      trig?.ok
+        ? ('[列表页] 已触发沟通 btn=' + (trig.buttonText || '') + (trig.stayed ? ' · 已点留在此页' : ' · 未检测到留在此页弹窗') + (trig.already ? ' · 继续沟通' : ''))
+        : ('[列表页] 触发沟通失败：' + (trig?.message || trig?.error || '')),
+      { jobId: job.jobId, detailTitle: trig?.detailTitle, samples: trig?.samples }
+    );
+    if (!trig?.ok) {
+      item.state = /LIST_JOB_NOT_FOUND|找不到/.test(String(trig?.error || '')) ? 'SKIPPED' : 'FAILED';
+      item.reasons = [trig?.message || trig?.error || '列表页触发沟通失败'];
+      if (item.state === 'SKIPPED') {
+        task.counters.skipped += 1;
+        await appendHistory({ jobId: job.jobId, title: job.title, company: job.company, status: 'skipped_list', taskId: task.id });
+        return 'skipped';
+      }
+      task.counters.failed += 1;
+      task.consecutiveFails += 1;
+      task.pauseReason = item.reasons[0];
+      return 'failed';
     }
-    task.counters.failed += 1;
-    task.consecutiveFails += 1;
-    task.pauseReason = item.reasons[0];
-    return 'failed';
-  }
 
-  // 列表详情拿到的 HR/公司/岗位，合并进 job，供消息页「公司+HR+岗位」匹配
-  /* merge identity from list trigger */
-  if (trig?.ok) {
+    // 列表详情拿到的 HR/公司/岗位，合并进 job，供消息页「公司+HR+岗位」匹配
     if (trig.hrName || trig.bossName) {
       job.hrName = trig.hrName || trig.bossName;
       job.bossName = trig.hrName || trig.bossName;
@@ -1201,10 +1255,44 @@ async function processOneJob(task, resultRow, config) {
       company: job.company || '',
       title: job.title || ''
     });
+
+    item.phase = JOB_PHASE.CHAT_TRIGGERED;
+    item.triggeredAt = Date.now();
+    item.beforeConversationKeys = [...new Set(beforeSnap?.keys || [])].slice(0, 160);
+    item.beforeConversationCount = Number(beforeSnap?.count || item.beforeConversationKeys.length || 0);
+    item.triggerIdentity = {
+      hrName: job.hrName || '',
+      bossName: job.bossName || job.hrName || '',
+      company: job.company || '',
+      title: job.title || ''
+    };
+    item.triggerReceipt = {
+      ok: true,
+      already: Boolean(trig.already),
+      buttonText: trig.buttonText || '',
+      stayed: Boolean(trig.stayed),
+      contentVersion: trig.contentVersion || ''
+    };
+    resultRow.job = job;
+    task.updatedAt = Date.now();
+    await publishTask(task);
+    await debugLog('background.task', 'chat_checkpoint_saved', {
+      taskId: task.id,
+      jobId: job.jobId,
+      phase: item.phase,
+      beforeKeyCount: item.beforeConversationKeys.length,
+      triggerIdentity: item.triggerIdentity
+    });
   }
 
+  // 独立消息标签页不会可靠接收列表页的新会话；每次执行/重试只在这里刷新一次。
+  const refreshResult = await refreshMessageTabOnce(task, msgTabId, {
+    jobId: job.jobId,
+    resumed: resumedFromChat
+  });
+  if (operationAborted(refreshResult)) return 'aborted';
+
   // 消息页阶段一：解析并打开会话（不含输入框门禁）
-  await sleep(600);
   if (runner.abort) return 'aborted';
   try { await chrome.tabs.update(msgTabId, { active: true }); } catch (_) {}
   await sleep(400);
@@ -1267,6 +1355,10 @@ async function processOneJob(task, resultRow, config) {
     return 'skipped';
   }
 
+  item.phase = JOB_PHASE.CONVERSATION_OPENED;
+  task.updatedAt = Date.now();
+  await publishTask(task);
+
   // 消息页阶段二：等待输入框（失败=暂停，绝不当成未找到会话）
   await log('info', '[消息页] 等待聊天输入框…', { jobId: job.jobId });
   try { await chrome.tabs.update(msgTabId, { active: true }); } catch (_) {}
@@ -1286,7 +1378,7 @@ async function processOneJob(task, resultRow, config) {
   if (!editor?.ok) {
     item.state = 'FAILED';
     item.reasons = [editor?.message || 'CHAT_EDITOR_NOT_READY'];
-    item.phase = 'CONVERSATION_OPENED_EDITOR_PENDING';
+    item.phase = JOB_PHASE.CONVERSATION_OPENED_EDITOR_PENDING;
     task.counters.failed += 1;
     task.pauseReason = '会话已打开，但消息输入框未识别，请检查消息页后点重试';
     task.awaitingUserRetry = true;
@@ -1403,7 +1495,7 @@ async function processOneJob(task, resultRow, config) {
   }
 
   for (const step of plan.plan) {
-    await waitWhilePaused(task);
+    await waitWhilePaused();
     if (runner.abort) return 'aborted';
     if (runner.skipCurrent) break;
 
@@ -1485,7 +1577,7 @@ async function processOneJob(task, resultRow, config) {
   }
 
   // resume: re-check controls after last text segment
-  await waitWhilePaused(task);
+  await waitWhilePaused();
   if (runner.abort) return 'aborted';
   if (runner.skipCurrent) {
     runner.skipCurrent = false;
@@ -1500,7 +1592,7 @@ async function processOneJob(task, resultRow, config) {
   // resume
   const profile = pickResumeProfile(job, config.resumes, config.bindings);
   const resumeImages = dedupeResumeImages(profile?.images);
-  const timing = config.settings.resumeSendTiming || 'on_request';
+  const timing = config.settings.resumeSendTiming || 'after_text';
   const hasImages = resumeImages.length > 0;
   const flagImage = Boolean(config.settings.autoSendImageResume);
   // 兼容旧设置字段：现在表示点击 BOSS 聊天页「发简历」，不再上传本地附件。
@@ -1707,7 +1799,7 @@ async function runTaskLoop(taskId) {
 
     for (let qi = 0; qi < queue.length; qi++) {
       const row = queue[qi];
-      await waitWhilePaused(task);
+      await waitWhilePaused();
       if (runner.abort) break;
 
       // refresh config each item for live setting changes
@@ -1808,7 +1900,7 @@ async function runTaskLoop(taskId) {
         task.lastErrorDetail = ['岗位：' + (row.job?.title || ''), '公司：' + (row.job?.company || ''), '原因：' + ((task.items.find((x) => x.jobId === row.job.jobId) || {}).reasons || []).join('；')].filter(Boolean).join('\n');
         runner.pause = true;
         await publishTask(task);
-        await waitWhilePaused(task);
+        await waitWhilePaused();
         if (runner.abort) {
           outcome = 'aborted';
           break;
@@ -2246,22 +2338,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             // payload.retry === true 表示弹窗「重试」：只重置当前失败岗位
             const wantRetry = Boolean(payload?.retry);
             if (wantRetry) {
-              const curId = all0.task.currentJobId;
+              let curId = all0.task.currentJobId;
+              if (!curId) {
+                curId = [...(all0.task.items || [])].reverse().find((it) => it.state === 'FAILED')?.jobId || null;
+                if (curId) all0.task.currentJobId = curId;
+              }
+              let resetFailedItem = false;
               all0.task.items = (all0.task.items || []).map((it) => {
                 if (curId && it.jobId === curId && it.state === 'FAILED') {
-                  return { ...it, state: 'NOT_STARTED', reasons: [] };
+                  resetFailedItem = true;
+                  const legacyChatFailure = !hasChatCheckpoint(it) &&
+                    /多个相似会话|会话未可靠打开|会话已打开|CONVERSATION_|CHAT_EDITOR/i.test(
+                      [...(it.reasons || []), all0.task.pauseReason || ''].join(' ')
+                    );
+                  return {
+                    ...it,
+                    state: 'NOT_STARTED',
+                    reasons: [],
+                    ...(legacyChatFailure ? {
+                      phase: JOB_PHASE.CHAT_TRIGGERED,
+                      triggeredAt: it.triggeredAt || Date.now(),
+                      beforeConversationKeys: it.beforeConversationKeys || []
+                    } : {})
+                  };
                 }
-                // 无 currentJobId 时，仅重置最近一个 FAILED
                 return it;
               });
-              if (!all0.task.currentJobId) {
-                const lastFail = [...(all0.task.items || [])].reverse().find((it) => it.state === 'FAILED');
-                if (lastFail) {
-                  all0.task.items = all0.task.items.map((it) =>
-                    it.jobId === lastFail.jobId ? { ...it, state: 'NOT_STARTED', reasons: [] } : it
-                  );
-                  all0.task.currentJobId = lastFail.jobId;
+              if (resetFailedItem) {
+                all0.task.counters = all0.task.counters || { success: 0, skipped: 0, failed: 0, processed: 0 };
+                all0.task.counters.failed = Math.max(0, Number(all0.task.counters.failed || 0) - 1);
+                const queueItem = (all0.task.queue || []).find((entry) => entry.jobId === curId);
+                if (queueItem) {
+                  queueItem.status = 'pending';
+                  delete queueItem.finishedAt;
+                  delete queueItem.outcome;
                 }
+                all0.task.testedJobIds = (all0.task.testedJobIds || []).filter((jobId) => String(jobId) !== String(curId));
+                await debugLog('background.task', 'retry_item_reset', {
+                  taskId: all0.task.id,
+                  jobId: curId,
+                  counters: all0.task.counters,
+                  checkpointPhase: all0.task.items.find((it) => it.jobId === curId)?.phase || ''
+                });
               }
               all0.task.retryCurrent = true;
               all0.task.uiErrorDismissed = false;
@@ -2369,10 +2487,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MSG.EXPORT_CONFIG:
         return { ok: true, data: await exportAll() };
       case MSG.IMPORT_CONFIG:
-        await importAll(payload?.data || payload, { merge: Boolean(payload?.merge) });
+        await importAll(payload?.data || payload);
         return { ok: true };
-      case MSG.GET_LOGS:
-        return { ok: true, logs: await getLogs(payload?.limit || 200) };
       case MSG.GET_DEBUG_LOGS:
         {
           const config = await getAllConfig();

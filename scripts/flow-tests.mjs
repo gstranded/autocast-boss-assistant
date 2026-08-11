@@ -131,6 +131,22 @@ test("delivery hardening contracts", () => {
   assert.ok(c.includes("waitForImageSendConfirm"));
 });
 
+test("retry resumes after chat trigger without clicking the list twice", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const checkpointAt = background.indexOf("item.phase = JOB_PHASE.CHAT_TRIGGERED");
+  const conversationAt = background.indexOf("MSG.WAIT_OPEN_CONVERSATION", checkpointAt);
+  assert.ok(checkpointAt >= 0 && conversationAt > checkpointAt, "checkpoint must persist before conversation matching");
+  assert.ok(background.includes("if (!resumedFromChat)"), "list trigger must be guarded on retry");
+  assert.ok(background.includes("不会再次点击「立即沟通」"));
+  assert.ok(background.includes("await chrome.tabs.reload(tabId)"), "message tab should refresh after chat creation");
+  assert.ok(background.includes("item.beforeConversationKeys"), "original conversation snapshot must survive retry");
+  assert.ok(background.includes("queueItem.status = 'pending'"), "retry should reopen the queue item");
+  assert.ok(background.includes("counters.failed = Math.max(0"), "retry should undo the previous task failure count");
+  assert.ok(content.includes("clearTimeout(innerTimeoutId)"), "completed operations must cancel their timeout timer");
+  assert.ok(!content.includes("sleep(opTimeoutMs).then"), "completed operations must not emit a later false timeout");
+});
+
 if (!process.exitCode) console.log("flow contract tests ok");
 
 

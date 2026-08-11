@@ -22,8 +22,6 @@ export const MESSAGE_MODES = {
 };
 
 export const TASK_STATUS = {
-  IDLE: 'idle',
-  PREVIEWING: 'previewing',
   AWAITING_CONFIRM: 'awaiting_confirm',
   RUNNING: 'running',
   PAUSED: 'paused',
@@ -38,7 +36,7 @@ export const ITEM_STATE = {
   NATIVE_GREETING_DETECTED: 'NATIVE_GREETING_DETECTED',
   TEXT_SEGMENT_SENT_PREFIX: 'TEXT_SEGMENT_',
   IMAGE_RESUME_SENT: 'IMAGE_RESUME_SENT',
-  ATTACHMENT_RESUME_SENT: 'ATTACHMENT_RESUME_SENT',
+  PLATFORM_RESUME_SENT: 'PLATFORM_RESUME_SENT',
   COMPLETED: 'COMPLETED',
   FAILED: 'FAILED',
   SKIPPED: 'SKIPPED',
@@ -60,8 +58,7 @@ export const DEFAULT_SETTINGS = {
   consecutiveFailPause: 3,
   autoSendImageResume: true,
   autoSendAttachmentResume: false, // 兼容旧字段名：现在表示点击 BOSS「发简历」
-  resumeSendTiming: 'after_text', // on_request | after_text | manual
-  previewRequired: true,
+  resumeSendTiming: 'after_text', // after_text | manual
   splitViewEnabled: true,
   debugLoggingEnabled: false,
   whitelistOnly: false
@@ -122,8 +119,3 @@ export const DEFAULT_LISTS = {
   companyBlacklist: [],
   companyWhitelist: []
 };
-
-export const BOSS_ORIGIN_PATTERNS = [
-  /^https?:\/\/([\w-]+\.)?zhipin\.com/i,
-  /^https?:\/\/([\w-]+\.)?bosszhipin\.com/i
-];

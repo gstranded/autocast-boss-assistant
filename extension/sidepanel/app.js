@@ -13,7 +13,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.6.9";
+const BHT_UI_VERSION = "1.7.0";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -447,7 +447,7 @@ function fillSettings(settings) {
   $('similarityThreshold').value = settings.similarityThreshold;
   $('autoSendImageResume').checked = Boolean(settings.autoSendImageResume);
   $('autoSendAttachmentResume').checked = Boolean(settings.autoSendAttachmentResume);
-  $('resumeSendTiming').value = settings.resumeSendTiming || 'on_request';
+  $('resumeSendTiming').value = settings.resumeSendTiming || 'after_text';
   $('taskMaxCommunicate').value = settings.taskMaxCommunicate;
   $('dailyMaxCommunicate').value = settings.dailyMaxCommunicate;
   $('companyDailyMax').value = settings.companyDailyMax;
@@ -1240,7 +1240,7 @@ async function saveResumeNow(opts = {}) {
 
   const resumes = structuredClone(state.config?.resumes || { profiles: [], defaultProfileId: null });
   if (!resumes.profiles?.length) {
-    resumes.profiles = [{ id: 'default', name: '默认方案', images: [], attachment: null }];
+    resumes.profiles = [{ id: 'default', name: '默认方案', images: [] }];
     resumes.defaultProfileId = 'default';
   }
   let profile = resumes.profiles.find((p) => p.id === state.activeProfileId);
@@ -1284,19 +1284,6 @@ async function saveResumeNow(opts = {}) {
     duplicates += merged.duplicates;
   }
 
-  const attach = includePendingFiles ? $('attachFile')?.files?.[0] : null;
-  if (attach) {
-    if (attach.size > 4.5 * 1024 * 1024) {
-      throw new Error('附件过大（建议 < 4.5MB）：' + attach.name);
-    }
-    profile.attachment = {
-      name: attach.name,
-      size: attach.size,
-      type: attach.type,
-      dataUrl: await fileToDataUrl(attach)
-    };
-  }
-
   const idx = resumes.profiles.findIndex((p) => p.id === profile.id);
   if (idx >= 0) resumes.profiles[idx] = profile;
   else resumes.profiles.push(profile);
@@ -1316,7 +1303,6 @@ async function saveResumeNow(opts = {}) {
   state.formDirty = false;
   if (clearInputs) {
     if ($('imageFiles')) $('imageFiles').value = '';
-    if ($('attachFile')) $('attachFile').value = '';
   }
   try { renderResumeEditor(); } catch (_) {}
   try { renderProfileList(); } catch (_) {}
@@ -1486,13 +1472,6 @@ function showErrorModal(title, body, { showRetry = true, force = false } = {}) {
   modal.hidden = false;
 }
 
-function hideErrorModal() {
-  const modal = $('bht-modal');
-  if (modal) modal.hidden = true;
-  state.modalDismissed = true;
-  state.modalClosedForKey = state.lastModalKey || state.modalClosedForKey || '';
-}
-
 function bindEvents() {
   document.querySelectorAll('.tabs button').forEach((btn) => {
     btn.addEventListener('click', () => showTab(btn.dataset.tab));
@@ -1573,7 +1552,7 @@ function bindEvents() {
     flushActiveProfileForm();
     const resumes = structuredClone(state.config.resumes);
     const id = uid('profile');
-    resumes.profiles.push({ id, name: `方案 ${resumes.profiles.length + 1}`, images: [], attachment: null });
+    resumes.profiles.push({ id, name: `方案 ${resumes.profiles.length + 1}`, images: [] });
     if (!resumes.defaultProfileId) resumes.defaultProfileId = id;
     state.activeProfileId = id;
     await api(MSG.SAVE_RESUMES, resumes);
@@ -1618,16 +1597,6 @@ function bindEvents() {
     state.formDirty = false;
     await refresh({ soft: false });
     toast('已清空图片', 'success');
-  });
-
-  $('btnClearAttach')?.addEventListener('click', async () => {
-    const resumes = structuredClone(state.config.resumes);
-    const profile = resumes.profiles.find((p) => p.id === state.activeProfileId);
-    if (profile) profile.attachment = null;
-    await api(MSG.SAVE_RESUMES, resumes);
-    state.formDirty = false;
-    await refresh({ soft: false });
-    toast('已清除附件', 'success');
   });
 
   $('btnAddBinding')?.addEventListener('click', () => {
@@ -1769,7 +1738,7 @@ function bindEvents() {
       ...(state.config?.settings || {}),
       autoSendImageResume: !!$('autoSendImageResume')?.checked,
       autoSendAttachmentResume: !!$('autoSendAttachmentResume')?.checked,
-      resumeSendTiming: $('resumeSendTiming')?.value || 'on_request'
+      resumeSendTiming: $('resumeSendTiming')?.value || 'after_text'
     };
     if ((settings.autoSendImageResume || settings.autoSendAttachmentResume) && settings.resumeSendTiming !== 'after_text') {
       toast('提示：已启用简历发送，但时机不是「文本发送完成后」，本次不会自动发简历', 'warn', 3500);

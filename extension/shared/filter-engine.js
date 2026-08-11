@@ -105,7 +105,6 @@ function matchActive(activeText, activeWithin) {
  * @param {object} settings
  */
 export function evaluateJob(job, filters, lists = {}, settings = {}) {
-  const reasons = [];
   const passReasons = [];
 
   if (!job || !(job.title || job.jobId)) {

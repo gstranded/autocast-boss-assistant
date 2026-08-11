@@ -1,6 +1,6 @@
 /** BOSS 直聘 URL 判定：扩展仅在这些域名生效 */
 
-export const BOSS_HOST_SUFFIXES = ['zhipin.com', 'bosszhipin.com'];
+const BOSS_HOST_SUFFIXES = ['zhipin.com', 'bosszhipin.com'];
 
 export const BOSS_MATCH_PATTERNS = [
   '*://*.zhipin.com/*',

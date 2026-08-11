@@ -47,7 +47,7 @@ export const REASON = {
   OK_ITEM_COMPLETED: 'OK_ITEM_COMPLETED'
 };
 
-export const REASON_TEXT = {
+const REASON_TEXT = {
   FILTER_TITLE_OR_MISS: '职位名称未命中包含词',
   FILTER_TITLE_AND_MISS: '职位名称未同时包含必需词',
   FILTER_TITLE_NOT_HIT: '职位名称命中排除词',

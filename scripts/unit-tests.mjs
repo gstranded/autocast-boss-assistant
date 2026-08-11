@@ -183,8 +183,15 @@ test("resume images are deduplicated by content", () => {
   assert.equal(merged.images.length, 1);
   assert.equal(merged.added, 0);
   assert.equal(merged.duplicates, 2);
-  const resumes = normalizeResumes({ profiles: [{ id: "default", images: [imageA, { ...imageA }] }] });
+  const resumes = normalizeResumes({
+    profiles: [{
+      id: "default",
+      images: [imageA, { ...imageA }],
+      attachment: { name: "legacy.pdf", dataUrl: "data:application/pdf;base64,OLD" }
+    }]
+  });
   assert.equal(resumes.profiles[0].images.length, 1);
+  assert.equal(resumes.profiles[0].attachment.name, "legacy.pdf");
 });
 
 console.log("5) dedup + limits");
@@ -471,7 +478,7 @@ test("skip while paused does not leave skipCurrent sticky", () => {
 test("resume stage rechecks pause/abort/skip controls", () => {
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   assert.ok(background.includes("resume: re-check controls after last text segment"));
-  assert.ok(background.includes("await waitWhilePaused(task);"));
+  assert.ok(background.includes("await waitWhilePaused();"));
 });
 
 test("template version only bumps when message content changes", () => {
@@ -540,6 +547,36 @@ test("trigger conversation always returns its result and reports undefined opera
   assert.ok(trigger.includes("TRIGGER_CONVERSATION_EXCEPTION"));
   assert.equal((content.match(/return triggerResult/g) || []).length, 1);
   assert.ok(content.includes("OP_RETURN_UNDEFINED"));
+});
+
+test("legacy message and local attachment paths stay removed", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const messaging = fs.readFileSync("extension/shared/messaging.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  const storage = fs.readFileSync("extension/shared/storage.js", "utf8");
+  const combined = [content, background, app, messaging, html].join("\n");
+  for (const legacyType of [
+    "BHT_OPEN_JOB",
+    "BHT_SEND_FILE_META",
+    "BHT_GET_CURRENT_JOB_DETAIL",
+    "BHT_GET_PAGE_INFO",
+    "BHT_GET_LOGS"
+  ]) {
+    assert.ok(!combined.includes(legacyType), legacyType + " should stay removed");
+  }
+  assert.ok(!content.includes("function openJobDetail"));
+  assert.ok(!content.includes("function getCurrentJobDetail"));
+  assert.ok(!app.includes("attachFile"));
+  assert.ok(!app.includes("btnClearAttach"));
+  assert.ok(!html.includes('option value="on_request"'));
+  assert.ok(storage.includes("settings.resumeSendTiming === 'on_request'"));
+  assert.ok(storage.includes("settings.resumeSendTiming = 'after_text'"));
+  assert.ok(!background.includes("bht_migrated_137"));
+  const missingButtonStart = content.indexOf('error: "CHAT_BUTTON_NOT_FOUND"', content.indexOf("async function triggerConversationOnList"));
+  const missingButtonBranch = content.slice(missingButtonStart, missingButtonStart + 500);
+  assert.ok(missingButtonBranch.includes("return missingButton"));
 });
 
 test("current BOSS card treats boss-name as company and detail name as HR", () => {
