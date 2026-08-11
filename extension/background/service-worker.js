@@ -82,6 +82,16 @@ async function debugLog(scope, event, data = {}, level = 'debug') {
   });
 }
 
+function serializeError(error) {
+  if (!error) return null;
+  return {
+    name: String(error.name || 'Error'),
+    message: String(error.message || error),
+    code: error.code || '',
+    stack: String(error.stack || '').slice(0, 8000)
+  };
+}
+
 function runnerIsBusy() {
   return runner.running || runner.starting || runner.previewing;
 }
@@ -758,7 +768,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       return await finishBridge({ ok: false, error: 'OP_TIMEOUT', message: '操作超时（岗位定位/发消息）。请保持在职位列表页并重新扫描预览' });
     } catch (bridgeErr) {
       await debugLog('background.sendToBoss', 'bridge_failed', {
-        type, opId: bridgeOpId, error: String(bridgeErr?.message || bridgeErr)
+        type, opId: bridgeOpId, error: serializeError(bridgeErr)
       }, 'error');
       if (bridgeOpId) {
         operations.delete(bridgeOpId);
@@ -796,6 +806,11 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       return await chrome.tabs.sendMessage(tab.id, { type, payload });
     }
   } catch (err) {
+    await debugLog('background.sendToBoss', 'direct_channel_exception', {
+      type,
+      tabId: tab?.id || null,
+      error: serializeError(err)
+    }, 'error');
     try {
       const latest = await chrome.tabs.get(tab.id);
       if (!isBossUrl(latest?.url || "")) {
@@ -809,6 +824,12 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       await sleep(250);
       return await chrome.tabs.sendMessage(tab.id, { type, payload });
     } catch (e2) {
+      await debugLog('background.sendToBoss', 'content_inject_failed', {
+        type,
+        tabId: tab?.id || null,
+        firstError: serializeError(err),
+        retryError: serializeError(e2)
+      }, 'error');
       return {
         ok: false,
         error: "CONTENT_INJECT_FAIL",
@@ -1731,6 +1752,18 @@ async function runTaskLoop(taskId) {
         }
       }
       let outcome = await processOneJob(task, row, config);
+      // processOneJob 会更新 item/reasons/counters；必须先持久化再重新读取配置，
+      // 否则失败计数和具体原因会被旧 storage 快照覆盖成 0/空。
+      task.updatedAt = Date.now();
+      await publishTask(task);
+      await debugLog('background.task', 'job_process_returned', {
+        taskId: task.id,
+        jobId: row.job?.jobId || '',
+        outcome,
+        counters: task.counters,
+        item: task.items?.find((entry) => entry.jobId === row.job?.jobId) || null,
+        pauseReason: task.pauseReason || ''
+      }, outcome === 'failed' ? 'error' : 'debug');
       try {
         config = await getAllConfig();
         task = config.task || task;
@@ -1790,6 +1823,15 @@ async function runTaskLoop(taskId) {
           task.retryCurrent = false;
           await publishTask(task);
           outcome = await processOneJob(task, row, config);
+          task.updatedAt = Date.now();
+          await publishTask(task);
+          await debugLog('background.task', 'job_retry_returned', {
+            taskId: task.id,
+            jobId: row.job?.jobId || '',
+            outcome,
+            counters: task.counters,
+            item: task.items?.find((entry) => entry.jobId === row.job?.jobId) || null
+          }, outcome === 'failed' ? 'error' : 'debug');
           continue;
         }
         // 用户关闭后点继续：不重试当前失败项，进入下一岗
@@ -1868,7 +1910,8 @@ async function runTaskLoop(taskId) {
     }
     return { ok: true, task };
   } catch (err) {
-    await log('error', `任务异常：${err?.message || err}`);
+    await debugLog('background.task', 'runner_exception', { taskId, error: serializeError(err) }, 'error');
+    await log('error', `任务异常：${err?.message || err}`, { error: serializeError(err) });
     const config = await getAllConfig();
     if (config.task) {
       config.task.status = TASK_STATUS.FAILED;
@@ -2331,16 +2374,53 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MSG.GET_LOGS:
         return { ok: true, logs: await getLogs(payload?.limit || 200) };
       case MSG.GET_DEBUG_LOGS:
-        return {
-          ok: true,
-          enabled: debugLoggingEnabled,
-          meta: {
-            version: chrome.runtime.getManifest().version,
-            exportedAt: new Date().toISOString(),
-            sessionOnly: true
-          },
-          logs: await getSessionDebugLogs()
-        };
+        {
+          const config = await getAllConfig();
+          const bossTabs = await chrome.tabs.query({ url: BOSS_MATCH_PATTERNS }).catch(() => []);
+          return {
+            ok: true,
+            enabled: debugLoggingEnabled,
+            meta: {
+              version: chrome.runtime.getManifest().version,
+              extensionId: chrome.runtime.id,
+              exportedAt: new Date().toISOString(),
+              sessionOnly: true,
+              userAgent: globalThis.navigator?.userAgent || '',
+              platform: globalThis.navigator?.platform || '',
+              language: globalThis.navigator?.language || '',
+              runner: sanitizeDebugValue({ ...runner, activeOperations: operations.size }),
+              settings: sanitizeDebugValue({
+                debugLoggingEnabled: config.settings?.debugLoggingEnabled === true,
+                splitViewEnabled: config.settings?.splitViewEnabled !== false,
+                messageMode: config.settings?.messageMode || '',
+                consecutiveFailPause: config.settings?.consecutiveFailPause
+              }),
+              task: sanitizeDebugValue(config.task ? {
+                id: config.task.id,
+                status: config.task.status,
+                revision: config.task.revision,
+                counters: config.task.counters,
+                currentJobId: config.task.currentJobId,
+                nextJobId: config.task.nextJobId,
+                pauseReason: config.task.pauseReason,
+                lastErrorDetail: config.task.lastErrorDetail,
+                awaitingUserRetry: config.task.awaitingUserRetry,
+                queueCursor: config.task.queueCursor,
+                queue: config.task.queue,
+                items: config.task.items
+              } : null),
+              bossTabs: sanitizeDebugValue(bossTabs.map((tab) => ({
+                id: tab.id,
+                windowId: tab.windowId,
+                active: tab.active,
+                status: tab.status,
+                title: tab.title,
+                url: tab.url
+              })))
+            },
+            logs: await getSessionDebugLogs()
+          };
+        }
       case MSG.DEBUG_EVENT:
         if (!debugLoggingEnabled) return { ok: true, recorded: false };
         await appendSessionDebugLog({
@@ -2369,7 +2449,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
   })()
     .then(sendResponse)
-    .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+    .catch(async (err) => {
+      await debugLog('background.message', 'handler_exception', {
+        type,
+        sender: { tabId: sender?.tab?.id || null, url: sender?.url || sender?.tab?.url || '' },
+        error: serializeError(err)
+      }, 'error');
+      sendResponse({ ok: false, error: String(err?.message || err), diagnostic: { error: serializeError(err) } });
+    });
   return true;
 });
 

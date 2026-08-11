@@ -13,7 +13,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.6.8";
+const BHT_UI_VERSION = "1.6.9";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -202,7 +202,53 @@ function extContextHint() {
   return "扩展上下文已失效（常见于刚重载/更新扩展）。请 F5 刷新 BOSS 页面，再打开面板后重新保存。";
 }
 
+function panelDebug(event, data = {}, level = 'debug') {
+  if (state.config?.settings?.debugLoggingEnabled !== true && $('debugLoggingEnabled')?.checked !== true) return;
+  try {
+    globalThis.chrome?.runtime?.sendMessage({
+      type: MSG.DEBUG_EVENT,
+      payload: {
+        ts: Date.now(),
+        level,
+        scope: 'sidepanel',
+        event,
+        data
+      }
+    }).catch(() => {});
+  } catch (_) {}
+}
+
+function summarizeApiPayload(payload) {
+  if (payload == null || typeof payload !== 'object') return payload;
+  return {
+    keys: Object.keys(payload),
+    jobId: payload.jobId || payload.job?.jobId || '',
+    selectedCount: Array.isArray(payload.selectedJobIds) ? payload.selectedJobIds.length : null,
+    mode: payload.mode || '',
+    textLength: typeof payload.text === 'string' ? payload.text.length : null
+  };
+}
+
+document.addEventListener('click', (event) => {
+  const target = event.target?.closest?.('button,a,input,label,select,textarea') || event.target;
+  panelDebug('ui_click', {
+    type: event.type,
+    isTrusted: Boolean(event.isTrusted),
+    target: target ? {
+      tag: target.tagName || '',
+      id: target.id || '',
+      className: String(target.className || '').slice(0, 300),
+      text: String(target.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+      value: target.tagName === 'SELECT' ? String(target.value || '') : '',
+      checked: typeof target.checked === 'boolean' ? target.checked : null,
+      disabled: Boolean(target.disabled)
+    } : null
+  });
+}, true);
+
 async function api(type, payload) {
+  const startedAt = Date.now();
+  if (type !== MSG.DEBUG_EVENT) panelDebug('api_request', { type, payload: summarizeApiPayload(payload) });
   try {
     if (!globalThis.chrome?.runtime?.id) throw new Error(extContextHint());
     const res = await globalThis.chrome.runtime.sendMessage({ type, payload });
@@ -212,12 +258,33 @@ async function api(type, payload) {
     if (res == null) {
       throw new Error(type + ' 未收到后台响应');
     }
+    if (type !== MSG.DEBUG_EVENT) {
+      panelDebug('api_response', {
+        type,
+        elapsedMs: Date.now() - startedAt,
+        ok: res?.ok,
+        error: res?.error || '',
+        message: res?.message || '',
+        responseKeys: res && typeof res === 'object' ? Object.keys(res) : []
+      }, res?.ok === false ? 'warn' : 'debug');
+    }
     // 后台用 {ok:false,error} 表达业务失败；必须向上抛，避免假成功
     if (res && res.ok === false) {
       throw new Error(res.message || res.error || (type + ' 执行失败'));
     }
     return res;
   } catch (e) {
+    if (type !== MSG.DEBUG_EVENT) {
+      panelDebug('api_exception', {
+        type,
+        elapsedMs: Date.now() - startedAt,
+        error: {
+          name: String(e?.name || 'Error'),
+          message: String(e?.message || e || ''),
+          stack: String(e?.stack || '').slice(0, 8000)
+        }
+      }, 'error');
+    }
     if (isExtContextDead(e)) {
       showContextDeadBanner();
       throw new Error(extContextHint());
@@ -1739,6 +1806,7 @@ function bindEvents() {
         version: res.meta?.version || BHT_UI_VERSION,
         exportedAt: res.meta?.exportedAt || new Date().toISOString(),
         sessionOnly: true,
+        diagnostics: res.meta || {},
         count: Array.isArray(res.logs) ? res.logs.length : 0,
         logs: Array.isArray(res.logs) ? res.logs : []
       };

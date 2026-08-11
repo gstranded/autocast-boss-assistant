@@ -19,7 +19,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.6.8";
+  const BHT_CONTENT_VERSION = "1.6.9";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
     return;
@@ -67,6 +67,135 @@
       }).catch(() => {});
     } catch (_) {}
   }
+
+  function serializeDebugError(error) {
+    if (!error) return null;
+    return {
+      name: String(error.name || "Error"),
+      message: String(error.message || error),
+      code: error.code || "",
+      stack: String(error.stack || "").slice(0, 8000)
+    };
+  }
+
+  function describeDebugElement(el) {
+    if (!el || typeof el !== "object") return null;
+    let rect = null;
+    try {
+      const box = el.getBoundingClientRect?.();
+      if (box) {
+        rect = {
+          x: Math.round(box.x),
+          y: Math.round(box.y),
+          width: Math.round(box.width),
+          height: Math.round(box.height)
+        };
+      }
+    } catch (_) {}
+    return {
+      tag: String(el.tagName || ""),
+      id: String(el.id || ""),
+      className: String(el.className || "").slice(0, 400),
+      role: String(el.getAttribute?.("role") || ""),
+      text: String(el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 500),
+      href: String(el.getAttribute?.("href") || "").slice(0, 600),
+      name: String(el.getAttribute?.("name") || ""),
+      ariaLabel: String(el.getAttribute?.("aria-label") || "").slice(0, 300),
+      dataKa: String(el.getAttribute?.("ka") || ""),
+      disabled: Boolean(el.disabled),
+      connected: Boolean(el.isConnected),
+      valueLength: typeof el.value === "string" ? el.value.length : null,
+      rect
+    };
+  }
+
+  function installDebugInstrumentation() {
+    try { window.__BHT_DEBUG_INSTRUMENTATION_CLEANUP__?.(); } catch (_) {}
+    const eventTypes = ["mousedown", "mouseup", "click", "keydown", "input", "change", "submit"];
+    const onDomEvent = (event) => {
+      if (window.__BHT_DEBUG_ENABLED__ !== true || !window.__BHT_ACTIVE_OP_ID__) return;
+      debugTrace("dom_event", {
+        type: event.type,
+        isTrusted: Boolean(event.isTrusted),
+        defaultPrevented: Boolean(event.defaultPrevented),
+        button: Number.isFinite(event.button) ? event.button : null,
+        key: event.type === "keydown" ? String(event.key || "") : "",
+        code: event.type === "keydown" ? String(event.code || "") : "",
+        modifiers: {
+          alt: Boolean(event.altKey),
+          ctrl: Boolean(event.ctrlKey),
+          meta: Boolean(event.metaKey),
+          shift: Boolean(event.shiftKey)
+        },
+        target: describeDebugElement(event.target)
+      });
+    };
+    eventTypes.forEach((type) => document.addEventListener(type, onDomEvent, true));
+
+    const onWindowError = (event) => {
+      if (window.__BHT_DEBUG_ENABLED__ !== true) return;
+      debugTrace("window_error", {
+        message: String(event.message || ""),
+        filename: String(event.filename || ""),
+        line: event.lineno || 0,
+        column: event.colno || 0,
+        error: serializeDebugError(event.error)
+      }, "error");
+    };
+    const onUnhandledRejection = (event) => {
+      if (window.__BHT_DEBUG_ENABLED__ !== true) return;
+      debugTrace("unhandled_rejection", {
+        error: serializeDebugError(event.reason),
+        reason: String(event.reason?.message || event.reason || "")
+      }, "error");
+    };
+    window.addEventListener("error", onWindowError, true);
+    window.addEventListener("unhandledrejection", onUnhandledRejection, true);
+
+    let mutationTimer = 0;
+    let mutationCount = 0;
+    let addedCount = 0;
+    let removedCount = 0;
+    let mutationSamples = [];
+    const observer = new MutationObserver((mutations) => {
+      if (window.__BHT_DEBUG_ENABLED__ !== true || !window.__BHT_ACTIVE_OP_ID__) return;
+      mutationCount += mutations.length;
+      for (const mutation of mutations) {
+        addedCount += mutation.addedNodes?.length || 0;
+        removedCount += mutation.removedNodes?.length || 0;
+        if (mutationSamples.length < 12) {
+          const sample = mutation.addedNodes?.[0] || mutation.removedNodes?.[0] || mutation.target;
+          if (sample?.nodeType === 1) mutationSamples.push(describeDebugElement(sample));
+        }
+      }
+      if (!mutationTimer) {
+        mutationTimer = setTimeout(() => {
+          debugTrace("dom_mutation_batch", {
+            mutationCount,
+            addedCount,
+            removedCount,
+            samples: mutationSamples
+          });
+          mutationTimer = 0;
+          mutationCount = 0;
+          addedCount = 0;
+          removedCount = 0;
+          mutationSamples = [];
+        }, 180);
+      }
+    });
+    try { observer.observe(document.documentElement, { childList: true, subtree: true }); } catch (_) {}
+
+    window.__BHT_DEBUG_INSTRUMENTATION_CLEANUP__ = () => {
+      eventTypes.forEach((type) => document.removeEventListener(type, onDomEvent, true));
+      window.removeEventListener("error", onWindowError, true);
+      window.removeEventListener("unhandledrejection", onUnhandledRejection, true);
+      observer.disconnect();
+      if (mutationTimer) clearTimeout(mutationTimer);
+    };
+  }
+
+  installDebugInstrumentation();
 
   
   function isListLikePage(href = location.href) {
@@ -256,6 +385,10 @@ const SELECTORS = {
       ".company-info h3 a",
       ".company-info .company-name",
       ".company-card a",
+      ".job-card-footer .boss-name",
+      ".job-card-footer .boss-info",
+      "a[ka^='company_logo_click'] .boss-name",
+      "a[ka^='company_logo_click']",
       "a[ka*='job_list_company']"
     ],
     hrName: [".boss-name", ".boss-info .name", ".name-box .name", ".job-boss-info .name", ".boss-info-attr .name", ".info-public .name"],
@@ -627,21 +760,60 @@ function firstEl(selectors, root = document) {
   }
 
   function clickLikeHuman(el) {
-    if (!el) return false;
+    if (!el) {
+      debugTrace("click_skipped_missing_element", {}, "warn");
+      return false;
+    }
+    const clickId = "click_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7);
+    const element = describeDebugElement(el);
+    debugTrace("click_attempt", {
+      clickId,
+      element,
+      caller: String(new Error().stack || "").split("\n").slice(1, 6).join("\n")
+    });
     try {
       el.scrollIntoView({ block: "center", behavior: "instant" });
-    } catch (_) {}
-    const opts = { bubbles: true, cancelable: true, view: window };
-    try {
-      el.dispatchEvent(new MouseEvent("mouseover", opts));
-      el.dispatchEvent(new MouseEvent("mousedown", opts));
-      el.dispatchEvent(new MouseEvent("mouseup", opts));
-      el.dispatchEvent(new MouseEvent("click", opts));
-    } catch (_) {
-      try {
-        el.click();
-      } catch (_) {}
+      debugTrace("click_scrolled_into_view", { clickId, element: describeDebugElement(el) });
+    } catch (error) {
+      debugTrace("click_scroll_error", { clickId, error: serializeDebugError(error), element }, "warn");
     }
+    const opts = { bubbles: true, cancelable: true, view: window };
+    const dispatched = [];
+    let fallback = false;
+    try {
+      for (const type of ["mouseover", "mousedown", "mouseup", "click"]) {
+        const accepted = el.dispatchEvent(new MouseEvent(type, opts));
+        dispatched.push({ type, accepted });
+      }
+    } catch (error) {
+      debugTrace("click_dispatch_error", { clickId, error: serializeDebugError(error), dispatched, element }, "warn");
+      try {
+        fallback = true;
+        el.click();
+      } catch (fallbackError) {
+        debugTrace("click_fallback_error", {
+          clickId,
+          error: serializeDebugError(fallbackError),
+          element: describeDebugElement(el)
+        }, "error");
+        return false;
+      }
+    }
+    debugTrace("click_dispatched", {
+      clickId,
+      dispatched,
+      fallback,
+      element: describeDebugElement(el),
+      activeElement: describeDebugElement(document.activeElement)
+    });
+    setTimeout(() => {
+      debugTrace("click_after_state", {
+        clickId,
+        element: describeDebugElement(el),
+        activeElement: describeDebugElement(document.activeElement),
+        documentReadyState: document.readyState
+      });
+    }, 0);
     return true;
   }
 
@@ -834,9 +1006,14 @@ function firstEl(selectors, root = document) {
       buttonText: btnText,
       hrName: (() => {
         try {
-          let hr = "";
-          if (SELECTORS.hrName) hr = textOf(firstEl(SELECTORS.hrName, card));
-          if (!hr) hr = textOf(card.querySelector?.(".boss-name, .boss-info .name, .name-box .name"));
+          // 当前 BOSS 列表卡中的 .boss-info/.boss-name 是公司，不是招聘者；
+          // 列表没有明确招聘者节点时保持为空，等右侧详情区读取 .job-boss-info .name。
+          let hr = textOf(firstEl([
+            ".recruiter-info .recruiter-name",
+            ".recruiter-name",
+            ".hr-name",
+            "[data-role='recruiter-name']"
+          ], scope));
           hr = globalThis.BHTConversationMatch?.cleanHrIdentity
             ? globalThis.BHTConversationMatch.cleanHrIdentity(hr)
             : String(hr || "").split(/[·|｜]/)[0].replace(/\s+/g, " ").trim();
@@ -2730,14 +2907,13 @@ async function startChat(job, opts = {}) {
       document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
       document;
     const sels = [
-      ...(SELECTORS.hrName || []),
-      ".boss-info .name",
-      ".boss-name",
       ".job-boss-info .name",
+      ".job-boss-info h2.name",
       ".boss-info-attr .name",
       ".info-public .name",
       ".detail-figure .name",
-      ".job-detail .name"
+      ".job-detail .name",
+      ...(SELECTORS.hrName || [])
     ];
     for (const sel of sels) {
       try {
@@ -2758,11 +2934,12 @@ async function startChat(job, opts = {}) {
       firstEl(SELECTORS.detailRoot) ||
       document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
       document;
-    return (
+    const structured =
       textOf(firstEl(SELECTORS.company, root)) ||
-      textOf(root.querySelector?.(".company-name, .company-info .name")) ||
-      ""
-    );
+      textOf(root.querySelector?.(".company-name, .company-info .name"));
+    if (structured) return structured;
+    const attr = textOf(root.querySelector?.(".job-boss-info .boss-info-attr, .boss-info-attr"));
+    return String(attr || "").split(/[·|｜]/)[0].trim();
   }
 
   async function triggerConversationOnList(job = {}) {
@@ -2782,10 +2959,21 @@ async function startChat(job, opts = {}) {
       if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
     }
 
-    await ensureJobList({ maxWaitMs: 8000, scroll: true, noHomeNav: true });
+    const ensureResult = await ensureJobList({ maxWaitMs: 8000, scroll: true, noHomeNav: true });
+    debugTrace("trigger_list_ready", {
+      ensureResult,
+      page: pageInfo(),
+      cardCount: getJobCards().length
+    }, ensureResult?.ok === false ? "warn" : "debug");
     let card = findCardByJob(job);
+    let cardFoundVia = card ? "current-dom" : "";
     if (!card) {
-      try { card = await findCardByScrolling(job, 50); } catch (_) {}
+      try {
+        card = await findCardByScrolling(job, 50);
+        if (card) cardFoundVia = "scroll-search";
+      } catch (error) {
+        debugTrace("trigger_card_scroll_search_error", { error: serializeDebugError(error) }, "error");
+      }
     }
     if (!card) {
       const samples = getJobCards().slice(0, 5).map((el, i) => parseJobCard(el, i).title).filter(Boolean);
@@ -2805,9 +2993,25 @@ async function startChat(job, opts = {}) {
       };
     }
 
+    debugTrace("trigger_card_found", {
+      via: cardFoundVia,
+      requested: { jobId: job.jobId || "", title: job.title || "", company: job.company || "" },
+      parsed: parseJobCard(card, Math.max(0, getJobCards().indexOf(card))),
+      element: describeDebugElement(card)
+    });
+
     const release = installJobNavGuard(12000);
     try {
       const wrap = card.closest?.(".job-card-wrap, li, .job-card-box") || card;
+      debugTrace("trigger_card_click_stage", {
+        stage: "card",
+        element: describeDebugElement(wrap),
+        detailBefore: {
+          title: textOf(firstEl(SELECTORS.title, firstEl(SELECTORS.detailRoot) || document)),
+          hrName: extractDetailHrName(),
+          company: extractDetailCompany()
+        }
+      });
       try { wrap.scrollIntoView({ block: "center", behavior: "instant" }); } catch (_) {}
       await sleep(200);
       // 点卡片切换右侧详情（拦截整页跳转）
@@ -2817,6 +3021,7 @@ async function startChat(job, opts = {}) {
 
       // 再点一次标题区域提高详情刷新概率
       const titleEl = firstEl(SELECTORS.title, wrap) || wrap;
+      debugTrace("trigger_card_click_stage", { stage: "title", element: describeDebugElement(titleEl) });
       preventLinkNavigation(wrap, 1500);
       clickLikeHuman(titleEl);
       await sleep(600);
@@ -2828,6 +3033,17 @@ async function startChat(job, opts = {}) {
       const want = normalizeText(job.title || "");
       const got = normalizeText(detailTitle || "");
       const titleOk = !want || !got || got.includes(want.slice(0, 8)) || want.includes(got.slice(0, 8));
+      debugTrace("trigger_detail_identity", {
+        requested: { title: job.title || "", company: job.company || "", hrName: job.hrName || job.bossName || "" },
+        extracted: {
+          title: detailTitle || "",
+          company: extractDetailCompany(),
+          hrName: extractDetailHrName()
+        },
+        normalized: { want, got },
+        titleOk,
+        detailRoot: describeDebugElement(firstEl(SELECTORS.detailRoot))
+      }, titleOk ? "debug" : "warn");
       if (!titleOk) {
         log("list detail title weak match", { want: job.title, got: detailTitle });
       }
@@ -2847,10 +3063,26 @@ async function startChat(job, opts = {}) {
           Array.from(document.querySelectorAll("a.op-btn-chat, a.op-btn, button, div[class*='btn']")).find((el) =>
             /立即沟通|继续沟通/.test(textOf(el))
           );
+        debugTrace("trigger_chat_button_probe", {
+          attempt: i + 1,
+          found: Boolean(btn),
+          button: describeDebugElement(btn),
+          scope: describeDebugElement(scope),
+          selectorCounts: {
+            detailButtons: allEl(SELECTORS.chatOnDetail, scope).length,
+            textCandidates: Array.from(scope.querySelectorAll("a,button,div,span"))
+              .filter((el) => /立即沟通|继续沟通/.test(textOf(el))).length
+          }
+        }, btn ? "debug" : "warn");
         if (btn) {
           const buttonText = textOf(btn);
-          clickLikeHuman(btn);
-          clicked = { ok: true, buttonText, already: /继续沟通/.test(buttonText) };
+          const clickOk = clickLikeHuman(btn);
+          clicked = { ok: clickOk, buttonText, already: /继续沟通/.test(buttonText) };
+          debugTrace("trigger_chat_button_clicked", {
+            buttonText,
+            clickOk,
+            button: describeDebugElement(btn)
+          }, clickOk ? "debug" : "error");
           break;
         }
         await sleep(280);
@@ -2860,7 +3092,7 @@ async function startChat(job, opts = {}) {
           const loginHit = detectLoginModal();
           if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
         }
-        return {
+        const missingButton = {
           ok: false,
           error: "CHAT_BUTTON_NOT_FOUND",
           message: "列表详情区未找到「立即沟通」按钮",
@@ -2876,6 +3108,7 @@ async function startChat(job, opts = {}) {
         await sleep(500);
         stay = clickStayOnListDialog();
       }
+      debugTrace("trigger_stay_on_list_dialog", { result: stay, page: pageInfo() }, stay.ok ? "debug" : "warn");
       // 再关一次常见弹层
       dismissCommonDialogs();
 
@@ -2894,6 +3127,23 @@ async function startChat(job, opts = {}) {
         listHref: location.href,
         contentVersion: BHT_CONTENT_VERSION
       };
+      debugTrace("trigger_conversation_done", triggerResult);
+      return triggerResult;
+    } catch (error) {
+      const failed = {
+        ok: false,
+        error: "TRIGGER_CONVERSATION_EXCEPTION",
+        message: String(error?.message || error || "触发沟通异常"),
+        diagnostic: {
+          error: serializeDebugError(error),
+          page: pageInfo(),
+          activeElement: describeDebugElement(document.activeElement),
+          card: describeDebugElement(card)
+        },
+        contentVersion: BHT_CONTENT_VERSION
+      };
+      debugTrace("trigger_conversation_exception", failed, "error");
+      return failed;
     } finally {
       try { release && release(); } catch (_) {}
     }
@@ -3262,6 +3512,8 @@ async function startChat(job, opts = {}) {
           rounds: ambiguousRounds,
           contentVersion: BHT_CONTENT_VERSION
         };
+        debugTrace("trigger_chat_button_not_found", missingButton, "error");
+        return missingButton;
       }
 
       const pick = selection.ok ? selection.item : null;
@@ -3431,8 +3683,6 @@ async function startChat(job, opts = {}) {
         })),
         contentVersion: BHT_CONTENT_VERSION
       };
-      debugTrace("trigger_conversation_done", triggerResult);
-      return triggerResult;
     }
 
     const notFound = {
@@ -3644,11 +3894,33 @@ async function runOpByType(type, payload = {}) {
         let workPromise;
         try {
           window.__BHT_ACTIVE_OP_ID__ = opId || null;
-          workPromise = runOpByType(opType, opPayload);
+          debugTrace("operation_dispatch_begin", {
+            opId,
+            opType,
+            timeoutMs: opTimeoutMs,
+            payloadKeys: Object.keys(opPayload || {}).filter((key) => key !== "__bhtDebugEnabled")
+          });
+          workPromise = (async () => {
+            const opResult = await runOpByType(opType, opPayload);
+            if (opResult === undefined) {
+              const undefinedResult = {
+                ok: false,
+                error: "OP_RETURN_UNDEFINED",
+                message: "页面操作函数结束但没有返回结果",
+                opType,
+                contentVersion: BHT_CONTENT_VERSION
+              };
+              debugTrace("operation_return_undefined", undefinedResult, "error");
+              return undefinedResult;
+            }
+            debugTrace("operation_dispatch_return", { opId, opType, result: opResult }, opResult?.ok ? "debug" : "warn");
+            return opResult;
+          })();
           result = await Promise.race([
             workPromise.then((r) => r),
             sleep(opTimeoutMs).then(() => {
               timedOut = true;
+              debugTrace("operation_inner_timeout", { opId, opType, timeoutMs: opTimeoutMs }, "error");
               return {
                 ok: false,
                 error: "OP_INNER_TIMEOUT",
@@ -3667,10 +3939,12 @@ async function runOpByType(type, payload = {}) {
               ]);
               if (late && late.ok) result = late;
             } catch (e) {
+              debugTrace("operation_late_settle_error", { opId, opType, error: serializeDebugError(e) }, "error");
               if (!result) result = { ok: false, error: String(e?.message || e), contentVersion: BHT_CONTENT_VERSION };
             }
           }
         } catch (err) {
+          debugTrace("operation_dispatch_exception", { opId, opType, error: serializeDebugError(err) }, "error");
           result = {
             ok: false,
             error: err?.code === "OP_CANCELLED" ? "OP_CANCELLED" : String(err?.message || err),
@@ -3745,7 +4019,8 @@ async function runOpByType(type, payload = {}) {
         return await runOpByType(type, payload || {});
       } catch (err) {
         log("handler error", err);
-        return { ok: false, error: String(err?.message || err) };
+        debugTrace("direct_handler_exception", { type, error: serializeDebugError(err) }, "error");
+        return { ok: false, error: String(err?.message || err), diagnostic: { error: serializeDebugError(err) } };
       }
     })().then((res) => {
       try { sendResponse(res); } catch (_) {}

@@ -519,8 +519,48 @@ test("debug logging is session-only, toggleable and exportable", () => {
   assert.ok(background.includes("case MSG.GET_DEBUG_LOGS"));
   assert.ok(content.includes("conversation_selection"));
   assert.ok(content.includes("conversation_switch_probe"));
+  assert.ok(content.includes("dom_event"));
+  assert.ok(content.includes("dom_mutation_batch"));
+  assert.ok(content.includes("window_error"));
+  assert.ok(content.includes("operation_dispatch_exception"));
+  assert.ok(content.includes("click_dispatched"));
   assert.ok(app.includes("btnExportDebugLogs"));
+  assert.ok(app.includes("ui_click"));
+  assert.ok(app.includes("api_exception"));
   assert.ok(html.includes('id="debugLoggingEnabled"'));
+});
+
+test("trigger conversation always returns its result and reports undefined operations", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const triggerStart = content.indexOf("async function triggerConversationOnList");
+  const triggerEnd = content.indexOf("const ConversationMatch", triggerStart);
+  const trigger = content.slice(triggerStart, triggerEnd);
+  assert.ok(trigger.includes('debugTrace("trigger_conversation_done", triggerResult)'));
+  assert.ok(trigger.includes("return triggerResult"));
+  assert.ok(trigger.includes("TRIGGER_CONVERSATION_EXCEPTION"));
+  assert.equal((content.match(/return triggerResult/g) || []).length, 1);
+  assert.ok(content.includes("OP_RETURN_UNDEFINED"));
+});
+
+test("current BOSS card treats boss-name as company and detail name as HR", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  assert.ok(content.includes('".job-card-footer .boss-name"'));
+  assert.ok(content.includes('"a[ka^=\'company_logo_click\']"'));
+  assert.ok(content.includes('".job-boss-info .name"'));
+  const parseStart = content.indexOf("function parseJobCard");
+  const parseEnd = content.indexOf("async function autoScrollList", parseStart);
+  const parse = content.slice(parseStart, parseEnd);
+  assert.ok(!parse.includes("if (SELECTORS.hrName)"));
+  assert.ok(parse.includes("当前 BOSS 列表卡中的 .boss-info/.boss-name 是公司"));
+});
+
+test("job failure counters persist before storage is reloaded", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const processAt = background.indexOf("let outcome = await processOneJob(task, row, config)");
+  const reloadAt = background.indexOf("config = await getAllConfig()", processAt);
+  const between = background.slice(processAt, reloadAt);
+  assert.ok(between.includes("await publishTask(task)"));
+  assert.ok(between.includes("job_process_returned"));
 });
 
 test("conversation opener never repeatedly clicks the same candidate", () => {
