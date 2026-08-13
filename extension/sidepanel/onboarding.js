@@ -245,6 +245,11 @@ function start() {
 async function init() {
   const replay = document.getElementById('btnReplayTour');
   if (replay) replay.addEventListener('click', function () { start(); });
+  window.addEventListener('message', function (event) {
+    const data = event.data || {};
+    if (data.source !== 'bht-agent') return;
+    if (data.cmd === 'skip-onboarding') finish(false);
+  });
   if (await isDone()) return;
   setTimeout(start, 250);
 }

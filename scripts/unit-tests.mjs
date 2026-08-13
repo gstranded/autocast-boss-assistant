@@ -1,5 +1,5 @@
 import assert from "assert";
-import { evaluateJob, summarizePreview } from "../extension/shared/filter-engine.js";
+import { evaluateJob, summarizePreview, previewReasonLines } from "../extension/shared/filter-engine.js";
 import { isSimilar, parseSalaryRange, normalizeText, parseKeywords } from "../extension/shared/text-utils.js";
 import { planMessageSegments } from "../extension/shared/message-planner.js";
 import { MESSAGE_MODES } from "../extension/shared/constants.js";
@@ -53,10 +53,27 @@ test("normalize greeting", () => {
 test("similar greetings", () => {
   assert.ok(isSimilar("您好，我对这个岗位很感兴趣", "你好，我对该职位很感兴趣！", 0.85));
 });
+test("greeting without punctuation still matches native hello", () => {
+  assert.ok(isSimilar("您好我对这个岗位很感兴趣", "你好，我对该职位很感兴趣", 0.85));
+  assert.equal(normalizeText("history"), "history");
+});
 test("salary parse 15-25K", () => {
   const s = parseSalaryRange("15-25K·14薪");
   assert.equal(s.min, 15000);
   assert.equal(s.max, 25000);
+});
+test("salary parse does not treat daily yuan as monthly K", () => {
+  const daily = parseSalaryRange("400-450元/天");
+  assert.ok(daily.min < 20000, "daily 400 yuan must not become 400000");
+  assert.ok(daily.max < 20000, "daily 450 yuan must not become 450000");
+  assert.ok(daily.min >= 400);
+  assert.ok(daily.max >= 450);
+  const monthly = parseSalaryRange("15-25K");
+  assert.equal(monthly.min, 15000);
+  assert.equal(monthly.max, 25000);
+  const bare = parseSalaryRange("15-25");
+  assert.equal(bare.min, 15000);
+  assert.equal(bare.max, 25000);
 });
 test("parseKeywords", () => {
   assert.deepEqual(parseKeywords("Java, Go，后端"), ["Java", "Go", "后端"]);
@@ -125,6 +142,20 @@ test("disabled location include ignores stored locations", () => {
   const r = evaluateJob({ ...passJob, location: "佛山" }, disabled, {}, {});
   assert.equal(r.decision, "pass");
 });
+test("daily yuan salary is compared as monthly, not as inflated K", () => {
+  const r = evaluateJob({ ...passJob, salary: "400-450元/天" }, filters, {}, {});
+  assert.equal(r.decision, "reject");
+  assert.ok(r.reasonCodes.includes(REASON.FILTER_SALARY_LOW));
+});
+test("empty filters still expose a pass reason for preview rows", () => {
+  const empty = { title: {}, company: {}, jd: {}, location: {} };
+  const r = evaluateJob(passJob, empty, {}, {});
+  assert.equal(r.decision, "pass");
+  assert.ok(r.reasonCodes.includes(REASON.OK_PREVIEW_PASS));
+  assert.deepEqual(previewReasonLines(r), [reasonText(REASON.OK_PREVIEW_PASS)]);
+  const withHits = evaluateJob(passJob, filters, {}, {});
+  assert.ok(previewReasonLines(withHits).some((t) => t.includes("职位命中包含词")));
+});
 
 console.log("3) template + resume bind");
 test("render template ok", () => {
@@ -156,6 +187,35 @@ test("pickResumeProfile priority", () => {
 });
 
 console.log("4) message planner");
+test("successful idempotency key is not planned twice", () => {
+  const job = { jobId: "j9", bossId: "b9", title: "Java" };
+  const template = {
+    version: 3,
+    segments: [
+      { id: "1", enabled: true, text: "第一段" },
+      { id: "2", enabled: true, text: "第二段" }
+    ]
+  };
+  const first = planMessageSegments({
+    mode: MESSAGE_MODES.PLUGIN_ONLY,
+    template,
+    job,
+    recentSelfMessages: []
+  });
+  assert.equal(first.plan.length, 2);
+  const sentKey = first.plan[0].key;
+  const retry = planMessageSegments({
+    mode: MESSAGE_MODES.PLUGIN_ONLY,
+    template,
+    job,
+    recentSelfMessages: [],
+    idempotency: { [sentKey]: { ts: Date.now() } }
+  });
+  assert.equal(retry.plan.length, 1);
+  assert.equal(retry.plan[0].index, 1);
+  assert.notEqual(retry.plan[0].key, sentKey);
+});
+
 test("auto detect skips first segment", () => {
   const plan = planMessageSegments({
     mode: MESSAGE_MODES.AUTO_DETECT,

@@ -1,6 +1,7 @@
 import { MSG } from '../shared/messaging.js';
 import { parseKeywords, uid } from '../shared/text-utils.js';
 import { reasonText } from '../shared/reason-codes.js';
+import { previewReasonLines } from '../shared/filter-engine.js';
 import { STORAGE_KEYS } from '../shared/constants.js';
 import { mergeResumeImages } from '../shared/resume-images.js';
 import {
@@ -775,6 +776,10 @@ function updateTaskUI(task, runner = {}) {
       `成功 ${c.success || 0} · 跳过 ${c.skipped || 0} · 失败 ${c.failed || 0} · 已处理 ${c.processed || 0}` +
       (pending ? ` · 未投 ${pending}` : '');
   }
+  if ($('taskWarnings') && (status !== 'idle' || (task?.warnings || []).length)) {
+    const warnText = (task?.warnings || []).join('；');
+    if (warnText) $('taskWarnings').textContent = warnText;
+  }
   if ($('taskHint')) {
     let hint = '';
     if (status === 'running') hint = '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
@@ -915,6 +920,10 @@ function renderPreview(task) {
     `生效设置：同公司每天最多 ${settings.companyDailyMax ?? '—'} · 每日最多 ${settings.dailyMaxCommunicate ?? '—'} · 本次最多 ${settings.taskMaxCommunicate ?? '—'} · 同HR冷却 ${settings.bossCooldownDays ?? '—'} 天 · 永不重复 ${settings.neverRepeatJob ? '开' : '关'}`
   );
   lines.push('说明：「本次/每日最多沟通」在正式投递时拦截，预览阶段主要做筛选词、永不重复、同公司已达今日上限等判断。');
+  if (Array.isArray(task.warnings) && task.warnings.length) {
+    lines.push('');
+    lines.push('提示：' + task.warnings.join('；'));
+  }
   $('summaryBox').textContent = lines.join('\n');
 
 const list = $('previewList');
@@ -941,7 +950,7 @@ const list = $('previewList');
       <div class="m">${escapeHtml(r.job.company || '')} · ${escapeHtml(r.job.location || '')} · ${escapeHtml(
       r.job.salary || ''
     )}</div>
-      <div class="r">${escapeHtml((r.decision === 'pass' ? r.passReasons : r.reasonTexts)?.join('；') || '')}</div>
+      <div class="r">${escapeHtml(previewReasonLines(r).join('；'))}</div>
     `;
     list.appendChild(div);
   });
@@ -1606,6 +1615,12 @@ function bindEvents() {
     state.formDirty = true;
     renderBindings();
     toast('已新增一条自动选简历规则', 'success');
+  });
+
+  window.addEventListener('message', (event) => {
+    const data = event.data || {};
+    if (data.source !== 'bht-agent') return;
+    if (data.cmd === 'scan-preview') $('btnPreview')?.click();
   });
 
   $('btnPreview').addEventListener('click', async () => {

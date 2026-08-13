@@ -131,6 +131,26 @@ test("delivery hardening contracts", () => {
   assert.ok(c.includes("waitForImageSendConfirm"));
 });
 
+test("preview UI falls back to reasonTexts and shows pass-rate warnings", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const engine = fs.readFileSync("extension/shared/filter-engine.js", "utf8");
+  assert.ok(engine.includes("export function previewReasonLines"));
+  assert.ok(app.includes("previewReasonLines(r)"));
+  assert.ok(app.includes("task.warnings.join"));
+  assert.ok(app.includes("通过率超过 80%") === false);
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(background.includes("通过率超过 80%，请检查筛选是否过宽"));
+});
+
+test("panel accepts agent postMessage to skip tour and start preview", () => {
+  const onboarding = fs.readFileSync("extension/sidepanel/onboarding.js", "utf8");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(onboarding.includes("source !== 'bht-agent'"));
+  assert.ok(onboarding.includes("skip-onboarding"));
+  assert.ok(app.includes("source !== 'bht-agent'"));
+  assert.ok(app.includes("scan-preview"));
+});
+
 test("retry resumes after chat trigger without clicking the list twice", () => {
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const content = fs.readFileSync("extension/content/content-main.js", "utf8");

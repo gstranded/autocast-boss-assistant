@@ -1,4 +1,4 @@
-const GREETING_PREFIX = /^(您好|你好|hello|hi|hey)[，,。.!！\s]*/i;
+const GREETING_PREFIX = /^(您好|你好|hello|hi|hey)(?:[，,。.!！]+|(?=[\u4e00-\u9fff])|$)/i;
 const EMOJI_RE = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu;
 
 export function normalizeText(input = '') {
@@ -114,23 +114,30 @@ export function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-/** 解析如 15-25K·14薪 / 8-12K / 面议 */
+function salaryScale(value, raw) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return n;
+  if (/元?\/(?:小时|时)|时薪/.test(raw)) return Math.round(n * 8 * 22);
+  if (/元?\/(?:天|日)|\/天|\/日/.test(raw)) return Math.round(n * 22);
+  if (/[kK千]/.test(raw) || n < 1000) return n * 1000;
+  return n;
+}
+
+/** 解析如 15-25K·14薪 / 8-12K / 400-450元/天 / 面议 */
 export function parseSalaryRange(text = '') {
   const s = String(text).replace(/\s/g, '');
   if (!s || /面议|薪资面议/.test(s)) return { min: null, max: null, raw: s };
-  const m = s.match(/(\d+(?:\.\d+)?)\s*[-~～—]\s*(\d+(?:\.\d+)?)\s*[kK千]?/);
+  const m = s.match(/(\d+(?:\.\d+)?)\s*[-~～—]\s*(\d+(?:\.\d+)?)/);
   if (m) {
-    let min = parseFloat(m[1]);
-    let max = parseFloat(m[2]);
-    if (/[kK千]/.test(s) || min < 1000) {
-      min *= 1000;
-      max *= 1000;
-    }
-    return { min, max, raw: s };
+    return {
+      min: salaryScale(m[1], s),
+      max: salaryScale(m[2], s),
+      raw: s
+    };
   }
-  const single = s.match(/(\d+(?:\.\d+)?)\s*[kK千]/);
+  const single = s.match(/(\d+(?:\.\d+)?)(?:\s*[kK千]|元?\/(?:天|日|小时|时))/);
   if (single) {
-    const v = parseFloat(single[1]) * 1000;
+    const v = salaryScale(single[1], s);
     return { min: v, max: v, raw: s };
   }
   return { min: null, max: null, raw: s };

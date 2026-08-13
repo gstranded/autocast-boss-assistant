@@ -233,6 +233,14 @@ export function evaluateJob(job, filters, lists = {}, settings = {}) {
   };
 }
 
+export function previewReasonLines(row = {}) {
+  if (row.decision === 'pass') {
+    const extra = Array.isArray(row.passReasons) ? row.passReasons.filter(Boolean) : [];
+    if (extra.length) return extra;
+  }
+  return Array.isArray(row.reasonTexts) ? row.reasonTexts.filter(Boolean) : [];
+}
+
 export function summarizePreview(results = []) {
   const summary = {
     scanned: results.length,
