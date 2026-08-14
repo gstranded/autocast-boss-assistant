@@ -257,7 +257,21 @@ chrome.action?.onClicked?.addListener(async (tab) => {
   }
 });
 
-async function getActiveBossTab({ allowInactiveBossTab = false } = {}) {
+async function tabFromSender(sender) {
+  const raw = sender?.tab;
+  if (!raw?.id) return null;
+  try {
+    const live = await chrome.tabs.get(raw.id);
+    return live || raw;
+  } catch (_) {
+    return raw;
+  }
+}
+
+async function getActiveBossTab({ allowInactiveBossTab = false, sender = null } = {}) {
+  const fromSender = await tabFromSender(sender);
+  if (isBossTab(fromSender)) return fromSender;
+
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   const active = tabs[0];
   if (isBossTab(active)) return active;
@@ -872,15 +886,17 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
   }
 }
 
-async function assertBossContext() {
-  const tab = await getActiveBossTab({ allowInactiveBossTab: false });
+async function assertBossContext(sender = null) {
+  const tab = await getActiveBossTab({ allowInactiveBossTab: false, sender });
   if (!tab) {
+    const senderTab = await tabFromSender(sender);
     const active = (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+    const fallback = senderTab || active;
     return {
       ok: false,
       error: "NO_BOSS_TAB",
-      message: bossUrlGuardMessage(active?.url || ""),
-      activeTab: active ? { id: active.id, url: active.url, title: active.title } : null
+      message: bossUrlGuardMessage(fallback?.url || ""),
+      activeTab: fallback ? { id: fallback.id, url: fallback.url, title: fallback.title } : null
     };
   }
   return { ok: true, tab };
@@ -951,11 +967,15 @@ function ensureItem(task, job) {
 }
 
 
-async function runPreview(payload = {}) {
+async function runPreview(payload = {}, previewTab = null) {
   await log('info', '开始扫描预览…');
   const config = await getAllConfig();
-  const previewTab = await getActiveBossTab({ allowInactiveBossTab: false });
-  const scan = await sendToBoss(MSG.SCAN_JOBS, { scroll: payload.scroll !== false, maxRounds: payload.maxRounds || 6 });
+  previewTab = previewTab || await getActiveBossTab({ allowInactiveBossTab: false });
+  const scan = await sendToBoss(
+    MSG.SCAN_JOBS,
+    { scroll: payload.scroll !== false, maxRounds: payload.maxRounds || 6 },
+    { tabId: previewTab?.id || null }
+  );
   if (!scan?.ok) {
     await log('error', scan?.message || '扫描失败', { error: scan?.error });
     return { ok: false, ...scan };
@@ -1833,7 +1853,13 @@ async function runTaskLoop(taskId) {
 
       // assertBossContext before process
       {
-        const guard = await assertBossContext();
+        let guard = await assertBossContext();
+        if (!guard.ok && task.execution?.listTabId) {
+          try {
+            const listTab = await chrome.tabs.get(task.execution.listTabId);
+            if (isBossTab(listTab)) guard = { ok: true, tab: listTab };
+          } catch (_) {}
+        }
         if (!guard.ok) {
           runner.pause = true;
           task.status = TASK_STATUS.PAUSED;
@@ -2017,17 +2043,19 @@ async function runTaskLoop(taskId) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  const { type, payload } = message || {};
+  const { type } = message || {};
+  let { payload } = message || {};
   (async () => {
     switch (type) {
       case MSG.GET_STATE: {
         const all = await getAllConfig();
-        const tab = await getActiveBossTab();
+        const tab = await getActiveBossTab({ sender });
         return {
           ok: true,
           ...all,
           activeTab: tab ? { id: tab.id, url: tab.url, title: tab.title } : null,
           activeIsBoss: Boolean(tab),
+          senderTab: sender?.tab ? { id: sender.tab.id, url: sender.tab.url || '' } : null,
           bossOnly: true,
           runner: {
             running: runner.running && !runner.abort,
@@ -2064,19 +2092,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { ok: true };
       case MSG.RUN_PREVIEW: {
         return await withRunnerAdmission('previewing', async () => {
-          const guard = await assertBossContext();
+          const guard = await assertBossContext(sender);
           if (!guard.ok) {
             await log("warn", guard.message);
             return guard;
           }
-          return await runPreview(payload || {});
+          return await runPreview(payload || {}, guard.tab);
         });
       }
       case MSG.CONFIRM_AND_START: {
         return await withRunnerAdmission('starting', async () => {
         // CONFIRM_AND_START guard
         {
-          const guard = await assertBossContext();
+          const guard = await assertBossContext(sender);
           if (!guard.ok) {
             await log("warn", guard.message);
             return guard;
@@ -2197,10 +2225,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'BHT_RUN_TEST_DELIVERY': {
         return await withRunnerAdmission('starting', async () => {
         {
-          const guard = await assertBossContext();
+          await log('info', '[投递一份] 收到启动请求', {
+            senderTab: sender?.tab ? { id: sender.tab.id, url: sender.tab.url || '' } : null
+          });
+          const guard = await assertBossContext(sender);
           if (!guard.ok) {
             await log('warn', guard.message);
             return guard;
+          }
+          if (guard.tab?.id) {
+            payload = {
+              ...(payload || {}),
+              listTabId: guard.tab.id,
+              listWindowId: guard.tab.windowId
+            };
           }
         }
         const all = await getAllConfig();
@@ -2280,6 +2318,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           task.completionSignal = null;
         }
 
+        if (payload?.listTabId) {
+          task.execution = {
+            ...(task.execution || {}),
+            listTabId: payload.listTabId,
+            listWindowId: payload.listWindowId || task.execution?.listWindowId || null
+          };
+        }
         task.testDelivery = true;
         task.testJobId = onlyId;
         task.testedJobIds = Array.from(new Set([...(task.testedJobIds || []).map(String), ...extraForPick]));
@@ -2401,7 +2446,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           runner.pausePublished = false;
         }
         {
-          const guard = await assertBossContext();
+          const guard = await assertBossContext(sender);
           if (!guard.ok) {
             await log("warn", guard.message);
             return guard;

@@ -29,6 +29,15 @@ test("background force-injects content on critical ops", () => {
   assert.ok(s.includes("critical.includes"));
 });
 
+test("boss context prefers the panel sender tab over the focused window tab", () => {
+  const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(s.includes("async function tabFromSender"));
+  assert.ok(s.includes("assertBossContext(sender)"));
+  assert.ok(s.includes("getActiveBossTab({ sender })"));
+  assert.ok(s.includes("isBossTab(fromSender)"));
+  assert.ok(s.includes("let { payload }"));
+});
+
 test("background uses the two-page trigger flow and returns safely after failures", () => {
   const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
   assert.ok(s.includes("TRIGGER_CONVERSATION"));

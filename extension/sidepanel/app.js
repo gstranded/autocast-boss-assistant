@@ -1620,7 +1620,96 @@ function bindEvents() {
   window.addEventListener('message', (event) => {
     const data = event.data || {};
     if (data.source !== 'bht-agent') return;
-    if (data.cmd === 'scan-preview') $('btnPreview')?.click();
+    const ack = (extra = {}) => {
+      try {
+        window.parent.postMessage({ source: 'bht-panel', type: 'ack', cmd: data.cmd, extra }, '*');
+      } catch (_) {}
+    };
+    if (data.cmd === 'scan-preview') { $('btnPreview')?.click(); ack({ has: !!$('btnPreview') }); }
+    if (data.cmd === 'test-one') {
+      const btn = $('btnTestOne');
+      ack({ has: !!btn, disabled: !!btn?.disabled, title: btn?.title || '' });
+      btn?.click();
+    }
+    if (data.cmd === 'pause') { $('btnPause')?.click(); ack({ has: !!$('btnPause') }); }
+    if (data.cmd === 'resume') { $('btnResume')?.click(); ack({ has: !!$('btnResume') }); }
+    if (data.cmd === 'stop') { $('btnStop')?.click(); ack({ has: !!$('btnStop') }); }
+    if (data.cmd === 'skip') { $('btnSkip')?.click(); ack({ has: !!$('btnSkip') }); }
+    if (data.cmd === 'switch-tab' && data.tab) {
+      const tab = document.querySelector(`.tab[data-tab="${data.tab}"]`);
+      tab?.click();
+      ack({ has: !!tab, tab: data.tab });
+    }
+    if (data.cmd === 'set-title-or') {
+      if ($('titleOr')) $('titleOr').value = String(data.value || '');
+      if ($('titleOrEnabled')) $('titleOrEnabled').checked = true;
+      $('titleOr')?.dispatchEvent(new Event('input', { bubbles: true }));
+      Promise.resolve(saveFilters({ refresh: false })).catch(() => {});
+      ack({ titleOr: $('titleOr')?.value || '' });
+    }
+    if (data.cmd === 'dump-state') {
+      window.__bhtAgentDump = {
+        ts: Date.now(),
+        tab: document.querySelector('.tab.active')?.dataset?.tab || '',
+        status: $('taskStatus')?.textContent || '',
+        counters: $('taskCounters')?.textContent || '',
+        hint: $('taskHint')?.textContent || '',
+        warnings: $('taskWarnings')?.textContent || '',
+        summary: $('summaryBox')?.textContent || '',
+        logs: $('logList')?.innerText?.slice(0, 4000) || '',
+        toast: $('bht-toast')?.textContent || '',
+        buttons: {
+          preview: { disabled: !!$('btnPreview')?.disabled },
+          testOne: { disabled: !!$('btnTestOne')?.disabled, title: $('btnTestOne')?.title || '' },
+          start: { disabled: !!$('btnStart')?.disabled }
+        },
+        runner: state.config?.runner || null,
+        senderTab: state.config?.senderTab || null,
+        activeIsBoss: state.config?.activeIsBoss,
+        previewSample: [...document.querySelectorAll('#previewList .item')].slice(0, 8).map((el) => el.innerText.slice(0, 200)),
+        historySample: [...document.querySelectorAll('#historyList .item')].slice(0, 5).map((el) => el.innerText.slice(0, 200)),
+        historyStats: $('historyStats')?.textContent || '',
+        settings: {
+          messageMode: $('messageMode')?.value || '',
+          taskMaxCommunicate: $('taskMaxCommunicate')?.value || '',
+          autoSendImageResume: !!$('autoSendImageResume')?.checked,
+          autoSendAttachmentResume: !!$('autoSendAttachmentResume')?.checked,
+          resumeSendTiming: $('resumeSendTiming')?.value || ''
+        },
+        messages: (state.config?.messageTemplate?.segments || []).map((s) => ({
+          id: s.id,
+          enabled: s.enabled !== false,
+          text: String(s.text || '').slice(0, 80)
+        })),
+        resumes: {
+          defaultProfileId: state.config?.resumes?.defaultProfileId || '',
+          profiles: (state.config?.resumes?.profiles || []).map((p) => ({
+            id: p.id,
+            name: p.name,
+            images: (p.images || []).length,
+            hasAttachment: Boolean(p.attachment?.name)
+          }))
+        },
+        task: {
+          status: state.config?.task?.status || '',
+          pass: (state.config?.task?.results || []).filter((r) => r.decision === 'pass').length,
+          reject: (state.config?.task?.results || []).filter((r) => r.decision === 'reject').length,
+          currentJobId: state.config?.task?.currentJobId || '',
+          pauseReason: state.config?.task?.pauseReason || '',
+          testedJobIds: state.config?.task?.testedJobIds || [],
+          items: (state.config?.task?.items || []).slice(-3).map((it) => ({
+            jobId: it.jobId,
+            title: it.title,
+            state: it.state,
+            phase: it.phase || '',
+            reasons: it.reasons || []
+          }))
+        }
+      };
+      try {
+        window.parent.postMessage({ source: 'bht-panel', type: 'dump', payload: window.__bhtAgentDump }, '*');
+      } catch (_) {}
+    }
   });
 
   $('btnPreview').addEventListener('click', async () => {
@@ -1762,10 +1851,18 @@ function bindEvents() {
     }
     $('btnTestOne').disabled = true;
     toast('正在启动投递一份…', 'warn', 1500);
-    const res = await api(MSG.RUN_TEST_DELIVERY || 'BHT_RUN_TEST_DELIVERY', {
-      jobId: selectedJobIds[0],
-      selectedJobIds
-    });
+    let res;
+    try {
+      res = await api(MSG.RUN_TEST_DELIVERY || 'BHT_RUN_TEST_DELIVERY', {
+        jobId: selectedJobIds[0],
+        selectedJobIds
+      });
+    } catch (e) {
+      toast(String(e?.message || e || '投递一份启动失败'), 'error', 4000);
+      showErrorModal('投递一份失败', String(e?.message || e || '无法启动'), { showRetry: false });
+      await refresh({ soft: true });
+      return;
+    }
     if (!res?.ok) {
       toast(res?.message || res?.error || '投递一份启动失败', 'error', 3500);
       showErrorModal('投递一份失败', res?.message || res?.error || '无法启动', { showRetry: false });
