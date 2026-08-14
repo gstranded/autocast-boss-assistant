@@ -15,7 +15,7 @@ import { HISTORY_STATUS_MAP, filterHistoryRows } from '../shared/history-view.js
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.1";
+const BHT_UI_VERSION = "1.7.2";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -1912,7 +1912,7 @@ function bindEvents() {
       const res = await api(MSG.GET_DEBUG_LOGS);
       if (!res?.ok) throw new Error(res?.message || res?.error || '读取调试日志失败');
       const payload = {
-        product: 'Boss海投助手',
+        product: 'AutoCast-Boss海投助手',
         version: res.meta?.version || BHT_UI_VERSION,
         exportedAt: res.meta?.exportedAt || new Date().toISOString(),
         sessionOnly: true,

@@ -8,7 +8,7 @@ const KEY = STORAGE_KEYS.ONBOARDING;
 const STEPS = [
   {
     sel: null,
-    title: '欢迎使用 Boss 海投助手',
+    title: '欢迎使用 AutoCast-Boss海投助手',
     body: '接下来 30 秒带你认识这个面板。每一步会高亮对应区域，随时可点「跳过」。'
   },
   {

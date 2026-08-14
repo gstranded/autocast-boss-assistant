@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/logo.svg" alt="Boss HaiTou Assistant Logo" width="128" />
+  <img src="https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/logo.png" alt="AutoCast-Boss HaiTou Assistant" width="128" />
 </p>
 
-<h1 align="center">Boss HaiTou Assistant</h1>
+<h1 align="center">AutoCast-Boss HaiTou Assistant</h1>
 
 <p align="center">
   <b>Preview before apply · Explainable filters · No duplicate messages · Correct resume · Controllable tasks</b>

@@ -67,46 +67,68 @@ function inPoly(x, y, pts) {
   }
   return inside;
 }
+function nearArc(nx, ny, cx, cy, radius, thickness, startAng, endAng) {
+  const dx = nx - cx;
+  const dy = ny - cy;
+  const dist = Math.hypot(dx, dy);
+  if (Math.abs(dist - radius) > thickness) return false;
+  let ang = Math.atan2(-(ny - cy), nx - cx);
+  if (ang < 0) ang += Math.PI * 2;
+  return ang >= startAng && ang <= endAng;
+}
+
 function drawLogo(x, y, s) {
   const mask = roundedMask(x, y, s, s * 0.18);
   if (mask <= 0) return [0, 0, 0, 0];
   const t = y / (s - 1);
-  let r = Math.round(37 + t * 12);
-  let g = Math.round(99 + t * 18);
-  let b = Math.round(235 - t * 30);
+  let r = Math.round(79 + t * -20);
+  let g = Math.round(70 + t * -18);
+  let b = Math.round(229 + t * -50);
   const nx = (x + 0.5) / s;
   const ny = (y + 0.5) / s;
-  const dx = nx - 0.34;
-  const dy = ny - 0.3;
-  if (dx * dx + dy * dy < 0.045) {
-    r = Math.min(255, r + 28);
+  const hx = nx - 0.32;
+  const hy = ny - 0.28;
+  if (hx * hx + hy * hy < 0.05) {
+    r = Math.min(255, r + 34);
     g = Math.min(255, g + 28);
-    b = Math.min(255, b + 12);
+    b = Math.min(255, b + 18);
   }
   const plane = [
-    [0.22, 0.48],
-    [0.78, 0.28],
-    [0.55, 0.5],
-    [0.72, 0.72],
-    [0.48, 0.55]
+    [0.26, 0.58],
+    [0.78, 0.24],
+    [0.54, 0.52],
+    [0.68, 0.74],
+    [0.46, 0.56]
   ];
   let a = Math.round(255 * Math.min(1, mask));
+  const originX = 0.34;
+  const originY = 0.58;
+  const thick = s <= 24 ? 0.055 : 0.038;
+  const arcs = s <= 24 ? [0.2, 0.32] : [0.18, 0.28, 0.38];
+  for (const radius of arcs) {
+    if (nearArc(nx, ny, originX, originY, radius, thick, 0.08, 1.35)) {
+      return [255, 255, 255, a];
+    }
+  }
   if (inPoly(nx, ny, plane)) return [255, 255, 255, a];
-  if ((nx - 0.28) ** 2 + (ny - 0.62) ** 2 < 0.0018) return [255, 214, 102, a];
-  if ((nx - 0.22) ** 2 + (ny - 0.68) ** 2 < 0.001) return [255, 214, 102, Math.round(a * 0.85)];
+  if ((nx - originX) ** 2 + (ny - originY) ** 2 < (s <= 24 ? 0.004 : 0.0024)) {
+    return [255, 214, 102, a];
+  }
   return [r, g, b, a];
 }
 
 const svg = [
   '<?xml version="1.0" encoding="UTF-8"?>',
-  '<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Boss HaiTou Assistant">',
+  '<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="AutoCast">',
   '  <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">',
-  '    <stop offset="0%" stop-color="#3B82F6"/><stop offset="100%" stop-color="#1D4ED8"/>',
+  '    <stop offset="0%" stop-color="#6366F1"/><stop offset="100%" stop-color="#312E81"/>',
   "  </linearGradient></defs>",
   '  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#g)"/>',
-  '  <path d="M120 250 L390 150 L280 260 L360 365 L245 285 Z" fill="#FFFFFF"/>',
-  '  <circle cx="145" cy="330" r="14" fill="#FFD666"/>',
-  '  <circle cx="118" cy="355" r="9" fill="#FFD666" opacity="0.85"/>',
+  '  <path d="M132 296 L400 122 L276 266 L348 378 L236 286 Z" fill="#FFFFFF"/>',
+  '  <circle cx="174" cy="297" r="16" fill="#FFD666"/>',
+  '  <path d="M214 232 A96 96 0 0 1 308 196" fill="none" stroke="#FFFFFF" stroke-width="28" stroke-linecap="round"/>',
+  '  <path d="M232 196 A148 148 0 0 1 372 152" fill="none" stroke="#FFFFFF" stroke-width="26" stroke-linecap="round"/>',
+  '  <path d="M248 160 A198 198 0 0 1 428 118" fill="none" stroke="#FFFFFF" stroke-width="24" stroke-linecap="round"/>',
   "</svg>"
 ].join("\n");
 

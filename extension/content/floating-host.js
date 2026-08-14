@@ -1,5 +1,5 @@
 (() => {
-  const BHT_FLOAT_HOST_VERSION = "1.7.1";
+  const BHT_FLOAT_HOST_VERSION = "1.7.2";
   if (window.__BHT_FLOAT_HOST_VERSION__ === BHT_FLOAT_HOST_VERSION && window.__BHT_FLOAT_HOST__) return;
   window.__BHT_FLOAT_HOST_VERSION__ = BHT_FLOAT_HOST_VERSION;
   window.__BHT_FLOAT_HOST__ = true;
@@ -65,21 +65,21 @@
     root = document.createElement("div");
     root.id = ROOT_ID;
     root.innerHTML = `
-      <button type="button" class="bht-fab" id="bht-fab" title="Boss 海投助手" aria-label="打开 Boss 海投助手">
+      <button type="button" class="bht-fab" id="bht-fab" title="AutoCast-Boss海投助手" aria-label="打开 AutoCast-Boss海投助手">
         <img src="${chrome.runtime.getURL("assets/icons/icon128.png")}" alt="" />
       </button>
       <div class="bht-panel" id="bht-panel" hidden>
         <div class="bht-panel-header" id="bht-drag">
           <div class="bht-panel-title">
             <img src="${chrome.runtime.getURL("assets/icons/icon48.png")}" alt="" />
-            <span>Boss 海投助手</span>
+            <span>AutoCast-Boss海投助手</span>
           </div>
           <div class="bht-panel-actions">
             <button type="button" class="bht-icon-btn" id="bht-min" title="收起">—</button>
             <button type="button" class="bht-icon-btn" id="bht-close" title="关闭">×</button>
           </div>
         </div>
-        <iframe class="bht-frame" id="bht-frame" title="Boss 海投助手面板"></iframe>
+        <iframe class="bht-frame" id="bht-frame" title="AutoCast-Boss海投助手面板"></iframe>
       </div>
     `;
     document.documentElement.appendChild(root);
@@ -128,8 +128,8 @@
       const frame = document.getElementById("bht-frame");
       if (frame) {
         // FORCE_IFRAME_RELOAD: 每次打开都带版本号，避免浮窗卡在旧 UI
-        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=1.7.1");
-        if (!frame.src || !frame.src.includes("v=1.7.1")) {
+        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=1.7.2");
+        if (!frame.src || !frame.src.includes("v=1.7.2")) {
           frame.src = next;
         }
       }

@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/logo.svg" alt="Boss 海投助手" width="112" />
+  <img src="https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/logo.png" alt="AutoCast-Boss海投助手" width="112" />
 </p>
 
-<h1 align="center">Boss 海投助手</h1>
+<h1 align="center">AutoCast-Boss海投助手</h1>
 
 <p align="center">BOSS 直聘网页端的职位筛选、投递确认、分段消息和简历发送助手。</p>
 

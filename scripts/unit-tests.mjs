@@ -500,7 +500,7 @@ test("logo png valid", () => {
 test("logo svg exists", () => {
   const s = fs.readFileSync("docs/assets/logo.svg", "utf8");
   assert.ok(s.includes("<svg"));
-  assert.ok(s.includes("#3B82F6"));
+  assert.ok(s.includes("#E73A7A"));
 });
 test("screenshots valid png", () => {
   for (const f of ["01-task", "02-filter", "03-message", "04-resume", "05-settings"]) {

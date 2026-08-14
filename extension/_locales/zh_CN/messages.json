@@ -1,4 +1,4 @@
 {
-  "extName": { "message": "Boss 海投助手" },
-  "extDesc": { "message": "投递前可预览、筛选可解释、消息不重复、简历不发错、任务随时可控" }
+  "extName": { "message": "AutoCast-Boss海投助手" },
+  "extDesc": { "message": "海投助手。先筛选岗位，再自动化批量投递；预览、去重、随时可停。" }
 }

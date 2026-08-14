@@ -1,4 +1,4 @@
 {
-  "extName": { "message": "Boss HaiTou Assistant" },
-  "extDesc": { "message": "Preview before apply, explainable filters, no duplicate messages, correct resume, controllable tasks" }
+  "extName": { "message": "AutoCast-Boss HaiTou Assistant" },
+  "extDesc": { "message": "Filter jobs first, then auto-apply at scale. Preview, dedupe, and stop anytime." }
 }

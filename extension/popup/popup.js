@@ -12,7 +12,7 @@ function renderGuide(version) {
   app.innerHTML = `
     <div class="hero">
       <img class="logo" src="../assets/icons/icon128.png" alt="logo" />
-      <div class="brand">Boss 海投助手</div>
+      <div class="brand">AutoCast-Boss海投助手</div>
     </div>
     <div class="title">请前往 BOSS 直聘页面使用插件</div>
     <div class="guide">
@@ -44,7 +44,7 @@ function renderBossReady(tab, version) {
   app.innerHTML = `
     <div class="hero">
       <img class="logo" src="../assets/icons/icon128.png" alt="logo" />
-      <div class="brand">Boss 海投助手</div>
+      <div class="brand">AutoCast-Boss海投助手</div>
     </div>
     <div class="status"><span class="dot"></span>已在 BOSS 页面，可使用悬浮插件</div>
     <div class="guide">
