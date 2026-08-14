@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  A Chrome / Edge MV3 extension for job seekers on <a href="https://www.zhipin.com/">BOSS Zhipin</a>
+  Filter jobs first, then auto-apply at scale on <a href="https://www.zhipin.com/">BOSS Zhipin</a>. Also on <a href="https://microsoftedge.microsoft.com/addons/detail/boss-%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod">Microsoft Edge Add-ons</a>.
 </p>
 
 <p align="center">
@@ -75,7 +75,14 @@ Safety limits are first-class features. The panel supports persistent light and 
 
 ## 🚀 Quick Start
 
-### Option A: Install from Release (recommended)
+### Option A: Install from Microsoft Edge Add-ons (recommended)
+
+1. Open [AutoCast-Boss HaiTou Assistant](https://microsoftedge.microsoft.com/addons/detail/boss-%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod)
+2. Click **Get**
+3. Open the BOSS job list, sign in, and refresh once
+4. Click the floating button on the right
+
+### Option B: Install from GitHub Release
 
 1. Open [Releases](https://github.com/gstranded/boss-haitou-assistant/releases)
 2. Download `boss-haitou-assistant-vX.Y.Z.zip`
@@ -86,10 +93,9 @@ Safety limits are first-class features. The panel supports persistent light and 
 5. Enable **Developer mode**
 6. Click **Load unpacked**
 7. Select the **`extension`** folder
-8. Open the side panel from the toolbar icon
-9. Open BOSS job list page and sign in
+8. Open the BOSS job list page and sign in
 
-### Option B: Install from source
+### Option C: Install from source
 
 ```bash
 git clone https://github.com/gstranded/boss-haitou-assistant.git

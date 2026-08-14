@@ -4,20 +4,28 @@
 
 <h1 align="center">AutoCast-Boss海投助手</h1>
 
-<p align="center">BOSS 直聘网页端的职位筛选、投递确认、分段消息和简历发送助手。</p>
+<p align="center">BOSS 直聘网页端的筛选 + 一键海投助手。先按规则过滤岗位，再自动批量沟通，不用逐个手动点。</p>
 
 <p align="center">
-  <a href="https://github.com/gstranded/boss-haitou-assistant/releases">下载最新版</a> ·
+  <a href="https://microsoftedge.microsoft.com/addons/detail/boss-%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod">Edge 商店安装</a> ·
+  <a href="https://github.com/gstranded/boss-haitou-assistant/releases">GitHub 下载</a> ·
   <a href="README_EN.md">English</a> ·
   <a href="PRIVACY.md">隐私政策</a> ·
   <a href="LICENSE">MIT License</a>
 </p>
 
-> 当前通过 GitHub Release 安装，Chrome Web Store 和 Microsoft Edge Add-ons 尚未上架。安装前请先阅读本文的“使用边界”。
+> 推荐用 Microsoft Edge 从商店安装。Chrome Web Store 尚未上架。安装前请先阅读本文的“使用边界”。
 
 ## 安装
 
-### 从 Release 安装
+### 从 Edge 商店安装（推荐）
+
+1. 打开 [AutoCast-Boss海投助手](https://microsoftedge.microsoft.com/addons/detail/boss-%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod)。
+2. 点击「获取」。
+3. 打开 [BOSS 直聘职位列表](https://www.zhipin.com/web/geek/jobs)，登录后刷新一次页面。
+4. 点击页面右侧悬浮按钮打开面板。
+
+### 从 GitHub Release 安装
 
 1. 打开 [Releases](https://github.com/gstranded/boss-haitou-assistant/releases)，下载最新的 `boss-haitou-assistant-vX.Y.Z.zip`。
 2. 解压 ZIP。
@@ -249,7 +257,7 @@ BOSS 在线简历不需要选择文件。开启“自动点击 BOSS‘发简历�
 2. 用户必须在预览页确认岗位范围和消息内容，并对发送行为负责。
 3. 请遵守目标网站条款、账号限制和当地法律，不要发送骚扰、欺诈或无关消息。
 4. 自动化会带来误投、限流或封禁风险。建议先投递一份，并使用保守上限。
-5. Chrome Web Store 要求代用户发消息前可确认内容和收件人；Microsoft Edge Add-ons 对自动生成或发送疑似垃圾消息的功能限制更严。当前 GitHub 版本不代表已经满足商店审核要求。
+5. 已上架 [Microsoft Edge Add-ons](https://microsoftedge.microsoft.com/addons/detail/boss-%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod)。Chrome Web Store 尚未上架。
 
 商店准备和阻断项见 [上架清单](docs/STORE_PUBLISHING.md)。
 
