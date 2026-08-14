@@ -10,6 +10,7 @@ import {
   countPendingPassJobs,
   shouldAcceptTaskSnapshot
 } from '../shared/task-model.js';
+import { HISTORY_STATUS_MAP, filterHistoryRows } from '../shared/history-view.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
@@ -989,23 +990,11 @@ function renderLogs(logs = []) {
 }
 
 
-const HISTORY_STATUS_MAP = {
-  success: { label: '成功', cls: 'success' },
-  skipped_list: { label: '跳过', cls: 'skipped' },
-  conversation_not_found: { label: '跳过', cls: 'skipped' },
-  skipped_missing: { label: '跳过', cls: 'skipped' },
-  failed: { label: '失败', cls: 'failed' }
-};
-
 function renderHistory(history = []) {
   const box = $('historyList');
   if (!box) return;
   const filter = $('historyFilter')?.value || 'all';
-  const filtered = history.filter((h) => {
-    if (filter === 'all') return true;
-    const info = HISTORY_STATUS_MAP[h.status] || { cls: 'skipped' };
-    return info.cls === filter;
-  });
+  const filtered = filterHistoryRows(history, filter);
 
   const total = history.length;
   const successCount = history.filter((h) => h.status === 'success').length;
@@ -1636,7 +1625,7 @@ function bindEvents() {
     if (data.cmd === 'stop') { $('btnStop')?.click(); ack({ has: !!$('btnStop') }); }
     if (data.cmd === 'skip') { $('btnSkip')?.click(); ack({ has: !!$('btnSkip') }); }
     if (data.cmd === 'switch-tab' && data.tab) {
-      const tab = document.querySelector(`.tab[data-tab="${data.tab}"]`);
+      const tab = document.querySelector(`#tabs [data-tab="${data.tab}"]`);
       tab?.click();
       ack({ has: !!tab, tab: data.tab });
     }
@@ -1647,10 +1636,36 @@ function bindEvents() {
       Promise.resolve(saveFilters({ refresh: false })).catch(() => {});
       ack({ titleOr: $('titleOr')?.value || '' });
     }
+    if (data.cmd === 'set-history-filter') {
+      if ($('historyFilter')) $('historyFilter').value = String(data.value || 'all');
+      $('historyFilter')?.dispatchEvent(new Event('change', { bubbles: true }));
+      ack({ filter: $('historyFilter')?.value || '' });
+    }
+    if (data.cmd === 'set-task-max') {
+      if ($('taskMaxCommunicate')) $('taskMaxCommunicate').value = String(data.value ?? '');
+      Promise.resolve(saveSettings({ refresh: false })).catch(() => {});
+      ack({ taskMaxCommunicate: $('taskMaxCommunicate')?.value || '' });
+    }
+    if (data.cmd === 'export-config') {
+      Promise.resolve(api(MSG.EXPORT_CONFIG)).then((res) => {
+        window.parent.postMessage({ source: 'bht-panel', type: 'export', ok: !!res?.ok, payload: res?.data || null }, '*');
+      }).catch((e) => {
+        window.parent.postMessage({ source: 'bht-panel', type: 'export', ok: false, error: String(e?.message || e) }, '*');
+      });
+    }
+    if (data.cmd === 'import-config' && data.data) {
+      Promise.resolve(api(MSG.IMPORT_CONFIG, { data: data.data })).then(async (res) => {
+        state.formDirty = false;
+        await refresh({ soft: false });
+        window.parent.postMessage({ source: 'bht-panel', type: 'import', ok: res?.ok !== false }, '*');
+      }).catch((e) => {
+        window.parent.postMessage({ source: 'bht-panel', type: 'import', ok: false, error: String(e?.message || e) }, '*');
+      });
+    }
     if (data.cmd === 'dump-state') {
       window.__bhtAgentDump = {
         ts: Date.now(),
-        tab: document.querySelector('.tab.active')?.dataset?.tab || '',
+        tab: document.querySelector('#tabs button.active')?.dataset?.tab || '',
         status: $('taskStatus')?.textContent || '',
         counters: $('taskCounters')?.textContent || '',
         hint: $('taskHint')?.textContent || '',
@@ -1667,11 +1682,25 @@ function bindEvents() {
         senderTab: state.config?.senderTab || null,
         activeIsBoss: state.config?.activeIsBoss,
         previewSample: [...document.querySelectorAll('#previewList .item')].slice(0, 8).map((el) => el.innerText.slice(0, 200)),
-        historySample: [...document.querySelectorAll('#historyList .item')].slice(0, 5).map((el) => el.innerText.slice(0, 200)),
+        historySample: [...document.querySelectorAll('#historyList .history-item, #historyList .item')].slice(0, 8).map((el) => el.innerText.slice(0, 200)),
         historyStats: $('historyStats')?.textContent || '',
+        historyFilter: $('historyFilter')?.value || '',
+        ioButtons: (() => {
+          const exp = $('btnExport');
+          const imp = $('btnImport');
+          const er = exp?.getBoundingClientRect();
+          const ir = imp?.getBoundingClientRect();
+          return {
+            export: er ? { w: Math.round(er.width), h: Math.round(er.height) } : null,
+            import: ir ? { w: Math.round(ir.width), h: Math.round(ir.height) } : null
+          };
+        })(),
         settings: {
           messageMode: $('messageMode')?.value || '',
           taskMaxCommunicate: $('taskMaxCommunicate')?.value || '',
+          dailyMaxCommunicate: $('dailyMaxCommunicate')?.value || '',
+          companyDailyMax: $('companyDailyMax')?.value || '',
+          neverRepeatJob: !!$('neverRepeatJob')?.checked,
           autoSendImageResume: !!$('autoSendImageResume')?.checked,
           autoSendAttachmentResume: !!$('autoSendAttachmentResume')?.checked,
           resumeSendTiming: $('resumeSendTiming')?.value || ''
@@ -1936,6 +1965,7 @@ function bindEvents() {
     await api(MSG.CLEAR_LOGS);
     toast('日志已清空', 'success');
     await refresh({ soft: true });
+  });
 
   $('historyFilter')?.addEventListener('change', () => {
     renderHistory(state.config?.history || []);
@@ -1963,7 +1993,6 @@ function bindEvents() {
     URL.revokeObjectURL(a.href);
     toast('已导出 ' + history.length + ' 条记录', 'success');
   });
-  });
 
   $('selectAllPass').addEventListener('change', () => {
     const on = $('selectAllPass').checked;
@@ -1974,6 +2003,10 @@ function bindEvents() {
       else state.selected.delete(id);
     });
     toast(on ? '已全选通过项' : '已取消全选', 'success', 1200);
+  });
+
+  $('btnImport')?.addEventListener('click', () => {
+    $('importFile')?.click();
   });
 
   $('btnExport').addEventListener('click', async () => {

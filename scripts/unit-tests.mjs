@@ -5,6 +5,10 @@ import { planMessageSegments } from "../extension/shared/message-planner.js";
 import { MESSAGE_MODES } from "../extension/shared/constants.js";
 import { checkDedup, checkLimits, segmentIdempotencyKey, jobIdempotencyKey } from "../extension/shared/dedup.js";
 import { renderTemplate, pickResumeProfile } from "../extension/shared/template.js";
+import { filterHistoryRows } from "../extension/shared/history-view.js";
+import { planResumeSend } from "../extension/shared/resume-policy.js";
+import { buildExportPayload, importConfigPatch, IMPORT_CONFIG_KEYS } from "../extension/shared/storage.js";
+import { STORAGE_KEYS } from "../extension/shared/constants.js";
 import { isBossUrl, isBossHostname, isBossTab, bossUrlGuardMessage } from "../extension/shared/boss-url.js";
 import { reasonText, REASON } from "../extension/shared/reason-codes.js";
 import { computeSideBySideBounds } from "../extension/shared/window-layout.js";
@@ -147,6 +151,69 @@ test("daily yuan salary is compared as monthly, not as inflated K", () => {
   assert.equal(r.decision, "reject");
   assert.ok(r.reasonCodes.includes(REASON.FILTER_SALARY_LOW));
 });
+test("title AND miss / company OR miss / company NOT / JD OR miss", () => {
+  const titleAnd = evaluateJob({ ...passJob, title: "Java 开发" }, filters, {}, {});
+  assert.equal(titleAnd.decision, "reject");
+  assert.ok(titleAnd.reasonCodes.includes(REASON.FILTER_TITLE_AND_MISS));
+  const companyOr = evaluateJob(passJob, { ...filters, company: { or: ["字节"], not: [] } }, {}, {});
+  assert.equal(companyOr.decision, "reject");
+  assert.ok(companyOr.reasonCodes.includes(REASON.FILTER_COMPANY_OR_MISS));
+  const companyNot = evaluateJob(passJob, { ...filters, company: { or: [], not: ["科技"] } }, {}, {});
+  assert.equal(companyNot.decision, "reject");
+  assert.ok(companyNot.reasonCodes.includes(REASON.FILTER_COMPANY_NOT_HIT));
+  const jdOr = evaluateJob(passJob, { ...filters, jd: { or: ["Golang"], and: [], not: [] } }, {}, {});
+  assert.equal(jdOr.decision, "reject");
+  assert.ok(jdOr.reasonCodes.includes(REASON.FILTER_JD_OR_MISS));
+});
+test("JD AND miss / location exclude / exact location / salary high", () => {
+  const jdAnd = evaluateJob(passJob, { ...filters, jd: { or: [], and: ["分布式", "高并发"], not: [] } }, {}, {});
+  assert.equal(jdAnd.decision, "reject");
+  assert.ok(jdAnd.reasonCodes.includes(REASON.FILTER_JD_AND_MISS));
+  const locEx = evaluateJob(passJob, { ...filters, location: { include: [], exclude: ["天河"], mode: "contains" } }, {}, {});
+  assert.equal(locEx.decision, "reject");
+  assert.ok(locEx.reasonCodes.includes(REASON.FILTER_LOCATION_EXCLUDED));
+  const exact = evaluateJob(passJob, { ...filters, location: { include: ["广州"], exclude: [], mode: "exact" } }, {}, {});
+  assert.equal(exact.decision, "reject");
+  assert.ok(exact.reasonCodes.includes(REASON.FILTER_LOCATION_MISS));
+  const high = evaluateJob({ ...passJob, salary: "40-60K" }, { ...filters, salaryMax: 20000 }, {}, {});
+  assert.equal(high.decision, "reject");
+  assert.ok(high.reasonCodes.includes(REASON.FILTER_SALARY_HIGH));
+});
+test("HR active / hunter / outsource / whitelist-only", () => {
+  const active = evaluateJob({ ...passJob, activeText: "本月活跃" }, { ...filters, activeWithin: "today" }, {}, {});
+  assert.equal(active.decision, "reject");
+  assert.ok(active.reasonCodes.includes(REASON.FILTER_ACTIVE));
+  const hunter = evaluateJob({ ...passJob, hrName: "猎头顾问" }, filters, {}, {});
+  assert.equal(hunter.decision, "reject");
+  assert.ok(hunter.reasonCodes.includes(REASON.FILTER_HUNTER));
+  const out = evaluateJob(
+    { ...passJob, company: "某某人力外包" },
+    { ...filters, jd: { or: [], and: [], not: [] } },
+    {},
+    {}
+  );
+  assert.equal(out.decision, "reject");
+  assert.ok(out.reasonCodes.includes(REASON.FILTER_OUTSOURCE));
+  const white = evaluateJob(passJob, filters, { companyWhitelist: ["字节"] }, { whitelistOnly: true });
+  assert.equal(white.decision, "reject");
+  assert.ok(white.reasonCodes.includes(REASON.FILTER_WHITELIST_COMPANY));
+});
+test("disabled company OR and JD NOT ignore stored keywords", () => {
+  const companyOff = evaluateJob(
+    passJob,
+    { ...filters, company: { or: ["字节"], not: [], enabled: { or: false, not: true } } },
+    {},
+    {}
+  );
+  assert.equal(companyOff.decision, "pass");
+  const jdOff = evaluateJob(
+    { ...passJob, jd: "驻场开发 Agent" },
+    { ...filters, jd: { or: [], and: [], not: ["驻场"], enabled: { or: true, and: true, not: false } }, excludeOutsource: false },
+    {},
+    {}
+  );
+  assert.equal(jdOff.decision, "pass");
+});
 test("empty filters still expose a pass reason for preview rows", () => {
   const empty = { title: {}, company: {}, jd: {}, location: {} };
   const r = evaluateJob(passJob, empty, {}, {});
@@ -214,6 +281,24 @@ test("successful idempotency key is not planned twice", () => {
   assert.equal(retry.plan.length, 1);
   assert.equal(retry.plan[0].index, 1);
   assert.notEqual(retry.plan[0].key, sentKey);
+});
+
+test("native_plus skips the first enabled segment", () => {
+  const plan = planMessageSegments({
+    mode: MESSAGE_MODES.NATIVE_PLUS,
+    template: {
+      version: 1,
+      segments: [
+        { id: "1", enabled: true, text: "第一段打招呼" },
+        { id: "2", enabled: true, text: "第二段补充" }
+      ]
+    },
+    job: { jobId: "n1", bossId: "b", title: "Java" },
+    recentSelfMessages: []
+  });
+  assert.equal(plan.startIndex, 1);
+  assert.equal(plan.plan.length, 1);
+  assert.ok(plan.plan[0].text.includes("第二段"));
 });
 
 test("auto detect skips first segment", () => {
@@ -284,6 +369,94 @@ test("idempotency key stable", () => {
   const k = segmentIdempotencyKey({ jobId: "j1", bossId: "b1" }, 1, 0);
   assert.ok(k.includes("j1"));
   assert.ok(jobIdempotencyKey({ jobId: "j1" }).includes("j1"));
+});
+test("saved settings drive limits and never-repeat", () => {
+  const settings = {
+    taskMaxCommunicate: 1,
+    dailyMaxCommunicate: 2,
+    neverRepeatJob: true,
+    bossCooldownDays: 0,
+    companyDailyMax: 0
+  };
+  assert.equal(checkLimits({ settings, taskSuccessCount: 1, todayStats: { communicate: 0 } }).ok, false);
+  assert.ok(
+    checkLimits({ settings, taskSuccessCount: 0, todayStats: { communicate: 2 } }).reasonCodes.includes("LIMIT_DAILY_MAX")
+  );
+  const dedup = checkDedup(
+    { jobId: "job-1", bossId: "b", company: "C", title: "T" },
+    {
+      settings,
+      history: [{ jobId: "job-1", status: "success", ts: Date.now() }],
+      todayStats: { byCompany: {} },
+      taskItemKeys: new Set(),
+      idempotency: {}
+    }
+  );
+  assert.equal(dedup.ok, false);
+  assert.ok(dedup.reasonCodes.includes("DEDUP_JOB"));
+});
+
+console.log("5b) history + resume policy + config io");
+test("history filter keeps only matching status classes", () => {
+  const rows = [
+    { status: "success", title: "A" },
+    { status: "skipped_list", title: "B" },
+    { status: "conversation_not_found", title: "C" },
+    { status: "failed", title: "D" }
+  ];
+  assert.equal(filterHistoryRows(rows, "all").length, 4);
+  assert.deepEqual(filterHistoryRows(rows, "success").map((r) => r.title), ["A"]);
+  assert.deepEqual(filterHistoryRows(rows, "skipped").map((r) => r.title), ["B", "C"]);
+  assert.deepEqual(filterHistoryRows(rows, "failed").map((r) => r.title), ["D"]);
+});
+test("platform resume is separate from images and requires after_text", () => {
+  const off = planResumeSend({
+    settings: { autoSendAttachmentResume: false, autoSendImageResume: true, resumeSendTiming: "after_text" },
+    hasImages: true
+  });
+  assert.equal(off.wantPlatformResume, false);
+  assert.equal(off.wantAutoImage, true);
+  assert.equal(off.doResume, true);
+  const platform = planResumeSend({
+    settings: { autoSendAttachmentResume: true, autoSendImageResume: false, resumeSendTiming: "after_text" },
+    hasImages: false
+  });
+  assert.equal(platform.wantPlatformResume, true);
+  assert.equal(platform.wantAutoImage, false);
+  assert.equal(platform.doResume, true);
+  const manual = planResumeSend({
+    settings: { autoSendAttachmentResume: true, autoSendImageResume: true, resumeSendTiming: "manual" },
+    hasImages: true
+  });
+  assert.equal(manual.doResume, false);
+  assert.equal(manual.wantPlatformResume, true);
+});
+test("export payload round-trips settings filters template and bindings", () => {
+  const now = new Date("2026-08-14T00:00:00.000Z");
+  const all = {
+    settings: { taskMaxCommunicate: 7, messageMode: "plugin_only", neverRepeatJob: false, autoSendAttachmentResume: true },
+    filters: { title: { or: ["Java"] } },
+    messageTemplate: { version: 2, segments: [{ id: "s1", text: "hi", enabled: true }] },
+    bindings: { rules: [{ keywords: ["Java"], profileId: "java", priority: 0 }] },
+    resumes: { defaultProfileId: "java", profiles: [{ id: "java" }] },
+    lists: { companyBlacklist: ["x"] },
+    history: [{ status: "success", title: "T" }],
+    logs: new Array(120).fill({ message: "x" })
+  };
+  const exported = buildExportPayload(all, now);
+  assert.equal(exported.version, 1);
+  assert.equal(exported.exportedAt, now.toISOString());
+  assert.equal(exported.settings.taskMaxCommunicate, 7);
+  assert.equal(exported.filters.title.or[0], "Java");
+  assert.equal(exported.messageTemplate.version, 2);
+  assert.equal(exported.bindings.rules[0].profileId, "java");
+  assert.equal(exported.logs.length, 100);
+  const patch = importConfigPatch(exported);
+  assert.deepEqual(patch[STORAGE_KEYS.SETTINGS], exported.settings);
+  assert.deepEqual(patch[STORAGE_KEYS.FILTERS], exported.filters);
+  assert.deepEqual(patch[STORAGE_KEYS.MESSAGE_TEMPLATE], exported.messageTemplate);
+  assert.deepEqual(patch[STORAGE_KEYS.BINDINGS], exported.bindings);
+  assert.equal(Object.keys(IMPORT_CONFIG_KEYS).includes("settings"), true);
 });
 
 console.log("6) boss-url guard");

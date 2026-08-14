@@ -190,32 +190,40 @@ export async function getTodayStats() {
   return stats[day] || { communicate: 0, success: 0, skip: 0, fail: 0, byCompany: {} };
 }
 
-export async function exportAll() {
-  const all = await getAllConfig();
+export const IMPORT_CONFIG_KEYS = {
+  settings: STORAGE_KEYS.SETTINGS,
+  filters: STORAGE_KEYS.FILTERS,
+  messageTemplate: STORAGE_KEYS.MESSAGE_TEMPLATE,
+  resumes: STORAGE_KEYS.RESUMES,
+  bindings: STORAGE_KEYS.BINDINGS,
+  lists: STORAGE_KEYS.LISTS,
+  history: STORAGE_KEYS.HISTORY
+};
+
+export function buildExportPayload(all = {}, now = new Date()) {
   return {
-    exportedAt: new Date().toISOString(),
+    exportedAt: now.toISOString(),
     version: 1,
     ...all,
-    // 不强制导出巨大日志
     logs: (all.logs || []).slice(0, 100)
   };
 }
 
-export async function importAll(payload) {
+export function importConfigPatch(payload) {
   if (!payload || typeof payload !== 'object') throw new Error('无效配置文件');
   const put = {};
-  const map = {
-    settings: STORAGE_KEYS.SETTINGS,
-    filters: STORAGE_KEYS.FILTERS,
-    messageTemplate: STORAGE_KEYS.MESSAGE_TEMPLATE,
-    resumes: STORAGE_KEYS.RESUMES,
-    bindings: STORAGE_KEYS.BINDINGS,
-    lists: STORAGE_KEYS.LISTS,
-    history: STORAGE_KEYS.HISTORY
-  };
-  for (const [k, sk] of Object.entries(map)) {
-    if (payload[k] != null) put[sk] = payload[k];
+  for (const [key, storageKey] of Object.entries(IMPORT_CONFIG_KEYS)) {
+    if (payload[key] != null) put[storageKey] = payload[key];
   }
+  return put;
+}
+
+export async function exportAll() {
+  return buildExportPayload(await getAllConfig());
+}
+
+export async function importAll(payload) {
+  const put = importConfigPatch(payload);
   await set(put);
   return getAllConfig();
 }

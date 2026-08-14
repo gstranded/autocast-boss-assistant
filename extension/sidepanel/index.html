@@ -333,9 +333,10 @@
           </div>
           <div class="card">
             <div class="card-title" data-help-title="导入与导出" data-help="导出筛选、消息、设置和简历方案到 JSON；文件可能包含图片简历数据，请勿公开分享。">导入 / 导出</div>
-            <div class="btn-row">
-              <button id="btnExport" class="btn">导出 JSON</button>
-              <label class="btn file-btn">导入 JSON<input id="importFile" type="file" accept="application/json,.json" hidden /></label>
+            <div class="btn-row config-io">
+              <button type="button" id="btnExport" class="btn">导出 JSON</button>
+              <button type="button" id="btnImport" class="btn">导入 JSON</button>
+              <input id="importFile" type="file" accept="application/json,.json" hidden />
             </div>
             <div class="hint">配置默认保存在本地。导出文件可能包含简历数据，请妥善保管。</div>
           </div>

@@ -237,6 +237,16 @@ select:disabled { cursor: not-allowed; opacity: 0.46; }
 .btn.tiny { min-height: 28px; padding: 4px 8px; font-size: 12px; }
 .btn.block { width: 100%; margin-top: 10px; }
 .file-btn { display: inline-flex; align-items: center; }
+.btn-row.config-io .btn {
+  flex: 1 1 0;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-height: 34px;
+  padding: 7px 10px;
+}
 
 .task-actions { display: grid; gap: 7px; }
 .task-primary-actions,

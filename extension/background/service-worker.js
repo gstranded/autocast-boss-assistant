@@ -25,6 +25,7 @@ import { evaluateJob, summarizePreview } from '../shared/filter-engine.js';
 import { checkDedup, checkLimits, jobIdempotencyKey, resumeIdempotencyKey } from '../shared/dedup.js';
 import { planMessageSegments } from '../shared/message-planner.js';
 import { pickResumeProfile } from '../shared/template.js';
+import { planResumeSend } from '../shared/resume-policy.js';
 import { REASON, reasonText } from '../shared/reason-codes.js';
 import { TASK_STATUS } from '../shared/constants.js';
 import { isBossUrl, isBossTab, bossUrlGuardMessage, BOSS_MATCH_PATTERNS } from '../shared/boss-url.js';
@@ -1612,15 +1613,15 @@ async function processOneJob(task, resultRow, config) {
   // resume
   const profile = pickResumeProfile(job, config.resumes, config.bindings);
   const resumeImages = dedupeResumeImages(profile?.images);
-  const timing = config.settings.resumeSendTiming || 'after_text';
   const hasImages = resumeImages.length > 0;
-  const flagImage = Boolean(config.settings.autoSendImageResume);
-  // 兼容旧设置字段：现在表示点击 BOSS 聊天页「发简历」，不再上传本地附件。
-  const flagPlatformResume = Boolean(config.settings.autoSendAttachmentResume);
-  const wantAutoImage = Boolean(flagImage && hasImages);
-  const wantPlatformResume = flagPlatformResume;
-  // 仅 after_text 自动发；其余情况写清原因，避免「发了文字没发简历」困惑
-  const doResume = Boolean((wantAutoImage || wantPlatformResume) && timing === 'after_text');
+  const {
+    timing,
+    flagImage,
+    wantPlatformResume,
+    wantAutoImage,
+    doResume
+  } = planResumeSend({ settings: config.settings, hasImages });
+  const flagPlatformResume = wantPlatformResume;
   if (!doResume) {
     let why = '';
     if (timing !== 'after_text') why = '发送时机不是「文本发送完成后立即发送」';

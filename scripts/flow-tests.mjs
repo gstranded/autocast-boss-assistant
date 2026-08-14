@@ -151,6 +151,29 @@ test("preview UI falls back to reasonTexts and shows pass-rate warnings", () => 
   assert.ok(background.includes("通过率超过 80%，请检查筛选是否过宽"));
 });
 
+test("history filter export clear and platform resume stay on shipped paths", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const worker = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  const css = fs.readFileSync("extension/sidepanel/styles.css", "utf8");
+  assert.ok(app.includes("filterHistoryRows(history, filter)"));
+  assert.ok(app.includes("btnExportHistory"));
+  assert.ok(app.includes("JSON.stringify(history"));
+  assert.ok(app.includes("CLEAR_HISTORY"));
+  assert.ok(app.includes("$('btnImport')"));
+  assert.ok(html.includes('id="btnExport" class="btn"'));
+  assert.ok(html.includes('id="btnImport" class="btn"'));
+  assert.ok(css.includes(".btn-row.config-io .btn"));
+  assert.ok(!/\#btnExport[^{]*\{[^}]*min-width:\s*[3-9]\d/.test(css));
+  assert.ok(worker.includes("planResumeSend({ settings: config.settings, hasImages })"));
+  assert.ok(worker.includes("wantPlatformResume"));
+  assert.ok(content.includes("sendPlatformResume"));
+  assert.ok(content.includes("发简历"));
+  assert.ok(content.includes("BHT_SEND_RESUME") || content.includes("SEND_RESUME"));
+  assert.ok(!content.includes("uploadFile("));
+});
+
 test("panel accepts agent postMessage to skip tour and start preview", () => {
   const onboarding = fs.readFileSync("extension/sidepanel/onboarding.js", "utf8");
   const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
