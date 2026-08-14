@@ -3,9 +3,50 @@
 商店页：https://microsoftedge.microsoft.com/addons/detail/boss-%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod  
 产品 ID：`dgmfdkboghlfdcbgoapehjhjgmldnmod`  
 包：`dist/autocast-boss-haitou-v1.7.2.zip`  
-图标：`docs/assets/logo.png`（512）或 `extension/assets/icons/icon128.png`
+商店图：`docs/store/edge/assets/`（按 Partner Center 尺寸出好，见下方对照）
 
 不要新建扩展，只更新这一条 listing。
+
+## 商店图上传对照
+
+全部在 `docs/store/edge/assets/`。先删旧图，再传新图。
+
+| Partner Center 栏 | 尺寸 | 上传这个文件 |
+|---|---|---|
+| Extension logo * | 300×300（1:1，最小 128） | `logo-300.png`（粉色公文包） |
+| Small promotional tile | 440×280 | `promo-small-440x280.png` |
+| Large promotional tile | 1400×560 | `promo-large-1400x560.png` |
+| Screenshot 1 发送效果（最前） | **正好 1280×800** | `screenshot-01-send-1280x800.png` |
+| Screenshot 2 任务/扫描预览 | 1280×800 | `screenshot-01-task-1280x800.png` |
+| Screenshot 3 筛选 | 1280×800 | `screenshot-02-filter-1280x800.png` |
+| Screenshot 4 消息（多段话术） | 1280×800 | `screenshot-03-message-1280x800.png` |
+| Screenshot 5 简历设置 | 1280×800 | `screenshot-04-resume-1280x800.png` |
+
+桌面可直接上传（像素已改好）：
+- `/Users/gaohaizhen/Desktop/效果截图-1280x800.png`（1280×800）
+- `/Users/gaohaizhen/Desktop/效果截图-640x400.png`（640×400）
+
+不要传原图 `效果截图.png`，商店只收 **正好** 1280×800 或 640×400。
+
+备用：`logo-512.png`；同名 `*-640x400.png`。
+
+扩展工具栏图标已经打进 ZIP，不用另选。
+
+## 搜索词
+
+最多 7 个，每个最多 30 字符，全部加起来不超过 21 个英文单词。中文每条算 1 个词。
+
+```text
+AutoCast
+Boss海投
+BOSS直聘
+求职助手
+职位筛选
+简历投递
+海投助手
+```
+
+如果后台已经有「消息模板」，删掉它，换成 `AutoCast`。
 
 ## 名称
 
@@ -65,3 +106,4 @@ AutoCast-Boss海投助手帮你在 BOSS 直聘网页端一键海投：先按规�
 
 无法提供公共测试账号，需要审核员自己的 BOSS 登录态。配置只保存在本机。
 ```
+

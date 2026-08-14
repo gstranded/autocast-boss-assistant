@@ -31,7 +31,7 @@ function renderGuide(version) {
     <div class="hint">本插件仅在 zhipin.com / bosszhipin.com 生效</div>
     <div class="footer">
       <span>v${version}</span>
-      <a href="https://github.com/gstranded/boss-haitou-assistant" target="_blank" rel="noreferrer">说明</a>
+      <a href="https://github.com/gstranded/autocast-boss-assistant" target="_blank" rel="noreferrer">说明</a>
     </div>
   `;
   document.getElementById("openBoss").addEventListener("click", async () => {

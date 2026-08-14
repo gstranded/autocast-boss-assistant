@@ -17,9 +17,9 @@
 ## 幕 1 · 下载与安装（约 40 秒）
 
 **画面操作**：
-1. 打开浏览器，访问 GitHub 仓库页面 `github.com/gstranded/boss-haitou-assistant`
+1. 打开浏览器，访问 GitHub 仓库页面 `github.com/gstranded/autocast-boss-assistant`
 2. 点击右侧 **Releases** 链接
-3. 下载最新的 `boss-haitou-assistant-vX.Y.Z.zip`
+3. 下载最新的 `autocast-boss-haitou-vX.Y.Z.zip`
 4. 解压 ZIP 文件到本地文件夹
 5. 打开 Chrome，地址栏输入 `chrome://extensions` 回车
 6. 打开右上角 **开发者模式** 开关

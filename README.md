@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/logo.png" alt="AutoCast-Boss海投助手" width="112" />
+  <img src="https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/logo.png" alt="AutoCast-Boss海投助手" width="112" />
 </p>
 
 <h1 align="center">AutoCast-Boss海投助手</h1>
@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://microsoftedge.microsoft.com/addons/detail/boss-%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod">Edge 商店安装</a> ·
-  <a href="https://github.com/gstranded/boss-haitou-assistant/releases">GitHub 下载</a> ·
+  <a href="https://github.com/gstranded/autocast-boss-assistant/releases">GitHub 下载</a> ·
   <a href="README_EN.md">English</a> ·
   <a href="PRIVACY.md">隐私政策</a> ·
   <a href="LICENSE">MIT License</a>
@@ -27,7 +27,7 @@
 
 ### 从 GitHub Release 安装
 
-1. 打开 [Releases](https://github.com/gstranded/boss-haitou-assistant/releases)，下载最新的 `boss-haitou-assistant-vX.Y.Z.zip`。
+1. 打开 [Releases](https://github.com/gstranded/autocast-boss-assistant/releases)，下载最新的 `autocast-boss-haitou-vX.Y.Z.zip`。
 2. 解压 ZIP。
 3. Chrome 打开 `chrome://extensions`；Edge 打开 `edge://extensions`。
 4. 开启“开发者模式”。
@@ -39,8 +39,8 @@
 从源码安装时，克隆仓库后直接加载仓库里的 `extension/` 目录：
 
 ```bash
-git clone https://github.com/gstranded/boss-haitou-assistant.git
-cd boss-haitou-assistant
+git clone https://github.com/gstranded/autocast-boss-assistant.git
+cd autocast-boss-assistant
 ```
 
 ## 第一次使用
@@ -58,7 +58,9 @@ cd boss-haitou-assistant
 
 任务停止或完成时，面板会汇报：`成功 / 跳过 / 失败 / 已处理`。
 
-![任务页](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/01-task.png)
+![实际发送效果：多段打招呼 + 图片简历](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/screenshots/00-send.png)
+
+![任务页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/screenshots/01-task.png)
 
 ## 界面主题与功能说明
 
@@ -111,7 +113,7 @@ cd boss-haitou-assistant
 | 公司白名单 | 记录允许优先处理的公司 |
 | 仅投白名单公司 | 开启后，未命中白名单的公司全部跳过 |
 
-![筛选页](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/02-filter.png)
+![筛选页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/screenshots/02-filter.png)
 
 ## 消息参数
 
@@ -144,7 +146,7 @@ cd boss-haitou-assistant
 
 变量无法解析时，该消息段不会盲目发送，日志会显示失败原因。
 
-![消息页](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/03-message.png)
+![消息页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/screenshots/03-message.png)
 
 ## 简历参数
 
@@ -182,7 +184,7 @@ BOSS 在线简历不需要选择文件。开启“自动点击 BOSS‘发简历�
 
 没有规则命中时使用默认方案。
 
-![简历页](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/04-resume.png)
+![简历页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/screenshots/04-resume.png)
 
 ## 设置参数
 
@@ -198,7 +200,7 @@ BOSS 在线简历不需要选择文件。开启“自动点击 BOSS‘发简历�
 
 “导出 JSON”会导出筛选、消息、设置和简历方案。“导入 JSON”会恢复这些配置。导出文件可能包含图片简历数据，不要公开上传。
 
-![设置页](https://raw.githubusercontent.com/gstranded/boss-haitou-assistant/main/docs/assets/screenshots/05-settings.png)
+![设置页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/screenshots/05-settings.png)
 
 ## 任务按钮
 
@@ -239,7 +241,7 @@ BOSS 在线简历不需要选择文件。开启“自动点击 BOSS‘发简历�
 
 ### 页面改版后全部扫描失败
 
-运行“页面诊断”，把浏览器版本、扩展版本、当前页面 URL 和日志一起提交到 [Issues](https://github.com/gstranded/boss-haitou-assistant/issues)。
+运行“页面诊断”，把浏览器版本、扩展版本、当前页面 URL 和日志一起提交到 [Issues](https://github.com/gstranded/autocast-boss-assistant/issues)。
 
 ## 数据与权限
 
