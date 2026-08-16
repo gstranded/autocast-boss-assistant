@@ -62,7 +62,7 @@
 ## 演练步骤（对应分镜 01-script.md）
 
 ### A. 安装段（分镜 3）
-- [ ] 打开 `chrome://extensions`，确认 AutoCast-Boss海投助手 已加载（版本 1.7.2）
+- [ ] 打开 `chrome://extensions`，确认 AutoCast-Boss海投助手 已加载（版本 1.7.3）
 - [ ] 打开 `https://www.zhipin.com/web/geek/jobs`，F5 刷新
 - [ ] 页面右下角出现 `#bht-fab` 悬浮按钮
 - [ ] 点击悬浮按钮 → 面板展开，显示 6 个标签：任务/筛选/消息/简历/记录/设置
