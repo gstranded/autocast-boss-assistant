@@ -110,6 +110,20 @@
             </div>
           </div>
           <div class="card">
+            <div class="card-title row">
+              <span data-help-title="HR 活跃" data-help="只投最近活跃时间符合条件的 HR。可多选，命中任意一个即可通过；不选表示不限。页面没有可靠活跃信息时按不符合处理。">HR 活跃</span>
+              <span class="logic-tag or">多选</span>
+            </div>
+            <div class="active-chips" id="activeChips">
+              <button type="button" class="chip" data-active="all">不限</button>
+              <button type="button" class="chip" data-active="just">刚刚活跃</button>
+              <button type="button" class="chip" data-active="today">今日活跃</button>
+              <button type="button" class="chip" data-active="3d">3 日内活跃</button>
+              <button type="button" class="chip" data-active="week">本周活跃</button>
+              <button type="button" class="chip" data-active="month">本月活跃</button>
+            </div>
+          </div>
+          <div class="card">
             <div class="card-title" data-help-title="公司与职位描述" data-help="公司规则只检查公司名称；JD 规则检查职位描述。每个开关都可以独立停用，输入内容不会被删除。">公司 / JD</div>
             <div class="filter-field" data-filter-field="companyOr">
               <div class="field-row">
@@ -178,13 +192,6 @@
                 <input id="salaryMax" type="number" placeholder="例如 40000" />
               </div>
             </div>
-            <label data-help-title="HR 活跃" data-help="只保留最近活跃时间符合条件的 HR；页面没有可靠活跃信息时可能被排除。">HR 活跃</label>
-            <select id="activeWithin">
-              <option value="">不限</option>
-              <option value="today">今日活跃</option>
-              <option value="3d">3 日内</option>
-              <option value="week">一周内</option>
-            </select>
             <label class="check" data-help-title="排除猎头" data-help="根据职位、公司、HR 和 JD 中的猎头或人力中介特征进行排除。"><input type="checkbox" id="excludeHunter" />排除猎头</label>
             <label class="check" data-help-title="排除外包或驻场" data-help="根据职位、公司和 JD 中的外包、驻场、外派等特征进行排除。"><input type="checkbox" id="excludeOutsource" />排除外包/驻场</label>
           </div>

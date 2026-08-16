@@ -93,7 +93,7 @@ export const DEFAULT_FILTERS = {
   salaryMax: null,
   experience: [], // empty = any
   degree: [],
-  activeWithin: '', // today | 3d | week | ''
+  activeWithin: [], // 多选 HR 活跃：just | today | 3d | week | month，空数组 = 不限
   excludeHunter: true,
   excludeOutsource: true,
   maxPostAgeDays: null

@@ -359,6 +359,30 @@ function kwJoin(arr) {
   return (arr || []).join(', ');
 }
 
+function normalizeActiveSelection(value) {
+  // 兼容旧版单选字符串：'' | today | 3d | week
+  if (Array.isArray(value)) return value.filter(Boolean);
+  if (!value) return [];
+  if (value === 'today') return ['today'];
+  if (value === '3d') return ['3d'];
+  if (value === 'week') return ['week'];
+  return [];
+}
+
+function setActiveChips(selected) {
+  const chips = document.querySelectorAll('#activeChips .chip');
+  chips.forEach((chip) => {
+    const val = chip.dataset.active;
+    chip.classList.toggle('active', selected.includes(val));
+  });
+}
+
+function readActiveChips() {
+  const chips = document.querySelectorAll('#activeChips .chip.active');
+  const values = [...chips].map((chip) => chip.dataset.active).filter((v) => v !== 'all');
+  return values;
+}
+
 function fillFilters(filters, lists, settings) {
   $('titleOr').value = kwJoin(filters.title?.or);
   $('titleAnd').value = kwJoin(filters.title?.and);
@@ -373,7 +397,7 @@ function fillFilters(filters, lists, settings) {
   $('locMode').value = filters.location?.mode || 'contains';
   $('salaryMin').value = filters.salaryMin ?? '';
   $('salaryMax').value = filters.salaryMax ?? '';
-  $('activeWithin').value = filters.activeWithin || '';
+  setActiveChips(normalizeActiveSelection(filters.activeWithin));
   $('excludeHunter').checked = filters.excludeHunter !== false;
   $('excludeOutsource').checked = filters.excludeOutsource !== false;
   $('blacklist').value = (lists.companyBlacklist || []).join('\n');
@@ -436,7 +460,7 @@ function readFilters() {
     salaryMax: $('salaryMax').value === '' ? null : Number($('salaryMax').value),
     experience: [],
     degree: [],
-    activeWithin: $('activeWithin').value,
+    activeWithin: readActiveChips(),
     excludeHunter: $('excludeHunter').checked,
     excludeOutsource: $('excludeOutsource').checked,
     maxPostAgeDays: null
@@ -1471,6 +1495,19 @@ function showErrorModal(title, body, { showRetry = true, force = false } = {}) {
 }
 
 function bindEvents() {
+  // HR 活跃多选 chips：选“不限”清空其它；选了具体项则取消“不限”
+  document.querySelectorAll('#activeChips .chip').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      const isAll = chip.dataset.active === 'all';
+      if (isAll) {
+        document.querySelectorAll('#activeChips .chip').forEach((c) => c.classList.toggle('active', c === chip));
+      } else {
+        chip.classList.toggle('active');
+        document.querySelector('#activeChips .chip[data-active="all"]')?.classList.remove('active');
+      }
+    });
+  });
+
   document.querySelectorAll('.tabs button').forEach((btn) => {
     btn.addEventListener('click', () => showTab(btn.dataset.tab));
   });

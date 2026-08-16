@@ -89,13 +89,33 @@ function looksOutsource(job) {
   return /外包|驻场|外派|人力外包|IT外包/.test(blob);
 }
 
+// BOSS 直聘 HR 活跃标签 → 筛选桶。BOSS 对同一 HR 只展示一个标签，直接按标签归类。
+const ACTIVE_PATTERNS = {
+  just: /刚刚活跃|当前在线|在线/,
+  today: /今日活跃/,
+  '3d': /3日内|两日内|昨日/,
+  week: /本周|一周内|7日内|近7日/,
+  month: /本月|近30日|30日内|近一月/
+};
+
+function normalizeActiveWithin(value) {
+  // 兼容旧版单选字符串配置：'' | today | 3d | week
+  if (Array.isArray(value)) return value;
+  if (!value) return [];
+  if (value === 'today') return ['today'];
+  if (value === '3d') return ['3d'];
+  if (value === 'week') return ['week'];
+  return [];
+}
+
 function matchActive(activeText, activeWithin) {
-  if (!activeWithin) return true;
+  const selected = normalizeActiveWithin(activeWithin);
+  if (!selected.length) return true;
   const t = activeText || '';
-  if (activeWithin === 'today') return /今日活跃|刚刚活跃|在线/.test(t);
-  if (activeWithin === '3d') return /今日活跃|刚刚活跃|在线|3日内|两日内|昨日/.test(t);
-  if (activeWithin === 'week') return /今日活跃|刚刚活跃|在线|3日内|两日内|昨日|本周|一周内|7日内/.test(t);
-  return true;
+  return selected.some((key) => {
+    const re = ACTIVE_PATTERNS[key];
+    return re ? re.test(t) : false;
+  });
 }
 
 /**
@@ -215,7 +235,7 @@ export function evaluateJob(job, filters, lists = {}, settings = {}) {
     };
   }
 
-  if (filters.activeWithin && !matchActive(job.activeText, filters.activeWithin)) {
+  if (normalizeActiveWithin(filters.activeWithin).length && !matchActive(job.activeText, filters.activeWithin)) {
     return {
       decision: 'reject',
       reasonCodes: [REASON.FILTER_ACTIVE],
@@ -223,7 +243,7 @@ export function evaluateJob(job, filters, lists = {}, settings = {}) {
       passReasons
     };
   }
-  if (filters.activeWithin) passReasons.push(`HR 活跃：${job.activeText || '符合'}`);
+  if (normalizeActiveWithin(filters.activeWithin).length) passReasons.push(`HR 活跃：${job.activeText || '符合'}`);
 
   return {
     decision: 'pass',
