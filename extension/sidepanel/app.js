@@ -359,6 +359,19 @@ function kwJoin(arr) {
   return (arr || []).join(', ');
 }
 
+// 投递间隔：设置基准秒 n → 实际等待 [n-1, n+1] 秒随机（最小下限 1 秒）
+function intervalBaseFromMs(ms) {
+  if (Array.isArray(ms) && ms.length >= 2 && Number.isFinite(ms[1]) && ms[1] > 0) {
+    return Math.max(1, Math.round(ms[1] / 1000 - 1));
+  }
+  return 5;
+}
+
+function intervalMsFromBase(baseSec) {
+  const n = Math.min(60, Math.max(1, Math.round(Number(baseSec) || 5)));
+  return [Math.max(1000, (n - 1) * 1000), (n + 1) * 1000];
+}
+
 function normalizeActiveSelection(value) {
   // 兼容旧版单选字符串：'' | today | 3d | week
   if (Array.isArray(value)) return value.filter(Boolean);
@@ -479,6 +492,7 @@ function fillSettings(settings) {
   $('companyDailyMax').value = settings.companyDailyMax;
   $('bossCooldownDays').value = settings.bossCooldownDays;
   $('consecutiveFailPause').value = settings.consecutiveFailPause;
+  $('jobIntervalSec').value = intervalBaseFromMs(settings.jobIntervalMs);
   $('neverRepeatJob').checked = settings.neverRepeatJob !== false;
   $('splitViewEnabled').checked = settings.splitViewEnabled !== false;
   $('debugLoggingEnabled').checked = settings.debugLoggingEnabled === true;
@@ -504,6 +518,7 @@ function readSettingsPatch(base) {
     companyDailyMax: Number($('companyDailyMax').value || 3),
     bossCooldownDays: Number($('bossCooldownDays').value || 30),
     consecutiveFailPause: Number($('consecutiveFailPause').value || 3),
+    jobIntervalMs: intervalMsFromBase(Number($('jobIntervalSec').value || 5)),
     neverRepeatJob: $('neverRepeatJob').checked,
     splitViewEnabled: $('splitViewEnabled').checked,
     debugLoggingEnabled: $('debugLoggingEnabled').checked,

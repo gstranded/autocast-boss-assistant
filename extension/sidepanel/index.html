@@ -329,6 +329,10 @@
                 <input id="bossCooldownDays" type="number" min="0" />
               </div>
               <div>
+                <label data-help-title="投递间隔（秒）" data-help="每投完一份后等待的基准时间。实际等待会在设置值 ±1 秒内随机，例如设为 5 时实际等待 4~6 秒，降低机械节奏。">投递间隔（秒）</label>
+                <input id="jobIntervalSec" type="number" min="1" max="60" />
+              </div>
+              <div>
                 <label data-help-title="连续失败暂停" data-help="连续失败达到这个次数后自动暂停，避免页面变化时继续误操作。">连续失败暂停</label>
                 <input id="consecutiveFailPause" type="number" min="1" />
               </div>

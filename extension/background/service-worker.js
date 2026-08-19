@@ -1982,8 +1982,8 @@ async function runTaskLoop(taskId) {
 
       // minJobInterval guard
       {
-        let iv = config.settings.jobIntervalMs || [3500, 6000];
-        if (Array.isArray(iv) && iv[0] < 2500) iv = [3500, 6000];
+        let iv = config.settings.jobIntervalMs || [4000, 6000];
+        if (Array.isArray(iv) && iv[0] < 1000) iv = [4000, 6000];
         await sleep(randomBetween(iv));
       }
     }

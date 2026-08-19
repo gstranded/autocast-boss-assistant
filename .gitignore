@@ -6,3 +6,5 @@ Thumbs.db
 .idea/
 .vscode/
 scripts/patch-bg.mjs
+# 视频素材不入库
+/docs/video/*.mp4
