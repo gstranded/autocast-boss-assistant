@@ -7,20 +7,28 @@
 <p align="center">BOSS 直聘网页端的筛选 + 一键海投助手。先按规则过滤岗位，再自动批量沟通，不用逐个手动点。</p>
 
 <p align="center">
-  <a href="https://microsoftedge.microsoft.com/addons/detail/boss-%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod">Edge 商店安装</a> ·
+  <a href="https://chromewebstore.google.com/detail/autocast-boss%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dhkfdlpjdpbckibdfabbhccffecilhdb">Chrome 商店安装</a> ·
+  <a href="https://microsoftedge.microsoft.com/addons/detail/autocastboss%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod">Edge 商店安装</a> ·
   <a href="https://github.com/gstranded/autocast-boss-assistant/releases">GitHub 下载</a> ·
   <a href="README_EN.md">English</a> ·
   <a href="PRIVACY.md">隐私政策</a> ·
   <a href="LICENSE">MIT License</a>
 </p>
 
-> 推荐用 Microsoft Edge 从商店安装。Chrome Web Store 尚未上架。安装前请先阅读本文的“使用边界”。
+> 已上架 Chrome Web Store 与 Microsoft Edge Add-ons，可直接从商店安装。安装前请先阅读本文的“使用边界”。
 
 ## 安装
 
-### 从 Edge 商店安装（推荐）
+### 从 Chrome 商店安装（推荐）
 
-1. 打开 [AutoCast-Boss海投助手](https://microsoftedge.microsoft.com/addons/detail/boss-%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod)。
+1. 打开 [AutoCast-Boss海投助手 - Chrome Web Store](https://chromewebstore.google.com/detail/autocast-boss%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dhkfdlpjdpbckibdfabbhccffecilhdb)。
+2. 点击「添加到 Chrome」。
+3. 打开 [BOSS 直聘职位列表](https://www.zhipin.com/web/geek/jobs)，登录后刷新一次页面。
+4. 点击页面右侧悬浮按钮打开面板。
+
+### 从 Edge 商店安装
+
+1. 打开 [AutoCast-Boss海投助手 - Edge Add-ons](https://microsoftedge.microsoft.com/addons/detail/autocastboss%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod)。
 2. 点击「获取」。
 3. 打开 [BOSS 直聘职位列表](https://www.zhipin.com/web/geek/jobs)，登录后刷新一次页面。
 4. 点击页面右侧悬浮按钮打开面板。
@@ -259,7 +267,7 @@ BOSS 在线简历不需要选择文件。开启“自动点击 BOSS‘发简历�
 2. 用户必须在预览页确认岗位范围和消息内容，并对发送行为负责。
 3. 请遵守目标网站条款、账号限制和当地法律，不要发送骚扰、欺诈或无关消息。
 4. 自动化会带来误投、限流或封禁风险。建议先投递一份，并使用保守上限。
-5. 已上架 [Microsoft Edge Add-ons](https://microsoftedge.microsoft.com/addons/detail/boss-%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod)。Chrome Web Store 尚未上架。
+5. 已上架 [Chrome Web Store](https://chromewebstore.google.com/detail/autocast-boss%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dhkfdlpjdpbckibdfabbhccffecilhdb) 与 [Microsoft Edge Add-ons](https://microsoftedge.microsoft.com/addons/detail/autocastboss%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod)。
 
 商店准备和阻断项见 [上架清单](docs/STORE_PUBLISHING.md)。
 
