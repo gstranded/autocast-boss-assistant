@@ -38,7 +38,9 @@ const state = {
   activeProfileId: null,
   draftBindings: [],
   lastCompletionSignalId: '',
-  theme: 'dark'
+  theme: 'dark',
+  lightboxImages: [],
+  lightboxIndex: 0
 };
 
 function applyTheme(theme) {
@@ -667,10 +669,77 @@ function renderResumeEditor() {
   (profile.images || []).forEach((img, idx) => {
     const el = document.createElement('img');
     el.src = img.dataUrl;
-    el.title = `${idx + 1}. ${img.name || ''}`;
+    el.title = `点击预览：${idx + 1}. ${img.name || ''}`;
+    el.dataset.idx = String(idx);
     thumbs.appendChild(el);
   });
   $('attachInfo').textContent = '无需上传本地附件；启用发送策略后会点击聊天页「发简历」。';
+}
+
+// —— 图片简历大图预览（lightbox）——
+function openImageLightbox(profile, index) {
+  const images = (profile?.images || []).filter((i) => i && i.dataUrl);
+  if (!images.length) return;
+  state.lightboxImages = images;
+  state.lightboxIndex = Math.min(Math.max(0, index || 0), images.length - 1);
+  renderImageLightbox();
+  $('img-lightbox').hidden = false;
+}
+
+function renderImageLightbox() {
+  const images = state.lightboxImages || [];
+  const idx = state.lightboxIndex;
+  if (!images.length) return;
+  const img = images[idx];
+  $('img-lightbox-img').src = img.dataUrl;
+  $('img-lightbox-img').alt = img.name || `简历图片 ${idx + 1}`;
+  $('img-lightbox-title').textContent = '图片简历预览';
+  $('img-lightbox-foot').textContent = `${idx + 1} / ${images.length} · ${img.name || ''}`;
+  document.querySelector('#img-lightbox .prev').style.visibility = images.length > 1 ? 'visible' : 'hidden';
+  document.querySelector('#img-lightbox .next').style.visibility = images.length > 1 ? 'visible' : 'hidden';
+}
+
+function closeImageLightbox() {
+  $('img-lightbox').hidden = true;
+  state.lightboxImages = [];
+  state.lightboxIndex = 0;
+}
+
+function stepImageLightbox(delta) {
+  const images = state.lightboxImages || [];
+  if (images.length < 2) return;
+  state.lightboxIndex = (state.lightboxIndex + delta + images.length) % images.length;
+  renderImageLightbox();
+}
+
+function bindImageLightbox() {
+  $('imagePreview').addEventListener('click', (event) => {
+    const thumb = event.target.closest('img[data-idx]');
+    if (!thumb) return;
+    // 上传后尚未保存的临时预览图：直接读文件展示
+    if (thumb.dataset.tmp === '1') {
+      const files = Array.from($('imageFiles')?.files || []);
+      const f = files[Number(thumb.dataset.idx)];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = () => openImageLightbox({ images: [{ dataUrl: reader.result, name: f.name }] }, 0);
+      reader.readAsDataURL(f);
+      return;
+    }
+    openImageLightbox(getActiveProfile(), Number(thumb.dataset.idx));
+  });
+  document.querySelectorAll('#img-lightbox [data-close]').forEach((el) => {
+    el.addEventListener('click', closeImageLightbox);
+  });
+  document.querySelectorAll('#img-lightbox [data-nav]').forEach((el) => {
+    el.addEventListener('click', () => stepImageLightbox(Number(el.dataset.nav)));
+  });
+  document.addEventListener('keydown', (event) => {
+    if ($('img-lightbox').hidden) return;
+    if (event.key === 'Escape') closeImageLightbox();
+    if (event.key === 'ArrowLeft') stepImageLightbox(-1);
+    if (event.key === 'ArrowRight') stepImageLightbox(1);
+  });
 }
 
 function flushActiveProfileForm() {
@@ -1437,8 +1506,10 @@ function wireResumeFilePreview() {
       const img = document.createElement('img');
       img.src = url;
       img.alt = f.name;
-      img.title = f.name + ' (' + Math.round(f.size / 1024) + 'KB)';
-      img.style.cssText = 'max-width:72px;max-height:72px;object-fit:cover;border-radius:6px;border:1px solid #ddd;margin:4px';
+      img.dataset.idx = String(files.indexOf(f));
+      img.dataset.tmp = '1';
+      img.title = `点击预览：${f.name} (${Math.round(f.size / 1024)}KB)`;
+      img.style.cssText = 'max-width:72px;max-height:72px;object-fit:cover;border-radius:6px;border:1px solid #ddd;margin:4px;cursor:zoom-in';
       frag.appendChild(img);
     }
     box.prepend(frag);
@@ -1510,6 +1581,7 @@ function showErrorModal(title, body, { showRetry = true, force = false } = {}) {
 }
 
 function bindEvents() {
+  bindImageLightbox();
   // HR 活跃多选 chips：选“不限”清空其它；选了具体项则取消“不限”
   document.querySelectorAll('#activeChips .chip').forEach((chip) => {
     chip.addEventListener('click', () => {
