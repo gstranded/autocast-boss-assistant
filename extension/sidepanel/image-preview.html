@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>图片简历预览</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #101014; overflow: hidden; }
+    body { display: flex; align-items: center; justify-content: center; }
+    #stage { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; }
+    #preview {
+      max-width: 94vw; max-height: 92vh; object-fit: contain;
+      background: #ffffff; border-radius: 6px;
+      box-shadow: 0 10px 44px rgba(0, 0, 0, 0.55);
+    }
+    #info {
+      position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+      color: #e8e8e8; background: rgba(0, 0, 0, 0.6);
+      padding: 7px 18px; border-radius: 999px;
+      font: 13px/1.4 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      max-width: 80vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      z-index: 10;
+    }
+    #closeBtn {
+      position: fixed; top: 12px; right: 16px; z-index: 10;
+      background: rgba(255, 255, 255, 0.12); color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.28); border-radius: 8px;
+      padding: 7px 16px; cursor: pointer;
+      font: 14px system-ui, -apple-system, sans-serif;
+    }
+    #closeBtn:hover { background: rgba(255, 255, 255, 0.26); }
+    .nav {
+      position: fixed; top: 50%; transform: translateY(-50%); z-index: 10;
+      width: 56px; height: 56px; border-radius: 50%;
+      background: rgba(255, 255, 255, 0.12); color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      font-size: 28px; line-height: 1; cursor: pointer;
+      display: none; align-items: center; justify-content: center;
+    }
+    .nav.show { display: flex; }
+    .nav:hover { background: rgba(255, 255, 255, 0.26); }
+    #prevBtn { left: 20px; }
+    #nextBtn { right: 20px; }
+    #hint {
+      position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+      color: #8a8a92; font: 12px system-ui, sans-serif; z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="info">图片简历预览</div>
+  <button id="closeBtn" title="关闭 (Esc)">✕ 关闭</button>
+  <button id="prevBtn" class="nav" title="上一张 (←)">‹</button>
+  <div id="stage"><img id="preview" alt="简历图片" /></div>
+  <button id="nextBtn" class="nav" title="下一张 (→)">›</button>
+  <div id="hint">← → 切换 · Esc 关闭</div>
+  <script src="image-preview.js"></script>
+</body>
+</html>

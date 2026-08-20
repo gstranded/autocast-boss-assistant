@@ -38,9 +38,7 @@ const state = {
   activeProfileId: null,
   draftBindings: [],
   lastCompletionSignalId: '',
-  theme: 'dark',
-  lightboxImages: [],
-  lightboxIndex: 0
+  theme: 'dark'
 };
 
 function applyTheme(theme) {
@@ -676,40 +674,25 @@ function renderResumeEditor() {
   $('attachInfo').textContent = '无需上传本地附件；启用发送策略后会点击聊天页「发简历」。';
 }
 
-// —— 图片简历大图预览（lightbox）——
-function openImageLightbox(profile, index) {
+// —— 图片简历全屏预览（独立窗口，避免受面板尺寸限制）——
+const IMG_PREVIEW_KEY = 'bht_img_preview';
+
+async function openImageLightbox(profile, index) {
   const images = (profile?.images || []).filter((i) => i && i.dataUrl);
   if (!images.length) return;
-  state.lightboxImages = images;
-  state.lightboxIndex = Math.min(Math.max(0, index || 0), images.length - 1);
-  renderImageLightbox();
-  $('img-lightbox').hidden = false;
-}
-
-function renderImageLightbox() {
-  const images = state.lightboxImages || [];
-  const idx = state.lightboxIndex;
-  if (!images.length) return;
-  const img = images[idx];
-  $('img-lightbox-img').src = img.dataUrl;
-  $('img-lightbox-img').alt = img.name || `简历图片 ${idx + 1}`;
-  $('img-lightbox-title').textContent = '图片简历预览';
-  $('img-lightbox-foot').textContent = `${idx + 1} / ${images.length} · ${img.name || ''}`;
-  document.querySelector('#img-lightbox .prev').style.visibility = images.length > 1 ? 'visible' : 'hidden';
-  document.querySelector('#img-lightbox .next').style.visibility = images.length > 1 ? 'visible' : 'hidden';
-}
-
-function closeImageLightbox() {
-  $('img-lightbox').hidden = true;
-  state.lightboxImages = [];
-  state.lightboxIndex = 0;
-}
-
-function stepImageLightbox(delta) {
-  const images = state.lightboxImages || [];
-  if (images.length < 2) return;
-  state.lightboxIndex = (state.lightboxIndex + delta + images.length) % images.length;
-  renderImageLightbox();
+  await chrome.storage.session.set({
+    [IMG_PREVIEW_KEY]: {
+      images,
+      index: Math.min(Math.max(0, index || 0), images.length - 1)
+    }
+  });
+  const url = chrome.runtime.getURL('sidepanel/image-preview.html');
+  try {
+    await chrome.windows.create({ url, type: 'popup', state: 'maximized' });
+  } catch (_) {
+    // 极少数环境不支持弹窗时回退为标签页
+    await chrome.tabs.create({ url });
+  }
 }
 
 function bindImageLightbox() {
@@ -727,18 +710,6 @@ function bindImageLightbox() {
       return;
     }
     openImageLightbox(getActiveProfile(), Number(thumb.dataset.idx));
-  });
-  document.querySelectorAll('#img-lightbox [data-close]').forEach((el) => {
-    el.addEventListener('click', closeImageLightbox);
-  });
-  document.querySelectorAll('#img-lightbox [data-nav]').forEach((el) => {
-    el.addEventListener('click', () => stepImageLightbox(Number(el.dataset.nav)));
-  });
-  document.addEventListener('keydown', (event) => {
-    if ($('img-lightbox').hidden) return;
-    if (event.key === 'Escape') closeImageLightbox();
-    if (event.key === 'ArrowLeft') stepImageLightbox(-1);
-    if (event.key === 'ArrowRight') stepImageLightbox(1);
   });
 }
 

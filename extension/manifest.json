@@ -27,7 +27,8 @@
     "storage",
     "tabs",
     "scripting",
-    "unlimitedStorage"
+    "unlimitedStorage",
+    "windows"
   ],
   "host_permissions": [
     "*://*.zhipin.com/*",
