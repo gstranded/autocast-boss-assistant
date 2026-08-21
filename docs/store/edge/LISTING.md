@@ -2,7 +2,7 @@
 
 商店页：https://microsoftedge.microsoft.com/addons/detail/boss-%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod  
 产品 ID：`dgmfdkboghlfdcbgoapehjhjgmldnmod`  
-包：`dist/autocast-boss-haitou-v1.7.2.zip`  
+包：`dist/autocast-boss-haitou-v1.7.6.zip`
 商店图：`docs/store/edge/assets/`（按 Partner Center 尺寸出好，见下方对照）
 
 不要新建扩展，只更新这一条 listing。
@@ -106,4 +106,3 @@ AutoCast-Boss海投助手帮你在 BOSS 直聘网页端一键海投：先按规�
 
 无法提供公共测试账号，需要审核员自己的 BOSS 登录态。配置只保存在本机。
 ```
-

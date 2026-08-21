@@ -23,6 +23,29 @@ test("content exposes return/ensure/close handlers", () => {
   ]) assert.ok(s.includes(k), "missing " + k);
 });
 
+test("preview auto-recovers non-list pages without silent zero results", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(content.includes('error: "LIST_NAV_REQUIRED"'));
+  assert.ok(content.includes("shouldNavigate: !noHomeNav"));
+  assert.ok(content.includes("getJobListNavigationTarget"));
+  assert.ok(content.includes("BHT_CONTENT_INSTANCE_ID"));
+  assert.ok(content.includes("window.__BHT_CONTENT_INSTANCE_ID__"));
+  assert.ok(content.includes("const updates = {}"));
+  assert.ok(content.includes('via: "saved-list-navigation-required"'));
+  assert.ok(background.includes("navigatePreviewToJobList"));
+  assert.ok(background.includes("scan?.error === 'NAVIGATED'"));
+  assert.ok(background.includes("scan_navigation_detected"));
+  assert.ok(background.includes("didContentDocumentChange"));
+  assert.ok(background.includes("type === MSG.SCAN_JOBS ? 38000 : 90000"));
+  assert.ok(background.includes("scan?.shouldNavigate === true"));
+  assert.ok(panel.includes("非列表页会自动跳转"));
+  assert.ok(panel.includes("下方暂时仍是上一次预览"));
+  assert.ok(panel.includes("取消本次扫描（保留上一次预览结果）"));
+  assert.ok(panel.includes("已连接 BOSS · 列表未就绪"));
+});
+
 test("background force-injects content on critical ops", () => {
   const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
   assert.ok(s.includes("forceInjectContent"));

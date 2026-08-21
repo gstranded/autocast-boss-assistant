@@ -10,6 +10,11 @@ import { planResumeSend } from "../extension/shared/resume-policy.js";
 import { buildExportPayload, importConfigPatch, IMPORT_CONFIG_KEYS } from "../extension/shared/storage.js";
 import { STORAGE_KEYS } from "../extension/shared/constants.js";
 import { isBossUrl, isBossHostname, isBossTab, bossUrlGuardMessage } from "../extension/shared/boss-url.js";
+import {
+  didContentDocumentChange,
+  isBossJobListUrl,
+  resolveBossJobListUrl
+} from "../extension/shared/job-list-navigation.js";
 import { reasonText, REASON } from "../extension/shared/reason-codes.js";
 import { computeSideBySideBounds } from "../extension/shared/window-layout.js";
 import {
@@ -483,6 +488,53 @@ test("isBossTab", () => {
   assert.equal(isBossTab({ id: 1, url: "https://baidu.com" }), false);
   assert.equal(isBossTab(null), false);
 });
+test("job list navigation preserves a safe saved search url", () => {
+  assert.equal(
+    resolveBossJobListUrl({
+      candidate: "https://www.zhipin.com/web/geek/jobs?query=AI%E5%BD%B1%E8%A7%86&city=101010100",
+      currentUrl: "https://www.zhipin.com/web/user/"
+    }),
+    "https://www.zhipin.com/web/geek/jobs?query=AI%E5%BD%B1%E8%A7%86&city=101010100"
+  );
+});
+test("job list navigation rejects non-list and non-BOSS targets", () => {
+  assert.equal(isBossJobListUrl("https://www.zhipin.com/web/user/"), false);
+  assert.equal(isBossJobListUrl("https://evil.example/web/geek/jobs"), false);
+  assert.equal(isBossJobListUrl("https://www.zhipin.com/job_detail/abc.html?searchId=123"), false);
+  assert.equal(
+    resolveBossJobListUrl({
+      candidate: "https://evil.example/web/geek/jobs",
+      currentUrl: "https://www.zhipin.com/web/user/"
+    }),
+    "https://www.zhipin.com/web/geek/jobs"
+  );
+});
+test("content document change detection distinguishes reload from SPA navigation", () => {
+  assert.equal(didContentDocumentChange({
+    previousInstanceId: "old",
+    currentInstanceId: "new",
+    previousUrl: "https://www.zhipin.com/gongsi/",
+    currentUrl: "https://www.zhipin.com/web/geek/jobs"
+  }), true);
+  assert.equal(didContentDocumentChange({
+    previousInstanceId: "same",
+    currentInstanceId: "same",
+    previousUrl: "https://www.zhipin.com/gongsi/",
+    currentUrl: "https://www.zhipin.com/web/geek/jobs"
+  }), false);
+  assert.equal(didContentDocumentChange({
+    previousInstanceId: "",
+    currentInstanceId: "new",
+    previousUrl: "https://www.zhipin.com/gongsi/",
+    currentUrl: "https://www.zhipin.com/web/geek/jobs"
+  }), true);
+  assert.equal(didContentDocumentChange({
+    previousInstanceId: "old",
+    currentInstanceId: "",
+    previousUrl: "https://www.zhipin.com/gongsi/",
+    currentUrl: "https://www.zhipin.com/web/geek/jobs"
+  }), false);
+});
 test("guard message non-empty", () => {
   assert.ok(bossUrlGuardMessage("https://baidu.com").length > 5);
   assert.ok(reasonText(REASON.DEDUP_JOB).length > 0);
@@ -743,7 +795,7 @@ test("preview scan uses try/finally to restore button", () => {
   const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
   const start = app.indexOf("$('btnPreview').addEventListener('click'");
   assert.ok(start > 0);
-  const chunk = app.slice(start, start + 1200);
+  const chunk = app.slice(start, start + 1800);
   assert.ok(chunk.includes("try {"));
   assert.ok(chunk.includes("} finally {"));
   assert.ok(chunk.includes("$('btnPreview').disabled = false"));

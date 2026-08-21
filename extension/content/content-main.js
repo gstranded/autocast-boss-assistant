@@ -21,15 +21,21 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.2";
+  const BHT_CONTENT_VERSION = "1.7.6";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
-  if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
+  if (
+    window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
+    window.__BHT_ON_MESSAGE__ &&
+    window.__BHT_CONTENT_INSTANCE_ID__
+  ) {
     return;
   }
   if (window.__BHT_ON_MESSAGE__) {
     try { chrome.runtime.onMessage.removeListener(window.__BHT_ON_MESSAGE__); } catch (_) {}
   }
   window.__BHT_CONTENT_VERSION__ = BHT_CONTENT_VERSION;
+  const BHT_CONTENT_INSTANCE_ID = `content_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  window.__BHT_CONTENT_INSTANCE_ID__ = BHT_CONTENT_INSTANCE_ID;
   window.__BHT_OP_LOCK__ = null; // boot: 导航后新脚本不继承旧锁
   window.__BHT_OP_CANCELLED__ = Object.create(null);
   window.__BHT_ACTIVE_OP_ID__ = null;
@@ -315,6 +321,25 @@
       return window.__BHT_LIST_HREF__ || sessionStorage.getItem("bht_list_href") || "";
     } catch (_) {
       return window.__BHT_LIST_HREF__ || "";
+    }
+  }
+
+  function getSavedJobListNavigationTarget() {
+    const saved = getSavedListHref();
+    try {
+      const parsed = new URL(saved || "", location.origin);
+      if (isBossHost(parsed.hostname) && isListLikePage(parsed.href)) return parsed.href;
+    } catch (_) {}
+    return "";
+  }
+
+  function getJobListNavigationTarget() {
+    const saved = getSavedJobListNavigationTarget();
+    if (saved) return saved;
+    try {
+      return new URL("/web/geek/jobs", location.origin).href;
+    } catch (_) {
+      return "https://www.zhipin.com/web/geek/jobs";
     }
   }
 
@@ -1091,6 +1116,24 @@ function firstEl(selectors, root = document) {
 
   async function scanJobs(payload = {}) {
     try { rememberListHref(); } catch (_) {}
+    const ensured = await ensureJobList({
+      maxWaitMs: payload.maxWaitMs || 12000,
+      scroll: payload.scroll !== false
+    });
+    if (!ensured.ok) {
+      debugTrace("scan_jobs_no_list", { href: location.href, error: ensured.error, message: ensured.message }, "warn");
+      return {
+        ok: false,
+        error: ensured.error || "LIST_NOT_FOUND",
+        message: ensured.message || "未找到职位列表页，请先打开 BOSS 职位列表页再扫描预览",
+        count: 0,
+        jobs: [],
+        shouldNavigate: ensured.shouldNavigate === true,
+        targetHref: ensured.targetHref || "",
+        via: ensured.via || "",
+        page: pageInfo()
+      };
+    }
     if (payload.scroll) await autoScrollList(payload.maxRounds || 6);
     const cards = getJobCards();
     const jobs = cards.map((c, i) => parseJobCard(c, i));
@@ -1335,8 +1378,9 @@ function dismissCommonDialogs() {
 
   async function ensureJobList({ maxWaitMs = 12000, scroll = true, noHomeNav = false } = {}) {
     const readyCount = () => getJobCards().length;
+    const startedHref = location.href;
     if (readyCount() > 0) {
-      return { ok: true, count: readyCount(), restored: false, href: location.href };
+      return { ok: true, count: readyCount(), restored: false, href: location.href, via: "already-list" };
     }
 
     // 聊天页先返回（软返回，不硬刷新）
@@ -1347,37 +1391,78 @@ function dismissCommonDialogs() {
     await closeChatPanel();
     await sleep(300);
 
-    if (scroll) {
+    const savedTarget = getSavedJobListNavigationTarget();
+    if (!noHomeNav && !isListLikePage() && savedTarget && !sameListUrl(location.href, savedTarget)) {
+      return {
+        ok: false,
+        count: 0,
+        restored: false,
+        href: location.href,
+        error: "LIST_NAV_REQUIRED",
+        message: "当前不在 BOSS 职位列表页，正在恢复上次职位列表…",
+        shouldNavigate: true,
+        targetHref: savedTarget,
+        via: "saved-list-navigation-required"
+      };
+    }
+
+    if (scroll && isListLikePage()) {
       try { await autoScrollList(6); } catch (_) {}
     }
 
     const start = Date.now();
     let navTried = false;
+    let navAttemptedAt = 0;
     while (Date.now() - start < maxWaitMs) {
       if (readyCount() > 0) {
-        return { ok: true, count: readyCount(), restored: true, href: location.href };
+        return {
+          ok: true,
+          count: readyCount(),
+          restored: location.href !== startedHref,
+          href: location.href,
+          via: navTried ? "job-nav" : "soft-wait"
+        };
       }
 
       // 仅当当前明显不是职位列表页时，才尝试点顶部「职位」入口。
       // 禁止点「推荐/首页」：会把用户选好的求职期望与网页筛选冲掉。
       if (!noHomeNav && !isListLikePage() && !navTried) {
-        const jobNav = Array.from(document.querySelectorAll("a,button,span,div")).find((el) => {
-          const t = textOf(el);
-          // 只允许精确「职位」或明确职位列表入口，避免点到推荐
-          return t === "职位" || t === "职位列表" || t === "找工作";
-        });
+        const jobNav = Array.from(document.querySelectorAll("a,button,[role='link']"))
+          .filter((el) => {
+            try {
+              const rect = el.getBoundingClientRect();
+              return rect.width > 8 && rect.height > 8;
+            } catch (_) {
+              return false;
+            }
+          })
+          .find((el) => {
+            const t = textOf(el).replace(/\s+/g, "").trim();
+            const href = el.getAttribute?.("href") || "";
+            return t === "职位" || t === "职位列表" || t === "找工作" || isListLikePage(href);
+          });
+        navTried = true;
+        navAttemptedAt = Date.now();
         if (jobNav) {
-          navTried = true;
           clickLikeHuman(jobNav);
           await sleep(800);
         }
       }
 
-      // 仍无卡片且不在列表：只等待 SPA，不 location 硬跳到裸 /web/geek/jobs
-      if (!navTried && readyCount() === 0 && /zhipin\.com|bosszhipin\.com/i.test(location.hostname)) {
-        if (!isListLikePage()) {
-          navTried = true;
-          await sleep(1500);
+      if (!isListLikePage() && (navTried || noHomeNav)) {
+        if (!navAttemptedAt) navAttemptedAt = Date.now();
+        if (Date.now() - navAttemptedAt >= 1600) {
+          return {
+            ok: false,
+            count: 0,
+            restored: false,
+            href: location.href,
+            error: "LIST_NAV_REQUIRED",
+            message: "当前不在 BOSS 职位列表页，正在自动跳转到职位列表…",
+            shouldNavigate: !noHomeNav,
+            targetHref: getJobListNavigationTarget(),
+            via: "background-navigation-required"
+          };
         }
       }
       if (scroll && (Date.now() - start) > 2500) {
@@ -1393,7 +1478,10 @@ function dismissCommonDialogs() {
       restored: true,
       href: location.href,
       error: count > 0 ? "" : "LIST_NOT_FOUND",
-      message: count > 0 ? "" : "未找到职位列表卡片。请停留在 BOSS 职位推荐/搜索列表页后重试，或重新扫描预览"
+      message: count > 0 ? "" : "已在 BOSS 职位列表页，但未找到岗位卡片。请确认已登录、当前筛选下有岗位，或刷新页面后重试",
+      shouldNavigate: false,
+      targetHref: "",
+      via: "list-cards-not-found"
     };
   }
 
@@ -3651,7 +3739,12 @@ async function runOpByType(type, payload = {}) {
     try {
     switch (type) {
       case MSG.PING:
-        return { ok: true, page: pageInfo(), contentVersion: BHT_CONTENT_VERSION };
+        return {
+          ok: true,
+          page: pageInfo(),
+          contentVersion: BHT_CONTENT_VERSION,
+          contentInstanceId: BHT_CONTENT_INSTANCE_ID
+        };
       case MSG.DIAGNOSE:
         return { ok: true, ...diagnose(), contentVersion: BHT_CONTENT_VERSION };
       case MSG.SCAN_JOBS:
@@ -3934,26 +4027,24 @@ async function runOpByType(type, payload = {}) {
   window.addEventListener("pagehide", () => {
     debugTrace("pagehide_pending_operations", {
       inflight: Object.keys(window.__BHT_OP_INFLIGHT__ || {}),
-      reason: "页面导航会中断所有待执行操作，后台不会自动恢复旧动作"
+      reason: "页面导航会中断本页操作；后台将等待新页面并恢复可安全重试的扫描"
     }, "warn");
     try {
-      // best-effort; may not complete if context dies instantly
-      chrome.storage.local.get(null, (all) => {
-        try {
-          const entries = Object.entries(all || {}).filter(([k, v]) => k.startsWith("bht_op_") && v && v.status === "pending");
-          for (const [k, v] of entries) {
-            // 页面离开后统一中断；禁止新页面自行恢复旧操作并继续操控会话。
-            chrome.storage.local.set({
-              [k]: {
-                status: "done",
-                opType: v.opType,
-                result: { ok: false, error: "NAVIGATED", message: "页面跳转，操作中断", contentVersion: BHT_CONTENT_VERSION },
-                at: Date.now()
-              }
-            });
-          }
-        } catch (_) {}
-      });
+      const updates = {};
+      for (const [opId, inflight] of Object.entries(window.__BHT_OP_INFLIGHT__ || {})) {
+        updates["bht_op_" + opId] = {
+          status: "done",
+          opType: inflight?.opType || "",
+          result: {
+            ok: false,
+            error: "NAVIGATED",
+            message: "页面跳转，操作中断",
+            contentVersion: BHT_CONTENT_VERSION
+          },
+          at: Date.now()
+        };
+      }
+      if (Object.keys(updates).length) chrome.storage.local.set(updates);
     } catch (_) {}
   });
 

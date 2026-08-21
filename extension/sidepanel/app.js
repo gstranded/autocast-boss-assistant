@@ -15,7 +15,7 @@ import { HISTORY_STATUS_MAP, filterHistoryRows } from '../shared/history-view.js
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.2";
+const BHT_UI_VERSION = "1.7.6";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -845,9 +845,24 @@ function updateTaskUI(task, runner = {}) {
   const status = task?.status || 'idle';
   const phase = describeTaskPhase(task, status);
   if ($('taskStatus')) {
-    const pauseBit = status === 'paused' && task?.pauseReason ? '' : (task?.pauseReason && status !== 'paused' ? `（${task.pauseReason}）` : '');
-    $('taskStatus').textContent = `状态：${statusLabel(status)}${phase ? ` · ${phase}` : ''}${pauseBit}`;
-    $('taskStatus').dataset.status = status;
+    if (runner.previewing) {
+      const elapsedSeconds = runner.previewStartedAt
+        ? Math.max(0, Math.floor((Date.now() - Number(runner.previewStartedAt)) / 1000))
+        : 0;
+      const previewPhaseText = {
+        locating_list: '正在定位职位列表',
+        navigating: '正在自动跳转职位列表',
+        waiting_navigation: '正在等待新页面加载',
+        scanning_cards: '正在读取岗位卡片',
+        filtering: '正在应用筛选规则'
+      }[runner.previewPhase] || '正在读取岗位';
+      $('taskStatus').textContent = `状态：扫描中 · ${elapsedSeconds} 秒 · ${previewPhaseText}`;
+      $('taskStatus').dataset.status = 'previewing';
+    } else {
+      const pauseBit = status === 'paused' && task?.pauseReason ? '' : (task?.pauseReason && status !== 'paused' ? `（${task.pauseReason}）` : '');
+      $('taskStatus').textContent = `状态：${statusLabel(status)}${phase ? ` · ${phase}` : ''}${pauseBit}`;
+      $('taskStatus').dataset.status = status;
+    }
   }
   const c = task?.counters || { success: 0, skipped: 0, failed: 0, processed: 0 };
   const pending = countPendingPassJobs(task);
@@ -862,7 +877,10 @@ function updateTaskUI(task, runner = {}) {
   }
   if ($('taskHint')) {
     let hint = '';
-    if (status === 'running') hint = '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
+    if (runner.previewing) {
+      hint = '正在扫描新页面；下方暂时仍是上一次预览，完成后才会替换。若超过 38 秒仍无结果，本次会自动结束并提示重试。';
+    }
+    else if (status === 'running') hint = '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
     else if (status === 'paused') hint = '已暂停：点「继续」恢复当前队列；或「停止」后重新批量投递。';
     else if (status === 'awaiting_confirm') hint = '预览已就绪：可「投递一份」试投，或「批量投递」勾选岗位。';
     else if (status === 'completed' || status === 'stopped') {
@@ -877,6 +895,7 @@ function updateTaskUI(task, runner = {}) {
   const onBoss = FLOAT_MODE || state.isBoss !== false;
   const isRunning = status === 'running';
   const isPaused = status === 'paused';
+  const isPreviewing = Boolean(runner.previewing);
   const executionBusy = Boolean(runner.running || runner.starting || runner.previewing || runner.stopping);
   const activeRun = isRunning || isPaused;
   // 控制条：按状态点亮当前可操作按钮，其它变暗
@@ -896,9 +915,13 @@ function updateTaskUI(task, runner = {}) {
     title: activeRun ? '跳过当前岗位，进入下一岗' : '仅在运行/暂停时可跳过'
   });
   setControlArmed('btnStop', {
-    enabled: onBoss && activeRun,
-    armed: activeRun && isRunning,
-    title: activeRun ? '停止任务（可之后批量投剩余）' : '当前没有运行中的任务'
+    enabled: onBoss && (activeRun || isPreviewing),
+    armed: isPreviewing || (activeRun && isRunning),
+    title: isPreviewing
+      ? '取消本次扫描（保留上一次预览结果）'
+      : activeRun
+        ? '停止任务（可之后批量投剩余）'
+        : '当前没有运行中的任务'
   });
 
   const hasPass = countPassJobs(task) > 0 || Array.from(state.selected || []).length > 0;
@@ -1838,18 +1861,24 @@ function bindEvents() {
 
   $('btnPreview').addEventListener('click', async () => {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
-    toast('开始扫描预览…', 'warn', 1500);
+    toast('正在定位职位列表并扫描；非列表页会自动跳转…', 'warn', 5000);
     $('btnPreview').disabled = true;
     $('taskStatus').textContent = '状态：扫描中…';
     try {
       await saveFilters();
       const res = await api(MSG.RUN_PREVIEW, { scroll: true });
       if (!res?.ok) {
+        if (res?.error === 'OP_CANCELLED') {
+          toast('已取消本次扫描，上一次预览结果已保留', 'warn', 3500);
+          return;
+        }
         toast(res?.message || res?.error || '扫描失败，请打开职位列表页', 'error', 3500);
-        setConn(false, '页面未就绪');
+        const disconnected = ['NO_BOSS_TAB', 'NOT_BOSS_URL', 'CONTENT_INJECT_FAIL'].includes(res?.error);
+        setConn(!disconnected, disconnected ? '页面未就绪' : '已连接 BOSS · 列表未就绪');
         showErrorModal('扫描失败', res?.message || res?.error || '请打开 BOSS 职位列表页后重试', { showRetry: false });
       } else if (res.summary) {
-        toast(`扫描完成：通过 ${res.summary.pass} / 共 ${res.summary.scanned}`, 'success');
+        const navText = res.navigation?.automatic ? '已自动回到职位列表；' : '';
+        toast(`${navText}扫描完成：通过 ${res.summary.pass} / 共 ${res.summary.scanned}`, 'success');
       } else {
         toast('预览完成', 'success');
       }
@@ -2264,6 +2293,8 @@ function wireControlButtons() {
     const res = await api(MSG.STOP_TASK);
     if (res?.ok === false) {
       toast(res.message || '停止失败', 'error');
+    } else if (res?.previewCancelled) {
+      toast('已取消本次扫描，上一次预览结果已保留', 'warn', 3500);
     } else if (res?.task) {
       announceTaskCompletion(res.task);
     }
