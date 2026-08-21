@@ -186,6 +186,22 @@
       document.documentElement.dataset.harnessBossGreeting = state.bossGreeting.status;
       return clone(state.bossGreeting);
     }
+    if (type === "BHT_SAVE_BOSS_GREETING_TEXT") {
+      const text = String(payload?.text || "").trim();
+      const templateId = state.bossGreeting.templateId || "harness-template-1";
+      state.bossGreeting = {
+        ...state.bossGreeting,
+        ok: true,
+        templateId,
+        text,
+        templates: [{ templateId, text, greetingType: 2, editable: true }],
+        syncedAt: Date.now(),
+        textSaved: true,
+        savedTemplateId: templateId
+      };
+      document.documentElement.dataset.harnessBossGreetingText = text;
+      return clone(state.bossGreeting);
+    }
     if (type === "BHT_OPEN_BOSS_GREETING_SETTINGS") {
       document.documentElement.dataset.harnessOpenedBossGreetingSettings = "true";
       return { ok: true, tabId: 202 };

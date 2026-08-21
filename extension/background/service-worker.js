@@ -706,6 +706,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     MSG.SEND_RESUME,
     MSG.GET_BOSS_GREETING,
     MSG.SET_BOSS_GREETING,
+    MSG.SAVE_BOSS_GREETING_TEXT,
     MSG.SCAN_JOBS,
     MSG.RETURN_TO_LIST,
     MSG.CLOSE_CHAT,
@@ -2380,10 +2381,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         return result;
       }
+      case MSG.SAVE_BOSS_GREETING_TEXT: {
+        const guard = await assertBossContext(sender);
+        if (!guard.ok) return guard;
+        const result = await sendToBoss(MSG.SAVE_BOSS_GREETING_TEXT, payload || {}, { tabId: guard.tab.id });
+        await log(result?.ok ? 'success' : 'error', result?.ok
+          ? 'BOSS 自动招呼话术已保存并完成回验'
+          : (result?.message || '保存 BOSS 自动招呼话术失败'));
+        if (result?.ok) {
+          const all = await getAllConfig();
+          if (all.task) {
+            all.task.bossGreetingSnapshot = {
+              ok: true,
+              enabled: result.enabled === true,
+              status: result.enabled ? 'on' : 'off',
+              templateId: result.templateId || '',
+              text: result.text || '',
+              syncedAt: result.syncedAt || Date.now(),
+              source: result.source || 'boss-api'
+            };
+            await publishTask(all.task);
+          }
+        }
+        return result;
+      }
       case MSG.OPEN_BOSS_GREETING_SETTINGS: {
+        const contextTab = await getActiveBossTab({ allowInactiveBossTab: true, sender });
         const tab = await chrome.tabs.create({
           url: 'https://www.zhipin.com/web/geek/notify-set?type=greetSet',
-          active: true
+          active: true,
+          ...(contextTab?.windowId != null ? { windowId: contextTab.windowId } : {})
         });
         return { ok: true, tabId: tab?.id || null, url: tab?.url || '' };
       }

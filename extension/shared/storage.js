@@ -8,6 +8,9 @@ import {
 import { deepClone, todayKey, uid } from './text-utils.js';
 import { countResumeImages, normalizeResumes } from './resume-images.js';
 import { normalizeMessageTemplateRoles } from './greeting-policy.js';
+import { mergeRuntimeLog, sortLogsNewestFirst } from './log-order.js';
+
+let logWriteChain = Promise.resolve();
 
 async function get(keys) {
   return chrome.storage.local.get(keys);
@@ -79,7 +82,7 @@ export async function getAllConfig() {
     history: data[STORAGE_KEYS.HISTORY] || [],
     idempotency: data[STORAGE_KEYS.IDEMPOTENCY] || {},
     task: data[STORAGE_KEYS.TASK],
-    logs: data[STORAGE_KEYS.LOGS] || [],
+    logs: sortLogsNewestFirst(data[STORAGE_KEYS.LOGS] || []),
     dailyStats: data[STORAGE_KEYS.DAILY_STATS] || {}
   };
 }
@@ -121,17 +124,19 @@ export async function saveTask(task) {
 }
 
 export async function appendLog(entry) {
-  const { [STORAGE_KEYS.LOGS]: logs = [] } = await get(STORAGE_KEYS.LOGS);
-  const next = [
-    {
+  const write = async () => {
+    const { [STORAGE_KEYS.LOGS]: logs = [] } = await get(STORAGE_KEYS.LOGS);
+    const created = {
       id: uid('log'),
       ts: Date.now(),
       ...entry
-    },
-    ...logs
-  ].slice(0, 1000);
-  await set({ [STORAGE_KEYS.LOGS]: next });
-  return next[0];
+    };
+    const next = mergeRuntimeLog(logs, created, 1000);
+    await set({ [STORAGE_KEYS.LOGS]: next });
+    return created;
+  };
+  logWriteChain = logWriteChain.then(write, write);
+  return logWriteChain;
 }
 
 export async function clearLogs() {

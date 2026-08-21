@@ -411,12 +411,20 @@ select:disabled { cursor: not-allowed; opacity: 0.46; }
 .source-message-label { color: var(--muted); font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
 .source-message-text { margin-top: 3px; color: var(--text); line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
 .source-message-text.muted { color: var(--muted); }
+.source-message-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.source-message-count { color: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.source-message-count.warning { color: var(--warn); }
+.source-message-editor { margin-top: 6px; min-height: 76px; line-height: 1.5; resize: vertical; }
+.source-message-editor.is-dirty { border-color: var(--primary); box-shadow: var(--focus); }
+.source-message-save-row { display: flex; align-items: center; justify-content: space-between; gap: 9px; margin-top: 7px; }
+.source-message-save-row .source-meta { flex: 1 1 auto; }
+.source-message-save-row .btn { flex: 0 0 auto; }
 .source-error { margin-top: 8px; padding: 8px 9px; border-radius: 7px; color: var(--danger); background: var(--danger-soft); font-size: 11.5px; }
 .source-confirm { margin-top: 9px; padding: 10px; border: 1px solid color-mix(in srgb, var(--warn) 48%, var(--line)); border-radius: 8px; background: var(--warn-soft); }
 .source-confirm > strong { display: block; color: var(--text); }
 .source-confirm-body { margin: 3px 0 9px; color: var(--muted); font-size: 11.5px; line-height: 1.45; }
 .source-actions { margin-top: 9px; }
-.source-actions .btn { flex: 1 1 0; }
+.source-actions .btn { flex: 1 1 0; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
 .plugin-source-card { border-color: color-mix(in srgb, var(--primary) 28%, var(--line)); }
 .flow-preview { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line); }
 .flow-preview-title { color: var(--text); font-size: 12px; font-weight: 750; margin-bottom: 7px; }

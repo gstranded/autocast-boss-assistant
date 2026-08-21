@@ -231,8 +231,15 @@
               </label>
             </div>
             <div class="source-message-box">
-              <div class="source-message-label">BOSS 当前话术</div>
-              <div id="bossGreetingText" class="source-message-text muted">同步后显示平台实际话术</div>
+              <div class="source-message-head">
+                <div class="source-message-label">BOSS 当前话术</div>
+                <span id="bossGreetingTextCount" class="source-message-count">0 / 100</span>
+              </div>
+              <textarea id="bossGreetingText" class="source-message-editor" rows="3" maxlength="100" disabled placeholder="同步后可在这里编辑 BOSS 当前话术"></textarea>
+              <div class="source-message-save-row">
+                <span class="source-meta">保存后会自动设为当前话术并回读确认</span>
+                <button type="button" id="btnSaveBossGreetingText" class="btn tiny primary" disabled>保存话术</button>
+              </div>
             </div>
             <div id="bossGreetingError" class="source-error" hidden></div>
             <div id="bossGreetingConfirm" class="source-confirm" hidden>
@@ -245,7 +252,7 @@
             </div>
             <div class="btn-row source-actions">
               <button type="button" id="btnSyncBossGreeting" class="btn tiny">同步状态</button>
-              <button type="button" id="btnOpenBossGreetingSettings" class="btn tiny">打开 BOSS 设置</button>
+              <a id="btnOpenBossGreetingSettings" class="btn tiny" href="https://www.zhipin.com/web/geek/notify-set?type=greetSet" target="_blank" rel="noopener noreferrer">打开 BOSS 设置</a>
             </div>
           </div>
 

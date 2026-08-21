@@ -11,11 +11,17 @@ import {
   shouldAcceptTaskSnapshot
 } from '../shared/task-model.js';
 import { HISTORY_STATUS_MAP, filterHistoryRows } from '../shared/history-view.js';
+import {
+  formatLogTimestamp,
+  mergeRuntimeLog,
+  sortLogsNewestFirst,
+  sortLogsOldestFirst
+} from '../shared/log-order.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.7";
+const BHT_UI_VERSION = "1.7.8";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -49,7 +55,10 @@ const state = {
     syncedAt: 0,
     loading: false,
     error: '',
-    pendingEnabled: null
+    pendingEnabled: null,
+    textDraft: '',
+    textDirty: false,
+    textSaving: false
   }
 };
 
@@ -665,6 +674,8 @@ function renderBossGreetingControl() {
   const confirmBox = $('bossGreetingConfirm');
   const confirmButton = $('btnConfirmBossGreeting');
   const syncButton = $('btnSyncBossGreeting');
+  const saveTextButton = $('btnSaveBossGreetingText');
+  const textCount = $('bossGreetingTextCount');
   if (!status || !meta || !toggle || !textBox) return;
 
   let cls = 'unknown';
@@ -700,10 +711,25 @@ function renderBossGreetingControl() {
   }
 
   const currentText = String(greeting.text || '').trim();
-  textBox.textContent = currentText || (greeting.ok
-    ? (greeting.enabled ? 'BOSS 未返回当前话术，请在官方设置页检查' : '已关闭；平台不会自动发送招呼语')
-    : '同步后显示平台实际话术');
-  textBox.classList.toggle('muted', !currentText);
+  if (!greeting.textDirty && document.activeElement !== textBox) {
+    greeting.textDraft = currentText;
+    textBox.value = currentText;
+  }
+  textBox.disabled = greeting.loading || greeting.textSaving || !greeting.ok;
+  textBox.placeholder = greeting.ok
+    ? '请输入 BOSS 自动招呼话术（最多 100 字）'
+    : '同步后可在这里编辑 BOSS 当前话术';
+  const draftLength = Array.from(String(textBox.value || '')).length;
+  if (textCount) {
+    textCount.textContent = `${draftLength} / 100`;
+    textCount.classList.toggle('warning', draftLength > 100);
+  }
+  textBox.classList.toggle('is-dirty', greeting.textDirty);
+  if (saveTextButton) {
+    saveTextButton.disabled = !greeting.ok || greeting.loading || greeting.textSaving ||
+      !greeting.textDirty || !String(textBox.value || '').trim() || draftLength > 100;
+    saveTextButton.textContent = greeting.textSaving ? '保存中…' : '保存话术';
+  }
 
   if (errorBox) {
     errorBox.hidden = !greeting.error;
@@ -822,14 +848,66 @@ async function syncBossGreeting(options = {}) {
       syncedAt: result.syncedAt || Date.now(),
       loading: false,
       error: '',
-      pendingEnabled: null
+      pendingEnabled: null,
+      textDraft: result.text || '',
+      textDirty: false,
+      textSaving: false
     });
   } catch (error) {
     greeting.ok = false;
     greeting.enabled = null;
     greeting.loading = false;
+    greeting.textSaving = false;
     greeting.error = String(error?.message || error || '读取 BOSS 自动招呼设置失败');
     if (!options.silent) toast(greeting.error, 'error', 5000);
+  }
+  renderBossGreetingControl();
+}
+
+function updateBossGreetingTextDraft() {
+  const greeting = state.bossGreeting;
+  const editor = $('bossGreetingText');
+  if (!editor) return;
+  greeting.textDraft = editor.value || '';
+  greeting.textDirty = String(greeting.textDraft).trim() !== String(greeting.text || '').trim();
+  renderBossGreetingControl();
+}
+
+async function saveBossGreetingText() {
+  const greeting = state.bossGreeting;
+  const editor = $('bossGreetingText');
+  const text = String(editor?.value || '').trim();
+  if (!greeting.ok || greeting.loading || greeting.textSaving) return;
+  if (!text) {
+    toast('请填写 BOSS 自动招呼话术', 'error', 3200);
+    return;
+  }
+  if (Array.from(text).length > 100) {
+    toast('BOSS 自动招呼话术最多 100 个字', 'error', 3200);
+    return;
+  }
+  greeting.textSaving = true;
+  greeting.error = '';
+  renderBossGreetingControl();
+  try {
+    const result = await api(MSG.SAVE_BOSS_GREETING_TEXT, { text });
+    Object.assign(greeting, {
+      ...result,
+      ok: true,
+      enabled: result.enabled === true,
+      status: result.enabled ? 'on' : 'off',
+      syncedAt: result.syncedAt || Date.now(),
+      loading: false,
+      textSaving: false,
+      textDraft: result.text || text,
+      textDirty: false,
+      error: ''
+    });
+    toast('BOSS 当前话术已保存，并完成回读确认', 'success', 3200);
+  } catch (error) {
+    greeting.textSaving = false;
+    greeting.error = `${String(error?.message || error || '保存失败')}。可点击“打开 BOSS 设置”手动确认。`;
+    toast(greeting.error, 'error', 6000);
   }
   renderBossGreetingControl();
 }
@@ -1359,10 +1437,10 @@ function escapeAttr(s) {
 function renderLogs(logs = []) {
   const box = $('logList');
   box.innerHTML = '';
-  logs.slice(0, 100).forEach((l) => {
+  sortLogsNewestFirst(logs).slice(0, 100).forEach((l) => {
     const div = document.createElement('div');
     div.className = `log ${l.level || 'info'}`;
-    const time = new Date(l.ts || Date.now()).toLocaleTimeString();
+    const time = formatLogTimestamp(l.ts, { includeDate: true });
     div.textContent = `[${time}] ${l.message}`;
     box.appendChild(div);
   });
@@ -1790,7 +1868,8 @@ function wireResumeFilePreview() {
 function shouldAutosaveTarget(target) {
   return Boolean(
     target?.matches?.('input, textarea, select') &&
-    String(target.type || '').toLowerCase() !== 'file'
+    String(target.type || '').toLowerCase() !== 'file' &&
+    target?.id !== 'bossGreetingText'
   );
 }
 function wireAutosave() {
@@ -1884,13 +1963,12 @@ function bindEvents() {
   $('btnSyncBossGreeting')?.addEventListener('click', () => {
     syncBossGreeting({ force: true }).catch((error) => toast(String(error?.message || error), 'error', 5000));
   });
-  $('btnOpenBossGreetingSettings')?.addEventListener('click', async () => {
-    try {
-      await api(MSG.OPEN_BOSS_GREETING_SETTINGS);
-      toast('已打开 BOSS 招呼语设置', 'success', 2200);
-    } catch (error) {
-      toast(String(error?.message || error), 'error', 5000);
-    }
+  $('bossGreetingText')?.addEventListener('input', updateBossGreetingTextDraft);
+  $('btnSaveBossGreetingText')?.addEventListener('click', () => {
+    saveBossGreetingText().catch((error) => toast(String(error?.message || error), 'error', 5000));
+  });
+  $('btnOpenBossGreetingSettings')?.addEventListener('click', () => {
+    toast('正在打开 BOSS 官方招呼语设置…', 'success', 1800);
   });
   $('pluginTextEnabled')?.addEventListener('change', () => {
     state.formDirty = true;
@@ -2374,11 +2452,9 @@ function bindEvents() {
 
   $('btnCopyLogs')?.addEventListener('click', async () => {
     const logs = state.config?.logs || [];
-    const text = logs
-      .slice()
-      .reverse()
+    const text = sortLogsOldestFirst(logs)
       .map((l) => {
-        const time = new Date(l.ts || Date.now()).toLocaleTimeString();
+        const time = formatLogTimestamp(l.ts, { includeDate: true });
         return `[${time}] ${l.message || ''}`;
       })
       .join('\n');
@@ -2499,7 +2575,7 @@ globalThis.chrome?.runtime?.onMessage?.addListener((msg) => {
     }
   }
   if (msg?.type === MSG.LOG_EVENT) {
-    const logs = [msg.payload, ...(state.config?.logs || [])].slice(0, 100);
+    const logs = mergeRuntimeLog(state.config?.logs || [], msg.payload, 1000);
     if (state.config) state.config.logs = logs;
     renderLogs(logs);
   }

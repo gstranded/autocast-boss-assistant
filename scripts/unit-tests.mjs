@@ -38,6 +38,12 @@ import {
   shouldAcceptTaskSnapshot
 } from "../extension/shared/task-model.js";
 import { createOperationRegistry } from "../extension/background/operation-registry.js";
+import {
+  formatLogTimestamp,
+  mergeRuntimeLog,
+  sortLogsNewestFirst,
+  sortLogsOldestFirst
+} from "../extension/shared/log-order.js";
 
 const {
   hasActiveState,
@@ -422,6 +428,26 @@ test("plugin text master switch suppresses every plugin segment", () => {
   });
   assert.equal(plan.blocked, false);
   assert.equal(plan.plan.length, 0);
+});
+
+test("runtime logs are deduplicated and sorted by numeric timestamps", () => {
+  const logs = [
+    { id: "middle", ts: 200, message: "middle" },
+    { id: "old", ts: 100, message: "old" },
+    { id: "new", ts: 300, message: "new" },
+    { id: "new", ts: 300, message: "duplicate" }
+  ];
+  assert.deepEqual(sortLogsNewestFirst(logs).map((entry) => entry.id), ["new", "middle", "old"]);
+  assert.deepEqual(sortLogsOldestFirst(logs).map((entry) => entry.id), ["old", "middle", "new"]);
+  assert.deepEqual(
+    mergeRuntimeLog(logs, { id: "latest", ts: 400, message: "latest" }, 3).map((entry) => entry.id),
+    ["latest", "new", "middle"]
+  );
+});
+
+test("runtime log timestamps include the calendar date", () => {
+  const formatted = formatLogTimestamp(new Date(2026, 7, 21, 9, 8, 7).getTime());
+  assert.equal(formatted, "08-21 09:08:07");
 });
 
 test("resume images are deduplicated by content", () => {

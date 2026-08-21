@@ -122,6 +122,8 @@ test("greeting control covers platform receipt, safe pause, account write and re
   assert.ok(hook.includes("showGreeting"));
   assert.ok(content.includes("/wapi/zpchat/greeting/getGreetingList"));
   assert.ok(content.includes("/wapi/zpchat/greeting/updateGreetingV2"));
+  assert.ok(content.includes("/wapi/zpchat/greeting/custom/saveV2"));
+  assert.ok(content.includes('"zp_token"'));
   assert.ok(content.includes("after.enabled !== enabled"));
   assert.ok(background.includes("waitForFreshSelfMessages"));
   assert.ok(background.includes("baselineMessages"));
@@ -129,14 +131,29 @@ test("greeting control covers platform receipt, safe pause, account write and re
   assert.ok(background.includes("已暂停以避免重复"));
   assert.ok(panel.includes("confirmBossGreetingChange"));
   assert.ok(panel.includes("MSG.SET_BOSS_GREETING"));
+  assert.ok(panel.includes("MSG.SAVE_BOSS_GREETING_TEXT"));
   for (const id of [
     "bossGreetingToggle",
     "bossGreetingText",
+    "btnSaveBossGreetingText",
     "bossGreetingConfirm",
     "pluginTextEnabled",
     "messageFlowPreview"
   ]) assert.ok(html.includes(`id="${id}"`), `missing ${id}`);
   assert.ok(html.includes("建议关闭 BOSS 自动招呼"));
+  assert.ok(html.includes('href="https://www.zhipin.com/web/geek/notify-set?type=greetSet"'));
+});
+
+test("real-time logs sort by timestamp and include dates", () => {
+  const storage = fs.readFileSync("extension/shared/storage.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const order = fs.readFileSync("extension/shared/log-order.js", "utf8");
+  assert.ok(storage.includes("logWriteChain"));
+  assert.ok(storage.includes("sortLogsNewestFirst"));
+  assert.ok(panel.includes("sortLogsNewestFirst(logs)"));
+  assert.ok(panel.includes("sortLogsOldestFirst(logs)"));
+  assert.ok(panel.includes("formatLogTimestamp"));
+  assert.ok(order.includes("includeDate = true"));
 });
 
 test("native greeting skip still works with multi segment", () => {

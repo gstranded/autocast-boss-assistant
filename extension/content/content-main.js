@@ -10,6 +10,7 @@
     GET_CHAT_SELF_MESSAGES: "BHT_GET_CHAT_SELF_MESSAGES",
     GET_BOSS_GREETING: "BHT_GET_BOSS_GREETING",
     SET_BOSS_GREETING: "BHT_SET_BOSS_GREETING",
+    SAVE_BOSS_GREETING_TEXT: "BHT_SAVE_BOSS_GREETING_TEXT",
     SEND_TEXT: "BHT_SEND_TEXT",
     SEND_IMAGE: "BHT_SEND_IMAGE",
     SEND_RESUME: "BHT_SEND_RESUME",
@@ -23,7 +24,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.7";
+  const BHT_CONTENT_VERSION = "1.7.8";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -525,12 +526,20 @@ const SELECTORS = {
   async function bossGreetingApi(path, options = {}) {
     const url = new URL(path, location.origin);
     if (!isBossHost(url.hostname)) throw new Error("BOSS_GREETING_BAD_ORIGIN");
+    const rawZpToken = String(document.cookie || "")
+      .split(";")
+      .map((part) => part.trim())
+      .find((part) => part.startsWith("bst="))
+      ?.slice(4) || "";
+    let zpToken = rawZpToken;
+    try { zpToken = decodeURIComponent(rawZpToken); } catch (_) {}
     const response = await fetch(url.href, {
       credentials: "include",
       cache: "no-store",
       ...options,
       headers: {
         "X-Requested-With": "XMLHttpRequest",
+        ...(zpToken ? { "zp_token": zpToken } : {}),
         ...(options.headers || {})
       }
     });
@@ -545,7 +554,8 @@ const SELECTORS = {
       templateId: String(item?.templateId || ""),
       text: String(item?.demo || item?.content || "").trim(),
       category: item?.category ?? null,
-      greetingType: item?.greetingType ?? null
+      greetingType: item?.greetingType ?? null,
+      editable: Number(item?.greetingType) === 2
     })).filter((item) => item.templateId || item.text);
     const templateId = String(greeting?.templateId || "");
     const current = templates.find((item) => item.templateId === templateId) || null;
@@ -557,6 +567,7 @@ const SELECTORS = {
       templateId,
       text: String(current?.text || greeting?.demo || greeting?.content || "").trim(),
       templates,
+      displayButton: zpData.displayButton === true || Number(zpData.displayButton) === 1,
       syncedAt: Date.now(),
       source: "boss-api"
     };
@@ -567,6 +578,14 @@ const SELECTORS = {
       const payload = await bossGreetingApi("/wapi/zpchat/greeting/getGreetingList?_=" + Date.now());
       if (Number(payload?.code) === 7) {
         return { ok: false, error: "LOGIN_REQUIRED", message: payload?.message || "请先登录 BOSS 直聘" };
+      }
+      if ([120, 121, 122].includes(Number(payload?.code))) {
+        return {
+          ok: false,
+          error: "BOSS_TOKEN_INVALID",
+          code: Number(payload?.code),
+          message: "BOSS 登录校验已失效（" + Number(payload?.code) + "），请刷新 BOSS 页面后重试"
+        };
       }
       if (Number(payload?.code) !== 0) {
         return { ok: false, error: "BOSS_GREETING_READ_FAILED", message: payload?.message || "读取 BOSS 自动招呼设置失败" };
@@ -585,7 +604,8 @@ const SELECTORS = {
     const enabled = payload.enabled === true;
     const before = await getBossGreetingSetting();
     if (!before.ok) return before;
-    const templateId = String(payload.templateId || before.templateId || before.templates?.[0]?.templateId || "");
+    let templateId = String(payload.templateId || before.templateId || "");
+    if (enabled && !templateId) templateId = String(before.templates?.[0]?.templateId || "");
     if (enabled && !templateId) {
       return {
         ok: false,
@@ -599,9 +619,17 @@ const SELECTORS = {
       body.set("templateId", templateId);
       const result = await bossGreetingApi("/wapi/zpchat/greeting/updateGreetingV2", {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: body.toString()
       });
+      if ([120, 121, 122].includes(Number(result?.code))) {
+        return {
+          ok: false,
+          error: "BOSS_TOKEN_INVALID",
+          code: Number(result.code),
+          message: "BOSS 登录校验已失效（" + Number(result.code) + "），请刷新 BOSS 页面后重试"
+        };
+      }
       if (Number(result?.code) !== 0) {
         return { ok: false, error: "BOSS_GREETING_WRITE_FAILED", message: result?.message || "修改 BOSS 自动招呼设置失败" };
       }
@@ -622,6 +650,108 @@ const SELECTORS = {
         ok: false,
         error: "BOSS_GREETING_WRITE_FAILED",
         message: "修改 BOSS 自动招呼设置失败：" + String(error?.message || error)
+      };
+    }
+  }
+
+  async function saveBossGreetingText(payload = {}) {
+    const text = String(payload.text || "").trim();
+    if (!text) {
+      return { ok: false, error: "BOSS_GREETING_TEXT_REQUIRED", message: "请填写 BOSS 自动招呼话术" };
+    }
+    if (Array.from(text).length > 100) {
+      return { ok: false, error: "BOSS_GREETING_TEXT_TOO_LONG", message: "BOSS 自动招呼话术最多 100 个字" };
+    }
+    const before = await getBossGreetingSetting();
+    if (!before.ok) return before;
+    const current = before.templates?.find((item) => item.templateId === before.templateId) || null;
+    // BOSS 官方页面只原地编辑 greetingType=2；内置模板优先复用账号已有的自定义槽，没有才创建。
+    const editableTemplate = current?.editable
+      ? current
+      : before.templates?.find((item) => item.editable) || null;
+    const editableTemplateId = editableTemplate?.templateId || "";
+    try {
+      const body = new URLSearchParams();
+      body.set("templateId", editableTemplateId);
+      body.set("content", text);
+      body.set("customType", "2");
+      const saved = await bossGreetingApi("/wapi/zpchat/greeting/custom/saveV2", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString()
+      });
+      if ([120, 121, 122].includes(Number(saved?.code))) {
+        return {
+          ok: false,
+          error: "BOSS_TOKEN_INVALID",
+          code: Number(saved.code),
+          message: "BOSS 登录校验已失效（" + Number(saved.code) + "），请刷新 BOSS 页面后重试"
+        };
+      }
+      if (Number(saved?.code) !== 0) {
+        return { ok: false, error: "BOSS_GREETING_TEXT_SAVE_FAILED", message: saved?.message || "保存 BOSS 自动招呼话术失败" };
+      }
+      await sleep(350);
+      let after = await getBossGreetingSetting();
+      if (!after.ok) return after;
+      const primitiveSavedId = ["string", "number"].includes(typeof saved?.zpData)
+        ? saved.zpData
+        : "";
+      const responseTemplateId = String(
+        primitiveSavedId || saved?.zpData?.templateId || saved?.zpData?.greeting?.templateId || saved?.templateId || ""
+      );
+      const target = after.templates?.find((item) =>
+        (responseTemplateId && item.templateId === responseTemplateId) ||
+        (editableTemplateId && item.templateId === editableTemplateId) ||
+        (item.editable && item.text === text)
+      ) || null;
+      if (!target?.templateId) {
+        return {
+          ok: false,
+          error: "BOSS_GREETING_TEXT_NOT_FOUND",
+          message: "BOSS 已响应保存请求，但回读时没有找到新话术。请打开 BOSS 设置页确认"
+        };
+      }
+      if (after.templateId !== target.templateId) {
+        const selectBody = new URLSearchParams();
+        selectBody.set("status", before.enabled ? "1" : "0");
+        selectBody.set("templateId", target.templateId);
+        const selected = await bossGreetingApi("/wapi/zpchat/greeting/updateGreetingV2", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: selectBody.toString()
+        });
+        if (Number(selected?.code) !== 0) {
+          return {
+            ok: false,
+            error: "BOSS_GREETING_TEXT_SELECT_FAILED",
+            message: selected?.message || "话术已保存，但设为当前 BOSS 招呼语失败"
+          };
+        }
+        await sleep(350);
+        after = await getBossGreetingSetting();
+      }
+      if (!after.ok || after.templateId !== target.templateId || String(after.text || "").trim() !== text) {
+        return {
+          ok: false,
+          error: "BOSS_GREETING_TEXT_NOT_CONFIRMED",
+          message: "BOSS 已响应保存请求，但当前话术回读不一致。请打开 BOSS 设置页确认",
+          before,
+          after
+        };
+      }
+      return {
+        ...after,
+        textSaved: true,
+        previousText: before.text || "",
+        created: !editableTemplateId,
+        savedTemplateId: target.templateId
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: "BOSS_GREETING_TEXT_SAVE_FAILED",
+        message: "保存 BOSS 自动招呼话术失败：" + String(error?.message || error)
       };
     }
   }
@@ -3918,6 +4048,8 @@ async function runOpByType(type, payload = {}) {
         return await getBossGreetingSetting();
       case MSG.SET_BOSS_GREETING:
         return await setBossGreetingSetting(payload || {});
+      case MSG.SAVE_BOSS_GREETING_TEXT:
+        return await saveBossGreetingText(payload || {});
       case MSG.SEND_TEXT:
         return await sendText(payload?.text || "", payload || {});
       case MSG.SEND_IMAGE:
