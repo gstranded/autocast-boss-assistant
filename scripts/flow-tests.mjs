@@ -107,6 +107,38 @@ test("message protocol includes list control", () => {
   assert.ok(s.includes("CLOSE_CHAT"));
 });
 
+test("greeting control covers platform receipt, safe pause, account write and readback", () => {
+  const manifest = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
+  const hook = fs.readFileSync("extension/content/page-network-hook.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const planner = fs.readFileSync("extension/shared/message-planner.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  const mainEntry = manifest.content_scripts.find((entry) => entry.world === "MAIN");
+  assert.ok(mainEntry?.js?.includes("content/page-network-hook.js"));
+  assert.equal(mainEntry?.run_at, "document_start");
+  assert.ok(hook.includes("/wapi\\/zpgeek\\/friend\\/add"));
+  assert.ok(hook.includes("showGreeting"));
+  assert.ok(content.includes("/wapi/zpchat/greeting/getGreetingList"));
+  assert.ok(content.includes("/wapi/zpchat/greeting/updateGreetingV2"));
+  assert.ok(content.includes("after.enabled !== enabled"));
+  assert.ok(background.includes("waitForFreshSelfMessages"));
+  assert.ok(background.includes("baselineMessages"));
+  assert.ok(planner.includes("NATIVE_GREETING_UNKNOWN"));
+  assert.ok(background.includes("已暂停以避免重复"));
+  assert.ok(panel.includes("confirmBossGreetingChange"));
+  assert.ok(panel.includes("MSG.SET_BOSS_GREETING"));
+  for (const id of [
+    "bossGreetingToggle",
+    "bossGreetingText",
+    "bossGreetingConfirm",
+    "pluginTextEnabled",
+    "messageFlowPreview"
+  ]) assert.ok(html.includes(`id="${id}"`), `missing ${id}`);
+  assert.ok(html.includes("建议关闭 BOSS 自动招呼"));
+});
+
 test("native greeting skip still works with multi segment", () => {
   const plan = planMessageSegments({
     mode: MESSAGE_MODES.AUTO_DETECT,

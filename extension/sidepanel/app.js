@@ -2,7 +2,7 @@ import { MSG } from '../shared/messaging.js';
 import { parseKeywords, uid } from '../shared/text-utils.js';
 import { reasonText } from '../shared/reason-codes.js';
 import { previewReasonLines } from '../shared/filter-engine.js';
-import { STORAGE_KEYS } from '../shared/constants.js';
+import { MESSAGE_SEGMENT_KINDS, STORAGE_KEYS } from '../shared/constants.js';
 import { mergeResumeImages } from '../shared/resume-images.js';
 import {
   collectDoneJobIds,
@@ -15,7 +15,7 @@ import { HISTORY_STATUS_MAP, filterHistoryRows } from '../shared/history-view.js
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.6";
+const BHT_UI_VERSION = "1.7.7";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -38,7 +38,19 @@ const state = {
   activeProfileId: null,
   draftBindings: [],
   lastCompletionSignalId: '',
-  theme: 'dark'
+  theme: 'dark',
+  bossGreeting: {
+    ok: false,
+    enabled: null,
+    status: 'unknown',
+    templateId: '',
+    text: '',
+    templates: [],
+    syncedAt: 0,
+    loading: false,
+    error: '',
+    pendingEnabled: null
+  }
 };
 
 function applyTheme(theme) {
@@ -320,6 +332,7 @@ function showTab(name) {
   document.querySelectorAll('.panel').forEach((p) => {
     p.classList.toggle('active', p.id === `tab-${name}`);
   });
+  if (name === 'message') syncBossGreeting({ silent: true }).catch(() => {});
 }
 
 function setConn(ok, text) {
@@ -482,8 +495,7 @@ function readFilters() {
 
 function fillSettings(settings) {
   applyTheme(settings.theme || 'dark');
-  $('messageMode').value = settings.messageMode;
-  $('similarityThreshold').value = settings.similarityThreshold;
+  $('pluginTextEnabled').checked = settings.pluginTextEnabled !== false;
   $('autoSendImageResume').checked = Boolean(settings.autoSendImageResume);
   $('autoSendAttachmentResume').checked = Boolean(settings.autoSendAttachmentResume);
   $('resumeSendTiming').value = settings.resumeSendTiming || 'after_text';
@@ -508,8 +520,11 @@ function readSettingsPatch(base) {
   return {
     ...base,
     theme: state.theme,
-    messageMode: $('messageMode').value,
-    similarityThreshold: Number($('similarityThreshold').value || 0.85),
+    messageMode: 'auto_detect',
+    similarityThreshold: Number(base.similarityThreshold || 0.85),
+    pluginTextEnabled: $('pluginTextEnabled')?.checked !== false,
+    strictGreetingGuard: true,
+    nativeGreetingWaitMs: Number(base.nativeGreetingWaitMs || 2600),
     autoSendImageResume: $('autoSendImageResume').checked,
     autoSendAttachmentResume: $('autoSendAttachmentResume').checked,
     resumeSendTiming: $('resumeSendTiming').value,
@@ -530,11 +545,21 @@ function renderSegments(template) {
   const box = $('segments');
   box.innerHTML = '';
   (template.segments || []).forEach((seg, idx) => {
+    const kind = seg.kind === MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+      ? MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+      : MESSAGE_SEGMENT_KINDS.GREETING;
     const div = document.createElement('div');
     div.className = 'seg';
+    div.dataset.kind = kind;
     div.innerHTML = `
       <div class="top">
-        <label class="check"><input type="checkbox" data-en="${seg.id}" ${seg.enabled !== false ? 'checked' : ''}/>启用第 ${idx + 1} 段</label>
+        <div class="seg-main-control">
+          <label class="check"><input type="checkbox" data-en="${seg.id}" ${seg.enabled !== false ? 'checked' : ''}/>第 ${idx + 1} 段</label>
+          <select class="seg-kind" data-kind="${seg.id}" aria-label="第 ${idx + 1} 段消息角色">
+            <option value="greeting" ${kind === MESSAGE_SEGMENT_KINDS.GREETING ? 'selected' : ''}>招呼</option>
+            <option value="supplement" ${kind === MESSAGE_SEGMENT_KINDS.SUPPLEMENT ? 'selected' : ''}>补充</option>
+          </select>
+        </div>
         <button class="btn tiny" data-del="${seg.id}">删除</button>
       </div>
       <textarea rows="3" data-text="${seg.id}"></textarea>
@@ -548,8 +573,23 @@ function renderSegments(template) {
       const id = btn.getAttribute('data-del');
       state.config.messageTemplate.segments = state.config.messageTemplate.segments.filter((s) => s.id !== id);
       renderSegments(state.config.messageTemplate);
+      state.formDirty = true;
+      scheduleAutosave();
     });
   });
+
+  box.querySelectorAll('[data-kind], [data-en], [data-text]').forEach((control) => {
+    const update = () => {
+      const card = control.closest('.seg');
+      const kindSelect = card?.querySelector('[data-kind]');
+      if (card && kindSelect) card.dataset.kind = kindSelect.value;
+      state.formDirty = true;
+      renderMessageFlowPreview();
+    };
+    control.addEventListener('input', update);
+    control.addEventListener('change', update);
+  });
+  renderMessageFlowPreview();
 }
 
 function templateSegmentsSignature(segments = []) {
@@ -557,6 +597,7 @@ function templateSegmentsSignature(segments = []) {
     .map((seg) => [
       String(seg?.id || ''),
       seg?.enabled === false ? '0' : '1',
+      String(seg?.kind || ''),
       String(seg?.text || '')
     ].join('\t'))
     .join('\n');
@@ -567,9 +608,13 @@ function readTemplate(base = {}, opts = {}) {
   for (const seg of base?.segments || []) {
     const en = document.querySelector('[data-en="' + seg.id + '"]');
     const tx = document.querySelector('[data-text="' + seg.id + '"]');
+    const kind = document.querySelector('[data-kind="' + seg.id + '"]');
     map.set(seg.id, {
       ...seg,
       enabled: en ? en.checked : seg.enabled !== false,
+      kind: kind?.value === MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+        ? MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+        : (seg.kind || MESSAGE_SEGMENT_KINDS.GREETING),
       text: tx ? tx.value : (seg.text || '')
     });
   }
@@ -578,7 +623,15 @@ function readTemplate(base = {}, opts = {}) {
     const id = tx.getAttribute('data-text');
     if (!id || map.has(id)) return;
     const en = document.querySelector('[data-en="' + id + '"]');
-    map.set(id, { id, enabled: en ? en.checked : true, text: tx.value || '' });
+    const kind = document.querySelector('[data-kind="' + id + '"]');
+    map.set(id, {
+      id,
+      enabled: en ? en.checked : true,
+      kind: kind?.value === MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+        ? MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+        : MESSAGE_SEGMENT_KINDS.GREETING,
+      text: tx.value || ''
+    });
   });
   const domOrder = Array.from(document.querySelectorAll('#segments [data-text]'))
     .map((el) => el.getAttribute('data-text'))
@@ -600,6 +653,230 @@ function readTemplate(base = {}, opts = {}) {
     version: shouldBump ? prevVersion + 1 : prevVersion,
     segments
   };
+}
+
+function renderBossGreetingControl() {
+  const greeting = state.bossGreeting;
+  const status = $('bossGreetingStatus');
+  const meta = $('bossGreetingMeta');
+  const toggle = $('bossGreetingToggle');
+  const textBox = $('bossGreetingText');
+  const errorBox = $('bossGreetingError');
+  const confirmBox = $('bossGreetingConfirm');
+  const confirmButton = $('btnConfirmBossGreeting');
+  const syncButton = $('btnSyncBossGreeting');
+  if (!status || !meta || !toggle || !textBox) return;
+
+  let cls = 'unknown';
+  let label = '未同步';
+  if (greeting.loading) {
+    label = '同步中…';
+  } else if (greeting.ok && greeting.enabled === true) {
+    cls = 'on';
+    label = '已开启';
+  } else if (greeting.ok && greeting.enabled === false) {
+    cls = 'off';
+    label = '已关闭 · 推荐';
+  } else if (greeting.error) {
+    cls = 'error';
+    label = '同步失败';
+  }
+  status.className = `source-status ${cls}`;
+  status.textContent = label;
+  toggle.disabled = greeting.loading || !greeting.ok;
+  toggle.checked = greeting.pendingEnabled == null
+    ? greeting.enabled === true
+    : greeting.pendingEnabled === true;
+
+  if (greeting.loading) {
+    meta.textContent = '正在读取 BOSS 账号设置…';
+  } else if (greeting.ok) {
+    const synced = greeting.syncedAt
+      ? new Date(greeting.syncedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+      : '刚刚';
+    meta.textContent = `已与 BOSS 账号同步 · ${synced}`;
+  } else {
+    meta.textContent = '尚未取得账号真实状态';
+  }
+
+  const currentText = String(greeting.text || '').trim();
+  textBox.textContent = currentText || (greeting.ok
+    ? (greeting.enabled ? 'BOSS 未返回当前话术，请在官方设置页检查' : '已关闭；平台不会自动发送招呼语')
+    : '同步后显示平台实际话术');
+  textBox.classList.toggle('muted', !currentText);
+
+  if (errorBox) {
+    errorBox.hidden = !greeting.error;
+    errorBox.textContent = greeting.error || '';
+  }
+  if (confirmBox) {
+    const pending = greeting.pendingEnabled;
+    confirmBox.hidden = pending == null;
+    if (pending != null) {
+      $('bossGreetingConfirmTitle').textContent = pending ? '确认开启 BOSS 自动招呼？' : '确认关闭 BOSS 自动招呼？';
+      $('bossGreetingConfirmBody').textContent = pending
+        ? '这是 BOSS 账号全局设置。开启后，插件会识别平台回执并跳过“招呼”段，只继续发送“补充”段。'
+        : '这是 BOSS 账号全局设置。关闭后，由插件按下方模板统一发送招呼与补充内容，可最大限度避免重复。';
+    }
+  }
+  if (confirmButton) confirmButton.disabled = greeting.loading;
+  if (syncButton) syncButton.disabled = greeting.loading;
+  renderMessageFlowPreview();
+}
+
+function getDraftMessageSegments() {
+  const base = state.config?.messageTemplate || { version: 1, segments: [] };
+  try {
+    return readTemplate(base, { bumpVersion: false }).segments || [];
+  } catch (_) {
+    return base.segments || [];
+  }
+}
+
+function appendFlowStep(box, index, label, message, cls = '') {
+  const row = document.createElement('div');
+  row.className = `flow-step ${cls}`.trim();
+  const number = document.createElement('span');
+  number.className = 'flow-step-index';
+  number.textContent = String(index);
+  const content = document.createElement('div');
+  const title = document.createElement('div');
+  title.className = 'flow-step-label';
+  title.textContent = label;
+  const textNode = document.createElement('div');
+  textNode.className = 'flow-step-text';
+  textNode.textContent = message;
+  content.append(title, textNode);
+  row.append(number, content);
+  box.appendChild(row);
+}
+
+function renderMessageFlowPreview() {
+  const box = $('messageFlowPreview');
+  if (!box) return;
+  box.innerHTML = '';
+  const greeting = state.bossGreeting;
+  const pluginEnabled = $('pluginTextEnabled')?.checked !== false;
+  const segments = getDraftMessageSegments().filter((seg) => seg.enabled !== false && String(seg.text || '').trim());
+  let index = 1;
+  let sendCount = 0;
+
+  if (greeting.ok && greeting.enabled === true) {
+    appendFlowStep(box, index++, 'BOSS · 自动招呼', greeting.text || '平台将自动发送当前招呼语', 'native');
+    sendCount += 1;
+  } else if (!greeting.ok) {
+    appendFlowStep(
+      box,
+      index++,
+      '安全检测 · 投递时确认',
+      '先读取平台回执并等待本人新消息；仍无法确认时自动暂停，不会冒险重复发送。',
+      'guard'
+    );
+  }
+
+  if (pluginEnabled) {
+    segments.forEach((segment) => {
+      const kind = segment.kind === MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+        ? MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+        : MESSAGE_SEGMENT_KINDS.GREETING;
+      if (greeting.ok && greeting.enabled === true && kind === MESSAGE_SEGMENT_KINDS.GREETING) return;
+      appendFlowStep(
+        box,
+        index++,
+        kind === MESSAGE_SEGMENT_KINDS.GREETING ? '插件 · 招呼' : '插件 · 补充',
+        String(segment.text || '').trim(),
+        kind
+      );
+      sendCount += 1;
+    });
+  }
+
+  if (sendCount === 0) {
+    appendFlowStep(box, index++, '不会发送文字', pluginEnabled
+      ? '请至少启用一个有内容的消息段。'
+      : '插件文字消息已关闭；BOSS 自动招呼也未开启或状态未知。', 'empty');
+  } else if (!pluginEnabled) {
+    appendFlowStep(box, index, '插件 · 已关闭', '插件不会再追加任何自定义文字。', 'disabled');
+  }
+}
+
+async function syncBossGreeting(options = {}) {
+  const force = options.force === true;
+  const greeting = state.bossGreeting;
+  if (greeting.loading) return;
+  if (!force && greeting.ok && Date.now() - Number(greeting.syncedAt || 0) < 60_000) {
+    renderBossGreetingControl();
+    return;
+  }
+  greeting.loading = true;
+  greeting.error = '';
+  greeting.pendingEnabled = null;
+  renderBossGreetingControl();
+  try {
+    const result = await api(MSG.GET_BOSS_GREETING);
+    Object.assign(greeting, {
+      ...result,
+      ok: true,
+      enabled: result.enabled === true,
+      status: result.enabled ? 'on' : 'off',
+      syncedAt: result.syncedAt || Date.now(),
+      loading: false,
+      error: '',
+      pendingEnabled: null
+    });
+  } catch (error) {
+    greeting.ok = false;
+    greeting.enabled = null;
+    greeting.loading = false;
+    greeting.error = String(error?.message || error || '读取 BOSS 自动招呼设置失败');
+    if (!options.silent) toast(greeting.error, 'error', 5000);
+  }
+  renderBossGreetingControl();
+}
+
+function requestBossGreetingChange(enabled) {
+  if (!state.bossGreeting.ok || state.bossGreeting.loading) {
+    renderBossGreetingControl();
+    return;
+  }
+  if (enabled === state.bossGreeting.enabled) {
+    state.bossGreeting.pendingEnabled = null;
+  } else {
+    state.bossGreeting.pendingEnabled = enabled;
+  }
+  renderBossGreetingControl();
+}
+
+async function confirmBossGreetingChange() {
+  const greeting = state.bossGreeting;
+  const enabled = greeting.pendingEnabled;
+  if (enabled == null || greeting.loading) return;
+  greeting.loading = true;
+  greeting.error = '';
+  renderBossGreetingControl();
+  try {
+    const result = await api(MSG.SET_BOSS_GREETING, {
+      enabled,
+      templateId: greeting.templateId || ''
+    });
+    Object.assign(greeting, {
+      ...result,
+      ok: true,
+      enabled: result.enabled === true,
+      status: result.enabled ? 'on' : 'off',
+      syncedAt: result.syncedAt || Date.now(),
+      loading: false,
+      error: '',
+      pendingEnabled: null
+    });
+    toast(`BOSS 自动招呼已${greeting.enabled ? '开启' : '关闭'}，并完成回读确认`, 'success', 3200);
+  } catch (error) {
+    greeting.loading = false;
+    greeting.pendingEnabled = null;
+    greeting.error = `${String(error?.message || error || '修改失败')}。可点击“打开 BOSS 设置”手动确认。`;
+    toast(greeting.error, 'error', 6000);
+  }
+  renderBossGreetingControl();
 }
 
 function getActiveProfile() {
@@ -1185,6 +1462,7 @@ async function refresh(options = {}) {
     renderResumeEditor();
     renderBindings();
   }
+  renderMessageFlowPreview();
 
   if (!editing && !state.formDirty) {
     renderPreview(res.task);
@@ -1593,6 +1871,32 @@ function bindEvents() {
     btn.addEventListener('click', () => showTab(btn.dataset.tab));
   });
 
+  $('bossGreetingToggle')?.addEventListener('change', (event) => {
+    requestBossGreetingChange(event.target.checked === true);
+  });
+  $('btnCancelBossGreeting')?.addEventListener('click', () => {
+    state.bossGreeting.pendingEnabled = null;
+    renderBossGreetingControl();
+  });
+  $('btnConfirmBossGreeting')?.addEventListener('click', () => {
+    confirmBossGreetingChange().catch((error) => toast(String(error?.message || error), 'error', 5000));
+  });
+  $('btnSyncBossGreeting')?.addEventListener('click', () => {
+    syncBossGreeting({ force: true }).catch((error) => toast(String(error?.message || error), 'error', 5000));
+  });
+  $('btnOpenBossGreetingSettings')?.addEventListener('click', async () => {
+    try {
+      await api(MSG.OPEN_BOSS_GREETING_SETTINGS);
+      toast('已打开 BOSS 招呼语设置', 'success', 2200);
+    } catch (error) {
+      toast(String(error?.message || error), 'error', 5000);
+    }
+  });
+  $('pluginTextEnabled')?.addEventListener('change', () => {
+    state.formDirty = true;
+    renderMessageFlowPreview();
+  });
+
   $('btnSaveFilter').addEventListener('click', async () => {
     try {
       await saveFilters();
@@ -1655,6 +1959,9 @@ function bindEvents() {
     template.segments.push({
       id: 'seg_' + Date.now().toString(36),
       enabled: true,
+      kind: template.segments.some((segment) => segment.kind === MESSAGE_SEGMENT_KINDS.GREETING)
+        ? MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+        : MESSAGE_SEGMENT_KINDS.GREETING,
       text: ''
     });
     state.config.messageTemplate = template;
@@ -1814,7 +2121,10 @@ function bindEvents() {
           };
         })(),
         settings: {
-          messageMode: $('messageMode')?.value || '',
+          messageMode: state.config?.settings?.messageMode || 'auto_detect',
+          pluginTextEnabled: $('pluginTextEnabled')?.checked !== false,
+          bossGreetingEnabled: state.bossGreeting?.enabled,
+          bossGreetingSyncedAt: state.bossGreeting?.syncedAt || 0,
           taskMaxCommunicate: $('taskMaxCommunicate')?.value || '',
           dailyMaxCommunicate: $('dailyMaxCommunicate')?.value || '',
           companyDailyMax: $('companyDailyMax')?.value || '',
@@ -1825,6 +2135,7 @@ function bindEvents() {
         },
         messages: (state.config?.messageTemplate?.segments || []).map((s) => ({
           id: s.id,
+          kind: s.kind || '',
           enabled: s.enabled !== false,
           text: String(s.text || '').slice(0, 80)
         })),

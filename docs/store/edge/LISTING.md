@@ -2,7 +2,7 @@
 
 商店页：https://microsoftedge.microsoft.com/addons/detail/boss-%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod  
 产品 ID：`dgmfdkboghlfdcbgoapehjhjgmldnmod`  
-包：`dist/autocast-boss-haitou-v1.7.6.zip`
+包：`dist/autocast-boss-haitou-v1.7.7.zip`
 商店图：`docs/store/edge/assets/`（按 Partner Center 尺寸出好，见下方对照）
 
 不要新建扩展，只更新这一条 listing。
@@ -73,7 +73,7 @@ AutoCast-Boss海投助手帮你在 BOSS 直聘网页端一键海投：先按规�
 - 一键海投：扫描后批量打招呼，不用逐个手动点
 - 岗位筛选：职位 / 公司 / JD / 地点，支持包含、必须、排除
 - 扫描预览：投之前先看通过和排除原因
-- 自动发消息：多段话术，自动识别是否已打过招呼
+- 自动发消息：同步 BOSS 自动招呼开关，区分招呼/补充话术并防止重复
 - 自动发简历：可点 BOSS「发简历」，或按方案发图片简历
 - 随时可控：暂停、继续、跳过、停止，任务可恢复
 - 数据在本地：筛选、话术、简历和记录保存在你的浏览器里

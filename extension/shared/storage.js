@@ -7,6 +7,7 @@ import {
 } from './constants.js';
 import { deepClone, todayKey, uid } from './text-utils.js';
 import { countResumeImages, normalizeResumes } from './resume-images.js';
+import { normalizeMessageTemplateRoles } from './greeting-policy.js';
 
 async function get(keys) {
   return chrome.storage.local.get(keys);
@@ -50,19 +51,28 @@ export async function ensureDefaults() {
 export async function getAllConfig() {
   await ensureDefaults();
   const data = await get(Object.values(STORAGE_KEYS));
-  const settings = { ...(data[STORAGE_KEYS.SETTINGS] || {}) };
+  const storedSettings = data[STORAGE_KEYS.SETTINGS] || {};
+  const settings = { ...deepClone(DEFAULT_SETTINGS), ...storedSettings };
   if (settings.resumeSendTiming === 'on_request') {
     settings.resumeSendTiming = 'after_text';
+  }
+  if (JSON.stringify(settings) !== JSON.stringify(storedSettings)) {
     await set({ [STORAGE_KEYS.SETTINGS]: settings });
   }
   const resumes = normalizeResumes(data[STORAGE_KEYS.RESUMES]);
   if (countResumeImages(resumes) < countResumeImages(data[STORAGE_KEYS.RESUMES])) {
     await set({ [STORAGE_KEYS.RESUMES]: resumes });
   }
+  const messageTemplate = normalizeMessageTemplateRoles(
+    data[STORAGE_KEYS.MESSAGE_TEMPLATE] || DEFAULT_MESSAGE_TEMPLATE
+  );
+  if (JSON.stringify(messageTemplate) !== JSON.stringify(data[STORAGE_KEYS.MESSAGE_TEMPLATE])) {
+    await set({ [STORAGE_KEYS.MESSAGE_TEMPLATE]: messageTemplate });
+  }
   return {
     settings,
     filters: data[STORAGE_KEYS.FILTERS],
-    messageTemplate: data[STORAGE_KEYS.MESSAGE_TEMPLATE],
+    messageTemplate,
     resumes,
     bindings: data[STORAGE_KEYS.BINDINGS],
     lists: data[STORAGE_KEYS.LISTS],
@@ -83,7 +93,7 @@ export async function saveFilters(filters) {
 }
 
 export async function saveMessageTemplate(template) {
-  await set({ [STORAGE_KEYS.MESSAGE_TEMPLATE]: template });
+  await set({ [STORAGE_KEYS.MESSAGE_TEMPLATE]: normalizeMessageTemplateRoles(template) });
 }
 
 export async function saveResumes(resumes) {

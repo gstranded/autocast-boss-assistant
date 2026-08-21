@@ -2,13 +2,17 @@ import assert from "assert";
 import { evaluateJob, summarizePreview, previewReasonLines } from "../extension/shared/filter-engine.js";
 import { isSimilar, parseSalaryRange, normalizeText, parseKeywords } from "../extension/shared/text-utils.js";
 import { planMessageSegments } from "../extension/shared/message-planner.js";
-import { MESSAGE_MODES } from "../extension/shared/constants.js";
+import { MESSAGE_MODES, MESSAGE_SEGMENT_KINDS, STORAGE_KEYS } from "../extension/shared/constants.js";
+import {
+  NATIVE_GREETING_STATES,
+  normalizeMessageTemplateRoles,
+  resolveNativeGreetingEvidence
+} from "../extension/shared/greeting-policy.js";
 import { checkDedup, checkLimits, segmentIdempotencyKey, jobIdempotencyKey } from "../extension/shared/dedup.js";
 import { renderTemplate, pickResumeProfile } from "../extension/shared/template.js";
 import { filterHistoryRows } from "../extension/shared/history-view.js";
 import { planResumeSend } from "../extension/shared/resume-policy.js";
 import { buildExportPayload, importConfigPatch, IMPORT_CONFIG_KEYS } from "../extension/shared/storage.js";
-import { STORAGE_KEYS } from "../extension/shared/constants.js";
 import { isBossUrl, isBossHostname, isBossTab, bossUrlGuardMessage } from "../extension/shared/boss-url.js";
 import {
   didContentDocumentChange,
@@ -325,6 +329,101 @@ test("auto detect skips first segment", () => {
   assert.equal(plan.plan.length, 1);
 });
 
+test("platform greeting receipt skips greeting roles but keeps supplements", () => {
+  const evidence = resolveNativeGreetingEvidence({
+    platformReceipt: { showGreeting: true, text: "平台实际发送的话术，与插件模板不同" },
+    settingSnapshot: { enabled: false }
+  });
+  assert.equal(evidence.state, NATIVE_GREETING_STATES.SENT);
+  assert.equal(evidence.source, "friend_add_receipt");
+  const plan = planMessageSegments({
+    mode: MESSAGE_MODES.AUTO_DETECT,
+    template: {
+      version: 4,
+      segments: [
+        { id: "hello", kind: MESSAGE_SEGMENT_KINDS.GREETING, enabled: true, text: "插件招呼" },
+        { id: "extra", kind: MESSAGE_SEGMENT_KINDS.SUPPLEMENT, enabled: true, text: "插件补充" }
+      ]
+    },
+    job: { jobId: "receipt-1", bossId: "boss-1" },
+    nativeGreetingState: evidence.state
+  });
+  assert.equal(plan.nativeDetected, true);
+  assert.deepEqual(plan.plan.map((step) => step.kind), [MESSAGE_SEGMENT_KINDS.SUPPLEMENT]);
+  assert.equal(plan.plan[0].text, "插件补充");
+});
+
+test("explicit no-greeting receipt sends greeting and supplement roles", () => {
+  const evidence = resolveNativeGreetingEvidence({
+    platformReceipt: { showGreeting: false },
+    settingSnapshot: { enabled: true }
+  });
+  assert.equal(evidence.state, NATIVE_GREETING_STATES.NOT_SENT);
+  const plan = planMessageSegments({
+    template: {
+      version: 1,
+      segments: [
+        { id: "hello", kind: "greeting", enabled: true, text: "你好" },
+        { id: "extra", kind: "supplement", enabled: true, text: "补充" }
+      ]
+    },
+    job: { jobId: "receipt-2" },
+    nativeGreetingState: evidence.state
+  });
+  assert.deepEqual(plan.plan.map((step) => step.text), ["你好", "补充"]);
+});
+
+test("fresh own bubble is accepted independently of template similarity", () => {
+  const evidence = resolveNativeGreetingEvidence({
+    settingSnapshot: { enabled: false },
+    freshSelfMessages: ["系统自动发送了一段完全不同的内容"]
+  });
+  assert.equal(evidence.state, NATIVE_GREETING_STATES.SENT);
+  assert.equal(evidence.source, "fresh_self_message");
+});
+
+test("unknown native greeting blocks templates containing a greeting role", () => {
+  const plan = planMessageSegments({
+    template: { version: 1, segments: [{ id: "hello", kind: "greeting", enabled: true, text: "你好" }] },
+    job: { jobId: "unknown-1" },
+    nativeGreetingState: NATIVE_GREETING_STATES.UNKNOWN,
+    strictUnknown: true
+  });
+  assert.equal(plan.blocked, true);
+  assert.equal(plan.blockReason, "NATIVE_GREETING_UNKNOWN");
+  assert.equal(plan.plan.length, 0);
+});
+
+test("unknown greeting state still permits supplements-only templates", () => {
+  const plan = planMessageSegments({
+    template: { version: 1, segments: [{ id: "extra", kind: "supplement", enabled: true, text: "补充" }] },
+    job: { jobId: "unknown-2" },
+    nativeGreetingState: NATIVE_GREETING_STATES.UNKNOWN,
+    strictUnknown: true
+  });
+  assert.equal(plan.blocked, false);
+  assert.equal(plan.plan.length, 1);
+});
+
+test("legacy templates migrate first segment to greeting and the rest to supplements", () => {
+  const migrated = normalizeMessageTemplateRoles({
+    version: 2,
+    segments: [{ id: "old-1", text: "第一段" }, { id: "old-2", text: "第二段" }]
+  });
+  assert.deepEqual(migrated.segments.map((segment) => segment.kind), ["greeting", "supplement"]);
+});
+
+test("plugin text master switch suppresses every plugin segment", () => {
+  const plan = planMessageSegments({
+    template: { version: 1, segments: [{ id: "hello", kind: "greeting", text: "你好" }] },
+    job: { jobId: "off-1" },
+    nativeGreetingState: NATIVE_GREETING_STATES.NOT_SENT,
+    pluginTextEnabled: false
+  });
+  assert.equal(plan.blocked, false);
+  assert.equal(plan.plan.length, 0);
+});
+
 test("resume images are deduplicated by content", () => {
   const imageA = { name: "resume.png", dataUrl: "data:image/png;base64,AAA" };
   const imageB = { name: "resume-2.png", dataUrl: "data:image/png;base64,BBB" };
@@ -566,8 +665,12 @@ test("manifest version + hosts", () => {
   const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
   assert.equal(m.version, pkg.version);
   assert.ok(m.host_permissions.some((h) => h.includes("zhipin.com")));
-  assert.ok(m.content_scripts[0].matches.every((h) => h.includes("zhipin.com") || h.includes("bosszhipin.com")));
-  assert.equal(m.content_scripts[0].js[0], "shared/conversation-match.js");
+  assert.ok(m.content_scripts.every((entry) => entry.matches.every((h) => h.includes("zhipin.com") || h.includes("bosszhipin.com"))));
+  const mainHook = m.content_scripts.find((entry) => entry.world === "MAIN");
+  const isolated = m.content_scripts.find((entry) => !entry.world || entry.world === "ISOLATED");
+  assert.equal(mainHook?.run_at, "document_start");
+  assert.ok(mainHook?.js?.includes("content/page-network-hook.js"));
+  assert.equal(isolated?.js?.[0], "shared/conversation-match.js");
 });
 test("UI exposes themes, help tips and filter switches", () => {
   const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");

@@ -24,6 +24,10 @@ import {
 import { evaluateJob, summarizePreview } from '../shared/filter-engine.js';
 import { checkDedup, checkLimits, jobIdempotencyKey, resumeIdempotencyKey } from '../shared/dedup.js';
 import { planMessageSegments } from '../shared/message-planner.js';
+import {
+  NATIVE_GREETING_STATES,
+  resolveNativeGreetingEvidence
+} from '../shared/greeting-policy.js';
 import { pickResumeProfile } from '../shared/template.js';
 import { planResumeSend } from '../shared/resume-policy.js';
 import { REASON, reasonText } from '../shared/reason-codes.js';
@@ -300,6 +304,16 @@ async function getActiveBossTab({ allowInactiveBossTab = false, sender = null } 
 }
 
 async function forceInjectContent(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content/page-network-hook.js"],
+      world: "MAIN",
+      injectImmediately: true
+    });
+  } catch (_) {
+    // 受限页面可能拒绝 MAIN world；隔离世界仍可继续走设置与 DOM 兜底。
+  }
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
@@ -690,6 +704,8 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     MSG.SEND_TEXT,
     MSG.SEND_IMAGE,
     MSG.SEND_RESUME,
+    MSG.GET_BOSS_GREETING,
+    MSG.SET_BOSS_GREETING,
     MSG.SCAN_JOBS,
     MSG.RETURN_TO_LIST,
     MSG.CLOSE_CHAT,
@@ -1273,6 +1289,58 @@ async function waitWhilePaused() {
   }
 }
 
+async function syncTaskBossGreeting(task, tabOpt, { force = false } = {}) {
+  const cached = task?.bossGreetingSnapshot;
+  if (!force && cached?.ok && Date.now() - Number(cached.syncedAt || 0) < 3 * 60 * 1000) {
+    return cached;
+  }
+  const result = await sendToBoss(MSG.GET_BOSS_GREETING, {}, tabOpt);
+  if (result?.ok) {
+    task.bossGreetingSnapshot = {
+      ok: true,
+      enabled: result.enabled === true,
+      status: result.enabled === true ? 'on' : 'off',
+      templateId: result.templateId || '',
+      text: result.text || '',
+      syncedAt: result.syncedAt || Date.now(),
+      source: result.source || 'boss-api'
+    };
+    task.bossGreetingError = '';
+  } else {
+    task.bossGreetingError = result?.message || result?.error || '无法读取 BOSS 自动招呼状态';
+  }
+  task.updatedAt = Date.now();
+  await publishTask(task);
+  return result;
+}
+
+async function waitForFreshSelfMessages(tabOpt, baselineMessages = [], timeoutMs = 2600) {
+  const started = Date.now();
+  const baseline = (baselineMessages || []).map((message) => String(message || '').trim()).filter(Boolean);
+  const baselineKey = JSON.stringify(baseline);
+  let latest = baseline;
+  while (Date.now() - started < timeoutMs) {
+    const result = await sendToBoss(MSG.GET_CHAT_SELF_MESSAGES, { limit: 8 }, tabOpt);
+    if (operationAborted(result)) return [];
+    latest = (result?.messages || []).map((message) => String(message || '').trim()).filter(Boolean);
+    if (JSON.stringify(latest) !== baselineKey) {
+      const baselineCount = new Map();
+      baseline.forEach((message) => baselineCount.set(message, (baselineCount.get(message) || 0) + 1));
+      const fresh = latest.filter((message) => {
+        const remaining = baselineCount.get(message) || 0;
+        if (remaining > 0) {
+          baselineCount.set(message, remaining - 1);
+          return false;
+        }
+        return true;
+      });
+      return fresh.length ? fresh : latest.slice(-1);
+    }
+    await sleep(250);
+  }
+  return [];
+}
+
 async function processOneJob(task, resultRow, config) {
   if (runner.abort) return 'aborted';
   const job = { ...resultRow.job };
@@ -1398,6 +1466,8 @@ async function processOneJob(task, resultRow, config) {
   if (runner.abort) return 'aborted';
   const msgTabId = messageTab.id;
   const msgOpt = { tabId: msgTabId, forceInject: true };
+  // 每个岗位都校验缓存；从安全暂停恢复时也会在消息页重新读取，避免因旧失败快照反复暂停。
+  await syncTaskBossGreeting(task, msgOpt);
 
   let beforeSnap = resumedFromChat
     ? { ok: true, keys: item.beforeConversationKeys || [], count: item.beforeConversationCount || 0 }
@@ -1469,6 +1539,7 @@ async function processOneJob(task, resultRow, config) {
       already: Boolean(trig.already),
       buttonText: trig.buttonText || '',
       stayed: Boolean(trig.stayed),
+      nativeGreeting: trig.nativeGreeting || null,
       contentVersion: trig.contentVersion || ''
     };
     resultRow.job = job;
@@ -1668,7 +1739,40 @@ async function processOneJob(task, resultRow, config) {
   // messages
   const selfRes = await sendToBoss(MSG.GET_CHAT_SELF_MESSAGES, { limit: 8 }, tabOpt);
   if (operationAborted(selfRes)) return 'aborted';
-  const recentSelfMessages = selfRes?.messages || [];
+  let recentSelfMessages = selfRes?.messages || [];
+  const platformReceipt = trig?.nativeGreeting || item.triggerReceipt?.nativeGreeting || null;
+  const settingSnapshot = task.bossGreetingSnapshot?.ok ? task.bossGreetingSnapshot : null;
+  let nativeEvidence = resolveNativeGreetingEvidence({
+    platformReceipt,
+    settingSnapshot,
+    alreadyContacted: Boolean(trig?.already),
+    freshSelfMessages: []
+  });
+  if (
+    nativeEvidence.state === NATIVE_GREETING_STATES.UNKNOWN &&
+    config.settings.pluginTextEnabled !== false &&
+    !trig?.already
+  ) {
+    recentSelfMessages = await waitForFreshSelfMessages(
+      tabOpt,
+      recentSelfMessages,
+      Number(config.settings.nativeGreetingWaitMs || 2600)
+    );
+    nativeEvidence = resolveNativeGreetingEvidence({
+      platformReceipt,
+      settingSnapshot,
+      alreadyContacted: false,
+      freshSelfMessages: recentSelfMessages
+    });
+  }
+  item.nativeGreetingEvidence = nativeEvidence;
+  task.nativeGreetingEvidence = nativeEvidence;
+  await log(
+    nativeEvidence.state === NATIVE_GREETING_STATES.UNKNOWN ? 'warn' : 'info',
+    '原生招呼判断：' + nativeEvidence.state + ' via=' + nativeEvidence.source +
+      (nativeEvidence.text ? (' · ' + nativeEvidence.text.slice(0, 60)) : ''),
+    { jobId: job.jobId, nativeEvidence, platformReceipt, settingSnapshot }
+  );
   const plan = planMessageSegments({
     mode: config.settings.messageMode,
     template: config.messageTemplate,
@@ -1679,12 +1783,27 @@ async function processOneJob(task, resultRow, config) {
     },
     recentSelfMessages,
     threshold: config.settings.similarityThreshold,
-    idempotency
+    idempotency,
+    nativeGreetingState: nativeEvidence.state,
+    strictUnknown: config.settings.strictGreetingGuard !== false,
+    pluginTextEnabled: config.settings.pluginTextEnabled !== false
   });
 
+  if (plan.blocked) {
+    item.state = 'PAUSED';
+    item.reasons = ['无法确认 BOSS 是否已发送自动招呼，已暂停以避免重复。请同步 BOSS 招呼状态后重试'];
+    runner.pause = true;
+    task.status = TASK_STATUS.PAUSED;
+    task.awaitingUserRetry = true;
+    task.pauseReason = item.reasons[0];
+    task.lastErrorDetail = '岗位：' + (job.title || '') + ' @ ' + (job.company || '') + '\n判断来源：' + nativeEvidence.source;
+    await publishTask(task);
+    await log('warn', item.reasons[0], { jobId: job.jobId, nativeEvidence });
+    return 'limited';
+  }
   if (plan.nativeDetected) {
     item.state = 'NATIVE_GREETING_DETECTED';
-    await log('info', '检测到原生/已发打招呼，跳过第一段', { jobId: job.jobId });
+    await log('info', '检测到 BOSS 已发送招呼，跳过插件招呼段，仅发送补充段', { jobId: job.jobId, nativeEvidence });
   }
   if (!plan.plan?.length) {
     await log('warn', '没有待发送的消息段（可能都被跳过或模板为空），将继续尝试简历发送', { jobId: job.jobId });
@@ -2066,8 +2185,15 @@ async function runTaskLoop(taskId) {
         if (task?.queue) {
           const q = task.queue.find((x) => x.jobId === row.job?.jobId);
           if (q) {
-            q.status = outcome === 'success' ? 'done' : outcome === 'skipped' ? 'skipped' : 'failed';
-            q.finishedAt = Date.now();
+            q.status = outcome === 'success'
+              ? 'done'
+              : outcome === 'skipped'
+                ? 'skipped'
+                : outcome === 'limited' || outcome === 'aborted'
+                  ? 'pending'
+                  : 'failed';
+            if (q.status === 'pending') delete q.finishedAt;
+            else q.finishedAt = Date.now();
             q.outcome = outcome;
           }
           // 一份一份投：成功/跳过/失败都记入已投，避免下一轮又点回同一岗
@@ -2139,14 +2265,14 @@ async function runTaskLoop(taskId) {
         break;
       }
 
+      if (outcome === 'limited') break;
+      if (outcome === 'aborted') break;
+
       // 双页模式：工作页直接打开下一岗 href，正常路径不再 RETURN_TO_LIST
       // （失败暂停时 while 里仍会尝试回列表，便于用户操作）
       task.counters.processed += 1;
       task.updatedAt = Date.now();
       await publishTask(task);
-
-      if (outcome === 'limited') break;
-      if (outcome === 'aborted') break;
 
       if (task.consecutiveFails >= (config.settings.consecutiveFailPause || 3)) {
         task.status = TASK_STATUS.PAUSED;
@@ -2225,6 +2351,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   let { payload } = message || {};
   (async () => {
     switch (type) {
+      case MSG.GET_BOSS_GREETING: {
+        const guard = await assertBossContext(sender);
+        if (!guard.ok) return guard;
+        return await sendToBoss(MSG.GET_BOSS_GREETING, {}, { tabId: guard.tab.id });
+      }
+      case MSG.SET_BOSS_GREETING: {
+        const guard = await assertBossContext(sender);
+        if (!guard.ok) return guard;
+        const result = await sendToBoss(MSG.SET_BOSS_GREETING, payload || {}, { tabId: guard.tab.id });
+        await log(result?.ok ? 'success' : 'error', result?.ok
+          ? ('BOSS 自动招呼已' + (result.enabled ? '开启' : '关闭') + '并完成回验')
+          : (result?.message || '修改 BOSS 自动招呼失败'));
+        if (result?.ok) {
+          const all = await getAllConfig();
+          if (all.task) {
+            all.task.bossGreetingSnapshot = {
+              ok: true,
+              enabled: result.enabled === true,
+              status: result.enabled ? 'on' : 'off',
+              templateId: result.templateId || '',
+              text: result.text || '',
+              syncedAt: result.syncedAt || Date.now(),
+              source: result.source || 'boss-api'
+            };
+            await publishTask(all.task);
+          }
+        }
+        return result;
+      }
+      case MSG.OPEN_BOSS_GREETING_SETTINGS: {
+        const tab = await chrome.tabs.create({
+          url: 'https://www.zhipin.com/web/geek/notify-set?type=greetSet',
+          active: true
+        });
+        return { ok: true, tabId: tab?.id || null, url: tab?.url || '' };
+      }
       case MSG.GET_STATE: {
         const all = await getAllConfig();
         const tab = await getActiveBossTab({ sender });

@@ -21,6 +21,11 @@ export const MESSAGE_MODES = {
   AUTO_DETECT: 'auto_detect'
 };
 
+export const MESSAGE_SEGMENT_KINDS = {
+  GREETING: 'greeting',
+  SUPPLEMENT: 'supplement'
+};
+
 export const TASK_STATUS = {
   AWAITING_CONFIRM: 'awaiting_confirm',
   RUNNING: 'running',
@@ -46,6 +51,9 @@ export const ITEM_STATE = {
 export const DEFAULT_SETTINGS = {
   theme: 'dark',
   messageMode: MESSAGE_MODES.AUTO_DETECT,
+  pluginTextEnabled: true,
+  strictGreetingGuard: true,
+  nativeGreetingWaitMs: 2600,
   similarityThreshold: 0.85,
   segmentIntervalMs: [1800, 3200],
   jobIntervalMs: [4000, 6000], // 投递间隔：基准 5 秒 → 4~6 秒随机
@@ -105,11 +113,13 @@ export const DEFAULT_MESSAGE_TEMPLATE = {
     {
       id: 'seg_1',
       enabled: true,
+      kind: MESSAGE_SEGMENT_KINDS.GREETING,
       text: '您好，我对{职位名称}很感兴趣，希望能进一步沟通。'
     },
     {
       id: 'seg_2',
       enabled: true,
+      kind: MESSAGE_SEGMENT_KINDS.SUPPLEMENT,
       text: '我具备相关项目经验，方便的话可以看看我的背景，期待您的回复。'
     }
   ]

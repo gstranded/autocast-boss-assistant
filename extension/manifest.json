@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "__MSG_extName__",
   "description": "__MSG_extDesc__",
-  "version": "1.7.6",
+  "version": "1.7.7",
   "default_locale": "zh_CN",
   "icons": {
     "16": "assets/icons/icon16.png",
@@ -37,6 +37,19 @@
     "*://bosszhipin.com/*"
   ],
   "content_scripts": [
+    {
+      "matches": [
+        "*://*.zhipin.com/*",
+        "*://zhipin.com/*",
+        "*://*.bosszhipin.com/*",
+        "*://bosszhipin.com/*"
+      ],
+      "js": [
+        "content/page-network-hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
     {
       "matches": [
         "*://*.zhipin.com/*",

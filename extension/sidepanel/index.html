@@ -208,15 +208,60 @@
 
         <!-- MESSAGE -->
         <section class="panel" id="tab-message">
-          <div class="card">
-            <div class="card-title" data-help-title="发送模式" data-help="自动识别会检查最近本人消息，避免重复发送第一段；原生打招呼模式固定跳过第一段；插件模式发送全部启用段落。">发送模式</div>
-            <select id="messageMode">
-              <option value="auto_detect">C. 自动识别（推荐）</option>
-              <option value="native_plus">A. 使用原生打招呼 + 插件补充</option>
-              <option value="plugin_only">B. 完全由插件发送</option>
-            </select>
-            <label data-help-title="相似度阈值" data-help="越低越容易把两段文字判定为相似并跳过首段；越高要求越接近。默认 0.85。">相似度阈值（0.5-1）</label>
-            <input id="similarityThreshold" type="number" min="0.5" max="1" step="0.01" />
+          <div class="card greeting-control-card">
+            <div class="card-title row">
+              <span><span class="source-logo boss">B</span>BOSS 自动招呼</span>
+              <span id="bossGreetingStatus" class="source-status unknown">未同步</span>
+            </div>
+            <div class="recommend-banner">
+              <span class="recommend-icon">✓</span>
+              <div>
+                <strong>建议关闭 BOSS 自动招呼</strong>
+                <div>由插件统一发送招呼和补充内容，顺序更可控，也最不容易重复。</div>
+              </div>
+            </div>
+            <div class="source-control-row">
+              <div>
+                <div class="source-label">账号全局开关</div>
+                <div id="bossGreetingMeta" class="source-meta">正在读取 BOSS 设置…</div>
+              </div>
+              <label class="switch source-switch" title="此开关会同步修改 BOSS 账号设置">
+                <input id="bossGreetingToggle" type="checkbox" disabled />
+                <span></span>
+              </label>
+            </div>
+            <div class="source-message-box">
+              <div class="source-message-label">BOSS 当前话术</div>
+              <div id="bossGreetingText" class="source-message-text muted">同步后显示平台实际话术</div>
+            </div>
+            <div id="bossGreetingError" class="source-error" hidden></div>
+            <div id="bossGreetingConfirm" class="source-confirm" hidden>
+              <strong id="bossGreetingConfirmTitle"></strong>
+              <div id="bossGreetingConfirmBody" class="source-confirm-body"></div>
+              <div class="btn-row">
+                <button type="button" id="btnCancelBossGreeting" class="btn tiny">取消</button>
+                <button type="button" id="btnConfirmBossGreeting" class="btn tiny primary">确认</button>
+              </div>
+            </div>
+            <div class="btn-row source-actions">
+              <button type="button" id="btnSyncBossGreeting" class="btn tiny">同步状态</button>
+              <button type="button" id="btnOpenBossGreetingSettings" class="btn tiny">打开 BOSS 设置</button>
+            </div>
+          </div>
+
+          <div class="card plugin-source-card">
+            <div class="card-title row">
+              <span><span class="source-logo plugin">A</span>插件消息</span>
+              <label class="switch" title="关闭后插件不发送任何文字消息">
+                <input id="pluginTextEnabled" type="checkbox" />
+                <span></span>
+              </label>
+            </div>
+            <div class="source-meta">平台状态不明确时，插件会先等待新的本人消息；仍无法确认则安全暂停，不会冒险重复发送。</div>
+            <div class="flow-preview">
+              <div class="flow-preview-title">预计发送顺序</div>
+              <div id="messageFlowPreview" class="flow-preview-list"></div>
+            </div>
             <div class="hint">变量：{HR称呼} {职位名称} {公司名称} {匹配技能} {工作城市}</div>
           </div>
           <div class="card">

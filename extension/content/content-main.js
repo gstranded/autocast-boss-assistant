@@ -8,6 +8,8 @@
     WAIT_OPEN_CONVERSATION: "BHT_WAIT_OPEN_CONVERSATION",
     WAIT_CHAT_EDITOR: "BHT_WAIT_CHAT_EDITOR",
     GET_CHAT_SELF_MESSAGES: "BHT_GET_CHAT_SELF_MESSAGES",
+    GET_BOSS_GREETING: "BHT_GET_BOSS_GREETING",
+    SET_BOSS_GREETING: "BHT_SET_BOSS_GREETING",
     SEND_TEXT: "BHT_SEND_TEXT",
     SEND_IMAGE: "BHT_SEND_IMAGE",
     SEND_RESUME: "BHT_SEND_RESUME",
@@ -21,7 +23,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.6";
+  const BHT_CONTENT_VERSION = "1.7.7";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -40,6 +42,23 @@
   window.__BHT_OP_CANCELLED__ = Object.create(null);
   window.__BHT_ACTIVE_OP_ID__ = null;
   window.__BHT_CONTENT_LOADED__ = true;
+  const nativeGreetingReceipts = [];
+  window.addEventListener("message", (event) => {
+    if (event.source !== window || event.origin !== location.origin) return;
+    const data = event.data;
+    if (!data || data.source !== "bht-page-network-hook" || data.type !== "friend-add-receipt") return;
+    nativeGreetingReceipts.push({
+      at: Number(data.at || Date.now()),
+      jobId: String(data.jobId || ""),
+      ok: data.ok === true,
+      code: Number(data.code),
+      hasShowGreeting: data.hasShowGreeting === true,
+      showGreeting: data.hasShowGreeting === true ? data.showGreeting === true : null,
+      greeting: String(data.greeting || "")
+    });
+    if (nativeGreetingReceipts.length > 30) nativeGreetingReceipts.splice(0, nativeGreetingReceipts.length - 30);
+    debugTrace("friend_add_receipt", nativeGreetingReceipts[nativeGreetingReceipts.length - 1]);
+  });
 
   function isBossHost(hostname) {
     const host = String(hostname || "").toLowerCase();
@@ -501,6 +520,134 @@ const SELECTORS = {
       if (opId && window.__BHT_OP_CANCELLED__?.[opId]) reject(operationCancelledError(opId));
       else resolve();
     }, ms));
+  }
+
+  async function bossGreetingApi(path, options = {}) {
+    const url = new URL(path, location.origin);
+    if (!isBossHost(url.hostname)) throw new Error("BOSS_GREETING_BAD_ORIGIN");
+    const response = await fetch(url.href, {
+      credentials: "include",
+      cache: "no-store",
+      ...options,
+      headers: {
+        "X-Requested-With": "XMLHttpRequest",
+        ...(options.headers || {})
+      }
+    });
+    if (!response.ok) throw new Error("BOSS_GREETING_HTTP_" + response.status);
+    return response.json();
+  }
+
+  function normalizeBossGreetingResponse(payload) {
+    const zpData = payload?.zpData || {};
+    const greeting = zpData.greeting || {};
+    const templates = (zpData.greetingTemplateList || []).map((item) => ({
+      templateId: String(item?.templateId || ""),
+      text: String(item?.demo || item?.content || "").trim(),
+      category: item?.category ?? null,
+      greetingType: item?.greetingType ?? null
+    })).filter((item) => item.templateId || item.text);
+    const templateId = String(greeting?.templateId || "");
+    const current = templates.find((item) => item.templateId === templateId) || null;
+    const enabled = Number(greeting?.status || 0) === 1;
+    return {
+      ok: true,
+      enabled,
+      status: enabled ? "on" : "off",
+      templateId,
+      text: String(current?.text || greeting?.demo || greeting?.content || "").trim(),
+      templates,
+      syncedAt: Date.now(),
+      source: "boss-api"
+    };
+  }
+
+  async function getBossGreetingSetting() {
+    try {
+      const payload = await bossGreetingApi("/wapi/zpchat/greeting/getGreetingList?_=" + Date.now());
+      if (Number(payload?.code) === 7) {
+        return { ok: false, error: "LOGIN_REQUIRED", message: payload?.message || "请先登录 BOSS 直聘" };
+      }
+      if (Number(payload?.code) !== 0) {
+        return { ok: false, error: "BOSS_GREETING_READ_FAILED", message: payload?.message || "读取 BOSS 自动招呼设置失败" };
+      }
+      return normalizeBossGreetingResponse(payload);
+    } catch (error) {
+      return {
+        ok: false,
+        error: "BOSS_GREETING_READ_FAILED",
+        message: "读取 BOSS 自动招呼设置失败：" + String(error?.message || error)
+      };
+    }
+  }
+
+  async function setBossGreetingSetting(payload = {}) {
+    const enabled = payload.enabled === true;
+    const before = await getBossGreetingSetting();
+    if (!before.ok) return before;
+    const templateId = String(payload.templateId || before.templateId || before.templates?.[0]?.templateId || "");
+    if (enabled && !templateId) {
+      return {
+        ok: false,
+        error: "BOSS_GREETING_TEMPLATE_REQUIRED",
+        message: "BOSS 当前没有可启用的招呼语模板，请先在 BOSS 设置页添加话术"
+      };
+    }
+    try {
+      const body = new URLSearchParams();
+      body.set("status", enabled ? "1" : "0");
+      body.set("templateId", templateId);
+      const result = await bossGreetingApi("/wapi/zpchat/greeting/updateGreetingV2", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: body.toString()
+      });
+      if (Number(result?.code) !== 0) {
+        return { ok: false, error: "BOSS_GREETING_WRITE_FAILED", message: result?.message || "修改 BOSS 自动招呼设置失败" };
+      }
+      await sleep(350);
+      const after = await getBossGreetingSetting();
+      if (!after.ok || after.enabled !== enabled) {
+        return {
+          ok: false,
+          error: "BOSS_GREETING_WRITE_NOT_CONFIRMED",
+          message: "BOSS 已响应设置请求，但回读状态不一致。请打开 BOSS 设置页确认",
+          before,
+          after
+        };
+      }
+      return { ...after, changed: before.enabled !== after.enabled, previousEnabled: before.enabled };
+    } catch (error) {
+      return {
+        ok: false,
+        error: "BOSS_GREETING_WRITE_FAILED",
+        message: "修改 BOSS 自动招呼设置失败：" + String(error?.message || error)
+      };
+    }
+  }
+
+  function findNativeGreetingReceipt(job = {}, afterTs = 0) {
+    const ids = [job.jobId, job.encryptJobId].map((value) => String(value || "")).filter(Boolean);
+    const rows = nativeGreetingReceipts.filter((row) => row.at >= afterTs && row.ok !== false);
+    return rows.slice().reverse().find((row) => !row.jobId || !ids.length || ids.includes(row.jobId)) || null;
+  }
+
+  async function waitForNativeGreetingReceipt(job = {}, afterTs = 0, timeoutMs = 1800) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      const receipt = findNativeGreetingReceipt(job, afterTs);
+      if (receipt) {
+        return {
+          available: true,
+          showGreeting: receipt.hasShowGreeting ? receipt.showGreeting : null,
+          text: receipt.greeting || "",
+          source: "friend-add-response",
+          at: receipt.at
+        };
+      }
+      await sleep(100);
+    }
+    return { available: false, showGreeting: null, text: "", source: "no-friend-add-receipt" };
   }
 
   function textOf(el) {
@@ -3048,6 +3195,7 @@ async function startChat(job, opts = {}) {
 
       // 点立即沟通 / 继续沟通（详情区优先）
       let clicked = { ok: false };
+      const nativeReceiptStartedAt = Date.now();
       for (let i = 0; i < 14; i++) {
         const scope =
           firstEl(SELECTORS.detailRoot) ||
@@ -3111,6 +3259,9 @@ async function startChat(job, opts = {}) {
       debugTrace("trigger_stay_on_list_dialog", { result: stay, page: pageInfo() }, stay.ok ? "debug" : "warn");
       // 再关一次常见弹层
       dismissCommonDialogs();
+      const nativeGreeting = clicked.already
+        ? { available: false, showGreeting: null, text: "", source: "already-contacted" }
+        : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 1600);
 
       const triggerResult = {
         ok: true,
@@ -3118,6 +3269,7 @@ async function startChat(job, opts = {}) {
         buttonText: clicked.buttonText,
         already: Boolean(clicked.already),
         stayed: Boolean(stay.ok),
+        nativeGreeting,
         stayText: stay.text || "",
         detailTitle: detailTitle || "",
         hrName: (typeof extractDetailHrName === "function" ? extractDetailHrName() : "") || job.hrName || job.bossName || "",
@@ -3762,6 +3914,10 @@ async function runOpByType(type, payload = {}) {
       case MSG.GET_CHAT_SELF_MESSAGES:
         await waitForChat(8000);
         return { ok: true, messages: getSelfMessages(payload?.limit || 8) };
+      case MSG.GET_BOSS_GREETING:
+        return await getBossGreetingSetting();
+      case MSG.SET_BOSS_GREETING:
+        return await setBossGreetingSetting(payload || {});
       case MSG.SEND_TEXT:
         return await sendText(payload?.text || "", payload || {});
       case MSG.SEND_IMAGE:

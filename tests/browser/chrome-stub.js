@@ -27,6 +27,9 @@
       theme: "dark",
       messageMode: "auto_detect",
       similarityThreshold: 0.85,
+      pluginTextEnabled: true,
+      strictGreetingGuard: true,
+      nativeGreetingWaitMs: 2600,
       taskMaxCommunicate: 1,
       dailyMaxCommunicate: 80,
       companyDailyMax: 3,
@@ -67,9 +70,19 @@
     messageTemplate: {
       version: 1,
       segments: [
-        { id: "seg_1", enabled: true, text: "您好，我对{职位名称}很感兴趣。" },
-        { id: "seg_2", enabled: true, text: "我有相关项目经验，期待进一步沟通。" }
+        { id: "seg_1", kind: "greeting", enabled: true, text: "您好，我对{职位名称}很感兴趣。" },
+        { id: "seg_2", kind: "supplement", enabled: true, text: "我有相关项目经验，期待进一步沟通。" }
       ]
+    },
+    bossGreeting: {
+      ok: true,
+      enabled: true,
+      status: "on",
+      templateId: "harness-template-1",
+      text: "Boss您好，我对贵司这个岗位很感兴趣，方便聊聊吗？",
+      templates: [{ templateId: "harness-template-1", text: "Boss您好，我对贵司这个岗位很感兴趣，方便聊聊吗？" }],
+      syncedAt: Date.now(),
+      source: "harness"
     },
     resumes: {
       profiles: [{
@@ -159,6 +172,24 @@
     await recordCall(type, payload);
 
     if (type === "BHT_GET_STATE") return stateResponse();
+    if (type === "BHT_GET_BOSS_GREETING") return clone(state.bossGreeting);
+    if (type === "BHT_SET_BOSS_GREETING") {
+      state.bossGreeting = {
+        ...state.bossGreeting,
+        ok: true,
+        enabled: payload?.enabled === true,
+        status: payload?.enabled === true ? "on" : "off",
+        syncedAt: Date.now(),
+        previousEnabled: state.bossGreeting.enabled,
+        changed: state.bossGreeting.enabled !== (payload?.enabled === true)
+      };
+      document.documentElement.dataset.harnessBossGreeting = state.bossGreeting.status;
+      return clone(state.bossGreeting);
+    }
+    if (type === "BHT_OPEN_BOSS_GREETING_SETTINGS") {
+      document.documentElement.dataset.harnessOpenedBossGreetingSettings = "true";
+      return { ok: true, tabId: 202 };
+    }
     if (type === "BHT_SAVE_SETTINGS") {
       state.settings = { ...state.settings, ...(payload || {}) };
       storage.bht_settings = clone(state.settings);
