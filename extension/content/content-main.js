@@ -24,7 +24,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.9";
+  const BHT_CONTENT_VERSION = "1.7.10";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -3234,6 +3234,121 @@ async function startChat(job, opts = {}) {
     return String(attr || "").split(/[·|｜]/)[0].trim();
   }
 
+  async function triggerConversationOnWorkerDetail(job = {}) {
+    debugTrace("worker_detail_trigger_begin", {
+      job: {
+        jobId: job.jobId || "",
+        title: job.title || "",
+        company: job.company || "",
+        href: job.href || ""
+      },
+      page: pageInfo()
+    });
+    dismissCommonDialogs();
+    if (typeof detectLoginModal === "function") {
+      const loginHit = detectLoginModal();
+      if (loginHit.ok) {
+        return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+      }
+    }
+
+    const nativeReceiptStartedAt = Date.now();
+    let clicked = { ok: false, buttonText: "", already: false };
+    let detailTitle = "";
+    for (let i = 0; i < 18; i++) {
+      const scope =
+        firstEl(SELECTORS.detailRoot) ||
+        document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+        document;
+      detailTitle =
+        textOf(firstEl(SELECTORS.title, scope)) ||
+        textOf(document.querySelector(".job-detail .job-name, .job-detail-box .job-name, h1.job-name")) ||
+        detailTitle;
+      const btn =
+        firstEl(SELECTORS.chatOnDetail, scope) ||
+        Array.from(scope.querySelectorAll("a,button,div,span")).find((el) =>
+          /立即沟通|继续沟通/.test(textOf(el))
+        ) ||
+        Array.from(document.querySelectorAll("a.op-btn-chat, a.op-btn, button, div[class*='btn']")).find((el) =>
+          /立即沟通|继续沟通/.test(textOf(el))
+        );
+      if (btn) {
+        const buttonText = textOf(btn);
+        const clickOk = clickLikeHuman(btn);
+        clicked = { ok: clickOk, buttonText, already: /继续沟通/.test(buttonText) };
+        window.__BHT_LAST_TRIGGER_CLICK__ = {
+          at: Date.now(),
+          jobId: String(job.jobId || job.encryptJobId || ""),
+          buttonText,
+          already: clicked.already,
+          detailTitle: detailTitle || job.title || "",
+          hrName: extractDetailHrName(scope) || job.hrName || job.bossName || "",
+          company: extractDetailCompany(scope) || job.company || "",
+          title: detailTitle || job.title || "",
+          listHref: job.listHref || ""
+        };
+        debugTrace("worker_detail_chat_button_clicked", {
+          buttonText,
+          clickOk,
+          button: describeDebugElement(btn),
+          page: pageInfo()
+        }, clickOk ? "debug" : "error");
+        break;
+      }
+      await sleep(250);
+    }
+
+    if (!clicked.ok) {
+      if (typeof detectLoginModal === "function") {
+        const loginHit = detectLoginModal();
+        if (loginHit.ok) {
+          return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+        }
+      }
+      const missing = {
+        ok: false,
+        error: "WORKER_CHAT_BUTTON_NOT_FOUND",
+        message: "临时执行页未找到「立即沟通」按钮",
+        detailTitle,
+        href: location.href,
+        contentVersion: BHT_CONTENT_VERSION
+      };
+      debugTrace("worker_detail_chat_button_not_found", missing, "warn");
+      return missing;
+    }
+
+    // 自动招呼开启时仍可能出现“留在此页”；执行页停留或跳转都不会影响左侧真实列表。
+    let stay = { ok: false };
+    for (let i = 0; i < 18 && !stay.ok; i++) {
+      stay = clickStayOnListDialog();
+      if (!stay.ok) await sleep(50);
+    }
+    dismissCommonDialogs();
+    const nativeGreeting = clicked.already
+      ? { available: false, showGreeting: null, text: "", source: "already-contacted" }
+      : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 1600);
+    const result = {
+      ok: true,
+      phase: "CHAT_TRIGGERED",
+      workerDetail: true,
+      buttonText: clicked.buttonText,
+      already: Boolean(clicked.already),
+      stayed: Boolean(stay.ok),
+      nativeGreeting,
+      stayText: stay.text || "",
+      detailTitle: detailTitle || job.title || "",
+      hrName: extractDetailHrName() || job.hrName || job.bossName || "",
+      bossName: extractDetailHrName() || job.hrName || job.bossName || "",
+      company: extractDetailCompany() || job.company || "",
+      title: detailTitle || job.title || "",
+      listHref: job.listHref || "",
+      href: location.href,
+      contentVersion: BHT_CONTENT_VERSION
+    };
+    debugTrace("worker_detail_trigger_done", result);
+    return result;
+  }
+
   async function triggerConversationOnList(job = {}) {
     debugTrace("trigger_conversation_begin", {
       job: {
@@ -4060,7 +4175,9 @@ async function runOpByType(type, payload = {}) {
       case MSG.SCAN_JOBS:
         return await scanJobs(payload || {});
       case MSG.TRIGGER_CONVERSATION:
-        return await triggerConversationOnList((payload && payload.job) || payload || {});
+        return payload?.workerDetail
+          ? await triggerConversationOnWorkerDetail(payload.job || {})
+          : await triggerConversationOnList((payload && payload.job) || payload || {});
       case MSG.GET_CONVERSATION_SNAPSHOT:
         return getConversationSnapshot();
       case MSG.WAIT_OPEN_CONVERSATION:

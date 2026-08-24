@@ -45,7 +45,7 @@
       bossName: String(click?.hrName || job.hrName || job.bossName || ''),
       company: String(click?.company || job.company || ''),
       title: String(click?.title || click?.detailTitle || job.title || ''),
-      listHref: href,
+      listHref: String(click?.listHref || href),
       contentVersion
     };
   }

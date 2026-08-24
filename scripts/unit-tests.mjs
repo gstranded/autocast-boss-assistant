@@ -19,6 +19,11 @@ import {
   isBossJobListUrl,
   resolveBossJobListUrl
 } from "../extension/shared/job-list-navigation.js";
+import {
+  buildConversationWorkerAttempts,
+  CONVERSATION_WORKER_MODE,
+  isListDocumentPreserved
+} from "../extension/shared/conversation-worker.js";
 import { reasonText, REASON } from "../extension/shared/reason-codes.js";
 import { computeSideBySideBounds } from "../extension/shared/window-layout.js";
 import {
@@ -708,6 +713,32 @@ test("content document change detection distinguishes reload from SPA navigation
     currentUrl: "https://www.zhipin.com/web/geek/jobs"
   }), false);
 });
+
+test("conversation worker prefers job detail and keeps a list fallback", () => {
+  const attempts = buildConversationWorkerAttempts({
+    job: {
+      href: "https://www.zhipin.com/job_detail/job-1.html",
+      listHref: "https://www.zhipin.com/web/geek/jobs?query=AI"
+    }
+  });
+  assert.deepEqual(attempts.map((attempt) => attempt.mode), [
+    CONVERSATION_WORKER_MODE.DETAIL,
+    CONVERSATION_WORKER_MODE.LIST
+  ]);
+  assert.equal(attempts[0].url, "https://www.zhipin.com/job_detail/job-1.html");
+  assert.equal(attempts[1].url, "https://www.zhipin.com/web/geek/jobs?query=AI");
+});
+
+test("left list preservation requires the same tab, URL and document instance", () => {
+  const before = {
+    tabId: 10,
+    url: "https://www.zhipin.com/web/geek/jobs?query=AI",
+    contentInstanceId: "content-a"
+  };
+  assert.equal(isListDocumentPreserved(before, { ...before }), true);
+  assert.equal(isListDocumentPreserved(before, { ...before, url: "https://www.zhipin.com/web/geek/chat" }), false);
+  assert.equal(isListDocumentPreserved(before, { ...before, contentInstanceId: "content-b" }), false);
+});
 test("guard message non-empty", () => {
   assert.ok(bossUrlGuardMessage("https://baidu.com").length > 5);
   assert.ok(reasonText(REASON.DEDUP_JOB).length > 0);
@@ -1331,7 +1362,7 @@ test("stop cancels page operations and protects the stopped terminal state", () 
   assert.ok(messaging.includes("BHT_CANCEL_OP"));
 });
 
-test("legacy worker-tab delivery path has been removed", () => {
+test("legacy persistent worker-tab delivery path stays removed", () => {
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   assert.ok(!background.includes("function ensureWorkerTab"));
   assert.ok(!background.includes("function openQueueJobOnWorker"));

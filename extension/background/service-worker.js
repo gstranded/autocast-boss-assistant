@@ -39,6 +39,11 @@ import { computeSideBySideBounds } from '../shared/window-layout.js';
 import { dedupeResumeImages } from '../shared/resume-images.js';
 import { pickNextTestDeliveryJob } from '../shared/test-delivery.js';
 import {
+  buildConversationWorkerAttempts,
+  CONVERSATION_WORKER_MODE,
+  isListDocumentPreserved
+} from '../shared/conversation-worker.js';
+import {
   buildDeliveryQueue,
   collectDoneJobIds,
   taskCounterSnapshot
@@ -190,6 +195,11 @@ async function reconcileStaleRunningTask(reason = '扩展后台已重启') {
     const all = await getAllConfig();
     const task = all.task;
     if (!task) return;
+    if (task.execution?.workerTabId) {
+      await closeConversationWorkerTab(task, task.execution.workerTabId, {
+        reason: '扩展后台重启，清理遗留沟通执行页'
+      });
+    }
     if (task.status === TASK_STATUS.RUNNING) {
       task.status = TASK_STATUS.PAUSED;
       task.pauseReason = reason + '，任务已安全暂停。请确认页面后点「继续」恢复队列。';
@@ -656,6 +666,163 @@ async function ensureListTab(task) {
     await publishTask(task);
   }
   return t;
+}
+
+async function getListTabFingerprint(tabId) {
+  if (!tabId) return { tabId: null, url: '', contentInstanceId: '' };
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch (_) {}
+  let contentInstanceId = '';
+  try {
+    const pong = await chrome.tabs.sendMessage(tabId, { type: MSG.PING, payload: {} });
+    contentInstanceId = String(pong?.contentInstanceId || '');
+  } catch (_) {}
+  return {
+    tabId,
+    url: String(tab?.url || tab?.pendingUrl || ''),
+    windowId: tab?.windowId || null,
+    contentInstanceId
+  };
+}
+
+async function closeConversationWorkerTab(task, tabId, { reason = '', publish = true } = {}) {
+  const workerTabId = tabId || task?.execution?.workerTabId || null;
+  if (workerTabId) {
+    try { await chrome.tabs.remove(workerTabId); } catch (_) {}
+  }
+  if (task?.execution && (!workerTabId || task.execution.workerTabId === workerTabId)) {
+    delete task.execution.workerTabId;
+    delete task.execution.workerMode;
+    delete task.execution.workerUrl;
+    task.updatedAt = Date.now();
+    if (publish) await publishTask(task);
+  }
+  if (reason) {
+    await debugLog('background.workerTab', 'closed', {
+      taskId: task?.id || null,
+      tabId: workerTabId,
+      reason
+    });
+  }
+  return { ok: true, tabId: workerTabId, closed: Boolean(workerTabId) };
+}
+
+async function openConversationWorkerTab(task, attempt, messageTab, job) {
+  if (!task.execution) task.execution = {};
+  if (task.execution.workerTabId) {
+    await closeConversationWorkerTab(task, task.execution.workerTabId, {
+      reason: '创建新执行页前清理旧执行页',
+      publish: false
+    });
+  }
+  const createOptions = {
+    url: attempt.url,
+    active: false
+  };
+  const targetWindowId = messageTab?.windowId || task.execution.messageWindowId || null;
+  if (targetWindowId != null) createOptions.windowId = targetWindowId;
+  if (messageTab?.id) createOptions.openerTabId = messageTab.id;
+  const tab = await chrome.tabs.create(createOptions);
+  if (!tab?.id) throw new Error('临时沟通执行页创建失败');
+  task.execution.workerTabId = tab.id;
+  task.execution.workerMode = attempt.mode;
+  task.execution.workerUrl = attempt.url;
+  task.updatedAt = Date.now();
+  await publishTask(task);
+  const ready = await waitTabComplete(tab.id, 30000);
+  const readyUrl = ready?.url || ready?.pendingUrl || '';
+  if (!ready?.id || !isBossUrl(readyUrl)) {
+    throw new Error('临时沟通执行页未能加载 BOSS 岗位：' + String(readyUrl || attempt.url));
+  }
+  await forceInjectContent(tab.id);
+  await sleep(250);
+  return ready;
+}
+
+async function triggerConversationInWorker(task, job, messageTab, listTabId) {
+  const listBefore = await getListTabFingerprint(listTabId);
+  const attempts = buildConversationWorkerAttempts({
+    job,
+    listHref: task?.listHref || job?.listHref || ''
+  });
+  if (!attempts.length) {
+    return {
+      ok: false,
+      error: 'WORKER_TARGET_MISSING',
+      message: '岗位缺少可用详情链接和列表锚点；为保护左侧筛选，已停止本次操作',
+      listBefore
+    };
+  }
+
+  let result = null;
+  const attemptResults = [];
+  for (let index = 0; index < attempts.length; index++) {
+    const attempt = attempts[index];
+    let workerTab = null;
+    let triggerStarted = false;
+    try {
+      workerTab = await openConversationWorkerTab(task, attempt, messageTab, job);
+      await log('info', '[执行页] 已在后台打开岗位，不会操作左侧职位列表', {
+        jobId: job.jobId,
+        workerTabId: workerTab.id,
+        mode: attempt.mode,
+        url: String(attempt.url || '').slice(0, 180)
+      });
+      triggerStarted = true;
+      result = await sendToBoss(
+        MSG.TRIGGER_CONVERSATION || 'BHT_TRIGGER_CONVERSATION',
+        {
+          job: { ...job, listHref: task?.listHref || job?.listHref || '' },
+          workerDetail: attempt.mode === CONVERSATION_WORKER_MODE.DETAIL
+        },
+        { tabId: workerTab.id, forceInject: true }
+      );
+      attemptResults.push({
+        mode: attempt.mode,
+        url: attempt.url,
+        ok: Boolean(result?.ok),
+        error: result?.error || '',
+        navigated: Boolean(result?.navigated)
+      });
+    } catch (error) {
+      result = {
+        ok: false,
+        error: triggerStarted ? 'WORKER_TRIGGER_EXCEPTION' : 'WORKER_TAB_FAILED',
+        message: '临时沟通执行页失败：' + String(error?.message || error)
+      };
+      attemptResults.push({ mode: attempt.mode, url: attempt.url, ok: false, error: result.error });
+    } finally {
+      await closeConversationWorkerTab(task, workerTab?.id || task.execution?.workerTabId, {
+        reason: '本岗位沟通触发结束'
+      });
+    }
+
+    if (result?.ok || operationAborted(result)) break;
+    const safeToFallback = /WORKER_CHAT_BUTTON_NOT_FOUND|WORKER_TAB_FAILED|CONTENT_INJECT_FAIL|TARGET_TAB_CLOSED/.test(
+      String(result?.error || '')
+    );
+    if (!safeToFallback) break;
+  }
+
+  const listAfter = await getListTabFingerprint(listTabId);
+  const listPreserved = isListDocumentPreserved(listBefore, listAfter);
+  await log(listPreserved ? 'success' : 'warn', listPreserved
+    ? '[列表页] 左侧职位页保持原样：筛选、滚动位置和页面实例均未变化'
+    : '[列表页] 检测到左侧页面发生外部变化；插件未在左侧触发沟通', {
+    jobId: job.jobId,
+    listBefore,
+    listAfter,
+    attempts: attemptResults
+  });
+  return {
+    ...(result || { ok: false, error: 'WORKER_TRIGGER_EMPTY', message: '临时沟通执行页没有返回结果' }),
+    workerMode: attemptResults[attemptResults.length - 1]?.mode || '',
+    workerTabClosed: true,
+    listPreserved,
+    listBefore,
+    listAfter,
+    workerAttempts: attemptResults
+  };
 }
 
 async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false, tabId = null } = {}) {
@@ -1485,9 +1652,8 @@ async function processOneJob(task, resultRow, config) {
     listHref: String(job.listHref || task.listHref || '').slice(0, 140)
   });
 
-  // 双页主路径：列表页建会话 + 消息页发送
+  // 三页主路径：左侧列表只读 + 临时执行页建会话 + 右侧消息页发送
   let listTabId = task.execution?.listTabId || null;
-  let listOpt = null;
   if (!resumedFromChat) {
     let listTab = await ensureListTab(task);
     listTabId = listTab?.id || task.execution?.listTabId || null;
@@ -1510,7 +1676,6 @@ async function processOneJob(task, resultRow, config) {
       }
       try { listTab = await chrome.tabs.get(listTabId); } catch (_) {}
     }
-    listOpt = { tabId: listTabId, forceInject: true };
   }
 
   let messageTab;
@@ -1542,22 +1707,30 @@ async function processOneJob(task, resultRow, config) {
 
   let trig = item.triggerReceipt || { ok: true, already: true, contentVersion: '' };
   if (!resumedFromChat) {
-    // 列表页：定位 + 立即沟通 + 留在此页
-    await log('info', '[列表页] 定位并触发沟通', { jobId: job.jobId, title: job.title, tabId: listTabId });
-    trig = await sendToBoss(
-      MSG.TRIGGER_CONVERSATION || 'BHT_TRIGGER_CONVERSATION',
-      { job },
-      listOpt
-    );
+    // 在临时后台执行页触发沟通；左侧真实列表不点击、不导航，完整保留 SPA 筛选和滚动位置。
+    await log('info', '[执行页] 正在后台定位并触发沟通（左侧职位页保持不动）', {
+      jobId: job.jobId,
+      title: job.title,
+      listTabId
+    });
+    trig = await triggerConversationInWorker(task, job, messageTab, listTabId);
     if (operationAborted(trig)) return 'aborted';
     await log(
       trig?.ok ? 'success' : 'error',
       trig?.ok
-        ? ('[列表页] 已触发沟通 btn=' + (trig.buttonText || '') +
-          (trig.navigated ? ' · BOSS 已跳到聊天页，将自动恢复列表' : (trig.stayed ? ' · 已点留在此页' : ' · 未检测到留在此页弹窗')) +
+        ? ('[执行页] 已触发沟通 btn=' + (trig.buttonText || '') +
+          (trig.navigated ? ' · BOSS 跳转发生在临时页（已关闭）' : (trig.stayed ? ' · 已点留在此页' : ' · 无需留在此页弹窗')) +
+          (trig.listPreserved ? ' · 左侧筛选保持' : ' · 左侧页面需检查') +
           (trig.already ? ' · 继续沟通' : ''))
-        : ('[列表页] 触发沟通失败：' + (trig?.message || trig?.error || '')),
-      { jobId: job.jobId, detailTitle: trig?.detailTitle, samples: trig?.samples }
+        : ('[执行页] 触发沟通失败：' + (trig?.message || trig?.error || '')),
+      {
+        jobId: job.jobId,
+        detailTitle: trig?.detailTitle,
+        samples: trig?.samples,
+        workerMode: trig?.workerMode,
+        listPreserved: trig?.listPreserved,
+        workerAttempts: trig?.workerAttempts
+      }
     );
     if (!trig?.ok) {
       item.state = /LIST_JOB_NOT_FOUND|找不到/.test(String(trig?.error || '')) ? 'SKIPPED' : 'FAILED';
@@ -1603,6 +1776,8 @@ async function processOneJob(task, resultRow, config) {
       buttonText: trig.buttonText || '',
       stayed: Boolean(trig.stayed),
       nativeGreeting: trig.nativeGreeting || null,
+      workerMode: trig.workerMode || '',
+      listPreserved: trig.listPreserved === true,
       contentVersion: trig.contentVersion || ''
     };
     resultRow.job = job;
@@ -1616,18 +1791,6 @@ async function processOneJob(task, resultRow, config) {
       triggerIdentity: item.triggerIdentity
     });
 
-    if (trig.navigated) {
-      const restored = await restoreListTabAfterTriggerNavigation(task, listTabId);
-      item.listNavigationRecovery = restored;
-      task.updatedAt = Date.now();
-      await publishTask(task);
-      if (!restored.ok) {
-        await log('warn', restored.message || '沟通已创建，但职位列表恢复失败；当前岗位仍会继续发送', {
-          jobId: job.jobId,
-          restored
-        });
-      }
-    }
   }
 
   // 独立消息标签页不会可靠接收列表页的新会话；每次执行/重试只在这里刷新一次。
@@ -2418,6 +2581,14 @@ async function runTaskLoop(taskId) {
     }
     return { ok: false, error: String(err?.message || err) };
   } finally {
+    try {
+      const all = await getAllConfig();
+      if (all.task?.execution?.workerTabId) {
+        await closeConversationWorkerTab(all.task, all.task.execution.workerTabId, {
+          reason: '任务循环结束，清理遗留沟通执行页'
+        });
+      }
+    } catch (_) {}
     runner.running = false;
   }
 }
@@ -2922,6 +3093,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         {
           const all = await getAllConfig();
           if (all.task) {
+            if (all.task.execution?.workerTabId) {
+              await closeConversationWorkerTab(all.task, all.task.execution.workerTabId, {
+                reason: '用户停止任务，关闭临时沟通执行页',
+                publish: false
+              });
+            }
             all.task.status = TASK_STATUS.STOPPED;
             all.task.updatedAt = Date.now();
             setTaskTerminalSignal(all.task, TASK_STATUS.STOPPED);

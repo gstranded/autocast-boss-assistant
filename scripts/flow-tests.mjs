@@ -86,7 +86,23 @@ test("successful conversation creation survives a forced list-to-chat navigation
   assert.ok(recovery.includes("navigationRecovered: true"));
   assert.ok(background.includes("restoreListTabAfterTriggerNavigation"));
   assert.ok(background.includes("BOSS 在沟通成功后跳到聊天页"));
-  assert.ok(background.includes("if (trig.navigated)"));
+});
+
+test("conversation trigger uses a temporary inactive worker and never navigates the left list", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const worker = fs.readFileSync("extension/shared/conversation-worker.js", "utf8");
+  assert.ok(worker.includes("buildConversationWorkerAttempts"));
+  assert.ok(worker.includes("isListDocumentPreserved"));
+  assert.ok(background.includes("triggerConversationInWorker"));
+  assert.ok(background.includes("openConversationWorkerTab"));
+  assert.ok(background.includes("active: false"));
+  assert.ok(background.includes("workerDetail: attempt.mode === CONVERSATION_WORKER_MODE.DETAIL"));
+  assert.ok(background.includes("closeConversationWorkerTab"));
+  assert.ok(background.includes("左侧职位页保持原样"));
+  assert.ok(content.includes("triggerConversationOnWorkerDetail"));
+  assert.ok(content.includes("worker_detail_chat_button_clicked"));
+  assert.ok(!background.includes("let listOpt = null"));
 });
 
 test("content operation bridge is versioned and cancellable", () => {
