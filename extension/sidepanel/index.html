@@ -285,10 +285,9 @@
         <!-- RESUME -->
         <section class="panel" id="tab-resume">
           <div class="card">
-            <div class="card-title" data-help-title="简历发送策略" data-help="图片简历与 BOSS 在线简历是两个独立动作。只有选择“文本发送完成后立即发送”时才会自动执行。">发送策略</div>
-            <div class="hint auto-resume-hint">图片简历支持 ≤ 8 MB 源文件并自动压缩；BOSS 在线简历无需上传文件，直接点击聊天页「发简历」。</div>
+            <div class="card-title" data-help-title="简历发送策略" data-help="自动发送当前求职方案中的图片简历。只有选择“文本发送完成后立即发送”时才会自动执行。">发送策略</div>
+            <div class="hint auto-resume-hint">图片简历支持 ≤ 8 MB 源文件并自动压缩；发送前会等待文本消息确认成功。</div>
             <label class="check" data-help-title="自动发送图片简历" data-help="按当前求职方案中的图片顺序发送；图片会在导入时压缩并保存在扩展本地。"><input type="checkbox" id="autoSendImageResume" />自动发送图片简历</label>
-            <label class="check" data-help-title="自动点击发简历" data-help="点击 BOSS 聊天页自带的“发简历”按钮，不会上传本地 PDF 或文档附件。"><input type="checkbox" id="autoSendAttachmentResume" />自动点击 BOSS「发简历」</label>
             <label data-help-title="简历发送时机" data-help="推荐文本发送成功后立即发送；手动模式不会自动发送任何简历。">发送时机</label>
             <select id="resumeSendTiming">
               <option value="after_text">文本发送完成后立即发送（推荐）</option>
@@ -313,8 +312,6 @@
             <input id="imageFiles" type="file" accept="image/*" multiple />
             <div id="imagePreview" class="thumbs"></div>
             <button id="btnClearImages" class="btn tiny">清空图片</button>
-            <label data-help-title="BOSS 在线简历" data-help="无需选择本地文件；启用发送策略后，插件只点击聊天页中平台自带的“发简历”。">BOSS 在线简历</label>
-            <div id="attachInfo" class="hint">无需上传本地附件；启用上方开关后，插件会在聊天页点击「发简历」。</div>
             <div class="btn-row" style="margin-top:10px">
               <button id="btnSaveResume" class="btn primary">保存当前方案</button>
               <button id="btnSetDefaultProfile" class="btn">设为默认</button>

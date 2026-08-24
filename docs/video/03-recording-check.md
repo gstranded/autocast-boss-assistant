@@ -45,7 +45,6 @@
 | 消息 | 相似度阈值 | `#similarityThreshold` |
 | 简历 | 方案名/图片 | `#profileName` `#imageFiles` `#imagePreview` |
 | 简历 | 图片简历开关 | `#autoSendImageResume` |
-| 简历 | BOSS发简历开关 | `#autoSendAttachmentResume` |
 | 简历 | 发送时机 | `#resumeSendTiming` |
 | 简历 | 绑定列表 | `#bindingList` |
 | 设置 | 本次上限/每日上限 | `#taskMaxCommunicate` `#dailyMaxCommunicate` |
@@ -86,7 +85,7 @@
 
 ### D. 简历页（分镜 5）
 - [ ] 切到「简历」tab
-- [ ] 开启「自动发送图片简历」（如测试号有图片）或「自动点击 BOSS 发简历」
+- [ ] 开启「自动发送图片简历」（测试号需配置图片）
 - [ ] 点「保存简历」
 
 ### E. 设置页（分镜 7）

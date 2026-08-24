@@ -12,7 +12,7 @@ import { checkDedup, checkLimits, segmentIdempotencyKey, jobIdempotencyKey } fro
 import { renderTemplate, pickResumeProfile } from "../extension/shared/template.js";
 import { filterHistoryRows } from "../extension/shared/history-view.js";
 import { planResumeSend } from "../extension/shared/resume-policy.js";
-import { buildExportPayload, importConfigPatch, IMPORT_CONFIG_KEYS } from "../extension/shared/storage.js";
+import { buildExportPayload, importConfigPatch, IMPORT_CONFIG_KEYS, normalizeSettings } from "../extension/shared/storage.js";
 import { isBossUrl, isBossHostname, isBossTab, bossUrlGuardMessage } from "../extension/shared/boss-url.js";
 import {
   didContentDocumentChange,
@@ -592,27 +592,27 @@ test("history filter keeps only matching status classes", () => {
   assert.deepEqual(filterHistoryRows(rows, "skipped").map((r) => r.title), ["B", "C"]);
   assert.deepEqual(filterHistoryRows(rows, "failed").map((r) => r.title), ["D"]);
 });
-test("platform resume is separate from images and requires after_text", () => {
-  const off = planResumeSend({
-    settings: { autoSendAttachmentResume: false, autoSendImageResume: true, resumeSendTiming: "after_text" },
+test("image resume requires images and after_text while legacy platform setting is ignored", () => {
+  const enabled = planResumeSend({
+    settings: { autoSendImageResume: true, resumeSendTiming: "after_text" },
     hasImages: true
   });
-  assert.equal(off.wantPlatformResume, false);
-  assert.equal(off.wantAutoImage, true);
-  assert.equal(off.doResume, true);
-  const platform = planResumeSend({
+  assert.equal(enabled.wantAutoImage, true);
+  assert.equal(enabled.doResume, true);
+  assert.equal("wantPlatformResume" in enabled, false);
+  const legacyOnly = planResumeSend({
     settings: { autoSendAttachmentResume: true, autoSendImageResume: false, resumeSendTiming: "after_text" },
     hasImages: false
   });
-  assert.equal(platform.wantPlatformResume, true);
-  assert.equal(platform.wantAutoImage, false);
-  assert.equal(platform.doResume, true);
+  assert.equal(legacyOnly.wantAutoImage, false);
+  assert.equal(legacyOnly.doResume, false);
   const manual = planResumeSend({
     settings: { autoSendAttachmentResume: true, autoSendImageResume: true, resumeSendTiming: "manual" },
     hasImages: true
   });
   assert.equal(manual.doResume, false);
-  assert.equal(manual.wantPlatformResume, true);
+  assert.equal("wantPlatformResume" in manual, false);
+  assert.equal(normalizeSettings({ autoSendAttachmentResume: true }).autoSendAttachmentResume, undefined);
 });
 test("export payload round-trips settings filters template and bindings", () => {
   const now = new Date("2026-08-14T00:00:00.000Z");
@@ -630,6 +630,7 @@ test("export payload round-trips settings filters template and bindings", () => 
   assert.equal(exported.version, 1);
   assert.equal(exported.exportedAt, now.toISOString());
   assert.equal(exported.settings.taskMaxCommunicate, 7);
+  assert.equal(exported.settings.autoSendAttachmentResume, undefined);
   assert.equal(exported.filters.title.or[0], "Java");
   assert.equal(exported.messageTemplate.version, 2);
   assert.equal(exported.bindings.rules[0].profileId, "java");
@@ -927,7 +928,7 @@ test("new rendered own message confirms a send", () => {
     true
   );
 });
-test("content script requires rendered own-message receipt", () => {
+test("content keeps text and image receipts while platform resume automation is absent", () => {
   const content = fs.readFileSync("extension/content/content-main.js", "utf8");
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const sidepanel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
@@ -935,17 +936,19 @@ test("content script requires rendered own-message receipt", () => {
   assert.ok(content.includes(".friend-content"));
   assert.ok(content.includes('".name-box"'));
   assert.ok(content.includes('confirmedVia: "self-message-dom"'));
-  assert.ok(content.includes("sendPlatformResume"));
-  assert.ok(content.includes('type: "RESUME_SENT"'));
+  assert.ok(content.includes("sendImageFromDataUrl"));
+  assert.ok(content.includes('type: "IMAGE_SENT"'));
+  assert.ok(!content.includes("sendPlatformResume"));
+  assert.ok(!content.includes('type: "RESUME_SENT"'));
   assert.ok(!content.includes("输入框被清空也视为已发送"));
   assert.ok(background.includes("receiptConfirmed"));
   assert.ok(background.includes("TASK_COMPLETED"));
   assert.ok(background.includes("TASK_STOPPED"));
   assert.ok(background.includes("成功投递"));
-  assert.ok(background.includes("MSG.SEND_RESUME"));
+  assert.ok(!background.includes("MSG.SEND_RESUME"));
   assert.ok(!background.includes("profile.attachment.dataUrl"));
   assert.ok(sidepanel.includes("MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024"));
-  assert.ok(messaging.includes("BHT_SEND_RESUME"));
+  assert.ok(!messaging.includes("BHT_SEND_RESUME"));
 });
 
 
@@ -1065,8 +1068,11 @@ test("legacy message and local attachment paths stay removed", () => {
   assert.ok(!app.includes("attachFile"));
   assert.ok(!app.includes("btnClearAttach"));
   assert.ok(!html.includes('option value="on_request"'));
-  assert.ok(storage.includes("settings.resumeSendTiming === 'on_request'"));
-  assert.ok(storage.includes("settings.resumeSendTiming = 'after_text'"));
+  assert.ok(storage.includes("normalized.resumeSendTiming === 'on_request'"));
+  assert.ok(storage.includes("normalized.resumeSendTiming = 'after_text'"));
+  assert.ok(storage.includes("delete normalized.autoSendAttachmentResume"));
+  assert.ok(!app.includes("autoSendAttachmentResume"));
+  assert.ok(!html.includes("autoSendAttachmentResume"));
   assert.ok(!background.includes("bht_migrated_137"));
   const missingButtonStart = content.indexOf('error: "CHAT_BUTTON_NOT_FOUND"', content.indexOf("async function triggerConversationOnList"));
   const missingButtonBranch = content.slice(missingButtonStart, missingButtonStart + 500);

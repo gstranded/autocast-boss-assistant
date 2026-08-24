@@ -32,7 +32,7 @@ const STEPS = [
     tab: 'resume',
     sel: '#tab-resume .card',
     title: '④ 准备简历',
-    body: '上传图片简历，或勾选「自动点击 BOSS 发简历」。发送时机建议选文本完成后立即发送。'
+    body: '上传图片简历并按岗位方向建立方案。发送时机建议选择文本完成后立即发送。'
   },
   {
     tab: 'settings',

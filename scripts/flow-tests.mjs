@@ -276,7 +276,7 @@ test("preview UI falls back to reasonTexts and shows pass-rate warnings", () => 
   assert.ok(background.includes("通过率超过 80%，请检查筛选是否过宽"));
 });
 
-test("history filter export clear and platform resume stay on shipped paths", () => {
+test("history/config controls and image-only resume stay on shipped paths", () => {
   const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
   const worker = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const content = fs.readFileSync("extension/content/content-main.js", "utf8");
@@ -292,10 +292,12 @@ test("history filter export clear and platform resume stay on shipped paths", ()
   assert.ok(css.includes(".btn-row.config-io .btn"));
   assert.ok(!/\#btnExport[^{]*\{[^}]*min-width:\s*[3-9]\d/.test(css));
   assert.ok(worker.includes("planResumeSend({ settings: config.settings, hasImages })"));
-  assert.ok(worker.includes("wantPlatformResume"));
-  assert.ok(content.includes("sendPlatformResume"));
-  assert.ok(content.includes("发简历"));
-  assert.ok(content.includes("BHT_SEND_RESUME") || content.includes("SEND_RESUME"));
+  assert.ok(worker.includes("wantAutoImage"));
+  assert.ok(worker.includes("MSG.SEND_IMAGE"));
+  assert.ok(content.includes("sendImageFromDataUrl"));
+  assert.ok(!content.includes("sendPlatformResume"));
+  assert.ok(!content.includes("BHT_SEND_RESUME"));
+  assert.ok(!html.includes("autoSendAttachmentResume"));
   assert.ok(!content.includes("uploadFile("));
 });
 

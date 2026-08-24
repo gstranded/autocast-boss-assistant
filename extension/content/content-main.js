@@ -13,7 +13,6 @@
     SAVE_BOSS_GREETING_TEXT: "BHT_SAVE_BOSS_GREETING_TEXT",
     SEND_TEXT: "BHT_SEND_TEXT",
     SEND_IMAGE: "BHT_SEND_IMAGE",
-    SEND_RESUME: "BHT_SEND_RESUME",
     HIGHLIGHT_JOBS: "BHT_HIGHLIGHT_JOBS",
     ENSURE_JOB_LIST: "BHT_ENSURE_JOB_LIST",
     RETURN_TO_LIST: "BHT_RETURN_TO_LIST",
@@ -24,7 +23,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.10";
+  const BHT_CONTENT_VERSION = "1.7.11";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -2817,194 +2816,6 @@ async function startChat(job, opts = {}) {
     };
   }
 
-  function visibleActionElement(el) {
-    if (!el || el.getAttribute?.("aria-hidden") === "true") return false;
-    try {
-      const style = getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-      const rect = el.getBoundingClientRect();
-      return rect.width > 8 && rect.height > 8;
-    } catch (_) {
-      return true;
-    }
-  }
-
-  function compactActionText(el) {
-    return textOf(el).replace(/\s+/g, "");
-  }
-
-  function findPlatformResumeButton({ includeAlreadySent = true } = {}) {
-    const chatRoot = getChatRoot() || document.getElementById("bht-mock-chat") || document;
-    const roots = [chatRoot, chatRoot?.parentElement, document].filter(Boolean);
-    const seen = new Set();
-    const candidates = [];
-    for (const root of roots) {
-      try {
-        for (const el of root.querySelectorAll("button, a, [role='button'], .btn, .chat-tool span, .chat-action span")) {
-          if (seen.has(el)) continue;
-          seen.add(el);
-          if (!visibleActionElement(el)) continue;
-          candidates.push(el);
-        }
-      } catch (_) {}
-    }
-    const sentPattern = /^(已发简历|简历已发送|已发送简历)$/;
-    if (includeAlreadySent) {
-      const already = candidates.find((el) => sentPattern.test(compactActionText(el)));
-      if (already) return { el: already, already: true };
-    }
-    const sendPattern = /^(发简历|发送简历|投递简历)$/;
-    const button = candidates.find((el) =>
-      sendPattern.test(compactActionText(el)) &&
-      !el.disabled &&
-      el.getAttribute?.("aria-disabled") !== "true"
-    );
-    return button ? { el: button, already: false } : null;
-  }
-
-  function findResumeConfirmButton() {
-    const dialogs = Array.from(document.querySelectorAll(
-      "[role='dialog'], .boss-dialog, .dialog-wrap, .dialog-container, .modal, .dialog"
-    )).filter((el) => visibleActionElement(el) && /简历/.test(textOf(el)));
-    for (const dialog of dialogs) {
-      const buttons = Array.from(dialog.querySelectorAll("button, a, [role='button'], .btn"))
-        .filter(visibleActionElement);
-      const confirm = buttons.find((el) =>
-        /^(发送|确定发送|确认发送|确认|确定)$/.test(compactActionText(el)) &&
-        !/取消|关闭/.test(compactActionText(el))
-      );
-      if (confirm) return confirm;
-    }
-    return null;
-  }
-
-  function resumeSuccessTextVisible() {
-    const selectors = [
-      ".toast",
-      ".toast-content",
-      ".message-tip",
-      ".alert",
-      "[role='status']",
-      "[role='dialog']",
-      ".boss-dialog",
-      ".dialog-wrap"
-    ];
-    try {
-      return Array.from(document.querySelectorAll(selectors.join(",")))
-        .filter(visibleActionElement)
-        .slice(-20)
-        .some((el) => {
-          const text = compactActionText(el);
-          return /简历.*(发送成功|已发送)|(发送成功|已发送).*简历/.test(text);
-        });
-    } catch (_) {
-      return false;
-    }
-  }
-
-  async function sendPlatformResume(context = {}) {
-    dismissCommonDialogs();
-    const ready = await waitForChat(10000);
-    if (!ready) {
-      return { ok: false, error: "CHAT_TIMEOUT", message: "聊天输入框未就绪，无法发送 BOSS 在线简历" };
-    }
-
-    const found = findPlatformResumeButton({ includeAlreadySent: true });
-    if (!found) {
-      return {
-        ok: false,
-        error: "RESUME_BUTTON_NOT_FOUND",
-        message: "聊天页未找到「发简历」按钮",
-        contentVersion: BHT_CONTENT_VERSION
-      };
-    }
-
-    const activeConversation = getActiveConversationIdentity();
-    const makeReceipt = (confirmedVia, already = false) => {
-      const sentAt = Date.now();
-      return {
-        type: "RESUME_SENT",
-        status: "confirmed",
-        receiptId: "resume_" + sentAt + "_" + Math.random().toString(36).slice(2, 10),
-        jobId: context.jobId || "",
-        conversationKey: context.conversationKey || activeConversation.key || "",
-        confirmedVia,
-        already,
-        sentAt,
-        contentVersion: BHT_CONTENT_VERSION
-      };
-    };
-
-    if (found.already) {
-      return {
-        ok: true,
-        confirmed: true,
-        already: true,
-        receipt: makeReceipt("button-already-sent", true),
-        activeConversation,
-        contentVersion: BHT_CONTENT_VERSION
-      };
-    }
-
-    const beforeMessages = getSelfMessages(30);
-    clickLikeHuman(found.el);
-
-    // 某些版本会弹出二次确认，只在“包含简历”的对话框内点击一次确认。
-    for (let i = 0; i < 8; i++) {
-      await sleep(200);
-      const confirm = findResumeConfirmButton();
-      if (confirm) {
-        clickLikeHuman(confirm);
-        break;
-      }
-    }
-
-    let confirmedVia = "";
-    let selfTail = beforeMessages;
-    for (let i = 0; i < 28; i++) {
-      await sleep(250);
-      selfTail = getSelfMessages(30);
-      const beforeSignature = beforeMessages.map((message) => String(message).replace(/\s+/g, "")).join("\n");
-      const afterSignature = selfTail.map((message) => String(message).replace(/\s+/g, "")).join("\n");
-      const resumeCardAdded =
-        beforeSignature !== afterSignature &&
-        selfTail.slice(-6).some((message) => /简历|在线简历|附件简历/.test(String(message)));
-      if (resumeCardAdded) {
-        confirmedVia = "self-message-resume-card";
-        break;
-      }
-      if (resumeSuccessTextVisible()) {
-        confirmedVia = "resume-success-status";
-        break;
-      }
-      const afterButton = findPlatformResumeButton({ includeAlreadySent: true });
-      if (afterButton?.already || (afterButton?.el && (afterButton.el.disabled || afterButton.el.getAttribute?.("aria-disabled") === "true"))) {
-        confirmedVia = "resume-button-state";
-        break;
-      }
-    }
-
-    if (!confirmedVia) {
-      return {
-        ok: false,
-        error: "RESUME_SEND_NOT_CONFIRMED",
-        message: "已点击「发简历」，但页面没有返回可验证的发送成功状态",
-        selfTail: selfTail.slice(-5),
-        activeConversation,
-        contentVersion: BHT_CONTENT_VERSION
-      };
-    }
-
-    return {
-      ok: true,
-      confirmed: true,
-      receipt: makeReceipt(confirmedVia),
-      activeConversation,
-      selfTail: selfTail.slice(-5),
-      contentVersion: BHT_CONTENT_VERSION
-    };
-  }
-
   function getSelfMediaSignature(limit = 30) {
     const texts = getSelfMessages(limit).map((message) => String(message).replace(/\s+/g, " "));
     const roots = [
@@ -4221,7 +4032,7 @@ async function startChat(job, opts = {}) {
 
 async function runOpByType(type, payload = {}) {
     const lockKey = String(type || '');
-    const needLock = /START_CHAT|TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SEND_RESUME|SCAN_JOBS/.test(lockKey);
+    const needLock = /START_CHAT|TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SCAN_JOBS/.test(lockKey);
     if (needLock) {
       if (window.__BHT_OP_LOCK__) {
         return { ok: false, error: 'OP_BUSY', message: '已有操作进行中', contentVersion: BHT_CONTENT_VERSION };
@@ -4266,8 +4077,6 @@ async function runOpByType(type, payload = {}) {
         return await sendText(payload?.text || "", payload || {});
       case MSG.SEND_IMAGE:
         return await sendImageFromDataUrl(payload?.dataUrl, payload?.fileName);
-      case MSG.SEND_RESUME:
-        return await sendPlatformResume(payload || {});
       case MSG.HIGHLIGHT_JOBS:
         return highlightJobs(payload?.map || {});
       case MSG.CLOSE_CHAT:
@@ -4367,7 +4176,7 @@ async function runOpByType(type, payload = {}) {
         // START_CHAT 允许更长；超时不强制清锁抢跑，由 finally 统一释放
         const opTimeoutMs = /START_CHAT/.test(String(opType || ""))
           ? 45000
-          : /TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SEND_RESUME|SCAN_JOBS/.test(String(opType || ""))
+          : /TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SCAN_JOBS/.test(String(opType || ""))
             ? 30000
             : 15000;
 

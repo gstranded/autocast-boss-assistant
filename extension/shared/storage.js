@@ -12,6 +12,14 @@ import { mergeRuntimeLog, sortLogsNewestFirst } from './log-order.js';
 
 let logWriteChain = Promise.resolve();
 
+export function normalizeSettings(settings = {}) {
+  const normalized = { ...deepClone(DEFAULT_SETTINGS), ...(settings || {}) };
+  // v1.7.11：BOSS「发简历」受双向回复门禁限制，平台简历自动发送功能已移除。
+  delete normalized.autoSendAttachmentResume;
+  if (normalized.resumeSendTiming === 'on_request') normalized.resumeSendTiming = 'after_text';
+  return normalized;
+}
+
 async function get(keys) {
   return chrome.storage.local.get(keys);
 }
@@ -55,10 +63,7 @@ export async function getAllConfig() {
   await ensureDefaults();
   const data = await get(Object.values(STORAGE_KEYS));
   const storedSettings = data[STORAGE_KEYS.SETTINGS] || {};
-  const settings = { ...deepClone(DEFAULT_SETTINGS), ...storedSettings };
-  if (settings.resumeSendTiming === 'on_request') {
-    settings.resumeSendTiming = 'after_text';
-  }
+  const settings = normalizeSettings(storedSettings);
   if (JSON.stringify(settings) !== JSON.stringify(storedSettings)) {
     await set({ [STORAGE_KEYS.SETTINGS]: settings });
   }
@@ -88,7 +93,7 @@ export async function getAllConfig() {
 }
 
 export async function saveSettings(settings) {
-  await set({ [STORAGE_KEYS.SETTINGS]: settings });
+  await set({ [STORAGE_KEYS.SETTINGS]: normalizeSettings(settings) });
 }
 
 export async function saveFilters(filters) {
@@ -220,6 +225,7 @@ export function buildExportPayload(all = {}, now = new Date()) {
     exportedAt: now.toISOString(),
     version: 1,
     ...all,
+    settings: normalizeSettings(all.settings || {}),
     logs: (all.logs || []).slice(0, 100)
   };
 }
@@ -228,7 +234,9 @@ export function importConfigPatch(payload) {
   if (!payload || typeof payload !== 'object') throw new Error('无效配置文件');
   const put = {};
   for (const [key, storageKey] of Object.entries(IMPORT_CONFIG_KEYS)) {
-    if (payload[key] != null) put[storageKey] = payload[key];
+    if (payload[key] != null) {
+      put[storageKey] = key === 'settings' ? normalizeSettings(payload[key]) : payload[key];
+    }
   }
   return put;
 }

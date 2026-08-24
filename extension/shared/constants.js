@@ -41,7 +41,6 @@ export const ITEM_STATE = {
   NATIVE_GREETING_DETECTED: 'NATIVE_GREETING_DETECTED',
   TEXT_SEGMENT_SENT_PREFIX: 'TEXT_SEGMENT_',
   IMAGE_RESUME_SENT: 'IMAGE_RESUME_SENT',
-  PLATFORM_RESUME_SENT: 'PLATFORM_RESUME_SENT',
   COMPLETED: 'COMPLETED',
   FAILED: 'FAILED',
   SKIPPED: 'SKIPPED',
@@ -65,7 +64,6 @@ export const DEFAULT_SETTINGS = {
   allowRepublishedJob: false,
   consecutiveFailPause: 3,
   autoSendImageResume: true,
-  autoSendAttachmentResume: false, // 兼容旧字段名：现在表示点击 BOSS「发简历」
   resumeSendTiming: 'after_text', // after_text | manual
   splitViewEnabled: true,
   debugLoggingEnabled: false,

@@ -870,7 +870,6 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     MSG.WAIT_CHAT_EDITOR,
     MSG.SEND_TEXT,
     MSG.SEND_IMAGE,
-    MSG.SEND_RESUME,
     MSG.GET_BOSS_GREETING,
     MSG.SET_BOSS_GREETING,
     MSG.SAVE_BOSS_GREETING_TEXT,
@@ -885,7 +884,6 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     MSG.WAIT_CHAT_EDITOR,
     MSG.SEND_TEXT,
     MSG.SEND_IMAGE,
-    MSG.SEND_RESUME,
     MSG.SCAN_JOBS,
     MSG.RETURN_TO_LIST
   ];
@@ -2162,30 +2160,27 @@ async function processOneJob(task, resultRow, config) {
   const {
     timing,
     flagImage,
-    wantPlatformResume,
     wantAutoImage,
     doResume
   } = planResumeSend({ settings: config.settings, hasImages });
-  const flagPlatformResume = wantPlatformResume;
   if (!doResume) {
     let why = '';
     if (timing !== 'after_text') why = '发送时机不是「文本发送完成后立即发送」';
-    else if (!flagImage && !flagPlatformResume) why = '未启用图片简历或 BOSS 在线简历';
-    else if (flagImage && !hasImages && !flagPlatformResume) why = '已启用图片简历，但当前方案中无图片';
+    else if (!flagImage) why = '未启用图片简历';
+    else if (!hasImages) why = '已启用图片简历，但当前方案中无图片';
     else why = '当前配置不满足自动发简历条件';
     await log('info', '本次不自动发送简历：' + why, {
       jobId: job.jobId,
       timing,
       flagImage,
-      flagPlatformResume,
       hasImages,
       profileId: profile?.id || null
     });
   } else {
-    await log('info', '将自动发送简历：' + [
-      wantAutoImage ? ('图片' + resumeImages.length + '张') : '',
-      wantPlatformResume ? 'BOSS 在线简历' : ''
-    ].filter(Boolean).join(' + '), { jobId: job.jobId, profileId: profile?.id || null });
+    await log('info', '将自动发送图片简历：' + resumeImages.length + '张', {
+      jobId: job.jobId,
+      profileId: profile?.id || null
+    });
   }
 
   if (doResume) {
@@ -2206,7 +2201,7 @@ async function processOneJob(task, resultRow, config) {
           imgRes?.receipt?.status === 'confirmed';
         if (!imageConfirmed) {
           item.state = 'FAILED';
-          item.reasons = [reasonText(REASON.EXEC_SEND_FILE_FAIL, imgRes?.message || imgRes?.error || '图片发送未确认')];
+          item.reasons = [reasonText(REASON.EXEC_SEND_IMAGE_FAIL, imgRes?.message || imgRes?.error || '图片发送未确认')];
           task.pauseReason = item.reasons[0];
           task.lastErrorDetail = '岗位：' + (job.title || '') + ' @ ' + (job.company || '') + '\n图片简历发送未确认';
           task.counters.failed += 1;
@@ -2227,46 +2222,6 @@ async function processOneJob(task, resultRow, config) {
           confirmedVia: imgRes.receipt.confirmedVia
         });
         await sleep(randomBetween(config.settings.segmentIntervalMs));
-      }
-    }
-    if (wantPlatformResume) {
-      const key = resumeIdempotencyKey(job, 'boss_online', profile?.id || 'boss_online');
-      if (!(await hasIdempotent(key))) {
-        const resumeRes = await sendToBoss(MSG.SEND_RESUME, {
-          jobId: job.jobId,
-          conversationKey: conv?.active?.key || ''
-        }, tabOpt);
-        if (operationAborted(resumeRes)) return 'aborted';
-        const resumeConfirmed =
-          resumeRes?.ok === true &&
-          resumeRes?.confirmed === true &&
-          resumeRes?.receipt?.type === 'RESUME_SENT' &&
-          resumeRes?.receipt?.status === 'confirmed';
-        if (resumeConfirmed) {
-          await markIdempotent(key, { jobId: job.jobId });
-          item.state = 'PLATFORM_RESUME_SENT';
-          item.resumeReceipt = resumeRes.receipt;
-          task.lastReceipt = resumeRes.receipt;
-          task.updatedAt = Date.now();
-          await publishTask(task);
-          await log('success', resumeRes?.already ? 'BOSS 在线简历此前已发送' : 'BOSS 在线简历发送确认', {
-            jobId: job.jobId,
-            receiptId: resumeRes.receipt.receiptId,
-            confirmedVia: resumeRes.receipt.confirmedVia
-          });
-        } else {
-          item.state = 'FAILED';
-          item.reasons = [reasonText(REASON.EXEC_SEND_FILE_FAIL, resumeRes?.message || resumeRes?.error || '')];
-          task.pauseReason = item.reasons[0];
-          task.lastErrorDetail = '岗位：' + (job.title || '') + ' @ ' + (job.company || '') + '\nBOSS 在线简历发送未确认';
-          task.counters.failed += 1;
-          task.consecutiveFails += 1;
-          await bumpDailyStat('fail');
-          await log('error', 'BOSS 在线简历发送失败：' + (resumeRes?.message || resumeRes?.error || '未确认'), {
-            jobId: job.jobId
-          });
-          return 'failed';
-        }
       }
     }
   }

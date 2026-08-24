@@ -21,7 +21,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.10";
+const BHT_UI_VERSION = "1.7.11";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -506,7 +506,6 @@ function fillSettings(settings) {
   applyTheme(settings.theme || 'dark');
   $('pluginTextEnabled').checked = settings.pluginTextEnabled !== false;
   $('autoSendImageResume').checked = Boolean(settings.autoSendImageResume);
-  $('autoSendAttachmentResume').checked = Boolean(settings.autoSendAttachmentResume);
   $('resumeSendTiming').value = settings.resumeSendTiming || 'after_text';
   $('taskMaxCommunicate').value = settings.taskMaxCommunicate;
   $('dailyMaxCommunicate').value = settings.dailyMaxCommunicate;
@@ -535,7 +534,6 @@ function readSettingsPatch(base) {
     strictGreetingGuard: true,
     nativeGreetingWaitMs: Number(base.nativeGreetingWaitMs || 2600),
     autoSendImageResume: $('autoSendImageResume').checked,
-    autoSendAttachmentResume: $('autoSendAttachmentResume').checked,
     resumeSendTiming: $('resumeSendTiming').value,
     taskMaxCommunicate: Number($('taskMaxCommunicate').value || 30),
     dailyMaxCommunicate: Number($('dailyMaxCommunicate').value || 80),
@@ -982,7 +980,7 @@ function renderProfileList() {
         ${isDefault ? '<span class="pill default">默认</span>' : ''}
         ${isActive ? '<span class="pill">编辑中</span>' : ''}
       </div>
-      <div class="meta">图片 ${(p.images || []).length} 张 · 可发送 BOSS 在线简历</div>
+      <div class="meta">图片 ${(p.images || []).length} 张</div>
       <div class="actions">
         <button class="btn tiny" data-switch="${p.id}">切换编辑</button>
         <button class="btn tiny" data-default="${p.id}">设默认</button>
@@ -1026,7 +1024,6 @@ function renderResumeEditor() {
     el.dataset.idx = String(idx);
     thumbs.appendChild(el);
   });
-  $('attachInfo').textContent = '无需上传本地附件；启用发送策略后会点击聊天页「发简历」。';
 }
 
 // —— 图片简历全屏预览（独立窗口，避免受面板尺寸限制）——
@@ -2208,7 +2205,6 @@ function bindEvents() {
           companyDailyMax: $('companyDailyMax')?.value || '',
           neverRepeatJob: !!$('neverRepeatJob')?.checked,
           autoSendImageResume: !!$('autoSendImageResume')?.checked,
-          autoSendAttachmentResume: !!$('autoSendAttachmentResume')?.checked,
           resumeSendTiming: $('resumeSendTiming')?.value || ''
         },
         messages: (state.config?.messageTemplate?.segments || []).map((s) => ({
@@ -2383,13 +2379,12 @@ function bindEvents() {
     const settings = {
       ...(state.config?.settings || {}),
       autoSendImageResume: !!$('autoSendImageResume')?.checked,
-      autoSendAttachmentResume: !!$('autoSendAttachmentResume')?.checked,
       resumeSendTiming: $('resumeSendTiming')?.value || 'after_text'
     };
-    if ((settings.autoSendImageResume || settings.autoSendAttachmentResume) && settings.resumeSendTiming !== 'after_text') {
+    if (settings.autoSendImageResume && settings.resumeSendTiming !== 'after_text') {
       toast('提示：已启用简历发送，但时机不是「文本发送完成后」，本次不会自动发简历', 'warn', 3500);
-    } else if (!settings.autoSendImageResume && !settings.autoSendAttachmentResume) {
-      toast('提示：未启用图片或 BOSS 在线简历，本次只发文字', 'warn', 2800);
+    } else if (!settings.autoSendImageResume) {
+      toast('提示：未启用图片简历，本次只发文字', 'warn', 2800);
     }
     $('btnTestOne').disabled = true;
     toast('正在启动投递一份…', 'warn', 1500);
