@@ -27,6 +27,7 @@ import {
   normalizeResumes
 } from "../extension/shared/resume-images.js";
 import "../extension/shared/conversation-match.js";
+import "../extension/shared/trigger-navigation-recovery.js";
 import fs from "fs";
 import vm from "vm";
 import { pickNextTestDeliveryJob, collectDoneJobIds } from "../extension/shared/test-delivery.js";
@@ -52,6 +53,7 @@ const {
   selectConversationCandidate,
   confirmRenderedOwnMessage
 } = globalThis.BHTConversationMatch;
+const { resolveTriggerNavigationRecovery } = globalThis.BHTTriggerNavigationRecovery;
 
 let passed = 0;
 function test(name, fn) {
@@ -430,6 +432,52 @@ test("plugin text master switch suppresses every plugin segment", () => {
   assert.equal(plan.plan.length, 0);
 });
 
+test("successful friend-add receipt recovers a trigger interrupted by navigation", () => {
+  const recovered = resolveTriggerNavigationRecovery({
+    opType: "BHT_TRIGGER_CONVERSATION",
+    job: { jobId: "job-1", title: "AI 应用工程师", company: "华为技术有限公司" },
+    inflightAt: 1000,
+    now: 1600,
+    click: { at: 1300, jobId: "job-1", buttonText: "立即沟通", already: false, hrName: "李先生" },
+    receipt: { at: 1500, jobId: "job-1", ok: true, hasShowGreeting: true, showGreeting: false, greeting: "" },
+    href: "https://www.zhipin.com/web/geek/jobs",
+    contentVersion: "test"
+  });
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.navigationRecovered, true);
+  assert.equal(recovered.phase, "CHAT_TRIGGERED");
+  assert.equal(recovered.nativeGreeting.showGreeting, false);
+  assert.equal(recovered.hrName, "李先生");
+});
+
+test("navigation without friend-add confirmation is not treated as a created conversation", () => {
+  const unconfirmed = resolveTriggerNavigationRecovery({
+    opType: "BHT_TRIGGER_CONVERSATION",
+    job: { jobId: "job-2" },
+    inflightAt: 1000,
+    now: 1500,
+    click: { at: 1300, jobId: "job-2", buttonText: "立即沟通", already: false },
+    receipt: null,
+    href: "https://www.zhipin.com/web/geek/jobs"
+  });
+  assert.equal(unconfirmed, null);
+});
+
+test("continue-chat navigation is recoverable without a new friend-add receipt", () => {
+  const recovered = resolveTriggerNavigationRecovery({
+    opType: "BHT_TRIGGER_CONVERSATION",
+    job: { jobId: "job-3" },
+    inflightAt: 1000,
+    now: 1500,
+    click: { at: 1300, jobId: "job-3", buttonText: "继续沟通", already: true },
+    receipt: null,
+    href: "https://www.zhipin.com/web/geek/jobs"
+  });
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.already, true);
+  assert.equal(recovered.nativeGreeting.source, "already-contacted");
+});
+
 test("runtime logs are deduplicated and sorted by numeric timestamps", () => {
   const logs = [
     { id: "middle", ts: 200, message: "middle" },
@@ -696,7 +744,8 @@ test("manifest version + hosts", () => {
   const isolated = m.content_scripts.find((entry) => !entry.world || entry.world === "ISOLATED");
   assert.equal(mainHook?.run_at, "document_start");
   assert.ok(mainHook?.js?.includes("content/page-network-hook.js"));
-  assert.equal(isolated?.js?.[0], "shared/conversation-match.js");
+  assert.equal(isolated?.js?.[0], "shared/trigger-navigation-recovery.js");
+  assert.equal(isolated?.js?.[1], "shared/conversation-match.js");
 });
 test("UI exposes themes, help tips and filter switches", () => {
   const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");

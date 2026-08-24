@@ -33,7 +33,7 @@ import { planResumeSend } from '../shared/resume-policy.js';
 import { REASON, reasonText } from '../shared/reason-codes.js';
 import { TASK_STATUS } from '../shared/constants.js';
 import { isBossUrl, isBossTab, bossUrlGuardMessage, BOSS_MATCH_PATTERNS } from '../shared/boss-url.js';
-import { didContentDocumentChange, resolveBossJobListUrl } from '../shared/job-list-navigation.js';
+import { didContentDocumentChange, isBossJobListUrl, resolveBossJobListUrl } from '../shared/job-list-navigation.js';
 import { normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
 import { computeSideBySideBounds } from '../shared/window-layout.js';
 import { dedupeResumeImages } from '../shared/resume-images.js';
@@ -317,7 +317,7 @@ async function forceInjectContent(tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ["shared/conversation-match.js", "content/content-main.js"],
+      files: ["shared/trigger-navigation-recovery.js", "shared/conversation-match.js", "content/content-main.js"],
       injectImmediately: true
     });
     await sleep(120);
@@ -1101,6 +1101,54 @@ async function navigatePreviewToJobList(previewTab, scan = {}) {
   }
 }
 
+async function restoreListTabAfterTriggerNavigation(task, tabId) {
+  if (!tabId) return { ok: false, error: 'LIST_TAB_MISSING', message: '列表标签页不存在' };
+  let before = null;
+  try { before = await chrome.tabs.get(tabId); } catch (_) {}
+  const fromHref = before?.url || before?.pendingUrl || '';
+  if (isBossJobListUrl(fromHref)) return { ok: true, restored: false, href: fromHref };
+  const targetHref = resolveBossJobListUrl({
+    candidate: task?.listHref || '',
+    currentUrl: fromHref
+  });
+  await log('warn', '[列表页] BOSS 在沟通成功后跳到聊天页，正在自动恢复职位列表…', {
+    tabId,
+    fromHref,
+    targetHref
+  });
+  try {
+    await chrome.tabs.update(tabId, { url: targetHref });
+    const ready = await waitTabComplete(tabId, 45000);
+    const href = ready?.url || ready?.pendingUrl || targetHref;
+    if (!ready || !isBossJobListUrl(href)) {
+      return {
+        ok: false,
+        error: 'LIST_RESTORE_FAILED',
+        message: '沟通已创建，但职位列表自动恢复失败。请手动打开职位列表后继续',
+        fromHref,
+        targetHref,
+        href
+      };
+    }
+    await forceInjectContent(tabId);
+    await sleep(300);
+    await log('success', '[列表页] 职位列表已自动恢复，可继续处理下一岗位', {
+      tabId,
+      fromHref,
+      href
+    });
+    return { ok: true, restored: true, fromHref, href };
+  } catch (error) {
+    return {
+      ok: false,
+      error: 'LIST_RESTORE_FAILED',
+      message: '沟通已创建，但职位列表自动恢复失败：' + String(error?.message || error),
+      fromHref,
+      targetHref
+    };
+  }
+}
+
 async function scanPreviewJobs(payload, previewTab) {
   const scanPayload = {
     scroll: payload.scroll !== false,
@@ -1441,7 +1489,7 @@ async function processOneJob(task, resultRow, config) {
   let listTabId = task.execution?.listTabId || null;
   let listOpt = null;
   if (!resumedFromChat) {
-    const listTab = await ensureListTab(task);
+    let listTab = await ensureListTab(task);
     listTabId = listTab?.id || task.execution?.listTabId || null;
     if (!listTabId) {
       item.state = 'FAILED';
@@ -1449,6 +1497,18 @@ async function processOneJob(task, resultRow, config) {
       task.counters.failed += 1;
       await log('error', '[列表页] 未找到列表标签页', { jobId: job.jobId });
       return 'failed';
+    }
+    if (!isBossJobListUrl(listTab?.url || listTab?.pendingUrl || '')) {
+      const restored = await restoreListTabAfterTriggerNavigation(task, listTabId);
+      if (!restored.ok) {
+        item.state = 'FAILED';
+        item.reasons = [restored.message || '未能恢复职位列表'];
+        task.counters.failed += 1;
+        task.pauseReason = item.reasons[0];
+        await log('error', '[列表页] ' + item.reasons[0], { jobId: job.jobId, restored });
+        return 'failed';
+      }
+      try { listTab = await chrome.tabs.get(listTabId); } catch (_) {}
     }
     listOpt = { tabId: listTabId, forceInject: true };
   }
@@ -1493,7 +1553,9 @@ async function processOneJob(task, resultRow, config) {
     await log(
       trig?.ok ? 'success' : 'error',
       trig?.ok
-        ? ('[列表页] 已触发沟通 btn=' + (trig.buttonText || '') + (trig.stayed ? ' · 已点留在此页' : ' · 未检测到留在此页弹窗') + (trig.already ? ' · 继续沟通' : ''))
+        ? ('[列表页] 已触发沟通 btn=' + (trig.buttonText || '') +
+          (trig.navigated ? ' · BOSS 已跳到聊天页，将自动恢复列表' : (trig.stayed ? ' · 已点留在此页' : ' · 未检测到留在此页弹窗')) +
+          (trig.already ? ' · 继续沟通' : ''))
         : ('[列表页] 触发沟通失败：' + (trig?.message || trig?.error || '')),
       { jobId: job.jobId, detailTitle: trig?.detailTitle, samples: trig?.samples }
     );
@@ -1553,6 +1615,19 @@ async function processOneJob(task, resultRow, config) {
       beforeKeyCount: item.beforeConversationKeys.length,
       triggerIdentity: item.triggerIdentity
     });
+
+    if (trig.navigated) {
+      const restored = await restoreListTabAfterTriggerNavigation(task, listTabId);
+      item.listNavigationRecovery = restored;
+      task.updatedAt = Date.now();
+      await publishTask(task);
+      if (!restored.ok) {
+        await log('warn', restored.message || '沟通已创建，但职位列表恢复失败；当前岗位仍会继续发送', {
+          jobId: job.jobId,
+          restored
+        });
+      }
+    }
   }
 
   // 独立消息标签页不会可靠接收列表页的新会话；每次执行/重试只在这里刷新一次。

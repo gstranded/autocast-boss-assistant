@@ -24,7 +24,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.8";
+  const BHT_CONTENT_VERSION = "1.7.9";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -43,6 +43,7 @@
   window.__BHT_OP_CANCELLED__ = Object.create(null);
   window.__BHT_ACTIVE_OP_ID__ = null;
   window.__BHT_CONTENT_LOADED__ = true;
+  window.__BHT_LAST_TRIGGER_CLICK__ = null;
   const nativeGreetingReceipts = [];
   window.addEventListener("message", (event) => {
     if (event.source !== window || event.origin !== location.origin) return;
@@ -778,6 +779,22 @@ const SELECTORS = {
       await sleep(100);
     }
     return { available: false, showGreeting: null, text: "", source: "no-friend-add-receipt" };
+  }
+
+  function buildTriggerNavigationRecovery(inflight = {}) {
+    const job = inflight?.opPayload?.job || inflight?.opPayload || {};
+    const receipt = findNativeGreetingReceipt(job, Number(inflight.at || 0));
+    return globalThis.BHTTriggerNavigationRecovery?.resolveTriggerNavigationRecovery?.({
+      opType: inflight?.opType || "",
+      triggerType: MSG.TRIGGER_CONVERSATION,
+      job,
+      inflightAt: Number(inflight.at || 0),
+      now: Date.now(),
+      click: window.__BHT_LAST_TRIGGER_CLICK__,
+      receipt,
+      href: location.href,
+      contentVersion: BHT_CONTENT_VERSION
+    }) || null;
   }
 
   function textOf(el) {
@@ -3354,6 +3371,17 @@ async function startChat(job, opts = {}) {
           const buttonText = textOf(btn);
           const clickOk = clickLikeHuman(btn);
           clicked = { ok: clickOk, buttonText, already: /继续沟通/.test(buttonText) };
+          window.__BHT_LAST_TRIGGER_CLICK__ = {
+            at: Date.now(),
+            jobId: String(job.jobId || job.encryptJobId || ""),
+            buttonText,
+            already: clicked.already,
+            detailTitle: detailTitle || job.title || "",
+            hrName: extractDetailHrName() || job.hrName || job.bossName || "",
+            company: extractDetailCompany() || job.company || "",
+            title: detailTitle || job.title || "",
+            listHref: location.href
+          };
           debugTrace("trigger_chat_button_clicked", {
             buttonText,
             clickOk,
@@ -3380,11 +3408,11 @@ async function startChat(job, opts = {}) {
         return missingButton;
       }
 
-      await sleep(450);
-      let stay = clickStayOnListDialog();
-      if (!stay.ok) {
-        await sleep(500);
+      // 弹层有时只出现 100~300ms，BOSS 随后就会整页进入聊天；高频短轮询避免固定等待 450ms 错过它。
+      let stay = { ok: false };
+      for (let i = 0; i < 18 && !stay.ok; i++) {
         stay = clickStayOnListDialog();
+        if (!stay.ok) await sleep(50);
       }
       debugTrace("trigger_stay_on_list_dialog", { result: stay, page: pageInfo() }, stay.ok ? "debug" : "warn");
       // 再关一次常见弹层
@@ -4126,7 +4154,7 @@ async function runOpByType(type, payload = {}) {
       } catch (_) {}
 
       (async () => {
-        if (opId) inflight[opId] = { opType, at: Date.now() };
+        if (opId) inflight[opId] = { opType, opPayload, at: Date.now() };
 
         // 若 storage 已是 done，不再重跑
         try {
@@ -4320,17 +4348,25 @@ async function runOpByType(type, payload = {}) {
     try {
       const updates = {};
       for (const [opId, inflight] of Object.entries(window.__BHT_OP_INFLIGHT__ || {})) {
+        const recoveredTrigger = buildTriggerNavigationRecovery(inflight);
         updates["bht_op_" + opId] = {
           status: "done",
           opType: inflight?.opType || "",
-          result: {
-            ok: false,
-            error: "NAVIGATED",
-            message: "页面跳转，操作中断",
-            contentVersion: BHT_CONTENT_VERSION
-          },
+          result: recoveredTrigger || {
+              ok: false,
+              error: "NAVIGATED",
+              message: "页面跳转，操作中断",
+              contentVersion: BHT_CONTENT_VERSION
+            },
           at: Date.now()
         };
+        if (recoveredTrigger) {
+          debugTrace("trigger_navigation_recovered", {
+            opId,
+            opType: inflight?.opType || "",
+            result: recoveredTrigger
+          }, "info");
+        }
       }
       if (Object.keys(updates).length) chrome.storage.local.set(updates);
     } catch (_) {}

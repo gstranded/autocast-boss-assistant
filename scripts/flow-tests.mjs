@@ -72,6 +72,23 @@ test("background uses the two-page trigger flow and returns safely after failure
   assert.ok(s.includes("while (outcome === 'failed')"));
 });
 
+test("successful conversation creation survives a forced list-to-chat navigation", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const recovery = fs.readFileSync("extension/shared/trigger-navigation-recovery.js", "utf8");
+  const manifest = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
+  const isolated = manifest.content_scripts.find((entry) => !entry.world || entry.world === "ISOLATED");
+  assert.ok(isolated?.js?.includes("shared/trigger-navigation-recovery.js"));
+  assert.ok(content.includes("trigger_navigation_recovered"));
+  assert.ok(content.includes("window.__BHT_LAST_TRIGGER_CLICK__"));
+  assert.ok(content.includes("for (let i = 0; i < 18 && !stay.ok; i++)"));
+  assert.ok(recovery.includes("receiptMatches"));
+  assert.ok(recovery.includes("navigationRecovered: true"));
+  assert.ok(background.includes("restoreListTabAfterTriggerNavigation"));
+  assert.ok(background.includes("BOSS 在沟通成功后跳到聊天页"));
+  assert.ok(background.includes("if (trig.navigated)"));
+});
+
 test("content operation bridge is versioned and cancellable", () => {
   const s = fs.readFileSync("extension/content/content-main.js", "utf8");
   const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
