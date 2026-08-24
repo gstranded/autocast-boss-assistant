@@ -1,5 +1,13 @@
 # GitHub Release 说明维护
 
+## 功能版本与 Commit 约定
+
+- 版本以完整、可验证的功能为单位：一个功能修好即可发一版；多个强关联改动形成同一闭环时可以合并为一版。
+- 不把尚未完成或未验证的功能塞进 Release，也不把无关本地修改带入版本提交。
+- Commit 标题使用 `type(scope): outcome`，正文至少包含 `Root cause / Implementation / Verification / Compatibility`。
+- 删除或迁移功能时，正文必须说明旧配置如何处理、保留了哪些相邻能力，以及用户可见变化。
+- 发布前必须确认源码版本、Manifest、面板版本、ZIP 文件名、标签和 Release 标题一致。
+
 所有 Release 使用 UTF-8 中文，正文固定包含：
 
 ```markdown
