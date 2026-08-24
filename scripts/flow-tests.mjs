@@ -105,6 +105,26 @@ test("conversation trigger uses a temporary inactive worker and never navigates 
   assert.ok(!background.includes("let listOpt = null"));
 });
 
+test("worker detail clicks the exact chat action and requires a creation receipt", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  assert.ok(content.includes("findConversationActionButton"));
+  assert.ok(content.includes("/^(立即沟通|继续沟通|打招呼)$/"));
+  assert.ok(content.includes("if (!explicitlyInteractive && /wrap|container/i.test(className)) continue"));
+  assert.ok(content.includes('error: "CONVERSATION_CREATE_NOT_CONFIRMED"'));
+  assert.ok(content.includes("!clicked.already && !nativeGreeting.available"));
+  assert.ok(content.includes("worker_detail_trigger_unconfirmed"));
+});
+
+test("message conversation matching performs a second real reload after propagation delay", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const branchStart = background.indexOf("首次刷新后暂未出现新会话");
+  assert.ok(branchStart > 0);
+  const retryBranch = background.slice(branchStart, branchStart + 1300);
+  assert.ok(retryBranch.includes("refreshMessageTabOnce"));
+  assert.ok(retryBranch.includes("timeoutMs: 14000"));
+  assert.ok(background.includes("if (!resumedFromChat) await sleep(700)"));
+});
+
 test("content operation bridge is versioned and cancellable", () => {
   const s = fs.readFileSync("extension/content/content-main.js", "utf8");
   const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));

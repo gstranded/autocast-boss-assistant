@@ -1793,7 +1793,8 @@ async function processOneJob(task, resultRow, config) {
 
   }
 
-  // 独立消息标签页不会可靠接收列表页的新会话；每次执行/重试只在这里刷新一次。
+  // 创建会话成功回执到消息列表可见之间存在短暂传播延迟；稍等后再刷新，避免刷新得比新会话入库更早。
+  if (!resumedFromChat) await sleep(700);
   const refreshResult = await refreshMessageTabOnce(task, msgTabId, {
     jobId: job.jobId,
     resumed: resumedFromChat
@@ -1808,18 +1809,27 @@ async function processOneJob(task, resultRow, config) {
   await log('info', '[消息页] 等待并匹配会话…', { jobId: job.jobId, company: job.company, title: job.title });
   let conv = await sendToBoss(
     MSG.WAIT_OPEN_CONVERSATION || 'BHT_WAIT_OPEN_CONVERSATION',
-    { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 18000 },
+    { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 9000 },
     msgOpt
   );
   if (operationAborted(conv)) return 'aborted';
   if (!conv?.ok && conv?.error === 'CONVERSATION_NOT_FOUND') {
-    await sleep(1000);
+    await log('info', '[消息页] 首次刷新后暂未出现新会话，正在执行第二次刷新…', {
+      jobId: job.jobId,
+      company: job.company,
+      title: job.title
+    });
+    await sleep(700);
     if (runner.abort) return 'aborted';
-    await forceInjectContent(msgTabId);
+    const secondRefresh = await refreshMessageTabOnce(task, msgTabId, {
+      jobId: job.jobId,
+      resumed: false
+    });
+    if (operationAborted(secondRefresh)) return 'aborted';
     try { await chrome.tabs.update(msgTabId, { active: true }); } catch (_) {}
     conv = await sendToBoss(
       MSG.WAIT_OPEN_CONVERSATION || 'BHT_WAIT_OPEN_CONVERSATION',
-      { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 12000 },
+      { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 14000 },
       msgOpt
     );
     if (operationAborted(conv)) return 'aborted';

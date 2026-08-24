@@ -1551,12 +1551,67 @@ function firstEl(selectors, root = document) {
 
   
 
+  function findConversationActionButton(scope = document) {
+    const roots = [scope, document].filter(Boolean);
+    const selector = [
+      "a.op-btn-chat",
+      "button.op-btn-chat",
+      ".job-detail-op a",
+      ".job-detail-op button",
+      ".job-detail-box a",
+      ".job-detail-box button",
+      "a.btn-startchat",
+      "button.btn-startchat",
+      "[class*='startchat']",
+      "[data-ka*='chat']",
+      "[ka*='chat']",
+      ".btn-container a",
+      ".btn-container button",
+      "a",
+      "button",
+      "[role='button']"
+    ].join(",");
+    const candidates = [];
+    const seen = new Set();
+    for (const root of roots) {
+      let nodes = [];
+      try { nodes = Array.from(root.querySelectorAll(selector)); } catch (_) {}
+      for (const node of nodes) {
+        const interactive = node.matches?.("a,button,[role='button']")
+          ? node
+          : node.closest?.("a,button,[role='button']") || node;
+        if (!interactive || seen.has(interactive)) continue;
+        seen.add(interactive);
+        const label = textOf(interactive).replace(/\s+/g, " ").trim();
+        if (!/^(立即沟通|继续沟通|打招呼)$/.test(label)) continue;
+        const className = String(interactive.className || "");
+        const tag = String(interactive.tagName || "").toUpperCase();
+        const explicitlyInteractive = /^(A|BUTTON)$/.test(tag) || interactive.getAttribute?.("role") === "button";
+        const explicitChatClass = /op-btn-chat|btn-startchat|start-chat|chat-btn/i.test(className);
+        if (!explicitlyInteractive && !explicitChatClass) continue;
+        if (!explicitlyInteractive && /wrap|container/i.test(className)) continue;
+        let area = Number.MAX_SAFE_INTEGER;
+        try {
+          const style = getComputedStyle(interactive);
+          const rect = interactive.getBoundingClientRect();
+          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity || "1") === 0) continue;
+          if (rect.width < 18 || rect.height < 10) continue;
+          area = rect.width * rect.height;
+        } catch (_) {}
+        if (interactive.disabled || interactive.getAttribute?.("aria-disabled") === "true") continue;
+        candidates.push({
+          element: interactive,
+          score: (/^(A|BUTTON)$/.test(tag) ? 100 : 60) + (explicitChatClass ? 20 : 0),
+          area
+        });
+      }
+    }
+    candidates.sort((a, b) => b.score - a.score || a.area - b.area);
+    return candidates[0]?.element || null;
+  }
+
   async function clickChatButton() {
-    let btn =
-      firstEl(SELECTORS.chatOnDetail) ||
-      Array.from(document.querySelectorAll("a.op-btn-chat, a.op-btn, button")).find((el) =>
-        /立即沟通|继续沟通|打招呼/.test(textOf(el))
-      );
+    const btn = findConversationActionButton(document);
 
     if (!btn) return { ok: false, error: "CHAT_BUTTON_NOT_FOUND", buttonText: "" };
     const buttonText = textOf(btn);
@@ -3264,14 +3319,7 @@ async function startChat(job, opts = {}) {
         textOf(firstEl(SELECTORS.title, scope)) ||
         textOf(document.querySelector(".job-detail .job-name, .job-detail-box .job-name, h1.job-name")) ||
         detailTitle;
-      const btn =
-        firstEl(SELECTORS.chatOnDetail, scope) ||
-        Array.from(scope.querySelectorAll("a,button,div,span")).find((el) =>
-          /立即沟通|继续沟通/.test(textOf(el))
-        ) ||
-        Array.from(document.querySelectorAll("a.op-btn-chat, a.op-btn, button, div[class*='btn']")).find((el) =>
-          /立即沟通|继续沟通/.test(textOf(el))
-        );
+      const btn = findConversationActionButton(scope);
       if (btn) {
         const buttonText = textOf(btn);
         const clickOk = clickLikeHuman(btn);
@@ -3326,7 +3374,21 @@ async function startChat(job, opts = {}) {
     dismissCommonDialogs();
     const nativeGreeting = clicked.already
       ? { available: false, showGreeting: null, text: "", source: "already-contacted" }
-      : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 1600);
+      : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 3200);
+    if (!clicked.already && !nativeGreeting.available) {
+      const unconfirmed = {
+        ok: false,
+        error: "CONVERSATION_CREATE_NOT_CONFIRMED",
+        message: "已尝试点击「立即沟通」，但未收到 BOSS 创建会话成功回执；已停止，避免误报成功",
+        buttonText: clicked.buttonText,
+        detailTitle: detailTitle || job.title || "",
+        href: location.href,
+        nativeGreeting,
+        contentVersion: BHT_CONTENT_VERSION
+      };
+      debugTrace("worker_detail_trigger_unconfirmed", unconfirmed, "error");
+      return unconfirmed;
+    }
     const result = {
       ok: true,
       phase: "CHAT_TRIGGERED",
@@ -3463,14 +3525,7 @@ async function startChat(job, opts = {}) {
           firstEl(SELECTORS.detailRoot) ||
           document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
           document;
-        let btn =
-          firstEl(SELECTORS.chatOnDetail, scope) ||
-          Array.from(scope.querySelectorAll("a,button,div,span")).find((el) =>
-            /立即沟通|继续沟通/.test(textOf(el))
-          ) ||
-          Array.from(document.querySelectorAll("a.op-btn-chat, a.op-btn, button, div[class*='btn']")).find((el) =>
-            /立即沟通|继续沟通/.test(textOf(el))
-          );
+        const btn = findConversationActionButton(scope);
         debugTrace("trigger_chat_button_probe", {
           attempt: i + 1,
           found: Boolean(btn),
@@ -3478,8 +3533,8 @@ async function startChat(job, opts = {}) {
           scope: describeDebugElement(scope),
           selectorCounts: {
             detailButtons: allEl(SELECTORS.chatOnDetail, scope).length,
-            textCandidates: Array.from(scope.querySelectorAll("a,button,div,span"))
-              .filter((el) => /立即沟通|继续沟通/.test(textOf(el))).length
+            textCandidates: Array.from(scope.querySelectorAll("a,button,[role='button']"))
+              .filter((el) => /^(立即沟通|继续沟通|打招呼)$/.test(textOf(el).replace(/\s+/g, " ").trim())).length
           }
         }, btn ? "debug" : "warn");
         if (btn) {
@@ -3534,7 +3589,19 @@ async function startChat(job, opts = {}) {
       dismissCommonDialogs();
       const nativeGreeting = clicked.already
         ? { available: false, showGreeting: null, text: "", source: "already-contacted" }
-        : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 1600);
+        : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 3200);
+      if (!clicked.already && !nativeGreeting.available) {
+        return {
+          ok: false,
+          error: "CONVERSATION_CREATE_NOT_CONFIRMED",
+          message: "已尝试点击「立即沟通」，但未收到 BOSS 创建会话成功回执；已停止，避免误报成功",
+          buttonText: clicked.buttonText,
+          detailTitle: detailTitle || "",
+          href: location.href,
+          nativeGreeting,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+      }
 
       const triggerResult = {
         ok: true,
