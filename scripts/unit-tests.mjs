@@ -432,7 +432,7 @@ test("plugin text master switch suppresses every plugin segment", () => {
   assert.equal(plan.plan.length, 0);
 });
 
-test("successful friend-add receipt recovers a trigger interrupted by navigation", () => {
+test("disabled native greeting friend-add receipt recovers direct chat navigation", () => {
   const recovered = resolveTriggerNavigationRecovery({
     opType: "BHT_TRIGGER_CONVERSATION",
     job: { jobId: "job-1", title: "AI 应用工程师", company: "华为技术有限公司" },
