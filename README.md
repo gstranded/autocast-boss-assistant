@@ -65,8 +65,6 @@ cd autocast-boss-assistant
 
 ![任务页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-task.png)
 
-*浮窗实拍（420×652 原始大小，点击看原图）*
-
 ## 任务页
 
 | 按钮 | 作用 |
@@ -89,8 +87,6 @@ cd autocast-boss-assistant
 ## 筛选页
 
 ![筛选页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-filter.png)
-
-*浮窗实拍（420×652 原始大小，点击看原图）*
 
 ### HR 活跃（多选）
 
@@ -145,8 +141,6 @@ cd autocast-boss-assistant
 
 ![消息页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-message.png)
 
-*浮窗实拍（420×652 原始大小，点击看原图）*
-
 ### BOSS 自动招呼与插件消息
 
 - 消息页会同步 BOSS 账号真实的自动招呼开关和当前话术；**建议关闭 BOSS 自动招呼**，由插件统一控制发送顺序。
@@ -179,8 +173,6 @@ cd autocast-boss-assistant
 
 ![简历页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-resume.png)
 
-*浮窗实拍（420×652 原始大小，点击看原图）*
-
 | 参数 | 作用 |
 |---|---|
 | 自动发送图片简历 | 依次发送当前方案中的图片（源文件单张 ≤ 8 MB，导入后自动压缩） |
@@ -198,8 +190,6 @@ cd autocast-boss-assistant
 ## 设置页
 
 ![设置页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-settings.png)
-
-*浮窗实拍（420×652 原始大小，点击看原图）*
 
 | 参数 | 默认值 | 作用 |
 |---|---|---:|---|
@@ -220,8 +210,6 @@ cd autocast-boss-assistant
 ## 记录页
 
 ![记录页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-history.png)
-
-*浮窗实拍（420×652 原始大小，点击看原图）*
 
 投递记录支持筛选、导出、清空；任务停止或完成时，面板会汇报 `成功 / 跳过 / 失败 / 已处理`。
 
