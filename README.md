@@ -20,7 +20,7 @@
 
 ## 效果预览
 
-[<img src="https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/hero.jpg" alt="效果预览" width="840" />](https://github.com/gstranded/autocast-boss-assistant)
+[<img src="https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/hero.jpg" alt="效果预览" />](https://github.com/gstranded/autocast-boss-assistant)
 
 *投递一份：右侧面板多段打招呼 + 图片简历，左侧职位列表保持不动（v1.7.10 起沟通动作在临时执行页完成，筛选状态零跳转）。*
 
@@ -63,7 +63,9 @@ cd autocast-boss-assistant
 
 面板右上角可在白色 / 黑色主题间切换；字段或功能标题旁的 `i` 是说明入口；任务按钮按“扫描与确认 / 测试与诊断 / 运行控制”分组。
 
-[<img src="https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-task.jpg" alt="任务页" width="720" />](https://github.com/gstranded/autocast-boss-assistant)
+![任务页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-task.png)
+
+*浮窗实拍（420×652 原始大小，点击看原图）*
 
 ## 任务页
 
@@ -86,7 +88,9 @@ cd autocast-boss-assistant
 
 ## 筛选页
 
-[<img src="https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-filter.jpg" alt="筛选页" width="720" />](https://github.com/gstranded/autocast-boss-assistant)
+![筛选页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-filter.png)
+
+*浮窗实拍（420×652 原始大小，点击看原图）*
 
 ### HR 活跃（多选）
 
@@ -139,7 +143,9 @@ cd autocast-boss-assistant
 
 ## 消息页
 
-[<img src="https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-message.jpg" alt="消息页" width="720" />](https://github.com/gstranded/autocast-boss-assistant)
+![消息页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-message.png)
+
+*浮窗实拍（420×652 原始大小，点击看原图）*
 
 ### BOSS 自动招呼与插件消息
 
@@ -171,7 +177,9 @@ cd autocast-boss-assistant
 
 ## 简历页
 
-[<img src="https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-resume.jpg" alt="简历页" width="720" />](https://github.com/gstranded/autocast-boss-assistant)
+![简历页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-resume.png)
+
+*浮窗实拍（420×652 原始大小，点击看原图）*
 
 | 参数 | 作用 |
 |---|---|
@@ -189,7 +197,9 @@ cd autocast-boss-assistant
 
 ## 设置页
 
-[<img src="https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-settings.jpg" alt="设置页" width="720" />](https://github.com/gstranded/autocast-boss-assistant)
+![设置页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-settings.png)
+
+*浮窗实拍（420×652 原始大小，点击看原图）*
 
 | 参数 | 默认值 | 作用 |
 |---|---|---:|---|
@@ -209,7 +219,9 @@ cd autocast-boss-assistant
 
 ## 记录页
 
-[<img src="https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-history.jpg" alt="记录页" width="720" />](https://github.com/gstranded/autocast-boss-assistant)
+![记录页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-history.png)
+
+*浮窗实拍（420×652 原始大小，点击看原图）*
 
 投递记录支持筛选、导出、清空；任务停止或完成时，面板会汇报 `成功 / 跳过 / 失败 / 已处理`。
 
