@@ -38,6 +38,7 @@ import { normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.j
 import { computeSideBySideBounds } from '../shared/window-layout.js';
 import { dedupeResumeImages } from '../shared/resume-images.js';
 import { pickNextTestDeliveryJob } from '../shared/test-delivery.js';
+import { decideAdaptiveScan } from '../shared/adaptive-scan.js';
 import {
   buildConversationWorkerAttempts,
   CONVERSATION_WORKER_MODE,
@@ -76,6 +77,8 @@ let runner = {
   previewing: false,
   previewStartedAt: 0,
   previewPhase: '',
+  previewScanned: 0,
+  previewPass: 0,
   abort: false,
   pause: false,
   skipCurrent: false,
@@ -124,6 +127,12 @@ function setPreviewPhase(phase) {
   if (runner.previewing) runner.previewPhase = String(phase || '');
 }
 
+function setPreviewProgress(scanned = 0, pass = 0) {
+  if (!runner.previewing) return;
+  runner.previewScanned = Math.max(0, Number(scanned || 0));
+  runner.previewPass = Math.max(0, Number(pass || 0));
+}
+
 async function withRunnerAdmission(kind, action) {
   if (runnerIsBusy()) {
     await debugLog('background.runner', 'admission_rejected', {
@@ -144,6 +153,8 @@ async function withRunnerAdmission(kind, action) {
   if (kind === 'previewing') {
     runner.previewStartedAt = Date.now();
     runner.previewPhase = 'locating_list';
+    runner.previewScanned = 0;
+    runner.previewPass = 0;
   }
   await debugLog('background.runner', 'admission_acquired', { kind });
   try {
@@ -153,6 +164,8 @@ async function withRunnerAdmission(kind, action) {
     if (kind === 'previewing') {
       runner.previewStartedAt = 0;
       runner.previewPhase = '';
+      runner.previewScanned = 0;
+      runner.previewPass = 0;
     }
     await debugLog('background.runner', 'admission_released', { kind });
   }
@@ -1317,7 +1330,11 @@ async function restoreListTabAfterTriggerNavigation(task, tabId) {
 async function scanPreviewJobs(payload, previewTab) {
   const scanPayload = {
     scroll: payload.scroll !== false,
-    maxRounds: payload.maxRounds || 6
+    maxRounds: payload.maxRounds || 4,
+    scrollWaitMs: payload.scrollWaitMs || 650,
+    scanSessionId: payload.scanSessionId || uid('scan'),
+    resetSession: payload.resetSession !== false,
+    deadlineAt: Math.max(0, Number(payload.deadlineAt || 0))
   };
   let navigation = null;
   setPreviewPhase('locating_list');
@@ -1373,35 +1390,16 @@ async function scanPreviewJobs(payload, previewTab) {
   return { scan, navigation, previewTab };
 }
 
-
-async function runPreview(payload = {}, previewTab = null) {
-  await log('info', '开始扫描预览…');
-  const config = await getAllConfig();
-  previewTab = previewTab || await getActiveBossTab({ allowInactiveBossTab: false });
-  const scanResult = await scanPreviewJobs(payload, previewTab);
-  const scan = scanResult.scan;
-  previewTab = scanResult.previewTab || previewTab;
-  const previewNavigation = scanResult.navigation || null;
-  if (!scan?.ok) {
-    await log('error', scan?.message || '扫描失败', { error: scan?.error });
-    return { ok: false, ...scan, navigation: previewNavigation };
-  }
-  setPreviewPhase('filtering');
-  const previewListHref = scan.listHref || '';
-  const previewListExpect = scan.listExpectLabel || scan.expectLabel || '';
-
+function evaluatePreviewResults(jobs = [], config = {}, todayStats = {}) {
   const history = config.history || [];
-  const todayStats = await getTodayStats();
   const idempotency = config.idempotency || {};
   const results = [];
-
-  for (const job of scan.jobs || []) {
+  for (const job of jobs) {
     const filterRes = evaluateJob(job, config.filters, config.lists, config.settings);
     let decision = filterRes.decision;
     let reasonCodes = filterRes.reasonCodes || [];
     let reasonTexts = filterRes.reasonTexts || [];
     let passReasons = filterRes.passReasons || [];
-
     if (decision === 'pass') {
       const dedup = checkDedup(job, {
         settings: config.settings,
@@ -1417,7 +1415,6 @@ async function runPreview(payload = {}, previewTab = null) {
         passReasons = [];
       }
     }
-
     results.push({
       job,
       decision,
@@ -1427,12 +1424,130 @@ async function runPreview(payload = {}, previewTab = null) {
       selected: decision === 'pass'
     });
   }
+  return results;
+}
 
-  const summary = summarizePreview(results);
+
+async function runPreview(payload = {}, previewTab = null) {
+  await log('info', '开始扫描预览…');
+  const config = await getAllConfig();
+  const scanSessionId = uid('scan');
+  const maxElapsedMs = Math.max(15000, Math.min(90000, Number(payload.maxScanMs || 50000)));
+  const minScanned = Math.max(15, Math.min(120, Number(payload.minScanJobs || 45)));
+  const maxScanned = Math.max(minScanned, Math.min(500, Number(payload.maxScanJobs || 300)));
+  const targetPass = Math.max(1, Math.min(60, Number(payload.targetPass || config.settings?.taskMaxCommunicate || 30)));
+  const previewStartedAt = runner.previewStartedAt || Date.now();
+  const deadlineAt = previewStartedAt + maxElapsedMs;
+  previewTab = previewTab || await getActiveBossTab({ allowInactiveBossTab: false });
+  const scanResult = await scanPreviewJobs({
+    ...payload,
+    scanSessionId,
+    resetSession: true,
+    deadlineAt,
+    maxRounds: Math.max(3, Math.min(6, Number(payload.maxRounds || 4)))
+  }, previewTab);
+  let scan = scanResult.scan;
+  previewTab = scanResult.previewTab || previewTab;
+  const previewNavigation = scanResult.navigation || null;
+  if (!scan?.ok) {
+    await log('error', scan?.message || '扫描失败', { error: scan?.error });
+    return { ok: false, ...scan, navigation: previewNavigation };
+  }
+  const todayStats = await getTodayStats();
+  let zeroGrowthBatches = 0;
+  let results = [];
+  let summary = { scanned: 0, pass: 0, reject: 0 };
+  let stopDecision = null;
+  let continuationError = '';
+
+  while (true) {
+    if (!runner.previewing) {
+      return { ok: false, error: 'OP_CANCELLED', message: '已取消本次扫描预览' };
+    }
+    setPreviewPhase('filtering');
+    results = evaluatePreviewResults((scan.jobs || []).slice(0, maxScanned), config, todayStats);
+    summary = summarizePreview(results);
+    setPreviewProgress(summary.scanned, summary.pass);
+    const elapsedMs = Date.now() - previewStartedAt;
+    stopDecision = decideAdaptiveScan({
+      scanned: summary.scanned,
+      pass: summary.pass,
+      targetPass,
+      minScanned,
+      maxScanned,
+      elapsedMs,
+      maxElapsedMs,
+      reachedEnd: scan.scanMeta?.reachedEnd === true,
+      batchAdded: Number(scan.scanMeta?.batchAdded || 0),
+      zeroGrowthBatches
+    });
+    if (scan.scanMeta?.timedOut === true && stopDecision.continue) {
+      stopDecision = decideAdaptiveScan({
+        scanned: summary.scanned,
+        pass: summary.pass,
+        elapsedMs: maxElapsedMs,
+        maxElapsedMs
+      });
+    }
+    if (!stopDecision.continue) break;
+
+    setPreviewPhase('scanning_more');
+    await log('info', `扫描进度：累计 ${summary.scanned} 岗，通过 ${summary.pass}（${(stopDecision.passRate * 100).toFixed(1)}%）；${stopDecision.message}`, {
+      scanSessionId,
+      elapsedMs,
+      nextRounds: stopDecision.nextRounds,
+      scanMeta: scan.scanMeta || null
+    });
+    const more = await sendToBoss(MSG.SCAN_JOBS, {
+      scroll: true,
+      maxRounds: stopDecision.nextRounds,
+      scrollWaitMs: payload.scrollWaitMs || 650,
+      scanSessionId,
+      resetSession: false,
+      deadlineAt
+    }, { tabId: previewTab?.id || null });
+    if (operationAborted(more)) {
+      return { ok: false, error: 'OP_CANCELLED', message: '已取消本次扫描预览' };
+    }
+    if (!more?.ok) {
+      continuationError = more?.message || more?.error || '继续滚动扫描失败';
+      await log('warn', '继续滚动扫描未完成，将使用当前已加载岗位：' + continuationError, {
+        error: more?.error || '',
+        scanSessionId
+      });
+      break;
+    }
+    const batchAdded = Number(more.scanMeta?.batchAdded || 0);
+    zeroGrowthBatches = batchAdded > 0 ? 0 : zeroGrowthBatches + 1;
+    scan = {
+      ...scan,
+      ...more,
+      listHref: more.listHref || scan.listHref,
+      listExpectLabel: more.listExpectLabel || scan.listExpectLabel
+    };
+  }
+
+  const previewListHref = scan.listHref || '';
+  const previewListExpect = scan.listExpectLabel || scan.expectLabel || '';
   const passRate = summary.scanned ? summary.pass / summary.scanned : 0;
   const warnings = [];
   if (summary.scanned >= 10 && passRate > 0.8) warnings.push('通过率超过 80%，请检查筛选是否过宽');
   if (summary.scanned >= 10 && passRate < 0.05) warnings.push('通过率低于 5%，请检查筛选是否过严');
+  if (stopDecision?.reason === 'timeout') warnings.push(`扫描已达到 ${Math.round(maxElapsedMs / 1000)} 秒上限，已使用当前加载结果`);
+  if (stopDecision?.reason === 'max_jobs') warnings.push(`扫描已达到 ${maxScanned} 岗上限，已停止继续加载`);
+  if (stopDecision?.reason === 'stalled') warnings.push('连续滚动未加载到新岗位，已停止扫描');
+  if (continuationError) warnings.push('继续加载异常：' + continuationError);
+  const scanMeta = {
+    ...(scan.scanMeta || {}),
+    stopReason: continuationError ? 'batch_error' : (stopDecision?.reason || 'unknown'),
+    stopMessage: continuationError || stopDecision?.message || '',
+    elapsedMs: Date.now() - previewStartedAt,
+    maxElapsedMs,
+    minScanned,
+    maxScanned,
+    targetPass,
+    passRate
+  };
 
   const task = {
     id: uid('task'),
@@ -1460,7 +1575,8 @@ async function runPreview(payload = {}, previewTab = null) {
       listTabId: previewTab?.id || null,
       listWindowId: previewTab?.windowId || null
     },
-    previewNavigation
+    previewNavigation,
+    scanMeta
   };
 
   
@@ -1486,8 +1602,10 @@ await publishTask(task);
   for (const r of results) map[r.job.jobId] = { decision: r.decision };
   await sendToBoss(MSG.HIGHLIGHT_JOBS, { map }, { tabId: previewTab?.id || null });
 
-  await log('success', `预览完成：扫描 ${summary.scanned}，通过 ${summary.pass}，排除 ${summary.reject}`);
-  return { ok: true, task, summary, warnings, navigation: previewNavigation };
+  await log('success', `预览完成：扫描 ${summary.scanned}，通过 ${summary.pass}，排除 ${summary.reject}；${scanMeta.stopMessage || '自适应扫描结束'}`, {
+    scanMeta
+  });
+  return { ok: true, task, summary, warnings, scanMeta, navigation: previewNavigation };
 }
 
 function itemErrorHint(task, row) {
@@ -2641,6 +2759,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             previewing: runner.previewing,
             previewStartedAt: runner.previewStartedAt || 0,
             previewPhase: runner.previewPhase || '',
+            previewScanned: runner.previewScanned || 0,
+            previewPass: runner.previewPass || 0,
             pause: runner.pause && !runner.abort,
             stopping: runner.running && runner.abort,
             activeOperations: operations.size
@@ -3048,6 +3168,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           runner.previewing = false;
           runner.previewStartedAt = 0;
           runner.previewPhase = '';
+          runner.previewScanned = 0;
+          runner.previewPass = 0;
           const all = await getAllConfig();
           await log('warn', '用户已取消扫描预览');
           return { ok: true, previewCancelled: true, task: all.task || null };

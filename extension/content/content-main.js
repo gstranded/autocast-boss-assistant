@@ -23,7 +23,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.11";
+  const BHT_CONTENT_VERSION = "1.7.12";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -1363,6 +1363,172 @@ function firstEl(selectors, root = document) {
     }
   }
 
+  function getAdaptiveScanScroller() {
+    const candidates = [];
+    for (const selector of SELECTORS.listScroller || []) {
+      try { candidates.push(...document.querySelectorAll(selector)); } catch (_) {}
+    }
+    candidates.push(document.scrollingElement, document.documentElement, document.body);
+    for (const el of candidates.filter(Boolean)) {
+      try {
+        const isDocumentScroller = el === document.scrollingElement || el === document.documentElement || el === document.body;
+        const style = getComputedStyle(el);
+        const scrollableStyle = /auto|scroll|overlay/i.test(style.overflowY || '');
+        if (el.scrollHeight > el.clientHeight + 80 && (isDocumentScroller || scrollableStyle)) return el;
+      } catch (_) {}
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+
+  function adaptiveScrollSnapshot(scroller) {
+    const isDocumentScroller =
+      scroller === document.scrollingElement ||
+      scroller === document.documentElement ||
+      scroller === document.body;
+    const top = isDocumentScroller ? window.scrollY : Number(scroller?.scrollTop || 0);
+    const viewport = isDocumentScroller ? window.innerHeight : Number(scroller?.clientHeight || 0);
+    const height = isDocumentScroller
+      ? Math.max(document.documentElement?.scrollHeight || 0, document.body?.scrollHeight || 0)
+      : Number(scroller?.scrollHeight || 0);
+    return {
+      top,
+      viewport,
+      height,
+      atBottom: height > 0 && top + viewport >= height - 48
+    };
+  }
+
+  function collectAdaptiveScanJobs(session) {
+    const cards = getJobCards();
+    const visibleKeys = [];
+    let added = 0;
+    cards.forEach((card, index) => {
+      const job = parseJobCard(card, index);
+      const key = String(job.jobId || `${normalizeText(job.title || '')}|${normalizeText(job.company || '')}`);
+      if (!key) return;
+      visibleKeys.push(key);
+      const previous = session.jobs.get(key);
+      if (!previous) added += 1;
+      session.jobs.set(key, {
+        ...(previous || {}),
+        ...job,
+        company: job.company || previous?.company || '',
+        href: job.href || previous?.href || '',
+        index: previous?.index ?? session.jobs.size
+      });
+    });
+    return {
+      added,
+      visibleCount: cards.length,
+      signature: visibleKeys.join('|')
+    };
+  }
+
+  async function scanAdaptiveJobBatch(payload = {}) {
+    const sessionId = String(payload.scanSessionId || 'default');
+    let session = window.__BHT_SCAN_SESSION__;
+    if (payload.resetSession === true || !session || session.id !== sessionId) {
+      session = window.__BHT_SCAN_SESSION__ = {
+        id: sessionId,
+        jobs: new Map(),
+        rounds: 0,
+        stableRounds: 0,
+        bottomStableRounds: 0,
+        reachedEnd: false,
+        startedAt: Date.now(),
+        lastGrowthAt: Date.now(),
+        lastSignature: ''
+      };
+    }
+
+    const scroller = getAdaptiveScanScroller();
+    const first = collectAdaptiveScanJobs(session);
+    let batchAdded = first.added;
+    let lastVisibleCount = first.visibleCount;
+    let lastSignature = first.signature;
+    const maxRounds = payload.scroll === false ? 0 : Math.max(1, Math.min(12, Number(payload.maxRounds || 6)));
+    const waitMs = Math.max(250, Math.min(900, Number(payload.scrollWaitMs || 650)));
+    const deadlineAt = Math.max(0, Number(payload.deadlineAt || 0));
+    let timedOut = false;
+
+    for (let round = 0; round < maxRounds && !session.reachedEnd; round++) {
+      if (deadlineAt && Date.now() >= deadlineAt) {
+        timedOut = true;
+        break;
+      }
+      let before = adaptiveScrollSnapshot(scroller);
+      // 已在底部但岗位尚未增长时，先轻微回拉再触底，重新触发 BOSS 的懒加载观察器。
+      if (before.atBottom && before.top > 0) {
+        try {
+          const isDocumentScroller =
+            scroller === document.scrollingElement ||
+            scroller === document.documentElement ||
+            scroller === document.body;
+          const retreat = Math.max(120, Math.round((before.viewport || 800) * 0.28));
+          if (isDocumentScroller) window.scrollTo(0, Math.max(0, before.top - retreat));
+          else scroller.scrollTop = Math.max(0, before.top - retreat);
+          const pulseRemainingMs = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : 100;
+          await sleep(Math.min(100, pulseRemainingMs));
+          before = adaptiveScrollSnapshot(scroller);
+        } catch (_) {}
+      }
+      const cards = getJobCards();
+      const last = cards[cards.length - 1];
+      try { last?.scrollIntoView({ block: 'end', behavior: 'instant' }); } catch (_) {}
+      try {
+        const isDocumentScroller =
+          scroller === document.scrollingElement ||
+          scroller === document.documentElement ||
+          scroller === document.body;
+        const step = Math.max(600, Math.round((before.viewport || window.innerHeight || 800) * 0.82));
+        if (isDocumentScroller) window.scrollBy(0, step);
+        else scroller.scrollTop = Math.min(scroller.scrollHeight, Number(scroller.scrollTop || 0) + step);
+      } catch (_) {}
+      const remainingMs = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : waitMs;
+      await sleep(Math.min(waitMs, remainingMs));
+
+      const collected = collectAdaptiveScanJobs(session);
+      batchAdded += collected.added;
+      lastVisibleCount = collected.visibleCount;
+      const after = adaptiveScrollSnapshot(scroller);
+      const moved = Math.abs(after.top - before.top) > 8 || after.height !== before.height;
+      const visibleChanged = Boolean(collected.signature && collected.signature !== lastSignature);
+      lastSignature = collected.signature;
+      session.rounds += 1;
+
+      if (collected.added <= 0 && !moved && !visibleChanged) session.stableRounds += 1;
+      else session.stableRounds = 0;
+      if (collected.added > 0) session.lastGrowthAt = Date.now();
+      if (after.atBottom && collected.added <= 0 && !visibleChanged) session.bottomStableRounds += 1;
+      else session.bottomStableRounds = 0;
+      if (session.bottomStableRounds >= 4 && Date.now() - session.lastGrowthAt >= 2000) {
+        session.reachedEnd = true;
+      }
+    }
+
+    if (deadlineAt && Date.now() >= deadlineAt) timedOut = true;
+    session.lastSignature = lastSignature;
+    const snapshot = adaptiveScrollSnapshot(scroller);
+    const jobs = Array.from(session.jobs.values()).map((job, index) => ({ ...job, index }));
+    return {
+      jobs,
+      count: jobs.length,
+      scanMeta: {
+        sessionId,
+        uniqueCount: jobs.length,
+        visibleCount: lastVisibleCount,
+        batchAdded,
+        rounds: session.rounds,
+        reachedEnd: session.reachedEnd,
+        timedOut,
+        stableRounds: session.stableRounds,
+        scrollTop: snapshot.top,
+        scrollHeight: snapshot.height,
+        elapsedMs: Date.now() - session.startedAt
+      }
+    };
+  }
+
   function pageInfo() {
     const cards = getJobCards();
     const hasChat = typeof hasUsableChatInput === "function" ? hasUsableChatInput() : Boolean(getChatInput());
@@ -1411,7 +1577,7 @@ function firstEl(selectors, root = document) {
     try { rememberListHref(); } catch (_) {}
     const ensured = await ensureJobList({
       maxWaitMs: payload.maxWaitMs || 12000,
-      scroll: payload.scroll !== false
+      scroll: false
     });
     if (!ensured.ok) {
       debugTrace("scan_jobs_no_list", { href: location.href, error: ensured.error, message: ensured.message }, "warn");
@@ -1427,9 +1593,9 @@ function firstEl(selectors, root = document) {
         page: pageInfo()
       };
     }
-    if (payload.scroll) await autoScrollList(payload.maxRounds || 6);
+    const adaptive = await scanAdaptiveJobBatch(payload);
     const cards = getJobCards();
-    const jobs = cards.map((c, i) => parseJobCard(c, i));
+    const jobs = adaptive.jobs;
     debugTrace("scan_jobs_snapshot", {
       cardCount: cards.length,
       parsedCount: jobs.length,
@@ -1448,6 +1614,7 @@ function firstEl(selectors, root = document) {
     try{rememberListHref();}catch(_){} return { ok: true, listHref: (typeof getSavedListHref==="function"?getSavedListHref():"")||location.href, listExpectLabel: (typeof detectSelectedJobExpect==="function"?detectSelectedJobExpect():"")||"", listFilterHints: (typeof detectActiveFilterHints==="function"?detectActiveFilterHints():[]), page: pageInfo(),
       jobs,
       count: jobs.length,
+      scanMeta: adaptive.scanMeta,
       diagnose: {
         cardCount: cards.length,
         companySelectorHits: document.querySelectorAll(SELECTORS.company[0]).length,

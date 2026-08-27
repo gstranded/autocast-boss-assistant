@@ -21,7 +21,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.11";
+const BHT_UI_VERSION = "1.7.12";
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -1206,9 +1206,13 @@ function updateTaskUI(task, runner = {}) {
         navigating: '正在自动跳转职位列表',
         waiting_navigation: '正在等待新页面加载',
         scanning_cards: '正在读取岗位卡片',
+        scanning_more: '正在向下加载更多岗位',
         filtering: '正在应用筛选规则'
       }[runner.previewPhase] || '正在读取岗位';
-      $('taskStatus').textContent = `状态：扫描中 · ${elapsedSeconds} 秒 · ${previewPhaseText}`;
+      const progressText = Number(runner.previewScanned || 0) > 0
+        ? ` · 已扫 ${runner.previewScanned} / 通过 ${runner.previewPass || 0}`
+        : '';
+      $('taskStatus').textContent = `状态：扫描中 · ${elapsedSeconds} 秒 · ${previewPhaseText}${progressText}`;
       $('taskStatus').dataset.status = 'previewing';
     } else {
       const pauseBit = status === 'paused' && task?.pauseReason ? '' : (task?.pauseReason && status !== 'paused' ? `（${task.pauseReason}）` : '');
@@ -1359,9 +1363,13 @@ function renderPreview(task) {
     `扫描岗位：${s.scanned}`,
     `符合规则：${s.pass}`,
     `将被排除：${s.reject}`,
+    task.scanMeta
+      ? `扫描策略：自适应滚动 ${task.scanMeta.rounds || 0} 轮 · 用时 ${(Number(task.scanMeta.elapsedMs || 0) / 1000).toFixed(1)} 秒 · ${task.scanMeta.stopMessage || task.scanMeta.stopReason || '完成'}`
+      : '',
     '',
     '排除原因（冒号后数字 = 被排除岗位数，不是设置上限）：'
   ];
+  if (!lines[3]) lines.splice(3, 1);
   if (s.byReason && Object.keys(s.byReason).length) {
     Object.entries(s.byReason)
       .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
@@ -1687,6 +1695,7 @@ function saveResume(opts = {}) {
 
 async function saveResumeNow(opts = {}) {
   const shouldRefresh = opts.refresh !== false;
+  const shouldRender = opts.render !== false;
   const clearInputs = opts.clearInputs !== false;
   const appendImages = opts.append !== false; // 默认追加，不覆盖已有图
   const includePendingFiles = opts.includePendingFiles !== false;
@@ -1757,8 +1766,10 @@ async function saveResumeNow(opts = {}) {
   if (clearInputs) {
     if ($('imageFiles')) $('imageFiles').value = '';
   }
-  try { renderResumeEditor(); } catch (_) {}
-  try { renderProfileList(); } catch (_) {}
+  if (shouldRender) {
+    try { renderResumeEditor(); } catch (_) {}
+    try { renderProfileList(); } catch (_) {}
+  }
   if (shouldRefresh) await refresh({ soft: true });
   return { resumes, added, skipped, duplicates };
 }
@@ -1776,38 +1787,63 @@ async function saveBindings(opts = {}) {
 }
 
 
+const AUTOSAVE_DELAY_MS = 1800;
 let autosaveTimer = null;
 let autosaving = false;
-async function flushAutosave() {
-  if (autosaving) return;
+let autosaveRevision = 0;
+let autosavePending = false;
+let autosaveComposingTarget = null;
+async function flushAutosave(options = {}) {
+  const force = options.force === true;
+  if (autosaveComposingTarget && !force) {
+    autosavePending = true;
+    return;
+  }
+  if (autosaving) {
+    autosavePending = true;
+    return;
+  }
   if (!globalThis.chrome?.runtime?.id) return;
+  clearTimeout(autosaveTimer);
+  autosaveTimer = null;
+  const revisionAtStart = autosaveRevision;
   autosaving = true;
+  let saveFailed = false;
   try {
     // 关键：先读齐草稿再写，中间禁止 refresh，避免新消息段被旧 storage 覆盖
-    const ok = [];
-    try { await saveMessage({ refresh: false }); ok.push('消息'); } catch (e) { console.warn('autosave message', e); }
-    try { await saveFilters({ refresh: false }); ok.push('筛选'); } catch (e) { console.warn('autosave filters', e); }
-    try { await saveSettings({ refresh: false }); ok.push('设置'); } catch (e) { console.warn('autosave settings', e); }
+    try { await saveMessage({ refresh: false }); } catch (e) { saveFailed = true; console.warn('autosave message', e); }
+    try { await saveFilters({ refresh: false }); } catch (e) { saveFailed = true; console.warn('autosave filters', e); }
+    try { await saveSettings({ refresh: false }); } catch (e) { saveFailed = true; console.warn('autosave settings', e); }
     try {
-      await saveResume({ refresh: false, clearInputs: false, includePendingFiles: false });
-      ok.push('简历');
-    } catch (e) { console.warn('autosave resume', e); }
-    try { await saveBindings({ refresh: false }); ok.push('绑定'); } catch (e) { console.warn('autosave bind', e); }
-    state.formDirty = false;
-    // 保存后用本地草稿重绘消息段，再 soft refresh 同步任务状态
-    try {
-      if (state.config?.messageTemplate) renderSegments(state.config.messageTemplate);
-    } catch (_) {}
-    try { await refresh({ soft: true }); } catch (_) {}
-    if (ok.length) toast('已自动保存', 'success', 900);
+      await saveResume({ refresh: false, render: false, clearInputs: false, includePendingFiles: false });
+    } catch (e) { saveFailed = true; console.warn('autosave resume', e); }
+    try { await saveBindings({ refresh: false }); } catch (e) { saveFailed = true; console.warn('autosave bind', e); }
+    // 输入期间不重建表单、不触发 refresh、不弹 toast；周期状态刷新会单独更新任务与日志。
+    if (!saveFailed && autosaveRevision === revisionAtStart && !autosaveComposingTarget) {
+      state.formDirty = false;
+    } else {
+      state.formDirty = true;
+    }
   } finally {
     autosaving = false;
+    const needsAnotherSave = autosavePending || autosaveRevision !== revisionAtStart;
+    autosavePending = false;
+    if (needsAnotherSave && !autosaveComposingTarget) {
+      scheduleAutosave({ bumpRevision: false });
+    }
   }
 }
-function scheduleAutosave() {
+function scheduleAutosave(options = {}) {
   state.formDirty = true;
+  if (options.bumpRevision !== false) autosaveRevision += 1;
   clearTimeout(autosaveTimer);
-  autosaveTimer = setTimeout(() => { flushAutosave(); }, 650);
+  autosaveTimer = null;
+  if (autosaveComposingTarget) {
+    autosavePending = true;
+    return;
+  }
+  const delayMs = Number(options.delayMs || AUTOSAVE_DELAY_MS);
+  autosaveTimer = setTimeout(() => { flushAutosave(); }, delayMs);
 }
 
 async function ensureConfigSavedBeforeDelivery() {
@@ -1874,10 +1910,41 @@ function wireAutosave() {
   if (!root || root.__bhtAutosave) return;
   root.__bhtAutosave = true;
   root.addEventListener('input', (e) => {
-    if (shouldAutosaveTarget(e.target)) scheduleAutosave();
+    if (!shouldAutosaveTarget(e.target)) return;
+    state.formDirty = true;
+    autosaveRevision += 1;
+    if (e.isComposing || autosaveComposingTarget === e.target) {
+      clearTimeout(autosaveTimer);
+      autosaveTimer = null;
+      autosavePending = true;
+      return;
+    }
+    scheduleAutosave({ bumpRevision: false });
   }, true);
   root.addEventListener('change', (e) => {
     if (shouldAutosaveTarget(e.target)) scheduleAutosave();
+  }, true);
+  root.addEventListener('compositionstart', (e) => {
+    if (!shouldAutosaveTarget(e.target)) return;
+    autosaveComposingTarget = e.target;
+    state.formDirty = true;
+    autosaveRevision += 1;
+    autosavePending = true;
+    clearTimeout(autosaveTimer);
+    autosaveTimer = null;
+  }, true);
+  root.addEventListener('compositionend', (e) => {
+    if (autosaveComposingTarget && autosaveComposingTarget !== e.target) return;
+    autosaveComposingTarget = null;
+    state.formDirty = true;
+    autosaveRevision += 1;
+    autosavePending = false;
+    scheduleAutosave({ bumpRevision: false });
+  }, true);
+  root.addEventListener('focusout', (e) => {
+    if (shouldAutosaveTarget(e.target) && autosaveComposingTarget !== e.target && state.formDirty) {
+      scheduleAutosave({ bumpRevision: false, delayMs: 300 });
+    }
   }, true);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') flushAutosave();
@@ -2246,12 +2313,12 @@ function bindEvents() {
 
   $('btnPreview').addEventListener('click', async () => {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
-    toast('正在定位职位列表并扫描；非列表页会自动跳转…', 'warn', 5000);
+    toast('正在自适应扫描：非列表页会自动跳转；会持续向下加载，达到投递目标、列表底部或 50 秒上限后停止…', 'warn', 6000);
     $('btnPreview').disabled = true;
     $('taskStatus').textContent = '状态：扫描中…';
     try {
       await saveFilters();
-      const res = await api(MSG.RUN_PREVIEW, { scroll: true });
+      const res = await api(MSG.RUN_PREVIEW, { scroll: true, maxScanMs: 50000, maxScanJobs: 300 });
       if (!res?.ok) {
         if (res?.error === 'OP_CANCELLED') {
           toast('已取消本次扫描，上一次预览结果已保留', 'warn', 3500);
@@ -2263,7 +2330,8 @@ function bindEvents() {
         showErrorModal('扫描失败', res?.message || res?.error || '请打开 BOSS 职位列表页后重试', { showRetry: false });
       } else if (res.summary) {
         const navText = res.navigation?.automatic ? '已自动回到职位列表；' : '';
-        toast(`${navText}扫描完成：通过 ${res.summary.pass} / 共 ${res.summary.scanned}`, 'success');
+        const stopText = res.scanMeta?.stopMessage ? ` · ${res.scanMeta.stopMessage}` : '';
+        toast(`${navText}扫描完成：通过 ${res.summary.pass} / 共 ${res.summary.scanned}${stopText}`, 'success', 4200);
       } else {
         toast('预览完成', 'success');
       }

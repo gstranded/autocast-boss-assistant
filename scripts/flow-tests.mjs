@@ -125,6 +125,42 @@ test("message conversation matching performs a second real reload after propagat
   assert.ok(background.includes("if (!resumedFromChat) await sleep(700)"));
 });
 
+test("autosave protects IME composition and never rebuilds message inputs", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(app.includes("AUTOSAVE_DELAY_MS = 1800"));
+  assert.ok(app.includes("compositionstart"));
+  assert.ok(app.includes("compositionend"));
+  assert.ok(app.includes("e.isComposing"));
+  assert.ok(app.includes("autosaveComposingTarget"));
+  const flushStart = app.indexOf("async function flushAutosave");
+  const flushEnd = app.indexOf("function scheduleAutosave", flushStart);
+  const flush = app.slice(flushStart, flushEnd);
+  assert.ok(!flush.includes("renderSegments("));
+  assert.ok(!flush.includes("refresh({ soft: true })"));
+  assert.ok(!flush.includes("toast("));
+  assert.ok(flush.includes("render: false"));
+});
+
+test("preview accumulates virtualized jobs and applies adaptive stop gates", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(content.includes("scanAdaptiveJobBatch"));
+  assert.ok(content.includes("window.__BHT_SCAN_SESSION__"));
+  assert.ok(content.includes("session.jobs = new Map") || content.includes("jobs: new Map()"));
+  assert.ok(content.includes("visibleChanged"));
+  assert.ok(content.includes("bottomStableRounds"));
+  assert.ok(content.includes("lastGrowthAt"));
+  assert.ok(content.includes("先轻微回拉再触底"));
+  assert.ok(content.includes("deadlineAt"));
+  assert.ok(content.includes("timedOut"));
+  assert.ok(background.includes("decideAdaptiveScan"));
+  assert.ok(background.includes("maxScanMs || 50000"));
+  assert.ok(background.includes("maxScanJobs || 300"));
+  assert.ok(background.includes("scanning_more"));
+  assert.ok(panel.includes("达到投递目标、列表底部或 50 秒上限"));
+});
+
 test("content operation bridge is versioned and cancellable", () => {
   const s = fs.readFileSync("extension/content/content-main.js", "utf8");
   const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));

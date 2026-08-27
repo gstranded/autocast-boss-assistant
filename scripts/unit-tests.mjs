@@ -24,6 +24,7 @@ import {
   CONVERSATION_WORKER_MODE,
   isListDocumentPreserved
 } from "../extension/shared/conversation-worker.js";
+import { ADAPTIVE_SCAN_STOP, decideAdaptiveScan } from "../extension/shared/adaptive-scan.js";
 import { reasonText, REASON } from "../extension/shared/reason-codes.js";
 import { computeSideBySideBounds } from "../extension/shared/window-layout.js";
 import {
@@ -739,6 +740,24 @@ test("left list preservation requires the same tab, URL and document instance", 
   assert.equal(isListDocumentPreserved(before, { ...before }), true);
   assert.equal(isListDocumentPreserved(before, { ...before, url: "https://www.zhipin.com/web/geek/chat" }), false);
   assert.equal(isListDocumentPreserved(before, { ...before, contentInstanceId: "content-b" }), false);
+});
+
+test("adaptive scan stops at target, bottom and timeout", () => {
+  const target = decideAdaptiveScan({ scanned: 80, pass: 30, targetPass: 30, minScanned: 45 });
+  assert.equal(target.continue, false);
+  assert.equal(target.reason, ADAPTIVE_SCAN_STOP.TARGET_MET);
+  const bottom = decideAdaptiveScan({ scanned: 60, pass: 2, reachedEnd: true });
+  assert.equal(bottom.reason, ADAPTIVE_SCAN_STOP.REACHED_END);
+  const timeout = decideAdaptiveScan({ scanned: 100, pass: 1, elapsedMs: 50000, maxElapsedMs: 50000 });
+  assert.equal(timeout.reason, ADAPTIVE_SCAN_STOP.TIMEOUT);
+});
+
+test("adaptive scan allocates more rounds when pass rate is low", () => {
+  const low = decideAdaptiveScan({ scanned: 60, pass: 1, targetPass: 30, minScanned: 45, elapsedMs: 10000 });
+  assert.equal(low.continue, true);
+  assert.equal(low.nextRounds, 10);
+  const stalled = decideAdaptiveScan({ scanned: 70, pass: 2, batchAdded: 0, zeroGrowthBatches: 2 });
+  assert.equal(stalled.reason, ADAPTIVE_SCAN_STOP.STALLED);
 });
 test("guard message non-empty", () => {
   assert.ok(bossUrlGuardMessage("https://baidu.com").length > 5);
