@@ -139,7 +139,16 @@ cd autocast-boss-assistant
 
 ## 消息页
 
-![消息页](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-message.png)
+<table>
+  <tr>
+    <td align="center"><img src="https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-message-1.png" alt="消息页（上）：BOSS 自动招呼联动" width="372" /></td>
+    <td align="center"><img src="https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/readme/panel-message-2.png" alt="消息页（下）：消息段编辑器" width="372" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>消息页（上）：BOSS 自动招呼联动</sub></td>
+    <td align="center"><sub>消息页（下）：消息段编辑器</sub></td>
+  </tr>
+</table>
 
 ### BOSS 自动招呼与插件消息
 
