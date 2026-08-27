@@ -141,7 +141,7 @@ test("autosave protects IME composition and never rebuilds message inputs", () =
   assert.ok(flush.includes("render: false"));
 });
 
-test("preview accumulates virtualized jobs and applies adaptive stop gates", () => {
+test("preview accumulates virtualized jobs until bottom or the 60 second deadline", () => {
   const content = fs.readFileSync("extension/content/content-main.js", "utf8");
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
@@ -154,11 +154,26 @@ test("preview accumulates virtualized jobs and applies adaptive stop gates", () 
   assert.ok(content.includes("先轻微回拉再触底"));
   assert.ok(content.includes("deadlineAt"));
   assert.ok(content.includes("timedOut"));
-  assert.ok(background.includes("decideAdaptiveScan"));
-  assert.ok(background.includes("maxScanMs || 50000"));
-  assert.ok(background.includes("maxScanJobs || 300"));
+  assert.ok(content.includes("scroller.scrollTop = scroller.scrollHeight"));
+  assert.ok(background.includes("maxScanMs || 60000"));
+  assert.ok(background.includes("只有确认到底或达到 60 秒边界后才执行筛选"));
+  assert.ok(!background.includes("targetPass"));
+  assert.ok(!background.includes("maxScanJobs"));
   assert.ok(background.includes("scanning_more"));
-  assert.ok(panel.includes("达到投递目标、列表底部或 50 秒上限"));
+  assert.ok(panel.includes("到达列表底部或 60 秒"));
+});
+
+test("panel and background reject mixed extension versions before delivery", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(background.includes("EXTENSION_VERSION_MISMATCH"));
+  assert.ok(background.includes("BHT_RUNTIME_VERSION"));
+  assert.ok(background.includes("content_version_reinject"));
+  assert.ok(background.includes("CONTENT_VERSION_MISMATCH"));
+  assert.ok(background.includes("legacyProtocol: 'BHT_SEND_RESUME'"));
+  assert.ok(panel.includes("clientVersion: BHT_UI_VERSION"));
+  assert.ok(panel.includes("showRuntimeMismatchBanner"));
+  assert.ok(panel.includes("已停止投递"));
 });
 
 test("content operation bridge is versioned and cancellable", () => {

@@ -106,7 +106,7 @@
   state.settings = { ...state.settings, ...(storage.bht_settings || {}) };
 
   function stateResponse() {
-    return { ok: true, ...clone(state) };
+    return { ok: true, runtimeVersion: "1.7.13", ...clone(state) };
   }
 
   function persistStorage() {

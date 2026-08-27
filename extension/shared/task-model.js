@@ -1,4 +1,4 @@
-import { normalizeText } from './text-utils.js';
+import { normalizeMatchText } from './text-utils.js';
 
 const DONE_ITEM_STATES = Object.freeze(['COMPLETED', 'SKIPPED', 'FAILED']);
 const DONE_QUEUE_STATES = Object.freeze(['done', 'skipped', 'failed']);
@@ -78,8 +78,8 @@ export function buildDeliveryQueue(results = [], { selectedOnly = true } = {}) {
   for (const row of rows) {
     const job = row.job || {};
     const id = String(job.jobId || '');
-    const title = normalizeText(job.title || '');
-    const company = normalizeText(job.company || '');
+    const title = normalizeMatchText(job.title || '');
+    const company = normalizeMatchText(job.company || '');
     const key = id && !id.startsWith('name_') && !id.startsWith('dom_')
       ? `id:${id}`
       : `tc:${company}|${title}`;

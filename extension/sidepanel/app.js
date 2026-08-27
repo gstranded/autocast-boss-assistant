@@ -21,7 +21,13 @@ import {
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.12";
+const BHT_UI_VERSION = "1.7.13";
+const VERSION_GUARDED_API_MESSAGES = new Set([
+  MSG.RUN_PREVIEW,
+  MSG.CONFIRM_AND_START,
+  MSG.RUN_TEST_DELIVERY,
+  MSG.RESUME_TASK
+]);
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -45,6 +51,9 @@ const state = {
   draftBindings: [],
   lastCompletionSignalId: '',
   theme: 'dark',
+  runtimeVersionChecked: false,
+  runtimeVersionMismatch: true,
+  runtimeVersion: '',
   bossGreeting: {
     ok: false,
     enabled: null,
@@ -274,7 +283,10 @@ async function api(type, payload) {
   if (type !== MSG.DEBUG_EVENT) panelDebug('api_request', { type, payload: summarizeApiPayload(payload) });
   try {
     if (!globalThis.chrome?.runtime?.id) throw new Error(extContextHint());
-    const res = await globalThis.chrome.runtime.sendMessage({ type, payload });
+    if (VERSION_GUARDED_API_MESSAGES.has(type) && (!state.runtimeVersionChecked || state.runtimeVersionMismatch)) {
+      throw new Error('扩展界面与后台版本未同步。请重新加载扩展并刷新 BOSS 页面后再操作');
+    }
+    const res = await globalThis.chrome.runtime.sendMessage({ type, payload, clientVersion: BHT_UI_VERSION });
     if (globalThis.chrome.runtime.lastError?.message) {
       throw new Error(globalThis.chrome.runtime.lastError.message);
     }
@@ -334,6 +346,24 @@ function showContextDeadBanner() {
   } catch (_) {}
 }
 
+function showRuntimeMismatchBanner(runtimeVersion = '') {
+  try {
+    let el = document.getElementById('bhtVersionMismatch');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'bhtVersionMismatch';
+      el.style.cssText = 'position:sticky;top:0;z-index:9998;background:#7f1d1d;color:#fff;padding:10px 12px;font-size:12px;line-height:1.5;border-bottom:1px solid #991b1b';
+      el.innerHTML = '<div style="font-weight:700;margin-bottom:4px">扩展代码版本不一致，已停止投递</div><div class="bht-version-detail"></div><button type="button" style="margin-top:8px;padding:5px 10px;border:0;border-radius:6px;cursor:pointer">重新加载扩展</button>';
+      el.querySelector('button')?.addEventListener('click', () => {
+        try { chrome.runtime.reload(); } catch (_) { location.reload(); }
+      });
+      document.body.prepend(el);
+    }
+    const detail = el.querySelector('.bht-version-detail');
+    if (detail) detail.textContent = `界面 ${BHT_UI_VERSION} / 后台 ${runtimeVersion || '旧版本或未知'}。点击重新加载后，再按 F5 刷新 BOSS 页面。`;
+  } catch (_) {}
+}
+
 function showTab(name) {
   document.querySelectorAll('.tabs button').forEach((b) => {
     b.classList.toggle('active', b.dataset.tab === name);
@@ -352,7 +382,7 @@ function setConn(ok, text) {
 
 function setBossMode(isBoss, reason = '') {
   // 浮窗只在 BOSS 注入；避免 activeTab 误判导致按钮全灰
-  const effectiveBoss = FLOAT_MODE ? true : Boolean(isBoss);
+  const effectiveBoss = state.runtimeVersionMismatch ? false : (FLOAT_MODE ? true : Boolean(isBoss));
   state.isBoss = effectiveBoss;
   state.bossBlockReason = effectiveBoss ? '' : (reason || '');
   if (!effectiveBoss) {
@@ -1210,7 +1240,9 @@ function updateTaskUI(task, runner = {}) {
         filtering: '正在应用筛选规则'
       }[runner.previewPhase] || '正在读取岗位';
       const progressText = Number(runner.previewScanned || 0) > 0
-        ? ` · 已扫 ${runner.previewScanned} / 通过 ${runner.previewPass || 0}`
+        ? (runner.previewPhase === 'filtering'
+          ? ` · 已扫 ${runner.previewScanned} / 通过 ${runner.previewPass || 0}`
+          : ` · 已累计 ${runner.previewScanned} 岗`)
         : '';
       $('taskStatus').textContent = `状态：扫描中 · ${elapsedSeconds} 秒 · ${previewPhaseText}${progressText}`;
       $('taskStatus').dataset.status = 'previewing';
@@ -1234,7 +1266,7 @@ function updateTaskUI(task, runner = {}) {
   if ($('taskHint')) {
     let hint = '';
     if (runner.previewing) {
-      hint = '正在扫描新页面；下方暂时仍是上一次预览，完成后才会替换。若超过 38 秒仍无结果，本次会自动结束并提示重试。';
+      hint = '正在持续向下加载岗位；下方暂时仍是上一次预览。到达列表底部或滚动满 60 秒后，才会开始筛选并替换结果。';
     }
     else if (status === 'running') hint = '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
     else if (status === 'paused') hint = '已暂停：点「继续」恢复当前队列；或「停止」后重新批量投递。';
@@ -1501,6 +1533,10 @@ async function refresh(options = {}) {
   const soft = options.soft === true;
   const res = await api(MSG.GET_STATE);
   if (!res?.ok) return;
+  state.runtimeVersion = String(res.runtimeVersion || '');
+  state.runtimeVersionChecked = true;
+  state.runtimeVersionMismatch = state.runtimeVersion !== BHT_UI_VERSION;
+  if (state.runtimeVersionMismatch) showRuntimeMismatchBanner(state.runtimeVersion);
   const currentTask = state.config?.task;
   if (!shouldAcceptTaskSnapshot(currentTask, res.task)) res.task = currentTask;
   const prevTemplate = state.config?.messageTemplate;
@@ -1559,13 +1595,15 @@ async function refresh(options = {}) {
   renderLogs(res.logs || []);
   renderHistory(res.history || []);
 
-  const isBoss = Boolean(res.activeIsBoss || res.activeTab);
+  const isBoss = Boolean(res.activeIsBoss || res.activeTab) && !state.runtimeVersionMismatch;
   if (isBoss) {
     setConn(true, '已连接 BOSS · v' + BHT_UI_VERSION);
     setBossMode(true);
   } else {
-    const reason = '当前不是 BOSS 直聘页面，助手仅在 zhipin.com 生效';
-    setConn(false, '未连接 BOSS');
+    const reason = state.runtimeVersionMismatch
+      ? `扩展界面 ${BHT_UI_VERSION} 与后台 ${state.runtimeVersion || '旧版本或未知'} 不一致，请重新加载扩展并刷新页面`
+      : '当前不是 BOSS 直聘页面，助手仅在 zhipin.com 生效';
+    setConn(false, state.runtimeVersionMismatch ? '版本不一致 · 已锁定' : '未连接 BOSS');
     setBossMode(false, reason);
   }
   if (isBoss) updateTaskUI(res.task, res.runner);
@@ -2313,12 +2351,12 @@ function bindEvents() {
 
   $('btnPreview').addEventListener('click', async () => {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
-    toast('正在自适应扫描：非列表页会自动跳转；会持续向下加载，达到投递目标、列表底部或 50 秒上限后停止…', 'warn', 6000);
+    toast('正在持续向下加载职位；非列表页会自动跳转，到达列表底部或 60 秒后使用累计岗位开始筛选…', 'warn', 6000);
     $('btnPreview').disabled = true;
     $('taskStatus').textContent = '状态：扫描中…';
     try {
       await saveFilters();
-      const res = await api(MSG.RUN_PREVIEW, { scroll: true, maxScanMs: 50000, maxScanJobs: 300 });
+      const res = await api(MSG.RUN_PREVIEW, { scroll: true, maxScanMs: 60000 });
       if (!res?.ok) {
         if (res?.error === 'OP_CANCELLED') {
           toast('已取消本次扫描，上一次预览结果已保留', 'warn', 3500);

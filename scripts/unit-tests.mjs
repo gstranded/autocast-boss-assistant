@@ -1,6 +1,6 @@
 import assert from "assert";
 import { evaluateJob, summarizePreview, previewReasonLines } from "../extension/shared/filter-engine.js";
-import { isSimilar, parseSalaryRange, normalizeText, parseKeywords } from "../extension/shared/text-utils.js";
+import { includesKeyword, isSimilar, normalizeMatchText, parseSalaryRange, normalizeText, parseKeywords } from "../extension/shared/text-utils.js";
 import { planMessageSegments } from "../extension/shared/message-planner.js";
 import { MESSAGE_MODES, MESSAGE_SEGMENT_KINDS, STORAGE_KEYS } from "../extension/shared/constants.js";
 import {
@@ -24,7 +24,6 @@ import {
   CONVERSATION_WORKER_MODE,
   isListDocumentPreserved
 } from "../extension/shared/conversation-worker.js";
-import { ADAPTIVE_SCAN_STOP, decideAdaptiveScan } from "../extension/shared/adaptive-scan.js";
 import { reasonText, REASON } from "../extension/shared/reason-codes.js";
 import { computeSideBySideBounds } from "../extension/shared/window-layout.js";
 import {
@@ -742,22 +741,14 @@ test("left list preservation requires the same tab, URL and document instance", 
   assert.equal(isListDocumentPreserved(before, { ...before, contentInstanceId: "content-b" }), false);
 });
 
-test("adaptive scan stops at target, bottom and timeout", () => {
-  const target = decideAdaptiveScan({ scanned: 80, pass: 30, targetPass: 30, minScanned: 45 });
-  assert.equal(target.continue, false);
-  assert.equal(target.reason, ADAPTIVE_SCAN_STOP.TARGET_MET);
-  const bottom = decideAdaptiveScan({ scanned: 60, pass: 2, reachedEnd: true });
-  assert.equal(bottom.reason, ADAPTIVE_SCAN_STOP.REACHED_END);
-  const timeout = decideAdaptiveScan({ scanned: 100, pass: 1, elapsedMs: 50000, maxElapsedMs: 50000 });
-  assert.equal(timeout.reason, ADAPTIVE_SCAN_STOP.TIMEOUT);
-});
-
-test("adaptive scan allocates more rounds when pass rate is low", () => {
-  const low = decideAdaptiveScan({ scanned: 60, pass: 1, targetPass: 30, minScanned: 45, elapsedMs: 10000 });
-  assert.equal(low.continue, true);
-  assert.equal(low.nextRounds, 10);
-  const stalled = decideAdaptiveScan({ scanned: 70, pass: 2, batchAdded: 0, zeroGrowthBatches: 2 });
-  assert.equal(stalled.reason, ADAPTIVE_SCAN_STOP.STALLED);
+test("filter matching normalizes spaces, separators, width and case", () => {
+  assert.equal(normalizeMatchText("ＡＩ Agent-优化_工程师"), "aiagent优化工程师");
+  assert.equal(includesKeyword("AI-Agent 优化工程师", "aiagent"), true);
+  assert.equal(includesKeyword("AI & Agent 优化工程师", "ai agent"), true);
+  assert.equal(includesKeyword("阿里 巴巴-集团", "阿里巴巴集团"), true);
+  assert.equal(includesKeyword("熟悉 Multi_Agent、RAG", "multi agent"), true);
+  assert.equal(includesKeyword("C++ 开发", "C++"), true);
+  assert.equal(includesKeyword("C 开发", "C++"), false);
 });
 test("guard message non-empty", () => {
   assert.ok(bossUrlGuardMessage("https://baidu.com").length > 5);

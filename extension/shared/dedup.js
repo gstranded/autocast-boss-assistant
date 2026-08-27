@@ -1,5 +1,5 @@
 import { REASON, reasonText } from './reason-codes.js';
-import { normalizeText } from './text-utils.js';
+import { normalizeMatchText } from './text-utils.js';
 
 function daysBetween(ts, now = Date.now()) {
   return (now - ts) / (24 * 3600 * 1000);
@@ -20,9 +20,9 @@ export function checkDedup(job, ctx) {
   const jobId = job.jobId || '';
   const bossId = job.bossId || '';
   const company = job.company || '';
-  const companyKey = normalizeText(company);
+  const companyKey = normalizeMatchText(company);
 
-  if (taskItemKeys.has(jobId || `${companyKey}|${normalizeText(job.title || '')}`)) {
+  if (taskItemKeys.has(jobId || `${companyKey}|${normalizeMatchText(job.title || '')}`)) {
     return {
       ok: false,
       reasonCodes: [REASON.DEDUP_TASK_ITEM],
@@ -112,5 +112,5 @@ export function resumeIdempotencyKey(job, kind, profileId) {
 }
 
 export function jobIdempotencyKey(job) {
-  return `job:${job.jobId || normalizeText(job.company || '') + '|' + normalizeText(job.title || '')}`;
+  return `job:${job.jobId || normalizeMatchText(job.company || '') + '|' + normalizeMatchText(job.title || '')}`;
 }

@@ -34,11 +34,10 @@ import { REASON, reasonText } from '../shared/reason-codes.js';
 import { TASK_STATUS } from '../shared/constants.js';
 import { isBossUrl, isBossTab, bossUrlGuardMessage, BOSS_MATCH_PATTERNS } from '../shared/boss-url.js';
 import { didContentDocumentChange, isBossJobListUrl, resolveBossJobListUrl } from '../shared/job-list-navigation.js';
-import { normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
+import { normalizeMatchText, normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
 import { computeSideBySideBounds } from '../shared/window-layout.js';
 import { dedupeResumeImages } from '../shared/resume-images.js';
 import { pickNextTestDeliveryJob } from '../shared/test-delivery.js';
-import { decideAdaptiveScan } from '../shared/adaptive-scan.js';
 import {
   buildConversationWorkerAttempts,
   CONVERSATION_WORKER_MODE,
@@ -57,6 +56,14 @@ import {
 } from '../shared/debug-log.js';
 
 const SPLIT_ZOOM_FACTOR = 0.8;
+const BHT_RUNTIME_VERSION = String(chrome.runtime.getManifest?.().version || 'unknown');
+const VERSION_GUARDED_MESSAGES = new Set([
+  MSG.RUN_PREVIEW,
+  MSG.CONFIRM_AND_START,
+  MSG.RUN_TEST_DELIVERY,
+  'BHT_RUN_TEST_DELIVERY',
+  MSG.RESUME_TASK
+]);
 const JOB_PHASE = Object.freeze({
   CHAT_TRIGGERED: 'CHAT_TRIGGERED',
   CONVERSATION_OPENED: 'CONVERSATION_OPENED',
@@ -212,6 +219,25 @@ async function reconcileStaleRunningTask(reason = '扩展后台已重启') {
       await closeConversationWorkerTab(task, task.execution.workerTabId, {
         reason: '扩展后台重启，清理遗留沟通执行页'
       });
+    }
+    const legacyResumeProtocolFailure = /(?:附件简历|BOSS\s*在线简历).*UNKNOWN_TYPE/i.test(
+      [task.pauseReason || '', task.lastErrorDetail || '', ...(task.items || []).flatMap((item) => item.reasons || [])].join(' ')
+    );
+    if (legacyResumeProtocolFailure) {
+      const recoveryMessage = '检测到旧版本后台残留的 BOSS 在线简历协议；该协议已移除。请点「重试」，插件会依据已发送回执跳过文字/图片并完成当前岗位';
+      task.status = TASK_STATUS.PAUSED;
+      task.pauseReason = recoveryMessage;
+      task.lastErrorDetail = recoveryMessage;
+      task.awaitingUserRetry = true;
+      task.uiErrorDismissed = false;
+      task.items = (task.items || []).map((item) => {
+        const hit = /(?:附件简历|BOSS\s*在线简历).*UNKNOWN_TYPE/i.test((item.reasons || []).join(' '));
+        return hit ? { ...item, reasons: [recoveryMessage] } : item;
+      });
+      task.updatedAt = Date.now();
+      await publishTask(task);
+      await log('warn', recoveryMessage, { taskId: task.id || null, legacyProtocol: 'BHT_SEND_RESUME' });
+      return;
     }
     if (task.status === TASK_STATUS.RUNNING) {
       task.status = TASK_STATUS.PAUSED;
@@ -907,7 +933,16 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     try {
       const pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
       contentInstanceId = String(pong?.contentInstanceId || '');
-      if (!pong?.ok) needInject = true;
+      const contentVersion = String(pong?.contentVersion || '');
+      if (!pong?.ok || (BHT_RUNTIME_VERSION !== 'unknown' && contentVersion !== BHT_RUNTIME_VERSION)) {
+        needInject = true;
+        await debugLog('background.sendToBoss', 'content_version_reinject', {
+          type,
+          tabId: tab.id,
+          runtimeVersion: BHT_RUNTIME_VERSION,
+          contentVersion: contentVersion || 'unknown'
+        }, 'warn');
+      }
     } catch (_) {
       needInject = true;
     }
@@ -920,6 +955,16 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     try {
       const pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
       contentInstanceId = String(pong?.contentInstanceId || '');
+      const contentVersion = String(pong?.contentVersion || '');
+      if (BHT_RUNTIME_VERSION !== 'unknown' && contentVersion !== BHT_RUNTIME_VERSION) {
+        return {
+          ok: false,
+          error: 'CONTENT_VERSION_MISMATCH',
+          message: `BOSS 页面脚本仍是旧版本（页面 ${contentVersion || '未知'} / 后台 ${BHT_RUNTIME_VERSION}）。请按 F5 刷新 BOSS 页面后重试`,
+          contentVersion,
+          runtimeVersion: BHT_RUNTIME_VERSION
+        };
+      }
     } catch (_) {}
   }
 
@@ -1052,7 +1097,10 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
             let pong = null;
             try {
               pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
-              alive = Boolean(pong?.ok);
+              alive = Boolean(
+                pong?.ok &&
+                (BHT_RUNTIME_VERSION === 'unknown' || String(pong?.contentVersion || '') === BHT_RUNTIME_VERSION)
+              );
             } catch (_) { alive = false; }
 
             // 其它长操作：仅当 content 已死时重注入并重发一次（content 侧 opId 幂等）
@@ -1330,8 +1378,8 @@ async function restoreListTabAfterTriggerNavigation(task, tabId) {
 async function scanPreviewJobs(payload, previewTab) {
   const scanPayload = {
     scroll: payload.scroll !== false,
-    maxRounds: payload.maxRounds || 4,
-    scrollWaitMs: payload.scrollWaitMs || 650,
+    maxRounds: payload.maxRounds || 6,
+    scrollWaitMs: payload.scrollWaitMs || 800,
     scanSessionId: payload.scanSessionId || uid('scan'),
     resetSession: payload.resetSession !== false,
     deadlineAt: Math.max(0, Number(payload.deadlineAt || 0))
@@ -1432,10 +1480,7 @@ async function runPreview(payload = {}, previewTab = null) {
   await log('info', '开始扫描预览…');
   const config = await getAllConfig();
   const scanSessionId = uid('scan');
-  const maxElapsedMs = Math.max(15000, Math.min(90000, Number(payload.maxScanMs || 50000)));
-  const minScanned = Math.max(15, Math.min(120, Number(payload.minScanJobs || 45)));
-  const maxScanned = Math.max(minScanned, Math.min(500, Number(payload.maxScanJobs || 300)));
-  const targetPass = Math.max(1, Math.min(60, Number(payload.targetPass || config.settings?.taskMaxCommunicate || 30)));
+  const maxElapsedMs = Math.max(15000, Math.min(120000, Number(payload.maxScanMs || 60000)));
   const previewStartedAt = runner.previewStartedAt || Date.now();
   const deadlineAt = previewStartedAt + maxElapsedMs;
   previewTab = previewTab || await getActiveBossTab({ allowInactiveBossTab: false });
@@ -1444,7 +1489,7 @@ async function runPreview(payload = {}, previewTab = null) {
     scanSessionId,
     resetSession: true,
     deadlineAt,
-    maxRounds: Math.max(3, Math.min(6, Number(payload.maxRounds || 4)))
+    maxRounds: Math.max(3, Math.min(8, Number(payload.maxRounds || 6)))
   }, previewTab);
   let scan = scanResult.scan;
   previewTab = scanResult.previewTab || previewTab;
@@ -1453,55 +1498,27 @@ async function runPreview(payload = {}, previewTab = null) {
     await log('error', scan?.message || '扫描失败', { error: scan?.error });
     return { ok: false, ...scan, navigation: previewNavigation };
   }
-  const todayStats = await getTodayStats();
-  let zeroGrowthBatches = 0;
-  let results = [];
-  let summary = { scanned: 0, pass: 0, reject: 0 };
-  let stopDecision = null;
   let continuationError = '';
+  let scanBatches = 1;
+  setPreviewProgress(Number(scan.count || scan.jobs?.length || 0), 0);
 
-  while (true) {
+  // 先完整滚动并累计岗位；只有确认到底或达到 60 秒边界后才执行筛选。
+  while (scan.scanMeta?.reachedEnd !== true && scan.scanMeta?.timedOut !== true && Date.now() < deadlineAt) {
     if (!runner.previewing) {
       return { ok: false, error: 'OP_CANCELLED', message: '已取消本次扫描预览' };
     }
-    setPreviewPhase('filtering');
-    results = evaluatePreviewResults((scan.jobs || []).slice(0, maxScanned), config, todayStats);
-    summary = summarizePreview(results);
-    setPreviewProgress(summary.scanned, summary.pass);
-    const elapsedMs = Date.now() - previewStartedAt;
-    stopDecision = decideAdaptiveScan({
-      scanned: summary.scanned,
-      pass: summary.pass,
-      targetPass,
-      minScanned,
-      maxScanned,
-      elapsedMs,
-      maxElapsedMs,
-      reachedEnd: scan.scanMeta?.reachedEnd === true,
-      batchAdded: Number(scan.scanMeta?.batchAdded || 0),
-      zeroGrowthBatches
-    });
-    if (scan.scanMeta?.timedOut === true && stopDecision.continue) {
-      stopDecision = decideAdaptiveScan({
-        scanned: summary.scanned,
-        pass: summary.pass,
-        elapsedMs: maxElapsedMs,
-        maxElapsedMs
-      });
-    }
-    if (!stopDecision.continue) break;
-
     setPreviewPhase('scanning_more');
-    await log('info', `扫描进度：累计 ${summary.scanned} 岗，通过 ${summary.pass}（${(stopDecision.passRate * 100).toFixed(1)}%）；${stopDecision.message}`, {
+    const collected = Number(scan.count || scan.jobs?.length || 0);
+    await log('info', `持续向下加载职位：已累计 ${collected} 岗；到达列表底部或 ${Math.round(maxElapsedMs / 1000)} 秒后开始筛选`, {
       scanSessionId,
-      elapsedMs,
-      nextRounds: stopDecision.nextRounds,
+      elapsedMs: Date.now() - previewStartedAt,
+      scanBatches,
       scanMeta: scan.scanMeta || null
     });
     const more = await sendToBoss(MSG.SCAN_JOBS, {
       scroll: true,
-      maxRounds: stopDecision.nextRounds,
-      scrollWaitMs: payload.scrollWaitMs || 650,
+      maxRounds: Math.max(4, Math.min(10, Number(payload.batchRounds || 8))),
+      scrollWaitMs: payload.scrollWaitMs || 800,
       scanSessionId,
       resetSession: false,
       deadlineAt
@@ -1517,35 +1534,42 @@ async function runPreview(payload = {}, previewTab = null) {
       });
       break;
     }
-    const batchAdded = Number(more.scanMeta?.batchAdded || 0);
-    zeroGrowthBatches = batchAdded > 0 ? 0 : zeroGrowthBatches + 1;
+    scanBatches += 1;
     scan = {
       ...scan,
       ...more,
       listHref: more.listHref || scan.listHref,
       listExpectLabel: more.listExpectLabel || scan.listExpectLabel
     };
+    setPreviewProgress(Number(scan.count || scan.jobs?.length || 0), 0);
   }
 
+  setPreviewPhase('filtering');
+  const todayStats = await getTodayStats();
+  const results = evaluatePreviewResults(scan.jobs || [], config, todayStats);
+  const summary = summarizePreview(results);
+  setPreviewProgress(summary.scanned, summary.pass);
   const previewListHref = scan.listHref || '';
   const previewListExpect = scan.listExpectLabel || scan.expectLabel || '';
   const passRate = summary.scanned ? summary.pass / summary.scanned : 0;
   const warnings = [];
   if (summary.scanned >= 10 && passRate > 0.8) warnings.push('通过率超过 80%，请检查筛选是否过宽');
   if (summary.scanned >= 10 && passRate < 0.05) warnings.push('通过率低于 5%，请检查筛选是否过严');
-  if (stopDecision?.reason === 'timeout') warnings.push(`扫描已达到 ${Math.round(maxElapsedMs / 1000)} 秒上限，已使用当前加载结果`);
-  if (stopDecision?.reason === 'max_jobs') warnings.push(`扫描已达到 ${maxScanned} 岗上限，已停止继续加载`);
-  if (stopDecision?.reason === 'stalled') warnings.push('连续滚动未加载到新岗位，已停止扫描');
+  const reachedEnd = scan.scanMeta?.reachedEnd === true;
+  const timedOut = scan.scanMeta?.timedOut === true || Date.now() >= deadlineAt;
+  if (timedOut && !reachedEnd) warnings.push(`滚动已达到 ${Math.round(maxElapsedMs / 1000)} 秒上限，已开始筛选当前累计岗位`);
   if (continuationError) warnings.push('继续加载异常：' + continuationError);
+  const stopReason = continuationError ? 'batch_error' : (reachedEnd ? 'reached_end' : 'timeout');
+  const stopMessage = continuationError || (reachedEnd
+    ? '已滚动到职位列表底部，开始筛选'
+    : `已达到 ${Math.round(maxElapsedMs / 1000)} 秒滚动上限，开始筛选当前累计岗位`);
   const scanMeta = {
     ...(scan.scanMeta || {}),
-    stopReason: continuationError ? 'batch_error' : (stopDecision?.reason || 'unknown'),
-    stopMessage: continuationError || stopDecision?.message || '',
+    stopReason,
+    stopMessage,
     elapsedMs: Date.now() - previewStartedAt,
     maxElapsedMs,
-    minScanned,
-    maxScanned,
-    targetPass,
+    scanBatches,
     passRate
   };
 
@@ -1602,7 +1626,7 @@ await publishTask(task);
   for (const r of results) map[r.job.jobId] = { decision: r.decision };
   await sendToBoss(MSG.HIGHLIGHT_JOBS, { map }, { tabId: previewTab?.id || null });
 
-  await log('success', `预览完成：扫描 ${summary.scanned}，通过 ${summary.pass}，排除 ${summary.reject}；${scanMeta.stopMessage || '自适应扫描结束'}`, {
+  await log('success', `预览完成：扫描 ${summary.scanned}，通过 ${summary.pass}，排除 ${summary.reject}；${scanMeta.stopMessage || '滚动扫描结束'}`, {
     scanMeta
   });
   return { ok: true, task, summary, warnings, scanMeta, navigation: previewNavigation };
@@ -2093,7 +2117,7 @@ async function processOneJob(task, resultRow, config) {
   if (chatRes.detailSalary && !job.salary) job.salary = chatRes.detailSalary;
 
   item.state = 'COMMUNICATION_CREATED';
-  await bumpDailyStat('communicate', 1, normalizeText(job.company || ''));
+  await bumpDailyStat('communicate', 1, normalizeMatchText(job.company || ''));
   await log('success', '已进入沟通，开始发送消息', {
     jobId: job.jobId,
     matchedVia: chatRes?.matchedVia,
@@ -2678,8 +2702,18 @@ async function runTaskLoop(taskId) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const { type } = message || {};
+  const clientVersion = String(message?.clientVersion || '');
   let { payload } = message || {};
   (async () => {
+    if (VERSION_GUARDED_MESSAGES.has(type) && clientVersion !== BHT_RUNTIME_VERSION) {
+      return {
+        ok: false,
+        error: 'EXTENSION_VERSION_MISMATCH',
+        message: `扩展界面与后台版本不一致（界面 ${clientVersion || '未知'} / 后台 ${BHT_RUNTIME_VERSION}）。请在扩展管理页重新加载扩展，再刷新 BOSS 页面`,
+        runtimeVersion: BHT_RUNTIME_VERSION,
+        clientVersion
+      };
+    }
     switch (type) {
       case MSG.GET_BOSS_GREETING: {
         const guard = await assertBossContext(sender);
@@ -2753,6 +2787,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           activeIsBoss: Boolean(tab),
           senderTab: sender?.tab ? { id: sender.tab.id, url: sender.tab.url || '' } : null,
           bossOnly: true,
+          runtimeVersion: BHT_RUNTIME_VERSION,
           runner: {
             running: runner.running && !runner.abort,
             starting: runner.starting,

@@ -23,7 +23,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.12";
+  const BHT_CONTENT_VERSION = "1.7.13";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -1139,10 +1139,12 @@ function firstEl(selectors, root = document) {
 
   function normalizeText(input = "") {
     return String(input || "")
+      .normalize("NFKC")
       .replace(/【[^】]*】/g, "")
       .replace(/\[[^\]]*\]/g, "")
-      .replace(/\s+/g, "")
-      .replace(/[【】\[\]()（）·•|｜]/g, "")
+      .replace(/[\u200B-\u200D\u2060\uFEFF]/g, "")
+      .replace(/[\uE000-\uF8FF]/g, "")
+      .replace(/[^\p{L}\p{N}+#]+/gu, "")
       .toLowerCase();
   }
 
@@ -1447,7 +1449,7 @@ function firstEl(selectors, root = document) {
     let lastVisibleCount = first.visibleCount;
     let lastSignature = first.signature;
     const maxRounds = payload.scroll === false ? 0 : Math.max(1, Math.min(12, Number(payload.maxRounds || 6)));
-    const waitMs = Math.max(250, Math.min(900, Number(payload.scrollWaitMs || 650)));
+    const waitMs = Math.max(300, Math.min(1200, Number(payload.scrollWaitMs || 800)));
     const deadlineAt = Math.max(0, Number(payload.deadlineAt || 0));
     let timedOut = false;
 
@@ -1480,9 +1482,12 @@ function firstEl(selectors, root = document) {
           scroller === document.scrollingElement ||
           scroller === document.documentElement ||
           scroller === document.body;
-        const step = Math.max(600, Math.round((before.viewport || window.innerHeight || 800) * 0.82));
-        if (isDocumentScroller) window.scrollBy(0, step);
-        else scroller.scrollTop = Math.min(scroller.scrollHeight, Number(scroller.scrollTop || 0) + step);
+        if (isDocumentScroller) window.scrollTo(0, Math.max(document.documentElement?.scrollHeight || 0, document.body?.scrollHeight || 0));
+        else scroller.scrollTop = scroller.scrollHeight;
+        // BOSS 不同列表版本可能监听内部容器或 window；两者都触底，避免只停在首批 45 岗。
+        if (!isDocumentScroller) {
+          window.scrollTo(0, Math.max(document.documentElement?.scrollHeight || 0, document.body?.scrollHeight || 0));
+        }
       } catch (_) {}
       const remainingMs = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : waitMs;
       await sleep(Math.min(waitMs, remainingMs));
@@ -1501,7 +1506,7 @@ function firstEl(selectors, root = document) {
       if (collected.added > 0) session.lastGrowthAt = Date.now();
       if (after.atBottom && collected.added <= 0 && !visibleChanged) session.bottomStableRounds += 1;
       else session.bottomStableRounds = 0;
-      if (session.bottomStableRounds >= 4 && Date.now() - session.lastGrowthAt >= 2000) {
+      if (session.bottomStableRounds >= 5 && Date.now() - session.lastGrowthAt >= 3500) {
         session.reachedEnd = true;
       }
     }

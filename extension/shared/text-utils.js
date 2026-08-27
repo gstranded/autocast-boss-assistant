@@ -24,6 +24,21 @@ export function normalizeText(input = '') {
     .trim();
 }
 
+/**
+ * 筛选专用标准化：统一全/半角、大小写、空白和装饰性分隔符。
+ * 保留 + 与 #，避免把 C++ / C# 退化成普通的 C。
+ */
+export function normalizeMatchText(input = '') {
+  return String(input || '')
+    .normalize('NFKC')
+    .replace(EMOJI_RE, '')
+    .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
+    .replace(/[\uE000-\uF8FF]/g, '')
+    .replace(/[^\p{L}\p{N}+#]+/gu, '')
+    .toLowerCase()
+    .trim();
+}
+
 export function bigrams(s) {
   if (!s) return new Set();
   if (s.length < 2) return new Set([s]);
@@ -145,7 +160,9 @@ export function parseSalaryRange(text = '') {
 
 export function includesKeyword(text, keyword) {
   if (!keyword) return false;
-  return normalizeText(text).includes(normalizeText(keyword));
+  const normalizedText = normalizeMatchText(text);
+  const normalizedKeyword = normalizeMatchText(keyword);
+  return Boolean(normalizedKeyword) && normalizedText.includes(normalizedKeyword);
 }
 
 export function deepClone(obj) {
