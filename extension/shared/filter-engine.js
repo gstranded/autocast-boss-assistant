@@ -98,7 +98,7 @@ const ACTIVE_PATTERNS = {
   month: /本月|近30日|30日内|近一月/
 };
 
-function normalizeActiveWithin(value) {
+export function normalizeActiveWithin(value) {
   // 兼容旧版单选字符串配置：'' | today | 3d | week
   if (Array.isArray(value)) return value;
   if (!value) return [];
@@ -108,7 +108,7 @@ function normalizeActiveWithin(value) {
   return [];
 }
 
-function matchActive(activeText, activeWithin) {
+export function matchActive(activeText, activeWithin) {
   const selected = normalizeActiveWithin(activeWithin);
   if (!selected.length) return true;
   const t = activeText || '';
@@ -123,9 +123,11 @@ function matchActive(activeText, activeWithin) {
  * @param {object} filters
  * @param {object} lists
  * @param {object} settings
+ * @param {object} options
  */
-export function evaluateJob(job, filters, lists = {}, settings = {}) {
+export function evaluateJob(job, filters, lists = {}, settings = {}, options = {}) {
   const passReasons = [];
+  let requiresActiveCheck = false;
 
   if (!job || !(job.title || job.jobId)) {
     return {
@@ -235,21 +237,30 @@ export function evaluateJob(job, filters, lists = {}, settings = {}) {
     };
   }
 
-  if (normalizeActiveWithin(filters.activeWithin).length && !matchActive(job.activeText, filters.activeWithin)) {
-    return {
-      decision: 'reject',
-      reasonCodes: [REASON.FILTER_ACTIVE],
-      reasonTexts: [reasonText(REASON.FILTER_ACTIVE, job.activeText || '未知')],
-      passReasons
-    };
+  if (normalizeActiveWithin(filters.activeWithin).length) {
+    const activeText = String(job.activeText || '').trim();
+    if (!activeText && options.deferUnknownActive === true) {
+      // 列表卡通常不展示 HR 活跃标签；临时详情页会在点击沟通前完成强校验。
+      requiresActiveCheck = true;
+    } else if (!matchActive(activeText, filters.activeWithin)) {
+      return {
+        decision: 'reject',
+        reasonCodes: [REASON.FILTER_ACTIVE],
+        reasonTexts: [reasonText(REASON.FILTER_ACTIVE, activeText || '未知')],
+        passReasons,
+        requiresActiveCheck: false
+      };
+    } else {
+      passReasons.push(`HR 活跃：${activeText}`);
+    }
   }
-  if (normalizeActiveWithin(filters.activeWithin).length) passReasons.push(`HR 活跃：${job.activeText || '符合'}`);
 
   return {
     decision: 'pass',
     reasonCodes: [REASON.OK_PREVIEW_PASS],
     reasonTexts: [reasonText(REASON.OK_PREVIEW_PASS)],
-    passReasons
+    passReasons,
+    requiresActiveCheck
   };
 }
 

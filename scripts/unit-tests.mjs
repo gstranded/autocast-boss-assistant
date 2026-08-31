@@ -1,5 +1,11 @@
 import assert from "assert";
-import { evaluateJob, summarizePreview, previewReasonLines } from "../extension/shared/filter-engine.js";
+import {
+  evaluateJob,
+  matchActive,
+  normalizeActiveWithin,
+  summarizePreview,
+  previewReasonLines
+} from "../extension/shared/filter-engine.js";
 import { includesKeyword, isSimilar, normalizeMatchText, parseSalaryRange, normalizeText, parseKeywords } from "../extension/shared/text-utils.js";
 import { planMessageSegments } from "../extension/shared/message-planner.js";
 import { MESSAGE_MODES, MESSAGE_SEGMENT_KINDS, STORAGE_KEYS } from "../extension/shared/constants.js";
@@ -223,6 +229,9 @@ test("HR active / hunter / outsource / whitelist-only", () => {
   const active = evaluateJob({ ...passJob, activeText: "本月活跃" }, { ...filters, activeWithin: "today" }, {}, {});
   assert.equal(active.decision, "reject");
   assert.ok(active.reasonCodes.includes(REASON.FILTER_ACTIVE));
+  assert.equal(matchActive("本周活跃", ["week"]), true);
+  assert.equal(matchActive("本周活跃", ["today"]), false);
+  assert.deepEqual(normalizeActiveWithin("week"), ["week"]);
   const hunter = evaluateJob({ ...passJob, hrName: "猎头顾问" }, filters, {}, {});
   assert.equal(hunter.decision, "reject");
   assert.ok(hunter.reasonCodes.includes(REASON.FILTER_HUNTER));
@@ -237,6 +246,27 @@ test("HR active / hunter / outsource / whitelist-only", () => {
   const white = evaluateJob(passJob, filters, { companyWhitelist: ["字节"] }, { whitelistOnly: true });
   assert.equal(white.decision, "reject");
   assert.ok(white.reasonCodes.includes(REASON.FILTER_WHITELIST_COMPANY));
+});
+test("unknown HR activity is deferred only for preview and remains strict by default", () => {
+  const activeFilters = { ...filters, activeWithin: ["week"] };
+  const strict = evaluateJob(passJob, activeFilters, {}, {});
+  assert.equal(strict.decision, "reject");
+  assert.ok(strict.reasonCodes.includes(REASON.FILTER_ACTIVE));
+
+  const preview = evaluateJob(passJob, activeFilters, {}, {}, { deferUnknownActive: true });
+  assert.equal(preview.decision, "pass");
+  assert.equal(preview.requiresActiveCheck, true);
+  assert.ok(!preview.passReasons.some((text) => /未知|待校验/.test(text)));
+
+  const known = evaluateJob(
+    { ...passJob, activeText: "本周活跃" },
+    activeFilters,
+    {},
+    {},
+    { deferUnknownActive: true }
+  );
+  assert.equal(known.decision, "pass");
+  assert.equal(known.requiresActiveCheck, false);
 });
 test("disabled company OR and JD NOT ignore stored keywords", () => {
   const companyOff = evaluateJob(
@@ -1370,13 +1400,14 @@ test("operation registry returns and clears every active content operation", () 
   assert.equal(registry.size, 0);
 });
 
-test("operation budgets share one deadline and leave bridge cleanup grace", () => {
+test("preview collection uses a hard deadline while other bridges retain cleanup grace", () => {
   const now = 1_000_000;
   const scanDeadline = now + OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS;
   const scanPageMs = resolvePageOperationTimeoutMs("BHT_SCAN_JOBS", { deadlineAt: scanDeadline }, now);
+  assert.equal(scanPageMs, OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS);
   assert.equal(
-    scanPageMs,
-    OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS + OPERATION_TIMEOUTS.SCAN_DEADLINE_GRACE_MS
+    resolvePageOperationTimeoutMs("BHT_SCAN_JOBS", { deadlineAt: now + 250 }, now),
+    250
   );
   assert.equal(
     resolveBridgeTimeoutMs(scanPageMs),
@@ -1384,7 +1415,7 @@ test("operation budgets share one deadline and leave bridge cleanup grace", () =
   );
   assert.equal(
     resolvePageOperationTimeoutMs("BHT_SCAN_JOBS", { deadlineAt: now - 1 }, now),
-    OPERATION_TIMEOUTS.SCAN_MIN_PAGE_MS
+    0
   );
   assert.equal(
     resolvePageOperationTimeoutMs("BHT_WAIT_CHAT_EDITOR", { timeoutMs: 30000 }, now),
@@ -1423,6 +1454,16 @@ test("preview scan stops only at bottom, deadline, or a real batch error", () =>
   assert.equal(
     resolvePreviewScanStop({ timedOut: true, batchError: "late bridge result" }).reason,
     PREVIEW_SCAN_STOP.TIMEOUT
+  );
+  assert.equal(
+    resolvePreviewScanStop({ reachedEnd: true, timedOut: true }).reason,
+    PREVIEW_SCAN_STOP.TIMEOUT,
+    "an expired deadline must never be reported as a confirmed list bottom"
+  );
+  assert.equal(
+    resolvePreviewScanStop({ reachedEnd: true, timedOut: false, deadlineAt: 1000, now: 1001 }).reason,
+    PREVIEW_SCAN_STOP.REACHED_END,
+    "a bottom confirmed before the deadline must survive later result processing"
   );
   assert.equal(
     resolvePreviewScanStop({ batchError: "real failure", deadlineAt: 2000, now: 1000 }).reason,

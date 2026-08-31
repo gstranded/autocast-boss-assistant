@@ -3,13 +3,10 @@ export const OPERATION_TIMEOUTS = Object.freeze({
   CHAT_PAGE_MS: 30000,
   START_CHAT_PAGE_MS: 45000,
   PAGE_PAYLOAD_GRACE_MS: 3000,
-  SCAN_DEADLINE_GRACE_MS: 2500,
-  SCAN_MIN_PAGE_MS: 4000,
   BRIDGE_GRACE_MS: 5000,
   BRIDGE_CANCEL_SETTLE_MS: 3000,
   BRIDGE_CANCEL_POLL_MS: 100,
   PREVIEW_SCROLL_MS: 60000,
-  PREVIEW_WORKER_LOAD_MS: 20000,
   PREVIEW_LIST_NAV_MS: 30000
 });
 
@@ -31,15 +28,9 @@ export function resolvePageOperationTimeoutMs(type, payload = {}, now = Date.now
   if (type === 'BHT_SCAN_JOBS') {
     const deadlineAt = finiteMs(payload?.deadlineAt);
     if (deadlineAt) {
-      return Math.min(
-        125000,
-        Math.max(
-          OPERATION_TIMEOUTS.SCAN_MIN_PAGE_MS,
-          deadlineAt - now + OPERATION_TIMEOUTS.SCAN_DEADLINE_GRACE_MS
-        )
-      );
+      return Math.max(0, Math.min(OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS, deadlineAt - now));
     }
-    return OPERATION_TIMEOUTS.CHAT_PAGE_MS;
+    return OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS;
   }
 
   const baseMs = type === 'BHT_START_CHAT'

@@ -21,7 +21,12 @@ import {
   saveSettings,
   saveTask
 } from '../shared/storage.js';
-import { evaluateJob, summarizePreview } from '../shared/filter-engine.js';
+import {
+  evaluateJob,
+  matchActive,
+  normalizeActiveWithin,
+  summarizePreview
+} from '../shared/filter-engine.js';
 import { checkDedup, checkLimits, jobIdempotencyKey, resumeIdempotencyKey } from '../shared/dedup.js';
 import { planMessageSegments } from '../shared/message-planner.js';
 import {
@@ -60,6 +65,7 @@ import {
   resolvePageOperationTimeoutMs
 } from '../shared/operation-timeouts.js';
 import {
+  normalizePreviewScanTerminalState,
   PREVIEW_SCAN_STOP,
   resolvePreviewScanStop
 } from '../shared/preview-scan-policy.js';
@@ -538,7 +544,36 @@ async function getActiveBossTab({ allowInactiveBossTab = false, sender = null } 
   return all.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0] || null;
 }
 
-async function forceInjectContent(tabId) {
+function deadlineReached(deadlineAt, now = Date.now()) {
+  const deadline = Number(deadlineAt || 0);
+  return Number.isFinite(deadline) && deadline > 0 && Number(now) >= deadline;
+}
+
+function remainingDeadlineMs(deadlineAt, capMs, now = Date.now()) {
+  const cap = Math.max(0, Number(capMs) || 0);
+  const deadline = Number(deadlineAt || 0);
+  if (!Number.isFinite(deadline) || deadline <= 0) return cap;
+  return Math.max(0, Math.min(cap, deadline - Number(now)));
+}
+
+async function sleepWithinDeadline(waitMs, deadlineAt = 0) {
+  const boundedWaitMs = remainingDeadlineMs(deadlineAt, waitMs);
+  if (deadlineAt && boundedWaitMs <= 0) return false;
+  await sleep(boundedWaitMs);
+  return !deadlineReached(deadlineAt);
+}
+
+function previewScanDeadlineResult(extra = {}) {
+  return {
+    ok: false,
+    error: 'OP_DEADLINE_EXCEEDED',
+    message: '岗位加载时间已结束，开始筛选已收集岗位',
+    ...extra
+  };
+}
+
+async function forceInjectContent(tabId, { deadlineAt = 0 } = {}) {
+  if (deadlineReached(deadlineAt)) return false;
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
@@ -549,6 +584,7 @@ async function forceInjectContent(tabId) {
   } catch (_) {
     // 受限页面可能拒绝 MAIN world；隔离世界仍可继续走设置与 DOM 兜底。
   }
+  if (deadlineReached(deadlineAt)) return false;
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
@@ -560,8 +596,7 @@ async function forceInjectContent(tabId) {
       ],
       injectImmediately: true
     });
-    await sleep(120);
-    return true;
+    return await sleepWithinDeadline(120, deadlineAt);
   } catch (_) {
     return false;
   }
@@ -569,11 +604,19 @@ async function forceInjectContent(tabId) {
 
 
 
-async function waitTabComplete(tabId, timeoutMs = 45000, { shouldStop = null, requireComplete = false } = {}) {
+async function waitTabComplete(tabId, timeoutMs = 45000, {
+  shouldStop = null,
+  requireComplete = false,
+  deadlineAt = 0
+} = {}) {
   const start = Date.now();
+  const timeoutDeadlineAt = start + Math.max(0, Number(timeoutMs) || 0);
+  const waitDeadlineAt = Number(deadlineAt) > 0
+    ? Math.min(timeoutDeadlineAt, Number(deadlineAt))
+    : timeoutDeadlineAt;
   let lastUrl = "";
   let stableSince = 0;
-  while (Date.now() - start < timeoutMs) {
+  while (Date.now() < waitDeadlineAt) {
     if (typeof shouldStop === 'function' && shouldStop()) return null;
     try {
       const t = await chrome.tabs.get(tabId);
@@ -591,7 +634,9 @@ async function waitTabComplete(tabId, timeoutMs = 45000, { shouldStop = null, re
     } catch (e) {
       return null;
     }
-    await sleep(200);
+    const remainingMs = Math.max(0, waitDeadlineAt - Date.now());
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(200, remainingMs));
   }
   if (requireComplete) return null;
   try { return await chrome.tabs.get(tabId); } catch (_) { return null; }
@@ -971,8 +1016,9 @@ async function openConversationWorkerTab(task, attempt, messageTab, job) {
   return ready;
 }
 
-async function triggerConversationInWorker(task, job, messageTab, listTabId) {
+async function triggerConversationInWorker(task, job, messageTab, listTabId, activeWithin = []) {
   const listBefore = await getListTabFingerprint(listTabId);
+  const selectedActiveBuckets = normalizeActiveWithin(activeWithin);
   const attempts = buildConversationWorkerAttempts({
     job,
     listHref: task?.listHref || job?.listHref || ''
@@ -990,8 +1036,11 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId) {
   const attemptResults = [];
   for (let index = 0; index < attempts.length; index++) {
     const attempt = attempts[index];
+    result = null;
     let workerTab = null;
     let triggerStarted = false;
+    let activityInspection = null;
+    let activityAccepted = null;
     try {
       workerTab = await openConversationWorkerTab(task, attempt, messageTab, job);
       await log('info', '[执行页] 已在后台打开岗位，不会操作左侧职位列表', {
@@ -1000,20 +1049,52 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId) {
         mode: attempt.mode,
         url: String(attempt.url || '').slice(0, 180)
       });
-      triggerStarted = true;
-      result = await sendToBoss(
-        MSG.TRIGGER_CONVERSATION || 'BHT_TRIGGER_CONVERSATION',
-        {
-          job: { ...job, listHref: task?.listHref || job?.listHref || '' },
-          workerDetail: attempt.mode === CONVERSATION_WORKER_MODE.DETAIL
-        },
-        { tabId: workerTab.id, forceInject: true }
-      );
+      if (selectedActiveBuckets.length) {
+        activityInspection = await sendToBoss(
+          MSG.INSPECT_JOB_DETAIL || 'BHT_INSPECT_JOB_DETAIL',
+          { job },
+          { tabId: workerTab.id }
+        );
+        if (operationAborted(activityInspection)) {
+          result = activityInspection;
+        } else {
+          const activeText = String(activityInspection?.activeText || '').trim();
+          job.activeText = activeText;
+          activityAccepted = Boolean(
+            activityInspection?.ok &&
+            activeText &&
+            matchActive(activeText, selectedActiveBuckets)
+          );
+          if (!activityAccepted) {
+            result = {
+              ok: false,
+              error: REASON.FILTER_ACTIVE,
+              filtered: true,
+              activeText,
+              activityInspection,
+              message: reasonText(REASON.FILTER_ACTIVE, activeText || '未知')
+            };
+          }
+        }
+      }
+      if (!result) {
+        triggerStarted = true;
+        result = await sendToBoss(
+          MSG.TRIGGER_CONVERSATION || 'BHT_TRIGGER_CONVERSATION',
+          {
+            job: { ...job, listHref: task?.listHref || job?.listHref || '' },
+            workerDetail: attempt.mode === CONVERSATION_WORKER_MODE.DETAIL
+          },
+          { tabId: workerTab.id, forceInject: true }
+        );
+      }
       attemptResults.push({
         mode: attempt.mode,
         url: attempt.url,
         ok: Boolean(result?.ok),
         error: result?.error || '',
+        activeText: activityInspection?.activeText || '',
+        activityAccepted,
         navigated: Boolean(result?.navigated)
       });
     } catch (error) {
@@ -1029,7 +1110,7 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId) {
       });
     }
 
-    if (result?.ok || operationAborted(result)) break;
+    if (result?.ok || result?.filtered || operationAborted(result)) break;
     const safeToFallback = /WORKER_CHAT_BUTTON_NOT_FOUND|WORKER_TAB_FAILED|CONTENT_INJECT_FAIL|TARGET_TAB_CLOSED/.test(
       String(result?.error || '')
     );
@@ -1068,6 +1149,10 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     : runKind === 'preview'
       ? !isPreviewRunActive(previewRunId)
       : false;
+  const scanDeadlineAt = type === MSG.SCAN_JOBS
+    ? Math.max(0, Number(payload?.deadlineAt || 0))
+    : 0;
+  const scanDeadlineResult = () => previewScanDeadlineResult();
   await debugLog('background.sendToBoss', 'begin', {
     type, tabId, retries, forceInject, taskBound,
     job: payload?.job ? {
@@ -1078,6 +1163,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     } : null
   });
   if (isCancelled()) return cancelledResult();
+  if (scanDeadlineAt && Date.now() >= scanDeadlineAt) return scanDeadlineResult();
   let tab = null;
   if (tabId != null) {
     try {
@@ -1105,6 +1191,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
   }
 
   const critical = [
+    MSG.INSPECT_JOB_DETAIL,
     MSG.TRIGGER_CONVERSATION,
     MSG.WAIT_OPEN_CONVERSATION,
     MSG.WAIT_CHAT_EDITOR,
@@ -1150,9 +1237,11 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
   }
   if (needInject) {
     if (isCancelled()) return cancelledResult();
-    await forceInjectContent(tab.id);
-    await sleep(180);
+    if (scanDeadlineAt && Date.now() >= scanDeadlineAt) return scanDeadlineResult();
+    await forceInjectContent(tab.id, { deadlineAt: scanDeadlineAt });
+    if (!await sleepWithinDeadline(180, scanDeadlineAt)) return scanDeadlineResult();
     if (isCancelled()) return cancelledResult();
+    if (scanDeadlineAt && Date.now() >= scanDeadlineAt) return scanDeadlineResult();
     try {
       const pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
       contentInstanceId = String(pong?.contentInstanceId || '');
@@ -1177,7 +1266,10 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       bridgeOpId = opId;
       const storageKey = 'bht_op_' + opId;
       const pageOperationTimeoutMs = resolvePageOperationTimeoutMs(type, payload);
-      const bridgeTimeoutMs = resolveBridgeTimeoutMs(pageOperationTimeoutMs);
+      const bridgeTimeoutMs = scanDeadlineAt
+        ? Math.max(0, scanDeadlineAt - Date.now())
+        : resolveBridgeTimeoutMs(pageOperationTimeoutMs);
+      if (scanDeadlineAt && bridgeTimeoutMs <= 0) return scanDeadlineResult();
       operations.add({ opId, tabId: tab.id, type, storageKey });
       const finishBridge = async (result, { removeStorage = true } = {}) => {
         operations.delete(opId);
@@ -1190,8 +1282,12 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       };
       await chrome.storage.local.remove(storageKey).catch(() => {});
       await chrome.storage.local.set({ [storageKey]: { status: 'pending', opType: type, at: Date.now() } });
+      if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) {
+        return await finishBridge(scanDeadlineResult());
+      }
       const fireOp = async () => {
         if (isCancelled()) return false;
+        if (scanDeadlineAt && Date.now() >= scanDeadlineAt) return false;
         await debugLog('background.sendToBoss', 'bridge_fire', { type, opId, tabId: tab.id });
         const ack = await chrome.tabs.sendMessage(tab.id, {
           type: 'BHT_RUN_OP',
@@ -1219,24 +1315,35 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       }
       if (!fired) {
         if (isCancelled()) return await finishBridge(cancelledResult());
-        await forceInjectContent(tab.id);
-        await sleep(220);
+        if (scanDeadlineAt && Date.now() >= scanDeadlineAt) {
+          return await finishBridge(scanDeadlineResult());
+        }
+        await forceInjectContent(tab.id, { deadlineAt: scanDeadlineAt });
+        if (!await sleepWithinDeadline(220, scanDeadlineAt)) {
+          return await finishBridge(scanDeadlineResult());
+        }
         if (isCancelled()) return await finishBridge(cancelledResult());
+        if (scanDeadlineAt && Date.now() >= scanDeadlineAt) {
+          return await finishBridge(scanDeadlineResult());
+        }
         fired = await fireOp();
       }
       if (!fired) throw new Error('RUN_OP_NOT_SUPPORTED');
       const started = Date.now();
+      const bridgeDeadlineAt = scanDeadlineAt || (started + bridgeTimeoutMs);
       const bridgeStartedUrl = tab.url || '';
       let navigationProbeAt = started + 700;
       let reinjectAt = started + 8000;
-      while (Date.now() - started < bridgeTimeoutMs) {
-        await sleep(350);
+      while (Date.now() < bridgeDeadlineAt) {
+        await sleep(Math.min(350, Math.max(0, bridgeDeadlineAt - Date.now())));
         if (isCancelled()) return await finishBridge(cancelledResult());
         const bag = await chrome.storage.local.get(storageKey);
         const row = bag && bag[storageKey];
         if (row?.status === 'cancelled') return await finishBridge(cancelledResult());
         if (row && row.status === 'done') {
           const result = row.result || { ok: false, error: 'EMPTY_OP_RESULT' };
+          const completedAt = Number(row.at || Date.now());
+          if (scanDeadlineAt && completedAt > scanDeadlineAt) break;
           await debugLog('background.sendToBoss', 'bridge_done', {
             type,
             opId,
@@ -1244,6 +1351,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
             result: summarizeBossOperationResult(result)
           });
           if (result && result.error === 'OP_BUSY') {
+            if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
             try {
               await chrome.storage.local.set({
                 [storageKey]: { status: 'pending', opType: type, at: Date.now(), note: 'ignore-op-busy' }
@@ -1267,16 +1375,19 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
           }
           return await finishBridge(result);
         }
+        if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
         if (type === MSG.SCAN_JOBS && Date.now() >= navigationProbeAt) {
           navigationProbeAt = Date.now() + 700;
           try {
             const latest = await chrome.tabs.get(tab.id);
+            if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
             const latestUrl = latest?.url || latest?.pendingUrl || '';
             let latestInstanceId = '';
             try {
               const pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
               latestInstanceId = String(pong?.contentInstanceId || '');
             } catch (_) {}
+            if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
             const instanceChanged = didContentDocumentChange({
               previousInstanceId: contentInstanceId,
               currentInstanceId: latestInstanceId,
@@ -1306,9 +1417,11 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
         // 超时前若仍 pending：content 被导航销毁时重注入并重发
         if (Date.now() > reinjectAt && longOps.includes(type)) {
           if (isCancelled()) return await finishBridge(cancelledResult());
+          if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
           reinjectAt = Date.now() + 12000;
           try {
             const latest = await chrome.tabs.get(tab.id);
+            if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
             if (!isBossUrl(latest?.url || '')) continue;
 
             let alive = false;
@@ -1320,6 +1433,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
                 (BHT_RUNTIME_VERSION === 'unknown' || String(pong?.contentVersion || '') === BHT_RUNTIME_VERSION)
               );
             } catch (_) { alive = false; }
+            if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
 
             // 其它长操作：仅当 content 已死时重注入并重发一次（content 侧 opId 幂等）
             if (!alive) {
@@ -1327,12 +1441,31 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
                 type, opId, tabId: tab.id, url: latest?.url || ''
               }, 'warn');
               if (isCancelled()) return await finishBridge(cancelledResult());
-              await forceInjectContent(tab.id);
-              await sleep(280);
+              if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
+              await forceInjectContent(tab.id, { deadlineAt: scanDeadlineAt });
+              if (!await sleepWithinDeadline(280, scanDeadlineAt)) break;
+              if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
               await fireOp();
             }
           } catch (_) {}
         }
+      }
+      if (scanDeadlineAt) {
+        await requestBridgeCancellation({
+          opId,
+          tabId: tab.id,
+          storageKey,
+          reason: '岗位采集达到统一截止时间'
+        });
+        scheduleBridgeStorageCleanup(storageKey);
+        await debugLog('background.sendToBoss', 'scan_deadline', {
+          type,
+          opId,
+          pageOperationTimeoutMs,
+          bridgeTimeoutMs,
+          elapsedMs: Date.now() - started
+        });
+        return await finishBridge(scanDeadlineResult(), { removeStorage: false });
       }
       const bridgeSettled = await cancelBridgeOperation({
         opId,
@@ -1359,15 +1492,22 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
         type, opId: bridgeOpId, error: serializeError(bridgeErr)
       }, 'error');
       if (bridgeOpId) {
-        await cancelBridgeOperation({
+        const failedOperation = {
           opId: bridgeOpId,
           tabId: tab.id,
           storageKey: 'bht_op_' + bridgeOpId,
           reason: '存储桥失败，取消旧操作后切换备用通道'
-        });
+        };
+        if (type === MSG.SCAN_JOBS) {
+          await requestBridgeCancellation(failedOperation);
+          scheduleBridgeStorageCleanup(failedOperation.storageKey);
+        } else {
+          await cancelBridgeOperation(failedOperation);
+        }
         operations.delete(bridgeOpId);
       }
       if (isCancelled()) return cancelledResult();
+      if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) return scanDeadlineResult();
       console.warn('storage bridge fail', bridgeErr);
       return {
         ok: false,
@@ -1511,7 +1651,8 @@ function ensureItem(task, job) {
   return item;
 }
 
-async function navigatePreviewToJobList(previewTab, scan = {}, previewRunId = '') {
+async function navigatePreviewToJobList(previewTab, scan = {}, previewRunId = '', deadlineAt = 0) {
+  if (deadlineReached(deadlineAt)) return previewScanDeadlineResult();
   const targetHref = resolveBossJobListUrl({
     candidate: scan?.targetHref || scan?.listHref || '',
     currentUrl: previewTab?.url || ''
@@ -1522,13 +1663,19 @@ async function navigatePreviewToJobList(previewTab, scan = {}, previewRunId = ''
     from: previewTab?.url || '',
     targetHref
   });
+  if (deadlineReached(deadlineAt)) return previewScanDeadlineResult({ targetHref });
 
   try {
     await chrome.tabs.update(previewTab.id, { url: targetHref });
-    const readyTab = await waitTabComplete(previewTab.id, OPERATION_TIMEOUTS.PREVIEW_LIST_NAV_MS, {
-      shouldStop: () => !isPreviewRunActive(previewRunId),
-      requireComplete: true
+    if (deadlineReached(deadlineAt)) return previewScanDeadlineResult({ targetHref });
+    const navigationWaitMs = remainingDeadlineMs(deadlineAt, OPERATION_TIMEOUTS.PREVIEW_LIST_NAV_MS);
+    if (deadlineAt && navigationWaitMs <= 0) return previewScanDeadlineResult({ targetHref });
+    const readyTab = await waitTabComplete(previewTab.id, navigationWaitMs, {
+      shouldStop: () => !isPreviewRunActive(previewRunId) || deadlineReached(deadlineAt),
+      requireComplete: true,
+      deadlineAt
     });
+    if (deadlineReached(deadlineAt)) return previewScanDeadlineResult({ targetHref });
     if (!readyTab || !isBossUrl(readyTab.url || readyTab.pendingUrl || '')) {
       return {
         ok: false,
@@ -1537,8 +1684,11 @@ async function navigatePreviewToJobList(previewTab, scan = {}, previewRunId = ''
         targetHref
       };
     }
-    await forceInjectContent(previewTab.id);
-    await sleep(300);
+    await forceInjectContent(previewTab.id, { deadlineAt });
+    if (!await sleepWithinDeadline(300, deadlineAt)) {
+      return previewScanDeadlineResult({ targetHref });
+    }
+    if (deadlineReached(deadlineAt)) return previewScanDeadlineResult({ targetHref });
     return {
       ok: true,
       targetHref,
@@ -1551,6 +1701,7 @@ async function navigatePreviewToJobList(previewTab, scan = {}, previewRunId = ''
       }
     };
   } catch (error) {
+    if (deadlineReached(deadlineAt)) return previewScanDeadlineResult({ targetHref });
     await debugLog('background.preview', 'list_navigation_failed', {
       tabId: previewTab?.id || null,
       targetHref,
@@ -1616,16 +1767,12 @@ async function restoreListTabAfterTriggerNavigation(task, tabId) {
 async function scanPreviewJobs(payload, previewTab, previewRunId = '') {
   const scanPayload = {
     scroll: payload.scroll !== false,
-    maxRounds: payload.maxRounds || 3,
-    scrollWaitMs: payload.scrollWaitMs || 650,
+    maxRounds: payload.maxRounds || 8,
+    scrollWaitMs: payload.scrollWaitMs ?? 300,
     scanSessionId: payload.scanSessionId || uid('scan'),
     resetSession: payload.resetSession !== false,
     deltaOnly: true,
-    deadlineAt: Math.max(0, Number(payload.deadlineAt || 0)),
-    listExpectLabel: String(payload.listExpectLabel || ''),
-    listFilterHints: Array.isArray(payload.listFilterHints)
-      ? payload.listFilterHints.slice(0, 12)
-      : []
+    deadlineAt: Math.max(0, Number(payload.deadlineAt || 0))
   };
   let navigation = null;
   setPreviewPhase('locating_list', previewRunId);
@@ -1635,16 +1782,35 @@ async function scanPreviewJobs(payload, previewTab, previewRunId = '') {
   });
 
   if (!scan?.ok && scan?.error === 'NAVIGATED') {
+    if (deadlineReached(scanPayload.deadlineAt)) {
+      return { scan: previewScanDeadlineResult(), navigation, previewTab };
+    }
     setPreviewPhase('waiting_navigation', previewRunId);
     await log('info', '页面正在返回职位列表，等待加载完成后继续扫描…');
-    const readyTab = await waitTabComplete(previewTab.id, OPERATION_TIMEOUTS.PREVIEW_LIST_NAV_MS, {
-      shouldStop: () => !isPreviewRunActive(previewRunId),
-      requireComplete: true
+    const navigationWaitMs = remainingDeadlineMs(
+      scanPayload.deadlineAt,
+      OPERATION_TIMEOUTS.PREVIEW_LIST_NAV_MS
+    );
+    if (scanPayload.deadlineAt && navigationWaitMs <= 0) {
+      return { scan: previewScanDeadlineResult(), navigation, previewTab };
+    }
+    const readyTab = await waitTabComplete(previewTab.id, navigationWaitMs, {
+      shouldStop: () => !isPreviewRunActive(previewRunId) || deadlineReached(scanPayload.deadlineAt),
+      requireComplete: true,
+      deadlineAt: scanPayload.deadlineAt
     });
+    if (deadlineReached(scanPayload.deadlineAt)) {
+      return { scan: previewScanDeadlineResult(), navigation, previewTab };
+    }
     if (readyTab) {
       previewTab = readyTab;
-      await forceInjectContent(previewTab.id);
-      await sleep(300);
+      await forceInjectContent(previewTab.id, { deadlineAt: scanPayload.deadlineAt });
+      if (!await sleepWithinDeadline(300, scanPayload.deadlineAt)) {
+        return { scan: previewScanDeadlineResult(), navigation, previewTab };
+      }
+      if (deadlineReached(scanPayload.deadlineAt)) {
+        return { scan: previewScanDeadlineResult(), navigation, previewTab };
+      }
       setPreviewPhase('scanning_cards', previewRunId);
       scan = await sendToBoss(MSG.SCAN_JOBS, scanPayload, {
         tabId: previewTab.id,
@@ -1660,10 +1826,21 @@ async function scanPreviewJobs(payload, previewTab, previewRunId = '') {
   }
 
   if (!scan?.ok && scan?.shouldNavigate === true) {
-    const nav = await navigatePreviewToJobList(previewTab, scan, previewRunId);
+    if (deadlineReached(scanPayload.deadlineAt)) {
+      return { scan: previewScanDeadlineResult(), navigation, previewTab };
+    }
+    const nav = await navigatePreviewToJobList(
+      previewTab,
+      scan,
+      previewRunId,
+      scanPayload.deadlineAt
+    );
     if (!nav.ok) return { scan: nav, navigation };
     previewTab = nav.tab || previewTab;
     navigation = nav.navigation;
+    if (deadlineReached(scanPayload.deadlineAt)) {
+      return { scan: previewScanDeadlineResult(), navigation, previewTab };
+    }
     setPreviewPhase('scanning_cards', previewRunId);
     scan = await sendToBoss(MSG.SCAN_JOBS, scanPayload, {
       tabId: previewTab.id,
@@ -1693,146 +1870,23 @@ async function scanPreviewJobs(payload, previewTab, previewRunId = '') {
   return { scan, navigation, previewTab };
 }
 
-async function openPreviewScanWorker(sourceTab, previewRunId = '', context = {}) {
-  const sourceUrl = String(sourceTab?.url || sourceTab?.pendingUrl || '');
-  if (!sourceTab?.id) return null;
-  let sourcePage = null;
-  try {
-    const pong = await chrome.tabs.sendMessage(sourceTab.id, { type: MSG.PING, payload: {} });
-    sourcePage = pong?.page || null;
-  } catch (_) {}
-  const sourcePageHref = String(sourcePage?.href || '');
-  if (!isBossUrl(sourceUrl) && !isBossUrl(sourcePageHref)) return null;
-  const sourcePageListHref = String(sourcePage?.listHref || '');
-  const savedListHref = String(sourcePage?.savedListHref || '');
-  const taskListHref = String(context?.listHref || context?.taskListHref || '');
-  const workerCandidates = [
-    isBossJobListUrl(sourceUrl) ? sourceUrl : '',
-    isBossJobListUrl(sourcePageHref) ? sourcePageHref : '',
-    sourcePageListHref,
-    savedListHref,
-    taskListHref
-  ];
-  const workerListHref = workerCandidates.find((href) => isBossJobListUrl(href)) || '';
-  const workerContextSource = workerListHref
-    ? (isBossJobListUrl(sourceUrl) && workerListHref === sourceUrl
-      ? 'source-url'
-      : (isBossJobListUrl(sourcePageHref) && workerListHref === sourcePageHref
-        ? 'source-page'
-        : (sourcePageListHref && workerListHref === sourcePageListHref ? 'saved-page' : 'task')))
-    : 'default';
-  const workerUrl = workerListHref || resolveBossJobListUrl({
-    candidate: '',
-    currentUrl: sourcePageHref || sourceUrl
-  });
-  const savedListExpectLabel = String(
-    sourcePage?.listExpectLabel || sourcePage?.savedListExpectLabel ||
-    context?.listExpectLabel || context?.taskListExpectLabel || ''
-  );
-  const savedListFilterHints = Array.isArray(sourcePage?.listFilterHints)
-    ? sourcePage.listFilterHints.slice(0, 12)
-    : (Array.isArray(sourcePage?.savedListFilterHints)
-      ? sourcePage.savedListFilterHints.slice(0, 12)
-      : (Array.isArray(context?.listFilterHints) ? context.listFilterHints.slice(0, 12) : []));
-  /*
-   * Keep the source tab untouched even when its URL changed while the PING
-   * was in flight. The worker is the only tab passed to scanPreviewJobs.
-   */
-  const sourceContext = {
-    href: sourcePageHref || sourceUrl,
-    listHref: workerListHref,
-    savedListHref,
-    listExpectLabel: savedListExpectLabel,
-    listFilterHints: savedListFilterHints
-  };
-  const sourcePageForWorker = sourcePage
-    ? { ...sourcePage, ...sourceContext }
-    : sourceContext;
-  if (previewRunId && !isPreviewRunActive(previewRunId)) return null;
-  if (workerContextSource === 'default') {
-    await log('warn', '[扫描] 未找到可复用的职位列表 URL，临时页将使用默认职位列表；URL 外筛选可能无法复制', {
-      sourceTabId: sourceTab.id,
-      sourceUrl: sourcePageHref || sourceUrl,
-      taskListHref: taskListHref || null
-    });
-  }
-  let tab = null;
-  try {
-    if (previewRunId && !isPreviewRunActive(previewRunId)) return null;
-    tab = await chrome.tabs.create({
-      url: workerUrl,
-      active: false,
-      ...(sourceTab.windowId != null ? { windowId: sourceTab.windowId } : {})
-    });
-    const ready = await waitTabComplete(tab.id, OPERATION_TIMEOUTS.PREVIEW_WORKER_LOAD_MS, {
-      shouldStop: () => !isPreviewRunActive(previewRunId),
-      requireComplete: true
-    });
-    if (!ready?.id || !isBossUrl(ready.url || ready.pendingUrl || '')) {
-      try { await chrome.tabs.remove(tab.id); } catch (_) {}
-      return null;
-    }
-    await forceInjectContent(ready.id);
-    await sleep(250);
-    if (previewRunId && !isPreviewRunActive(previewRunId)) {
-      try { await chrome.tabs.remove(ready.id); } catch (_) {}
-      return null;
-    }
-    await log('info', '[扫描] 已打开不激活的临时扫描页，原职位列表保持不动', {
-      sourceTabId: sourceTab.id,
-      workerTabId: ready.id,
-      sourceUrl,
-      url: ready.url || workerUrl,
-      savedListHref: savedListHref || null,
-      taskListHref: taskListHref || null,
-      workerListHref: workerListHref || null,
-      workerContextSource,
-      savedListExpectLabel,
-      savedListFilterHints
-    });
-    return {
-      ...ready,
-      sourcePage: sourcePageForWorker,
-      workerUrl,
-      workerListHref,
-      workerContextSource,
-      savedListHref,
-      savedListExpectLabel,
-      savedListFilterHints
-    };
-  } catch (error) {
-    if (tab?.id) {
-      try { await chrome.tabs.remove(tab.id); } catch (_) {}
-    }
-    await debugLog('background.preview', 'scan_worker_open_failed', {
-      sourceTabId: sourceTab?.id || null,
-      error: serializeError(error)
-    }, 'warn');
-    return null;
-  }
-}
-
-async function closePreviewScanWorker(tab, reason = '扫描结束') {
-  if (!tab?.id) return false;
-  try {
-    await chrome.tabs.remove(tab.id);
-    await debugLog('background.preview', 'scan_worker_closed', { tabId: tab.id, reason });
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
 function evaluatePreviewResults(jobs = [], config = {}, todayStats = {}) {
   const history = config.history || [];
   const idempotency = config.idempotency || {};
   const results = [];
   for (const job of jobs) {
-    const filterRes = evaluateJob(job, config.filters, config.lists, config.settings);
+    const filterRes = evaluateJob(
+      job,
+      config.filters,
+      config.lists,
+      config.settings,
+      { deferUnknownActive: true }
+    );
     let decision = filterRes.decision;
     let reasonCodes = filterRes.reasonCodes || [];
     let reasonTexts = filterRes.reasonTexts || [];
     let passReasons = filterRes.passReasons || [];
+    let requiresActiveCheck = filterRes.requiresActiveCheck === true;
     if (decision === 'pass') {
       const dedup = checkDedup(job, {
         settings: config.settings,
@@ -1846,6 +1900,7 @@ function evaluatePreviewResults(jobs = [], config = {}, todayStats = {}) {
         reasonCodes = dedup.reasonCodes;
         reasonTexts = dedup.reasonTexts;
         passReasons = [];
+        requiresActiveCheck = false;
       }
     }
     results.push({
@@ -1854,6 +1909,7 @@ function evaluatePreviewResults(jobs = [], config = {}, todayStats = {}) {
       reasonCodes,
       reasonTexts,
       passReasons,
+      requiresActiveCheck: decision === 'pass' && requiresActiveCheck,
       selected: decision === 'pass'
     });
   }
@@ -1881,68 +1937,41 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
   if (!isActive()) return cancelled();
   runner.previewPreviousTask = cloneTaskSnapshot(config.task);
   const scanSessionId = uid('scan');
-  const maxElapsedMs = Math.max(15000, Math.min(120000, Number(payload.maxScanMs || OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS)));
+  const requestedMaxScanMs = Number(payload.maxScanMs);
+  const maxElapsedMs = Number.isFinite(requestedMaxScanMs) && requestedMaxScanMs > 0
+    ? Math.max(1000, Math.min(OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS, requestedMaxScanMs))
+    : OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS;
   const previewStartedAt = runner.previewStartedAt || Date.now();
   const sourcePreviewTab = previewTab || await getActiveBossTab({ allowInactiveBossTab: false });
-  const taskListHref = String(config.task?.listHref || '');
-  const taskListExpectLabel = String(config.task?.listExpectLabel || '');
-  setPreviewPhase('opening_worker', previewRunId);
-  let scanWorkerTab = await openPreviewScanWorker(sourcePreviewTab, previewRunId, {
-    listHref: payload.listHref || taskListHref,
-    listExpectLabel: payload.listExpectLabel || taskListExpectLabel,
-    listFilterHints: payload.listFilterHints || config.task?.listFilterHints || []
-  });
-  if (!isActive()) {
-    if (scanWorkerTab) await closePreviewScanWorker(scanWorkerTab, '扫描已取消');
-    scanWorkerTab = null;
-    return cancelled();
+  if (!sourcePreviewTab?.id) {
+    return { ok: false, error: 'LIST_TAB_NOT_FOUND', message: '请先打开当前要扫描的 BOSS 职位列表页' };
   }
-  const scanWorkerUsed = Boolean(scanWorkerTab);
-  if (!scanWorkerTab) {
-    if (!isActive()) {
-      return previewCancelledResult();
-    }
-    const failure = {
-      ok: false,
-      error: 'SCAN_WORKER_OPEN_FAILED',
-      message: '临时扫描页未能在 20 秒内就绪；为保护当前页面，本次没有在原页面滚动'
-    };
-    await log('error', failure.message, { error: failure.error });
-    return failure;
-  }
-  try {
-    // 预览期间所有导航、等待和滚动都绑定到临时 worker；源职位页只在
-    // 扫描完成后接收高亮，绝不作为扫描失败时的回退目标。
-    previewTab = scanWorkerTab;
+  previewTab = sourcePreviewTab;
+  {
+    // BOSS 的求职期望和部分筛选只存在当前 SPA 状态中。
+    // 直接滚动当前职位页，才能保证扫描的就是用户看到的这批岗位。
     const scanStartedAt = Date.now();
     runner.previewScanStartedAt = scanStartedAt;
     setPreviewPhase('collecting', previewRunId);
     const deadlineAt = scanStartedAt + maxElapsedMs;
-    const workerSourcePage = scanWorkerTab.sourcePage || {};
+    await log('info', '[扫描] 正在当前职位页向下加载岗位，现有求职期望和筛选保持不变', {
+      tabId: sourcePreviewTab.id,
+      url: sourcePreviewTab.url || sourcePreviewTab.pendingUrl || ''
+    });
+    if (!isActive()) return cancelled();
     const scanResult = await scanPreviewJobs({
       ...payload,
       scanSessionId,
       resetSession: true,
-      listExpectLabel: scanWorkerTab.savedListExpectLabel ||
-        workerSourcePage.savedListExpectLabel || workerSourcePage.listExpectLabel ||
-        payload.listExpectLabel || taskListExpectLabel || '',
-      listFilterHints: scanWorkerTab.savedListFilterHints ||
-        workerSourcePage.savedListFilterHints || workerSourcePage.listFilterHints ||
-        payload.listFilterHints || config.task?.listFilterHints || [],
       deadlineAt,
-      maxRounds: Math.max(2, Math.min(4, Number(payload.maxRounds || 3)))
+      maxRounds: Math.max(2, Math.min(12, Number(payload.maxRounds || 8))),
+      scrollWaitMs: payload.scrollWaitMs ?? 300
     }, previewTab, previewRunId);
     if (!isActive()) return cancelled();
     let scan = scanResult.scan;
     previewTab = scanResult.previewTab || previewTab;
     const previewNavigation = scanResult.navigation || null;
     if (!scan?.ok) {
-      if (scanWorkerTab) {
-        scan = {
-          ...scan,
-          message: `${scan?.message || '临时扫描页未能读取岗位'}；为保护原职位列表，未回退到原页面滚动`
-        };
-      }
       await log('error', scan?.message || '扫描失败', { error: scan?.error });
       return { ok: false, ...scan, navigation: previewNavigation };
     }
@@ -1958,8 +1987,8 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
         return cancelled();
       }
       setPreviewPhase('collecting', previewRunId);
-      const collected = collectedJobs.size;
-      await log('info', `持续向下加载职位：已累计 ${collected} 岗；到达列表底部或 ${Math.round(maxElapsedMs / 1000)} 秒后开始筛选`, {
+      await debugLog('background.preview', 'collection_progress', {
+        collected: collectedJobs.size,
         scanSessionId,
         elapsedMs: Date.now() - scanStartedAt,
         scanBatches,
@@ -1967,8 +1996,8 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
       });
       const more = await sendToBoss(MSG.SCAN_JOBS, {
         scroll: true,
-        maxRounds: Math.max(2, Math.min(4, Number(payload.batchRounds || 3))),
-        scrollWaitMs: payload.scrollWaitMs || 650,
+        maxRounds: Math.max(2, Math.min(12, Number(payload.batchRounds || 8))),
+        scrollWaitMs: payload.scrollWaitMs ?? 300,
         scanSessionId,
         resetSession: false,
         deltaOnly: true,
@@ -2006,6 +2035,7 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
     }
 
     if (!isActive()) return cancelled();
+    const collectionFinishedAt = Date.now();
     setPreviewPhase('filtering', previewRunId);
     const todayStats = await getTodayStats();
     if (!isActive()) return cancelled();
@@ -2018,8 +2048,11 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
     const warnings = [];
     if (summary.scanned >= 10 && passRate > 0.8) warnings.push('通过率超过 80%，请检查筛选是否过宽');
     if (summary.scanned >= 10 && passRate < 0.05) warnings.push('通过率低于 5%，请检查筛选是否过严');
-    const reachedEnd = scan.scanMeta?.reachedEnd === true;
-    const timedOut = scan.scanMeta?.timedOut === true || Date.now() >= deadlineAt;
+    const { reachedEnd, timedOut } = normalizePreviewScanTerminalState({
+      reachedEnd: scan.scanMeta?.reachedEnd === true,
+      timedOut: scan.scanMeta?.timedOut === true,
+      deadlineAt
+    });
     const stop = resolvePreviewScanStop({
       reachedEnd,
       timedOut,
@@ -2027,16 +2060,27 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
       batchError: continuationError,
       maxElapsedMs
     });
-    if (stop.reason === PREVIEW_SCAN_STOP.TIMEOUT) warnings.push(`滚动已达到 ${Math.round(maxElapsedMs / 1000)} 秒上限，已开始筛选当前累计岗位`);
+    if (stop.reason === PREVIEW_SCAN_STOP.TIMEOUT) {
+      await debugLog('background.preview', 'collection_deadline', {
+        scanSessionId,
+        collected: collectedJobs.size,
+        elapsedMs: collectionFinishedAt - scanStartedAt,
+        maxElapsedMs
+      });
+    }
     if (stop.reason === PREVIEW_SCAN_STOP.BATCH_ERROR) warnings.push('继续加载异常：' + continuationError);
     const scanMeta = {
       ...(scan.scanMeta || {}),
       uniqueCount: collectedJobs.size,
-      isolatedWorker: scanWorkerUsed,
+      reachedEnd,
+      timedOut,
+      sourceContextPreserved: true,
+      scanTabId: sourcePreviewTab.id,
       stopReason: stop.reason,
       stopMessage: stop.message,
       elapsedMs: Date.now() - previewStartedAt,
-      scrollElapsedMs: Date.now() - scanStartedAt,
+      scrollElapsedMs: collectionFinishedAt - scanStartedAt,
+      collectionFinishedAt,
       maxElapsedMs,
       scanBatches,
       passRate
@@ -2073,9 +2117,9 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
   };
 
   
-  task.listHref = previewListHref || taskListHref || scanWorkerTab.workerListHref || '';
-  if (previewListExpect || taskListExpectLabel) {
-    task.listExpectLabel = previewListExpect || taskListExpectLabel;
+  task.listHref = previewListHref || '';
+  if (previewListExpect) {
+    task.listExpectLabel = previewListExpect;
   }
   task.queue = (task.results || [])
     .filter((r) => r.selected !== false && r.decision === 'pass')
@@ -2089,7 +2133,7 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
       status: 'pending'
     }));
   task.queueCursor = 0;
-  await log('info', '预览队列已建立：' + task.queue.length + ' 个待投；列表锚点 ' + String(task.listHref || '无').slice(0, 140));
+  await log('info', '预览队列已建立：' + task.queue.length + ' 个待投');
     if (!isActive()) return cancelled();
     const published = await publishPreviewTask(task, previewRunId, runner.previewPreviousTask);
     if (!published) return cancelled();
@@ -2104,12 +2148,10 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
   });
   if (!isActive()) return cancelled();
 
-  await log('success', `预览完成：扫描 ${summary.scanned}，通过 ${summary.pass}，排除 ${summary.reject}；${scanMeta.stopMessage || '滚动扫描结束'}`, {
+  await log('success', `预览完成：扫描 ${summary.scanned}，通过 ${summary.pass}，排除 ${summary.reject}`, {
     scanMeta
   });
   return { ok: true, task, summary, warnings, scanMeta, navigation: previewNavigation };
-  } finally {
-    if (scanWorkerTab) await closePreviewScanWorker(scanWorkerTab, '扫描流程结束');
   }
 }
 
@@ -2334,16 +2376,24 @@ async function processOneJob(task, resultRow, config) {
       title: job.title,
       listTabId
     });
-    trig = await triggerConversationInWorker(task, job, messageTab, listTabId);
+    trig = await triggerConversationInWorker(
+      task,
+      job,
+      messageTab,
+      listTabId,
+      config.filters?.activeWithin || []
+    );
     if (operationAborted(trig)) return 'aborted';
     await log(
-      trig?.ok ? 'success' : 'error',
+      trig?.ok ? 'success' : (trig?.filtered ? 'info' : 'error'),
       trig?.ok
         ? ('[执行页] 已触发沟通 btn=' + (trig.buttonText || '') +
           (trig.navigated ? ' · BOSS 跳转发生在临时页（已关闭）' : (trig.stayed ? ' · 已点留在此页' : ' · 无需留在此页弹窗')) +
           (trig.listPreserved ? ' · 左侧筛选保持' : ' · 左侧页面需检查') +
           (trig.already ? ' · 继续沟通' : ''))
-        : ('[执行页] 触发沟通失败：' + (trig?.message || trig?.error || '')),
+        : (trig?.filtered
+          ? ('已跳过：' + (trig?.message || 'HR 活跃时间不满足'))
+          : ('[执行页] 触发沟通失败：' + (trig?.message || trig?.error || ''))),
       {
         jobId: job.jobId,
         detailTitle: trig?.detailTitle,
@@ -2354,6 +2404,20 @@ async function processOneJob(task, resultRow, config) {
       }
     );
     if (!trig?.ok) {
+      if (trig?.filtered === true && trig?.error === REASON.FILTER_ACTIVE) {
+        job.activeText = String(trig.activeText || '');
+        resultRow.job = job;
+        item.state = 'SKIPPED';
+        item.reasons = [trig.message || reasonText(REASON.FILTER_ACTIVE, job.activeText || '未知')];
+        task.counters.skipped += 1;
+        await bumpDailyStat('skip');
+        await log('info', `${job.title} - ${item.reasons[0]}`, {
+          jobId: job.jobId,
+          activeText: job.activeText || '',
+          activityCheckedBeforeClick: true
+        });
+        return 'skipped';
+      }
       item.state = /LIST_JOB_NOT_FOUND|找不到/.test(String(trig?.error || '')) ? 'SKIPPED' : 'FAILED';
       item.reasons = [trig?.message || trig?.error || '列表页触发沟通失败'];
       if (item.state === 'SKIPPED') {

@@ -4,6 +4,7 @@
     SCAN_JOBS: "BHT_SCAN_JOBS",
     START_CHAT: "BHT_START_CHAT",
     TRIGGER_CONVERSATION: "BHT_TRIGGER_CONVERSATION",
+    INSPECT_JOB_DETAIL: "BHT_INSPECT_JOB_DETAIL",
     GET_CONVERSATION_SNAPSHOT: "BHT_GET_CONVERSATION_SNAPSHOT",
     WAIT_OPEN_CONVERSATION: "BHT_WAIT_OPEN_CONVERSATION",
     WAIT_CHAT_EDITOR: "BHT_WAIT_CHAT_EDITOR",
@@ -23,7 +24,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.14";
+  const BHT_CONTENT_VERSION = "1.7.15";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -1432,6 +1433,22 @@ function firstEl(selectors, root = document) {
     return document.scrollingElement || document.documentElement;
   }
 
+  function describeAdaptiveScanScroller(scroller) {
+    const isDocumentScroller =
+      scroller === document.scrollingElement ||
+      scroller === document.documentElement ||
+      scroller === document.body;
+    let overflowY = '';
+    try { overflowY = String(getComputedStyle(scroller).overflowY || ''); } catch (_) {}
+    return {
+      kind: isDocumentScroller ? 'document' : 'element',
+      tag: String(scroller?.tagName || ''),
+      id: String(scroller?.id || ''),
+      className: String(scroller?.className || '').slice(0, 160),
+      overflowY
+    };
+  }
+
   function adaptiveScrollSnapshot(scroller) {
     const isDocumentScroller =
       scroller === document.scrollingElement ||
@@ -1448,6 +1465,22 @@ function firstEl(selectors, root = document) {
       height,
       atBottom: height > 0 && top + viewport >= height - 48
     };
+  }
+
+  function setAdaptiveScrollTop(scroller, top) {
+    const nextTop = Math.max(0, Number(top || 0));
+    const isDocumentScroller =
+      scroller === document.scrollingElement ||
+      scroller === document.documentElement ||
+      scroller === document.body;
+    if (isDocumentScroller) window.scrollTo(0, nextTop);
+    else scroller.scrollTop = nextTop;
+  }
+
+  function nextAdaptiveScrollTop(snapshot) {
+    const viewport = Math.max(1, Number(snapshot?.viewport || 0));
+    const maxTop = Math.max(0, Number(snapshot?.height || 0) - viewport);
+    return maxTop;
   }
 
   function collectAdaptiveScanJobs(session) {
@@ -1495,83 +1528,127 @@ function firstEl(selectors, root = document) {
         reachedEnd: false,
         startedAt: Date.now(),
         lastGrowthAt: Date.now(),
+        growthEvents: 0,
+        initialScrollTop: null,
+        initialScrollHeight: null,
+        scanStartTop: null,
         lastSignature: ''
       };
     }
 
-    const scroller = session.scroller?.isConnected ? session.scroller : getAdaptiveScanScroller();
+    let scroller = session.scroller?.isConnected
+      ? session.scroller
+      : getAdaptiveScanScroller();
     session.scroller = scroller;
-    const first = collectAdaptiveScanJobs(session);
+    const initialSnapshot = adaptiveScrollSnapshot(scroller);
+    if (session.initialScrollTop == null) session.initialScrollTop = initialSnapshot.top;
+    if (session.initialScrollHeight == null) session.initialScrollHeight = initialSnapshot.height;
     const batchJobs = new Map();
-    for (const job of first.newJobs) batchJobs.set(String(job.jobId || `${normalizeText(job.title)}|${normalizeText(job.company)}`), job);
-    let batchAdded = first.added;
-    let lastVisibleCount = first.visibleCount;
-    let lastSignature = first.signature;
-    const maxRounds = payload.scroll === false ? 0 : Math.max(1, Math.min(12, Number(payload.maxRounds || 6)));
-    const waitMs = Math.max(300, Math.min(1200, Number(payload.scrollWaitMs || 800)));
+    let batchAdded = 0;
+    let lastVisibleCount = 0;
+    let lastSignature = '';
     const deadlineAt = Math.max(0, Number(payload.deadlineAt || 0));
     let timedOut = false;
+    const collectWindow = () => {
+      const sizeBefore = session.jobs.size;
+      const collected = collectAdaptiveScanJobs(session);
+      for (const job of collected.newJobs) {
+        batchJobs.set(String(job.jobId || `${normalizeText(job.title)}|${normalizeText(job.company)}`), job);
+      }
+      batchAdded += collected.added;
+      lastVisibleCount = collected.visibleCount;
+      lastSignature = collected.signature;
+      if (collected.added > 0 && sizeBefore > 0) {
+        session.lastGrowthAt = Date.now();
+        session.growthEvents += 1;
+      }
+      return collected;
+    };
+
+    // Preserve the current virtual window before returning to the top. BOSS
+    // currently appends cards, but this also covers a future recycled list.
+    collectWindow();
+    if (payload.resetSession === true && initialSnapshot.top > 8) {
+      try {
+        setAdaptiveScrollTop(scroller, 0);
+        let topStableRounds = 0;
+        let previousTopSignature = '';
+        for (let attempt = 0; attempt < 6; attempt++) {
+          const remainingMs = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : 80;
+          if (deadlineAt && remainingMs <= 0) {
+            timedOut = true;
+            break;
+          }
+          await sleep(Math.min(80, remainingMs));
+          scroller = session.scroller?.isConnected
+            ? session.scroller
+            : getAdaptiveScanScroller();
+          session.scroller = scroller;
+          const topWindow = collectWindow();
+          const topSnapshot = adaptiveScrollSnapshot(scroller);
+          if (topSnapshot.top <= 8 && topWindow.signature === previousTopSignature) topStableRounds += 1;
+          else topStableRounds = 0;
+          previousTopSignature = topWindow.signature;
+          if (topStableRounds >= 2) break;
+          if (topSnapshot.top > 8) setAdaptiveScrollTop(scroller, 0);
+        }
+      } catch (_) {}
+    }
+    if (session.scanStartTop == null) session.scanStartTop = adaptiveScrollSnapshot(scroller).top;
+    const requestedRounds = Number(payload.maxRounds);
+    const maxRounds = payload.scroll === false
+      ? 0
+      : Math.max(1, Math.min(16, Number.isFinite(requestedRounds) ? requestedRounds : 8));
+    const requestedWaitMs = Number(payload.scrollWaitMs);
+    const waitMs = Math.max(200, Math.min(1000, Number.isFinite(requestedWaitMs) ? requestedWaitMs : 300));
 
     for (let round = 0; round < maxRounds && !session.reachedEnd; round++) {
       if (deadlineAt && Date.now() >= deadlineAt) {
         timedOut = true;
         break;
       }
-      let before = adaptiveScrollSnapshot(scroller);
-      // 已在底部但岗位尚未增长时，先轻微回拉再触底，重新触发 BOSS 的懒加载观察器。
-      if (before.atBottom && before.top > 0) {
-        try {
-          const isDocumentScroller =
-            scroller === document.scrollingElement ||
-            scroller === document.documentElement ||
-            scroller === document.body;
-          const retreat = Math.max(120, Math.round((before.viewport || 800) * 0.28));
-          if (isDocumentScroller) window.scrollTo(0, Math.max(0, before.top - retreat));
-          else scroller.scrollTop = Math.max(0, before.top - retreat);
-          const pulseRemainingMs = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : 100;
-          await sleep(Math.min(100, pulseRemainingMs));
-          before = adaptiveScrollSnapshot(scroller);
-        } catch (_) {}
-      }
+      scroller = session.scroller?.isConnected
+        ? session.scroller
+        : getAdaptiveScanScroller();
+      session.scroller = scroller;
+      const before = adaptiveScrollSnapshot(scroller);
       try {
-        const isDocumentScroller =
-          scroller === document.scrollingElement ||
-          scroller === document.documentElement ||
-          scroller === document.body;
-        if (isDocumentScroller) window.scrollTo(0, Math.max(document.documentElement?.scrollHeight || 0, document.body?.scrollHeight || 0));
-        else scroller.scrollTop = scroller.scrollHeight;
-        // BOSS 不同列表版本可能监听内部容器或 window；两者都触底，避免只停在首批 45 岗。
-        if (!isDocumentScroller) {
-          window.scrollTo(0, Math.max(document.documentElement?.scrollHeight || 0, document.body?.scrollHeight || 0));
-        }
+        // BOSS appends each lazy-loaded batch. Jumping to the current tail is
+        // both faster and the event that requests the next batch.
+        setAdaptiveScrollTop(scroller, nextAdaptiveScrollTop(before));
       } catch (_) {}
       const remainingMs = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : waitMs;
       await sleep(Math.min(waitMs, remainingMs));
 
-      const collected = collectAdaptiveScanJobs(session);
-      for (const job of collected.newJobs) batchJobs.set(String(job.jobId || `${normalizeText(job.title)}|${normalizeText(job.company)}`), job);
-      batchAdded += collected.added;
-      lastVisibleCount = collected.visibleCount;
+      scroller = session.scroller?.isConnected
+        ? session.scroller
+        : getAdaptiveScanScroller();
+      session.scroller = scroller;
+      const previousSignature = lastSignature;
+      const collected = collectWindow();
       const after = adaptiveScrollSnapshot(scroller);
       const moved = Math.abs(after.top - before.top) > 8 || after.height !== before.height;
-      const visibleChanged = Boolean(collected.signature && collected.signature !== lastSignature);
-      lastSignature = collected.signature;
+      const visibleChanged = Boolean(collected.signature && collected.signature !== previousSignature);
       session.rounds += 1;
+      const deadlineReached = Boolean(deadlineAt && Date.now() >= deadlineAt);
+      if (deadlineReached) timedOut = true;
 
       if (collected.added <= 0 && !moved && !visibleChanged) session.stableRounds += 1;
       else session.stableRounds = 0;
-      if (collected.added > 0) session.lastGrowthAt = Date.now();
       // 虚拟列表替换节点时可能短暂没有卡片；空 DOM 不能作为“到底”证据。
       if (after.atBottom && collected.visibleCount > 0 && collected.added <= 0 && !visibleChanged) session.bottomStableRounds += 1;
       else session.bottomStableRounds = 0;
-      if (session.bottomStableRounds >= 5 && Date.now() - session.lastGrowthAt >= 3500) {
+      if (!timedOut && session.bottomStableRounds >= 5 && Date.now() - session.lastGrowthAt >= 1400) {
         session.reachedEnd = true;
       }
+      if (timedOut) break;
     }
 
-    if (deadlineAt && Date.now() >= deadlineAt) timedOut = true;
+    if (!session.reachedEnd && deadlineAt && Date.now() >= deadlineAt) timedOut = true;
+    if (timedOut) session.reachedEnd = false;
     session.lastSignature = lastSignature;
     const snapshot = adaptiveScrollSnapshot(scroller);
+    const scrollerInfo = describeAdaptiveScanScroller(scroller);
     const allJobs = Array.from(session.jobs.values()).map((job, index) => ({ ...job, index }));
     const jobs = payload.deltaOnly === true
       ? Array.from(batchJobs.values())
@@ -1588,9 +1665,18 @@ function firstEl(selectors, root = document) {
         rounds: session.rounds,
         reachedEnd: session.reachedEnd,
         timedOut,
+        atBottom: snapshot.atBottom,
         stableRounds: session.stableRounds,
+        bottomStableRounds: session.bottomStableRounds,
+        growthEvents: session.growthEvents,
+        initialScrollTop: session.initialScrollTop,
+        initialScrollHeight: session.initialScrollHeight,
+        scanStartTop: session.scanStartTop,
         scrollTop: snapshot.top,
         scrollHeight: snapshot.height,
+        scrollViewport: snapshot.viewport,
+        scroller: scrollerInfo,
+        lastGrowthAgoMs: Math.max(0, Date.now() - session.lastGrowthAt),
         elapsedMs: Date.now() - session.startedAt
       }
     };
@@ -1609,8 +1695,7 @@ function firstEl(selectors, root = document) {
     const liveExpect = onList ? String(detectSelectedJobExpect() || "") : "";
     const liveHints = onList ? detectActiveFilterHints() : [];
     // PING is also used while the source tab is on a detail/chat page. Expose
-    // the last intact list context under both explicit `saved*` names and the
-    // compact aliases consumed by background workers.
+    // the last intact list context for delivery recovery and diagnostics.
     const listHref = onList ? location.href : savedHref;
     const listExpectLabel = onList ? (liveExpect || savedExpect) : savedExpect;
     const listFilterHints = onList
@@ -1627,8 +1712,8 @@ function firstEl(selectors, root = document) {
       hasChatInput: hasChat,
       isChatPage: /\/chat/i.test(location.pathname + location.hash),
       path: location.pathname,
-      // Expose the last intact list target so the background can open an
-      // isolated scan worker without navigating this tab from a detail/chat page.
+      // Keep the last intact list target available when delivery temporarily
+      // operates from a detail or chat page.
       savedListHref: savedHref,
       savedListExpectLabel: savedExpect,
       savedListFilterHints: savedHints,
@@ -1692,10 +1777,8 @@ function firstEl(selectors, root = document) {
         page: pageInfo()
       };
     }
-    // A worker opened from a detail/chat tab has its own sessionStorage and
-    // starts with the default job expectation. Restore the source tab's
-    // expectation once on the first batch; continuation batches must not
-    // click the tab again while the virtual list is being replaced.
+    // Legacy callers may still provide an expectation. Apply it only before
+    // the first batch; continuation batches must not change the active list.
     if (payload.resetSession !== false && payload.listExpectLabel && isListLikePage()) {
       try { await restoreJobExpectIfNeeded(payload.listExpectLabel); } catch (_) {}
     }
@@ -3360,6 +3443,16 @@ async function startChat(job, opts = {}) {
     return "";
   }
 
+  function extractDetailActiveText(scope) {
+    const root =
+      scope ||
+      firstEl(SELECTORS.detailRoot) ||
+      document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+      document;
+    return textOf(firstEl(SELECTORS.activeText, root)) ||
+      (firstEl(SELECTORS.online, root) ? "在线" : "");
+  }
+
   function extractDetailCompany(scope) {
     const root =
       scope ||
@@ -3372,6 +3465,62 @@ async function startChat(job, opts = {}) {
     if (structured) return structured;
     const attr = textOf(root.querySelector?.(".job-boss-info .boss-info-attr, .boss-info-attr"));
     return String(attr || "").split(/[·|｜]/)[0].trim();
+  }
+
+  async function inspectWorkerJobDetail(job = {}) {
+    const expectedJobId = String(job.jobId || "");
+    const expectedTitle = normalizeText(job.title || "");
+    let last = null;
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const root =
+        firstEl(SELECTORS.detailRoot) ||
+        document.querySelector(".job-detail, .job-detail-box, .job-detail-container");
+      const detailHref =
+        root?.querySelector?.("a.more-job-btn[href*='job_detail'], a[href*='job_detail']")?.href ||
+        (/\/job_detail\//i.test(location.pathname) ? location.href : "");
+      const actualJobId = extractJobIdFromHref(detailHref);
+      const detailTitle = textOf(firstEl(SELECTORS.title, root || document)) ||
+        textOf(document.querySelector(".job-detail .job-name, .job-detail-box .job-name, h1.job-name"));
+      const normalizedDetailTitle = normalizeText(detailTitle || "");
+      const identityMatches = Boolean(
+        root && (
+          (expectedJobId && actualJobId && expectedJobId === actualJobId) ||
+          (!actualJobId && expectedTitle && normalizedDetailTitle === expectedTitle) ||
+          (!expectedJobId && expectedTitle && normalizedDetailTitle === expectedTitle)
+        )
+      );
+      last = { root, detailHref, actualJobId, detailTitle, identityMatches };
+      if (identityMatches) {
+        const activeText = extractDetailActiveText(root);
+        if (activeText) {
+          const result = {
+            ok: true,
+            activeText,
+            jobId: actualJobId || expectedJobId,
+            title: detailTitle || job.title || "",
+            company: extractDetailCompany(root) || job.company || "",
+            hrName: extractDetailHrName(root) || job.hrName || job.bossName || "",
+            contentVersion: BHT_CONTENT_VERSION
+          };
+          debugTrace("worker_detail_activity_ready", result);
+          return result;
+        }
+      }
+      await sleep(125);
+    }
+    const result = {
+      ok: Boolean(last?.identityMatches),
+      error: last?.identityMatches ? "DETAIL_ACTIVE_UNKNOWN" : "DETAIL_IDENTITY_MISMATCH",
+      activeText: "",
+      jobId: last?.actualJobId || "",
+      title: last?.detailTitle || "",
+      message: last?.identityMatches
+        ? "岗位详情未提供 HR 活跃时间"
+        : "临时详情页与待投岗位不一致",
+      contentVersion: BHT_CONTENT_VERSION
+    };
+    debugTrace("worker_detail_activity_unavailable", result, "warn");
+    return result;
   }
 
   async function triggerConversationOnWorkerDetail(job = {}) {
@@ -4306,7 +4455,7 @@ async function startChat(job, opts = {}) {
 
 async function runOpByType(type, payload = {}) {
     const lockKey = String(type || '');
-    const needLock = /START_CHAT|TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SCAN_JOBS/.test(lockKey);
+    const needLock = /START_CHAT|INSPECT_JOB_DETAIL|TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SCAN_JOBS/.test(lockKey);
     if (needLock) {
       if (window.__BHT_OP_LOCK__) {
         return { ok: false, error: 'OP_BUSY', message: '已有操作进行中', contentVersion: BHT_CONTENT_VERSION };
@@ -4326,6 +4475,8 @@ async function runOpByType(type, payload = {}) {
         return { ok: true, ...diagnose(), contentVersion: BHT_CONTENT_VERSION };
       case MSG.SCAN_JOBS:
         return await scanJobs(payload || {});
+      case MSG.INSPECT_JOB_DETAIL:
+        return await inspectWorkerJobDetail(payload?.job || {});
       case MSG.TRIGGER_CONVERSATION:
         return payload?.workerDetail
           ? await triggerConversationOnWorkerDetail(payload.job || {})

@@ -21,7 +21,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.14";
+const BHT_UI_VERSION = "1.7.15";
 const VERSION_GUARDED_API_MESSAGES = new Set([
   MSG.RUN_PREVIEW,
   MSG.CONFIRM_AND_START,
@@ -1233,27 +1233,20 @@ function updateTaskUI(task, runner = {}) {
   const phase = describeTaskPhase(task, status);
   if ($('taskStatus')) {
     if (runner.previewing) {
-      const isCollecting = Boolean(runner.previewScanStartedAt) && ['collecting', 'filtering'].includes(runner.previewPhase);
-      const clockStartedAt = isCollecting ? runner.previewScanStartedAt : runner.previewStartedAt;
-      const elapsedSeconds = clockStartedAt
-        ? Math.max(0, Math.floor((Date.now() - Number(clockStartedAt)) / 1000))
-        : 0;
       const previewPhaseText = {
-        opening_worker: '正在准备临时扫描页',
+        opening_worker: '正在准备职位列表',
         locating_list: '正在定位职位列表',
         navigating: '正在自动跳转职位列表',
         waiting_navigation: '正在等待新页面加载',
         scanning_cards: '正在读取岗位卡片',
-        scanning_more: '正在向下加载更多岗位',
-        collecting: '正在滚动采集岗位',
-        filtering: '正在应用筛选规则'
+        scanning_more: '正在加载更多岗位',
+        collecting: '正在加载更多岗位',
+        filtering: '正在筛选岗位'
       }[runner.previewPhase] || '正在读取岗位';
       const progressText = Number(runner.previewScanned || 0) > 0
-        ? (runner.previewPhase === 'filtering'
-          ? ` · 已扫 ${runner.previewScanned} / 通过 ${runner.previewPass || 0}`
-          : ` · 已累计 ${runner.previewScanned} 岗`)
+        ? ` · 已加载 ${runner.previewScanned} 岗`
         : '';
-      $('taskStatus').textContent = `状态：扫描中 · ${isCollecting ? '滚动' : '准备'} ${elapsedSeconds} 秒 · ${previewPhaseText}${progressText}`;
+      $('taskStatus').textContent = `状态：扫描中 · ${previewPhaseText}${progressText}`;
       $('taskStatus').dataset.status = 'previewing';
     } else {
       const pauseBit = status === 'paused' && task?.pauseReason ? '' : (task?.pauseReason && status !== 'paused' ? `（${task.pauseReason}）` : '');
@@ -1275,7 +1268,7 @@ function updateTaskUI(task, runner = {}) {
   if ($('taskHint')) {
     let hint = '';
     if (runner.previewing) {
-      hint = '正在持续向下加载岗位；下方暂时仍是上一次预览。到达列表底部或滚动满 60 秒后，才会开始筛选并替换结果。';
+      hint = '正在加载更多岗位，完成后会自动筛选。';
     }
     else if (status === 'running') hint = '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
     else if (status === 'paused') hint = '已暂停：点「继续」恢复当前队列；或「停止」后重新批量投递。';
@@ -1421,13 +1414,9 @@ function renderPreview(task) {
     `扫描岗位：${s.scanned}`,
     `符合规则：${s.pass}`,
     `将被排除：${s.reject}`,
-    task.scanMeta
-      ? `扫描方式：${task.scanMeta.isolatedWorker ? '临时页' : '当前页'}滚动 ${task.scanMeta.rounds || 0} 轮 · 滚动用时 ${(Number(task.scanMeta.scrollElapsedMs ?? task.scanMeta.elapsedMs ?? 0) / 1000).toFixed(1)} 秒 · ${task.scanMeta.stopMessage || task.scanMeta.stopReason || '完成'}`
-      : '',
     '',
     '排除原因（冒号后数字 = 被排除岗位数，不是设置上限）：'
   ];
-  if (!lines[3]) lines.splice(3, 1);
   if (s.byReason && Object.keys(s.byReason).length) {
     Object.entries(s.byReason)
       .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
@@ -2423,7 +2412,7 @@ function bindEvents() {
 
   $('btnPreview').addEventListener('click', async () => {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
-    toast('正在持续向下加载职位；非列表页会自动跳转，到达列表底部或 60 秒后使用累计岗位开始筛选…', 'warn', 6000);
+    toast('正在加载更多岗位，完成后自动筛选…', 'warn', 3500);
     $('btnPreview').disabled = true;
     $('taskStatus').textContent = '状态：扫描中…';
     try {
@@ -2451,8 +2440,7 @@ function bindEvents() {
         showErrorModal('扫描失败', res?.message || res?.error || '请打开 BOSS 职位列表页后重试', { showRetry: false });
       } else if (res.summary) {
         const navText = res.navigation?.automatic ? '已自动回到职位列表；' : '';
-        const stopText = res.scanMeta?.stopMessage ? ` · ${res.scanMeta.stopMessage}` : '';
-        toast(`${navText}扫描完成：通过 ${res.summary.pass} / 共 ${res.summary.scanned}${stopText}`, 'success', 4200);
+        toast(`${navText}扫描完成：通过 ${res.summary.pass} / 共 ${res.summary.scanned}`, 'success', 4200);
       } else {
         toast('预览完成', 'success');
       }

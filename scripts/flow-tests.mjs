@@ -17,6 +17,188 @@ async function runRegisteredTests() {
   }
 }
 
+function extractFunctionSource(source, startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start);
+  assert.ok(start >= 0, `missing function marker: ${startMarker}`);
+  assert.ok(end > start, `missing function boundary: ${endMarker}`);
+  return source.slice(start, end).trim();
+}
+
+function createVirtualScanHarness({
+  totalJobs = 12,
+  visibleJobs = 3,
+  initialTop = 0,
+  replaceScrollerAfterSleeps = 0,
+  initialLoadedJobs = totalJobs,
+  appendBatchSize = 0
+} = {}) {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const functionSource = extractFunctionSource(
+    content,
+    "async function scanAdaptiveJobBatch",
+    "function pageInfo()"
+  );
+  const itemHeight = 100;
+  const viewport = visibleJobs * itemHeight;
+  let loadedJobs = appendBatchSize > 0
+    ? Math.max(1, Math.min(totalJobs, initialLoadedJobs))
+    : totalJobs;
+  const currentHeight = () => loadedJobs * itemHeight;
+  const assignments = [];
+  const collections = [];
+  const events = [];
+  let clock = 0;
+  let sleepCount = 0;
+  let scrollerGeneration = 1;
+
+  function makeScroller(top, generation) {
+    let scrollTop = Math.max(0, Math.min(currentHeight() - viewport, top));
+    const scroller = {
+      isConnected: true,
+      tagName: "DIV",
+      id: `virtual-scroller-${generation}`,
+      className: "virtual-job-list",
+      clientHeight: viewport,
+      get scrollHeight() { return currentHeight(); },
+      get scrollTop() { return scrollTop; },
+      set scrollTop(next) {
+        scrollTop = Math.max(0, Math.min(currentHeight() - viewport, Number(next) || 0));
+        assignments.push({ generation, requested: Number(next) || 0, actual: scrollTop });
+        events.push({ type: "scroll", generation, top: scrollTop });
+      }
+    };
+    return scroller;
+  }
+
+  let activeScroller = makeScroller(initialTop, scrollerGeneration);
+  const documentElement = { get scrollHeight() { return currentHeight(); } };
+  const body = { get scrollHeight() { return currentHeight(); } };
+  const document = { scrollingElement: documentElement, documentElement, body };
+  const window = {
+    __BHT_SCAN_SESSION__: null,
+    innerHeight: viewport,
+    scrollY: 0,
+    scrollTo(_x, top) { this.scrollY = Number(top) || 0; }
+  };
+  const scrollHelperSource = extractFunctionSource(
+    content,
+    "function setAdaptiveScrollTop",
+    "function collectAdaptiveScanJobs"
+  );
+  const scrollHelpers = new Function(
+    "window",
+    "document",
+    `${scrollHelperSource}; return { setAdaptiveScrollTop, nextAdaptiveScrollTop };`
+  )(window, document);
+
+  function adaptiveScrollSnapshot(scroller) {
+    const top = Number(scroller.scrollTop || 0);
+    return {
+      top,
+      viewport: scroller.clientHeight,
+      height: scroller.scrollHeight,
+      atBottom: top + scroller.clientHeight >= scroller.scrollHeight - 48
+    };
+  }
+
+  function collectAdaptiveScanJobs(session) {
+    const firstIndex = Math.max(0, Math.floor(activeScroller.scrollTop / itemHeight));
+    const firstRenderedIndex = appendBatchSize > 0 ? 0 : firstIndex;
+    const renderedCount = appendBatchSize > 0
+      ? loadedJobs
+      : Math.min(visibleJobs, totalJobs - firstIndex);
+    const visible = Array.from(
+      { length: renderedCount },
+      (_, offset) => ({
+        jobId: `job-${firstRenderedIndex + offset}`,
+        title: `Job ${firstRenderedIndex + offset}`,
+        company: "Virtual Co"
+      })
+    );
+    collections.push({
+      generation: scrollerGeneration,
+      top: activeScroller.scrollTop,
+      ids: visible.map((job) => job.jobId)
+    });
+    events.push({ type: "collect", generation: scrollerGeneration, top: activeScroller.scrollTop });
+    const newJobs = [];
+    for (const job of visible) {
+      if (!session.jobs.has(job.jobId)) newJobs.push(job);
+      session.jobs.set(job.jobId, job);
+    }
+    return {
+      added: newJobs.length,
+      newJobs,
+      visibleCount: visible.length,
+      signature: visible.map((job) => job.jobId).join("|")
+    };
+  }
+
+  const sleep = async (ms) => {
+    clock += Math.max(0, Number(ms) || 0);
+    sleepCount += 1;
+    const wasAtBottom = activeScroller.scrollTop + viewport >= activeScroller.scrollHeight - 48;
+    if (appendBatchSize > 0 && wasAtBottom && loadedJobs < totalJobs) {
+      loadedJobs = Math.min(totalJobs, loadedJobs + appendBatchSize);
+      events.push({ type: "load", at: clock, loadedJobs });
+    }
+    if (replaceScrollerAfterSleeps > 0 && sleepCount === replaceScrollerAfterSleeps) {
+      const previous = activeScroller;
+      previous.isConnected = false;
+      scrollerGeneration += 1;
+      activeScroller = makeScroller(previous.scrollTop, scrollerGeneration);
+    }
+  };
+  const getAdaptiveScanScroller = () => activeScroller;
+  const describeAdaptiveScanScroller = (scroller) => ({
+    kind: "element",
+    tag: scroller.tagName,
+    id: scroller.id,
+    className: scroller.className,
+    overflowY: "auto"
+  });
+  const normalizeText = (value) => String(value || "").toLowerCase();
+  const FakeDate = { now: () => clock };
+  const scanAdaptiveJobBatch = new Function(
+    "window",
+    "document",
+    "getAdaptiveScanScroller",
+    "describeAdaptiveScanScroller",
+    "adaptiveScrollSnapshot",
+    "collectAdaptiveScanJobs",
+    "normalizeText",
+    "sleep",
+    "Date",
+    "setAdaptiveScrollTop",
+    "nextAdaptiveScrollTop",
+    `return (${functionSource});`
+  )(
+    window,
+    document,
+    getAdaptiveScanScroller,
+    describeAdaptiveScanScroller,
+    adaptiveScrollSnapshot,
+    collectAdaptiveScanJobs,
+    normalizeText,
+    sleep,
+    FakeDate,
+    scrollHelpers.setAdaptiveScrollTop,
+    scrollHelpers.nextAdaptiveScrollTop
+  );
+
+  return {
+    scanAdaptiveJobBatch,
+    assignments,
+    collections,
+    events,
+    get activeScroller() { return activeScroller; },
+    get sleepCount() { return sleepCount; },
+    get clock() { return clock; },
+    get loadedJobs() { return loadedJobs; }
+  };
+}
+
 test("content exposes return/ensure/close handlers", () => {
   const s = fs.readFileSync("extension/content/content-main.js", "utf8");
   for (const k of [
@@ -50,8 +232,8 @@ test("preview auto-recovers non-list pages without silent zero results", () => {
   assert.ok(background.includes("OP_BRIDGE_TIMEOUT"));
   assert.ok(!background.includes("扫描等待超过 38 秒"));
   assert.ok(background.includes("scan?.shouldNavigate === true"));
-  assert.ok(panel.includes("非列表页会自动跳转"));
-  assert.ok(panel.includes("下方暂时仍是上一次预览"));
+  assert.ok(panel.includes("正在加载更多岗位，完成后自动筛选"));
+  assert.ok(!panel.includes("下方暂时仍是上一次预览"));
   assert.ok(panel.includes("取消本次扫描（保留上一次预览结果）"));
   assert.ok(panel.includes("已连接 BOSS · 列表未就绪"));
 });
@@ -125,6 +307,30 @@ test("worker detail clicks the exact chat action and requires a creation receipt
   assert.ok(content.includes("worker_detail_trigger_unconfirmed"));
 });
 
+test("HR activity is inspected on the temporary detail before any conversation click", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const messaging = fs.readFileSync("extension/shared/messaging.js", "utf8");
+  const worker = extractFunctionSource(
+    background,
+    "async function triggerConversationInWorker",
+    "async function sendToBoss"
+  );
+  const inspectAt = worker.indexOf("MSG.INSPECT_JOB_DETAIL");
+  const triggerAt = worker.indexOf("MSG.TRIGGER_CONVERSATION");
+  assert.ok(inspectAt >= 0 && triggerAt > inspectAt);
+  assert.ok(worker.includes("matchActive(activeText, selectedActiveBuckets)"));
+  assert.ok(worker.includes("if (!result)"));
+  assert.ok(worker.includes("filtered: true"));
+  assert.ok(worker.includes("result?.filtered"));
+  assert.ok(background.includes("{ deferUnknownActive: true }"));
+  assert.ok(background.includes("requiresActiveCheck: decision === 'pass' && requiresActiveCheck"));
+  assert.ok(content.includes("async function inspectWorkerJobDetail"));
+  assert.ok(content.includes("extractDetailActiveText"));
+  assert.ok(content.includes('case MSG.INSPECT_JOB_DETAIL'));
+  assert.ok(messaging.includes("INSPECT_JOB_DETAIL: 'BHT_INSPECT_JOB_DETAIL'"));
+});
+
 test("message conversation matching performs a second real reload after propagation delay", () => {
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const branchStart = background.indexOf("首次刷新后暂未出现新会话");
@@ -161,10 +367,13 @@ test("preview accumulates virtualized jobs until bottom or the 60 second deadlin
   assert.ok(content.includes("visibleChanged"));
   assert.ok(content.includes("bottomStableRounds"));
   assert.ok(content.includes("lastGrowthAt"));
-  assert.ok(content.includes("先轻微回拉再触底"));
+  assert.ok(!content.includes("先轻微回拉再触底"));
+  assert.ok(content.includes("nextAdaptiveScrollTop"));
+  assert.ok(content.includes("setAdaptiveScrollTop(scroller, nextAdaptiveScrollTop(before))"));
   assert.ok(content.includes("deadlineAt"));
   assert.ok(content.includes("timedOut"));
-  assert.ok(content.includes("scroller.scrollTop = scroller.scrollHeight"));
+  assert.ok(content.includes("return maxTop"));
+  assert.ok(content.includes("Number.isFinite(requestedWaitMs) ? requestedWaitMs : 300"));
   assert.ok(content.includes("payload.deltaOnly === true"));
   assert.ok(content.includes("returnedCount"));
   assert.ok(content.includes("continuingSession"));
@@ -176,20 +385,215 @@ test("preview accumulates virtualized jobs until bottom or the 60 second deadlin
   assert.ok(!continuationGuard.includes("getJobCards().length"));
   assert.ok(content.includes("只按 pathname 判断"));
   assert.ok(content.includes("collected.visibleCount > 0"));
-  assert.ok(background.includes("maxScanMs || OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS"));
+  assert.ok(background.includes("const requestedMaxScanMs = Number(payload.maxScanMs)"));
+  assert.ok(background.includes("Number.isFinite(requestedMaxScanMs) && requestedMaxScanMs > 0"));
+  assert.ok(background.includes("Math.min(OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS, requestedMaxScanMs)"));
   assert.ok(background.includes("mergePreviewJobBatch"));
   assert.ok(background.includes("deltaOnly: true"));
-  assert.ok(background.includes("payload.batchRounds || 3"));
+  assert.ok(background.includes("payload.batchRounds || 8"));
   assert.ok(background.includes("滚动阶段只采集和去重；确认到底或到达统一截止时间后，才执行一次筛选"));
   assert.ok(!background.includes("targetPass"));
   assert.ok(!background.includes("maxScanJobs"));
   assert.ok(background.includes("collecting"));
   assert.ok(background.includes("scanStartedAt + maxElapsedMs"));
+  assert.ok(background.includes("scrollElapsedMs: collectionFinishedAt - scanStartedAt"));
+  assert.ok(!background.includes("scrollElapsedMs: Math.min"));
   assert.ok(background.includes("resolvePreviewScanStop"));
   assert.ok(background.includes("滚动阶段只采集和去重"));
-  assert.ok(background.includes("SCAN_WORKER_OPEN_FAILED"));
-  assert.ok(!background.includes("临时页初次扫描失败，回退原职位页"));
-  assert.ok(panel.includes("到达列表底部或 60 秒"));
+  assert.ok(!background.includes("SCAN_WORKER_OPEN_FAILED"));
+  assert.ok(background.includes("正在当前职位页向下加载岗位"));
+  assert.ok(!panel.includes("到达列表底部或 60 秒"));
+  assert.ok(!panel.includes("滚动用时"));
+  assert.ok(!panel.includes("elapsedSeconds"));
+  assert.ok(panel.includes("正在加载更多岗位，完成后会自动筛选。"));
+});
+
+test("virtual preview preserves the starting window and jumps to the current bottom", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 12,
+    visibleJobs: 4,
+    initialTop: 400
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "virtual-mid-list",
+    resetSession: true,
+    deltaOnly: false,
+    scroll: true,
+    maxRounds: 12,
+    scrollWaitMs: 300,
+    deadlineAt: 60000
+  });
+
+  assert.equal(
+    harness.events[0]?.type,
+    "collect",
+    "the currently rendered jobs must be captured before resetting to the top"
+  );
+  assert.deepEqual(
+    harness.collections[0]?.ids,
+    ["job-4", "job-5", "job-6", "job-7"],
+    "a scan started midway down the list must not discard that rendered window"
+  );
+  assert.equal(
+    result.count,
+    12,
+    `all virtualized windows should be accumulated exactly once; got ${result.count} from ${JSON.stringify(harness.collections)}`
+  );
+  assert.deepEqual(
+    result.jobs.map((job) => job.jobId).sort(),
+    Array.from({ length: 12 }, (_, index) => `job-${index}`).sort()
+  );
+
+  const firstForwardScroll = harness.assignments.find((entry) => entry.actual > 0);
+  assert.ok(firstForwardScroll, "the scan should move down after resetting to the top");
+  assert.equal(firstForwardScroll.actual, 800, "each round should jump to the current tail");
+});
+
+test("append-only preview loads 15 to 50 jobs at the fast cadence", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 50,
+    visibleJobs: 5,
+    initialLoadedJobs: 15,
+    appendBatchSize: 15
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "append-only-fast",
+    resetSession: true,
+    deltaOnly: false,
+    scroll: true,
+    maxRounds: 12,
+    scrollWaitMs: 300,
+    deadlineAt: 60000
+  });
+
+  assert.deepEqual(
+    harness.events.filter((event) => event.type === "load").map((event) => event.loadedJobs),
+    [30, 45, 50]
+  );
+  assert.equal(result.count, 50);
+  assert.equal(result.scanMeta.reachedEnd, true);
+  assert.equal(result.scanMeta.timedOut, false);
+  assert.ok(harness.clock <= 3000, `fast lazy loading took ${harness.clock}ms in the fake clock`);
+});
+
+test("preview collection stops exactly at a mid-round deadline", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 100,
+    visibleJobs: 5,
+    initialLoadedJobs: 15,
+    appendBatchSize: 15
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "hard-deadline",
+    resetSession: true,
+    deltaOnly: false,
+    scroll: true,
+    maxRounds: 16,
+    scrollWaitMs: 300,
+    deadlineAt: 750
+  });
+
+  assert.equal(harness.clock, 750);
+  assert.equal(result.scanMeta.elapsedMs, 750);
+  assert.equal(result.scanMeta.timedOut, true);
+  assert.equal(result.scanMeta.reachedEnd, false);
+});
+
+test("preview top stabilization consumes only the shared deadline budget", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 100,
+    visibleJobs: 5,
+    initialTop: 400,
+    initialLoadedJobs: 15,
+    appendBatchSize: 15
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "top-reset-hard-deadline",
+    resetSession: true,
+    deltaOnly: false,
+    scroll: true,
+    maxRounds: 16,
+    scrollWaitMs: 300,
+    deadlineAt: 120
+  });
+
+  assert.equal(harness.clock, 120);
+  assert.equal(result.scanMeta.elapsedMs, 120);
+  assert.equal(result.scanMeta.timedOut, true);
+  assert.equal(result.scanMeta.reachedEnd, false);
+});
+
+test("virtual preview reacquires a replaced scroll container between rounds", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 8,
+    visibleJobs: 4,
+    initialTop: 0,
+    replaceScrollerAfterSleeps: 1
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "virtual-replaced-scroller",
+    resetSession: true,
+    deltaOnly: false,
+    scroll: true,
+    maxRounds: 12,
+    scrollWaitMs: 300,
+    deadlineAt: 60000
+  });
+
+  assert.ok(
+    harness.assignments.some((entry) => entry.generation === 2),
+    "later rounds must scroll the replacement container instead of a detached node"
+  );
+  assert.ok(
+    harness.collections.some((entry) => entry.generation === 2),
+    "jobs rendered by the replacement container must be collected"
+  );
+  assert.equal(
+    result.count,
+    8,
+    `container replacement must not truncate the accumulated scan; got ${result.count} from ${JSON.stringify(harness.collections)}`
+  );
+});
+
+test("preview terminal metadata keeps reachedEnd and timedOut mutually exclusive", async () => {
+  const policy = await import("../extension/shared/preview-scan-policy.js");
+  assert.equal(
+    typeof policy.normalizePreviewScanTerminalState,
+    "function",
+    "preview-scan-policy must expose the terminal-state normalizer used by background finalization"
+  );
+  assert.deepEqual(
+    policy.normalizePreviewScanTerminalState({ reachedEnd: true, timedOut: true }),
+    { reachedEnd: false, timedOut: true }
+  );
+  assert.deepEqual(
+    policy.normalizePreviewScanTerminalState({
+      reachedEnd: true,
+      timedOut: false,
+      deadlineAt: 1000,
+      now: 1001
+    }),
+    { reachedEnd: true, timedOut: false },
+    "a bottom confirmed before return processing must remain a bottom result"
+  );
+  assert.deepEqual(
+    policy.normalizePreviewScanTerminalState({
+      reachedEnd: false,
+      timedOut: false,
+      deadlineAt: 1000,
+      now: 1001
+    }),
+    { reachedEnd: false, timedOut: true }
+  );
+
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const runStart = background.indexOf("async function runPreview");
+  const runEnd = background.indexOf("function itemErrorHint", runStart);
+  const runPreview = background.slice(runStart, runEnd);
+  assert.ok(
+    runPreview.includes("normalizePreviewScanTerminalState"),
+    "runPreview finalization must normalize the two terminal flags before publishing scanMeta"
+  );
 });
 
 test("page operations consume the background budget and keep timeout terminal states distinct", () => {
@@ -226,6 +630,64 @@ test("page operations consume the background budget and keep timeout terminal st
   assert.ok(content.includes('settled: true'));
   assert.ok(!content.includes('error: "OP_INNER_TIMEOUT"'));
   assert.ok(!content.includes("sleep(15000).then"));
+});
+
+test("preview navigation recovery and scan bridge failures share the hard deadline", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const waitTabComplete = extractFunctionSource(
+    background,
+    "async function waitTabComplete",
+    "async function getDisplayMetrics"
+  );
+  const navigatePreview = extractFunctionSource(
+    background,
+    "async function navigatePreviewToJobList",
+    "async function restoreListTabAfterTriggerNavigation"
+  );
+  const scanPreview = extractFunctionSource(
+    background,
+    "async function scanPreviewJobs",
+    "function evaluatePreviewResults"
+  );
+  const sendToBoss = extractFunctionSource(
+    background,
+    "async function sendToBoss",
+    "async function assertBossContext"
+  );
+
+  assert.ok(waitTabComplete.includes("Math.min(timeoutDeadlineAt, Number(deadlineAt))"));
+  assert.ok(waitTabComplete.includes("Math.min(200, remainingMs)"));
+  assert.ok(navigatePreview.includes("deadlineAt = 0"));
+  assert.ok(navigatePreview.includes(
+    "remainingDeadlineMs(deadlineAt, OPERATION_TIMEOUTS.PREVIEW_LIST_NAV_MS)"
+  ));
+  assert.ok(navigatePreview.includes("deadlineAt\n    })"));
+  assert.ok(navigatePreview.includes("previewScanDeadlineResult"));
+  assert.ok(scanPreview.includes(
+    "remainingDeadlineMs(\n      scanPayload.deadlineAt,\n      OPERATION_TIMEOUTS.PREVIEW_LIST_NAV_MS"
+  ));
+  assert.ok(scanPreview.includes("deadlineAt: scanPayload.deadlineAt"));
+  assert.ok(scanPreview.includes("scanPayload.deadlineAt\n    )"));
+  assert.ok(scanPreview.includes("error: 'OP_DEADLINE_EXCEEDED'") ||
+    scanPreview.includes("previewScanDeadlineResult()"));
+
+  assert.ok(sendToBoss.includes("forceInjectContent(tab.id, { deadlineAt: scanDeadlineAt })"));
+  assert.ok(sendToBoss.includes("sleepWithinDeadline(220, scanDeadlineAt)"));
+  assert.ok(sendToBoss.includes("sleepWithinDeadline(280, scanDeadlineAt)"));
+  const deadlineCheckAt = sendToBoss.indexOf("if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;");
+  const navigationProbeAt = sendToBoss.indexOf("if (type === MSG.SCAN_JOBS && Date.now() >= navigationProbeAt)");
+  assert.ok(deadlineCheckAt >= 0 && deadlineCheckAt < navigationProbeAt);
+
+  const failedOperationAt = sendToBoss.indexOf("const failedOperation =");
+  const failedOperationEnd = sendToBoss.indexOf("operations.delete(bridgeOpId)", failedOperationAt);
+  const failedOperationBlock = sendToBoss.slice(failedOperationAt, failedOperationEnd);
+  const scanCatchAt = failedOperationBlock.indexOf("if (type === MSG.SCAN_JOBS)");
+  const nonScanElseAt = failedOperationBlock.indexOf("} else {", scanCatchAt);
+  const scanCatch = failedOperationBlock.slice(scanCatchAt, nonScanElseAt);
+  assert.ok(scanCatch.includes("await requestBridgeCancellation(failedOperation)"));
+  assert.ok(scanCatch.includes("scheduleBridgeStorageCleanup(failedOperation.storageKey)"));
+  assert.ok(!scanCatch.includes("cancelBridgeOperation"));
+  assert.ok(failedOperationBlock.slice(nonScanElseAt).includes("await cancelBridgeOperation(failedOperation)"));
 });
 
 test("cancelled preview generations cannot filter or publish late results", () => {
@@ -266,36 +728,28 @@ test("cancelled preview generations cannot filter or publish late results", () =
   const sendEnd = background.indexOf("async function assertBossContext", sendStart);
   const sendToBoss = background.slice(sendStart, sendEnd);
   assert.ok(sendToBoss.includes("const runKind = previewRunId ? 'preview'"));
-  const workerStart = background.indexOf("async function openPreviewScanWorker");
-  const workerEnd = background.indexOf("async function closePreviewScanWorker", workerStart);
-  const worker = background.slice(workerStart, workerEnd);
-  assert.ok(worker.includes("if (previewRunId && !isPreviewRunActive(previewRunId))"));
-  assert.ok(worker.indexOf("await sleep(250)") < worker.lastIndexOf("if (previewRunId && !isPreviewRunActive(previewRunId))"));
-  assert.ok(runPreview.indexOf("await openPreviewScanWorker") < runPreview.indexOf("if (!isActive())", runPreview.indexOf("await openPreviewScanWorker")));
+  assert.ok(runPreview.includes("const sourcePreviewTab = previewTab || await getActiveBossTab"));
+  assert.ok(runPreview.indexOf("if (!isActive()) return cancelled();", runPreview.indexOf("const scanResult")) > -1);
 });
 
-test("preview scanning isolates DOM work and uses lightweight one-second status updates", () => {
+test("preview scans the current SPA list and uses lightweight one-second status updates", () => {
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const content = fs.readFileSync("extension/content/content-main.js", "utf8");
   const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
   const host = fs.readFileSync("extension/content/floating-host.js", "utf8");
   const debugLog = fs.readFileSync("extension/shared/debug-log.js", "utf8");
-  assert.ok(background.includes("openPreviewScanWorker"));
-  assert.ok(background.includes("active: false"));
-  assert.ok(background.includes("sourcePage?.savedListHref"));
-  assert.ok(background.includes("listExpectLabel: scanWorkerTab.savedListExpectLabel ||"));
-  assert.ok(background.includes("const workerCandidates"));
-  assert.ok(background.includes("sourcePageHref"));
-  assert.ok(background.includes("taskListHref"));
-  assert.ok(background.includes("workerUrl = workerListHref || resolveBossJobListUrl"));
-  assert.ok(background.includes("if (!sourceTab?.id) return null"));
+  assert.ok(background.includes("previewTab = sourcePreviewTab"));
+  assert.ok(background.includes("sourceContextPreserved: true"));
+  assert.ok(!background.includes("openPreviewScanWorker"));
+  assert.ok(!background.includes("SCAN_WORKER_OPEN_FAILED"));
   assert.ok(content.includes("savedListHref: savedHref"));
   assert.ok(content.includes("savedListFilterHints"));
   assert.ok(content.includes("listHref,"));
   assert.ok(content.includes("listFilterHints"));
-  assert.ok(content.includes("payload.listExpectLabel && isListLikePage()"));
-  assert.ok(background.includes("closePreviewScanWorker"));
-  assert.ok(background.includes("isolatedWorker: scanWorkerUsed"));
+  assert.ok(content.includes("describeAdaptiveScanScroller"));
+  assert.ok(content.includes("growthEvents"));
+  assert.ok(content.includes("bottomStableRounds >= 5"));
+  assert.ok(content.includes("if (timedOut) session.reachedEnd = false"));
   assert.ok(background.includes("GET_RUNNER_STATE"));
   assert.ok(background.includes("pause/abort/skip 只能来自上一轮残留"));
   assert.ok(panel.includes("refreshRunnerState"));
@@ -313,19 +767,18 @@ test("preview scanning isolates DOM work and uses lightweight one-second status 
   assert.ok(!content.includes("jobs.slice(0, 80)"));
 });
 
-test("preview never falls back to scrolling the source tab", () => {
+test("preview continuously collects on the source tab and filters once afterwards", () => {
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const runStart = background.indexOf("async function runPreview");
   const runEnd = background.indexOf("function itemErrorHint", runStart);
   const run = background.slice(runStart, runEnd);
-  assert.ok(run.includes("openPreviewScanWorker(sourcePreviewTab, previewRunId"));
-  assert.ok(run.includes("if (!scanWorkerTab)"));
-  assert.ok(run.includes("SCAN_WORKER_OPEN_FAILED"));
-  assert.ok(run.includes("previewTab = scanWorkerTab"));
-  assert.ok(!run.includes("scanWorkerTab || sourcePreviewTab"));
-  assert.ok(!run.includes("previewTab = sourcePreviewTab || previewTab"));
-  assert.ok(run.includes("listHref: payload.listHref || taskListHref"));
-  assert.ok(run.includes("listExpectLabel: payload.listExpectLabel || taskListExpectLabel"));
+  assert.ok(run.includes("previewTab = sourcePreviewTab"));
+  assert.ok(run.includes("const collectedJobs = new Map()"));
+  assert.ok(run.includes("mergePreviewJobBatch(collectedJobs, more.jobs || [])"));
+  assert.ok(run.indexOf("while (scan.scanMeta?.reachedEnd") < run.indexOf("const results = evaluatePreviewResults"));
+  assert.equal((run.match(/evaluatePreviewResults\(/g) || []).length, 1);
+  assert.ok(run.includes("deadlineAt: scanStartedAt + maxElapsedMs") || run.includes("const deadlineAt = scanStartedAt + maxElapsedMs"));
+  assert.ok(!run.includes("listExpectLabel: scanWorkerTab"));
 });
 
 test("panel and background reject mixed extension versions before delivery", () => {
