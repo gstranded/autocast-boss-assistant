@@ -1,5 +1,5 @@
 (() => {
-  const BHT_FLOAT_HOST_VERSION = "1.7.13";
+  const BHT_FLOAT_HOST_VERSION = "1.7.14";
   if (window.__BHT_FLOAT_HOST_VERSION__ === BHT_FLOAT_HOST_VERSION && window.__BHT_FLOAT_HOST__) return;
   window.__BHT_FLOAT_HOST_VERSION__ = BHT_FLOAT_HOST_VERSION;
   window.__BHT_FLOAT_HOST__ = true;
@@ -124,19 +124,22 @@
     if (!panel || !fab) return;
     panel.hidden = !open;
     fab.classList.toggle("is-hidden", open);
+    const frame = document.getElementById("bht-frame");
     if (open) {
-      const frame = document.getElementById("bht-frame");
       if (frame) {
         // FORCE_IFRAME_RELOAD: 每次打开都带版本号，避免浮窗卡在旧 UI
-        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=1.7.13");
-        if (!frame.src || !frame.src.includes("v=1.7.13")) {
+        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=1.7.14");
+        if (!frame.src || !frame.src.includes("v=1.7.14")) {
           frame.src = next;
         }
+        try { frame.contentWindow?.postMessage({ source: "bht-host", cmd: "resume" }, "*"); } catch (_) {}
       }
       restorePos(panel);
+    } else if (frame) {
+      try { frame.contentWindow?.postMessage({ source: "bht-host", cmd: "suspend" }, "*"); } catch (_) {}
     }
     try {
-      localStorage.setItem(STORAGE_OPEN, open ? "1" : "0");
+      sessionStorage.setItem(STORAGE_OPEN, open ? "1" : "0");
     } catch (_) {}
   }
 
@@ -350,7 +353,9 @@
 
     let shouldOpen = false;
     try {
-      shouldOpen = localStorage.getItem(STORAGE_OPEN) === "1";
+      // 面板开关只属于当前标签页，避免一个页面打开后所有 BOSS 标签都加载面板并轮询。
+      shouldOpen = sessionStorage.getItem(STORAGE_OPEN) === "1";
+      localStorage.removeItem(STORAGE_OPEN);
     } catch (_) {}
     if (shouldOpen) setOpen(true);
     return true;

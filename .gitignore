@@ -8,3 +8,5 @@ Thumbs.db
 scripts/patch-bg.mjs
 # 视频素材不入库
 /docs/video/*.mp4
+# 本地截图浏览器配置可能包含登录态与历史记录，禁止入库
+/docs/marketing/csdn-shots/chrome-profile/

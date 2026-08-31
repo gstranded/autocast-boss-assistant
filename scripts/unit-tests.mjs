@@ -33,6 +33,7 @@ import {
 } from "../extension/shared/resume-images.js";
 import "../extension/shared/conversation-match.js";
 import "../extension/shared/trigger-navigation-recovery.js";
+import "../extension/shared/operation-dispatch-gate.js";
 import fs from "fs";
 import vm from "vm";
 import { pickNextTestDeliveryJob, collectDoneJobIds } from "../extension/shared/test-delivery.js";
@@ -44,6 +45,15 @@ import {
   shouldAcceptTaskSnapshot
 } from "../extension/shared/task-model.js";
 import { createOperationRegistry } from "../extension/background/operation-registry.js";
+import {
+  OPERATION_TIMEOUTS,
+  resolveBridgeTimeoutMs,
+  resolvePageOperationTimeoutMs
+} from "../extension/shared/operation-timeouts.js";
+import {
+  PREVIEW_SCAN_STOP,
+  resolvePreviewScanStop
+} from "../extension/shared/preview-scan-policy.js";
 import {
   formatLogTimestamp,
   mergeRuntimeLog,
@@ -59,16 +69,24 @@ const {
   confirmRenderedOwnMessage
 } = globalThis.BHTConversationMatch;
 const { resolveTriggerNavigationRecovery } = globalThis.BHTTriggerNavigationRecovery;
+const { awaitOperationDispatchPermit } = globalThis.BHTOperationDispatchGate;
 
 let passed = 0;
+const registeredTests = [];
 function test(name, fn) {
-  try {
-    fn();
-    passed++;
-    console.log("  PASS", name);
-  } catch (e) {
-    console.error("  FAIL", name, "-", e.message);
-    process.exitCode = 1;
+  registeredTests.push({ name, fn });
+}
+
+async function runRegisteredTests() {
+  for (const { name, fn } of registeredTests) {
+    try {
+      await fn();
+      passed++;
+      console.log("  PASS", name);
+    } catch (e) {
+      console.error("  FAIL", name, "-", e.message);
+      process.exitCode = 1;
+    }
   }
 }
 
@@ -788,6 +806,7 @@ test("manifest version + hosts", () => {
   assert.ok(mainHook?.js?.includes("content/page-network-hook.js"));
   assert.equal(isolated?.js?.[0], "shared/trigger-navigation-recovery.js");
   assert.equal(isolated?.js?.[1], "shared/conversation-match.js");
+  assert.equal(isolated?.js?.[2], "shared/operation-dispatch-gate.js");
 });
 test("UI exposes themes, help tips and filter switches", () => {
   const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
@@ -1017,7 +1036,8 @@ test("preview scan uses try/finally to restore button", () => {
   const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
   const start = app.indexOf("$('btnPreview').addEventListener('click'");
   assert.ok(start > 0);
-  const chunk = app.slice(start, start + 1800);
+  const end = app.indexOf("$('btnDiagnose')", start);
+  const chunk = app.slice(start, end > start ? end : start + 4000);
   assert.ok(chunk.includes("try {"));
   assert.ok(chunk.includes("} finally {"));
   assert.ok(chunk.includes("$('btnPreview').disabled = false"));
@@ -1350,6 +1370,66 @@ test("operation registry returns and clears every active content operation", () 
   assert.equal(registry.size, 0);
 });
 
+test("operation budgets share one deadline and leave bridge cleanup grace", () => {
+  const now = 1_000_000;
+  const scanDeadline = now + OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS;
+  const scanPageMs = resolvePageOperationTimeoutMs("BHT_SCAN_JOBS", { deadlineAt: scanDeadline }, now);
+  assert.equal(
+    scanPageMs,
+    OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS + OPERATION_TIMEOUTS.SCAN_DEADLINE_GRACE_MS
+  );
+  assert.equal(
+    resolveBridgeTimeoutMs(scanPageMs),
+    scanPageMs + OPERATION_TIMEOUTS.BRIDGE_GRACE_MS
+  );
+  assert.equal(
+    resolvePageOperationTimeoutMs("BHT_SCAN_JOBS", { deadlineAt: now - 1 }, now),
+    OPERATION_TIMEOUTS.SCAN_MIN_PAGE_MS
+  );
+  assert.equal(
+    resolvePageOperationTimeoutMs("BHT_WAIT_CHAT_EDITOR", { timeoutMs: 30000 }, now),
+    33000
+  );
+  assert.equal(resolvePageOperationTimeoutMs("BHT_RETURN_TO_LIST", {}, now), 30000);
+  assert.equal(OPERATION_TIMEOUTS.BRIDGE_CANCEL_SETTLE_MS, 3000);
+  assert.equal(OPERATION_TIMEOUTS.BRIDGE_CANCEL_POLL_MS, 100);
+});
+
+test("operation dispatch gate observes cancellation before side effects start", async () => {
+  let row = { status: "pending" };
+  let settledReason = "";
+  let dispatchStarted = false;
+  const permit = await awaitOperationDispatchPermit({
+    isCancelled: () => false,
+    readOperationState: async () => row,
+    settleCancellation: async (reason) => { settledReason = reason; },
+    yieldTurn: async () => { row = { status: "cancelled", reason: "用户停止" }; }
+  });
+  if (permit.ok) dispatchStarted = true;
+  assert.equal(permit.ok, false);
+  assert.equal(permit.reason, "cancelled");
+  assert.equal(settledReason, "用户停止");
+  assert.equal(dispatchStarted, false);
+});
+
+test("preview scan stops only at bottom, deadline, or a real batch error", () => {
+  const scanning = resolvePreviewScanStop({ deadlineAt: 2000, now: 1000 });
+  assert.equal(scanning.reason, PREVIEW_SCAN_STOP.SCANNING);
+  assert.equal(scanning.done, false);
+  assert.equal(
+    resolvePreviewScanStop({ reachedEnd: true, deadlineAt: 2000, now: 1000 }).reason,
+    PREVIEW_SCAN_STOP.REACHED_END
+  );
+  assert.equal(
+    resolvePreviewScanStop({ timedOut: true, batchError: "late bridge result" }).reason,
+    PREVIEW_SCAN_STOP.TIMEOUT
+  );
+  assert.equal(
+    resolvePreviewScanStop({ batchError: "real failure", deadlineAt: 2000, now: 1000 }).reason,
+    PREVIEW_SCAN_STOP.BATCH_ERROR
+  );
+});
+
 test("older polling snapshots cannot overwrite a stopped task event", () => {
   const stopped = { id: "task-1", revision: 8, updatedAt: 200, status: "stopped", createdAt: 100 };
   const staleRunning = { id: "task-1", revision: 7, updatedAt: 190, status: "running", createdAt: 100 };
@@ -1357,6 +1437,8 @@ test("older polling snapshots cannot overwrite a stopped task event", () => {
   assert.equal(shouldAcceptTaskSnapshot(stopped, staleRunning), false);
   assert.equal(shouldAcceptTaskSnapshot(stopped, restarted), true);
   assert.equal(shouldAcceptTaskSnapshot(staleRunning, stopped), true);
+  assert.equal(shouldAcceptTaskSnapshot(stopped, null, { authoritative: true }), true);
+  assert.equal(shouldAcceptTaskSnapshot(stopped, staleRunning, { authoritative: true }), true);
 });
 
 test("stop cancels page operations and protects the stopped terminal state", () => {
@@ -1386,6 +1468,8 @@ test("legacy persistent worker-tab delivery path stays removed", () => {
   assert.ok(background.includes("collectDoneJobIds"));
 });
 
+
+await runRegisteredTests();
 
 if (process.exitCode) {
   console.error("\nSome tests failed");

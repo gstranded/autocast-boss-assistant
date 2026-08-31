@@ -23,7 +23,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.13";
+  const BHT_CONTENT_VERSION = "1.7.14";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -40,7 +40,9 @@
   window.__BHT_CONTENT_INSTANCE_ID__ = BHT_CONTENT_INSTANCE_ID;
   window.__BHT_OP_LOCK__ = null; // boot: 导航后新脚本不继承旧锁
   window.__BHT_OP_CANCELLED__ = Object.create(null);
+  window.__BHT_OP_TIMED_OUT__ = Object.create(null);
   window.__BHT_ACTIVE_OP_ID__ = null;
+  window.__BHT_ACTIVE_OP_TYPE__ = null;
   window.__BHT_CONTENT_LOADED__ = true;
   window.__BHT_LAST_TRIGGER_CLICK__ = null;
   const nativeGreetingReceipts = [];
@@ -106,6 +108,23 @@
     };
   }
 
+  function summarizeOperationResult(result) {
+    if (!result || typeof result !== 'object') return result;
+    return {
+      ok: result.ok === true,
+      error: result.error || '',
+      message: result.message || '',
+      count: Number(result.count || 0),
+      contentVersion: result.contentVersion || BHT_CONTENT_VERSION,
+      scanMeta: result.scanMeta || null,
+      receipt: result.receipt ? {
+        type: result.receipt.type || '',
+        status: result.receipt.status || '',
+        receiptId: result.receipt.receiptId || ''
+      } : null
+    };
+  }
+
   function describeDebugElement(el) {
     if (!el || typeof el !== "object") return null;
     let rect = null;
@@ -141,7 +160,11 @@
     try { window.__BHT_DEBUG_INSTRUMENTATION_CLEANUP__?.(); } catch (_) {}
     const eventTypes = ["mousedown", "mouseup", "click", "keydown", "input", "change", "submit"];
     const onDomEvent = (event) => {
-      if (window.__BHT_DEBUG_ENABLED__ !== true || !window.__BHT_ACTIVE_OP_ID__) return;
+      if (
+        window.__BHT_DEBUG_ENABLED__ !== true ||
+        !window.__BHT_ACTIVE_OP_ID__ ||
+        window.__BHT_ACTIVE_OP_TYPE__ === MSG.SCAN_JOBS
+      ) return;
       debugTrace("dom_event", {
         type: event.type,
         isTrusted: Boolean(event.isTrusted),
@@ -186,7 +209,11 @@
     let removedCount = 0;
     let mutationSamples = [];
     const observer = new MutationObserver((mutations) => {
-      if (window.__BHT_DEBUG_ENABLED__ !== true || !window.__BHT_ACTIVE_OP_ID__) return;
+      if (
+        window.__BHT_DEBUG_ENABLED__ !== true ||
+        !window.__BHT_ACTIVE_OP_ID__ ||
+        window.__BHT_ACTIVE_OP_TYPE__ === MSG.SCAN_JOBS
+      ) return;
       mutationCount += mutations.length;
       for (const mutation of mutations) {
         addedCount += mutation.addedNodes?.length || 0;
@@ -228,8 +255,10 @@
   
   function isListLikePage(href = location.href) {
     try {
-      const u = String(href || "");
-      return /\/web\/geek\/jobs|recommend|search|rec-job|job-recommend|geek\/job(?!_detail)/i.test(u);
+      const parsed = new URL(String(href || ""), location.origin);
+      // 只按 pathname 判断，避免详情页 query 中的 search/recommend 参数
+      // 被误认成职位列表，导致续批扫描跳过列表恢复。
+      return /\/web\/geek\/jobs|\/recommend(?:\/|$)|\/search(?:\/|$)|\/rec-job(?:\/|$)|\/job-recommend(?:\/|$)|\/geek\/job(?!_detail)(?:\/|$)/i.test(parsed.pathname);
     } catch (_) {
       return false;
     }
@@ -319,7 +348,7 @@
     try {
       const href = forceHref || location.href;
       const cards = getJobCards().length;
-      if (forceHref || (cards >= 3 && /jobs|recommend|search|geek\/job/i.test(href))) {
+      if (forceHref || (cards >= 3 && isListLikePage(href))) {
         const ctx = {
           href,
           expectLabel: detectSelectedJobExpect(),
@@ -510,6 +539,27 @@ const SELECTORS = {
     error.code = "OP_CANCELLED";
     error.opId = opId || "";
     return error;
+  }
+
+  function operationStorageKey(opId) {
+    return opId ? `bht_op_${opId}` : '';
+  }
+
+  async function markOperationCancelled(opId, reason = "任务已停止", settled = false) {
+    const key = operationStorageKey(opId);
+    if (!key) return;
+    try {
+      await chrome.storage.local.set({
+        [key]: {
+          status: "cancelled",
+          opId,
+          reason,
+          at: Date.now(),
+          settled,
+          contentVersion: BHT_CONTENT_VERSION
+        }
+      });
+    } catch (_) {}
   }
 
   function sleep(ms) {
@@ -1403,6 +1453,7 @@ function firstEl(selectors, root = document) {
   function collectAdaptiveScanJobs(session) {
     const cards = getJobCards();
     const visibleKeys = [];
+    const newJobs = [];
     let added = 0;
     cards.forEach((card, index) => {
       const job = parseJobCard(card, index);
@@ -1410,17 +1461,22 @@ function firstEl(selectors, root = document) {
       if (!key) return;
       visibleKeys.push(key);
       const previous = session.jobs.get(key);
-      if (!previous) added += 1;
-      session.jobs.set(key, {
+      const merged = {
         ...(previous || {}),
         ...job,
         company: job.company || previous?.company || '',
         href: job.href || previous?.href || '',
         index: previous?.index ?? session.jobs.size
-      });
+      };
+      if (!previous) {
+        added += 1;
+        newJobs.push(merged);
+      }
+      session.jobs.set(key, merged);
     });
     return {
       added,
+      newJobs,
       visibleCount: cards.length,
       signature: visibleKeys.join('|')
     };
@@ -1443,8 +1499,11 @@ function firstEl(selectors, root = document) {
       };
     }
 
-    const scroller = getAdaptiveScanScroller();
+    const scroller = session.scroller?.isConnected ? session.scroller : getAdaptiveScanScroller();
+    session.scroller = scroller;
     const first = collectAdaptiveScanJobs(session);
+    const batchJobs = new Map();
+    for (const job of first.newJobs) batchJobs.set(String(job.jobId || `${normalizeText(job.title)}|${normalizeText(job.company)}`), job);
     let batchAdded = first.added;
     let lastVisibleCount = first.visibleCount;
     let lastSignature = first.signature;
@@ -1474,9 +1533,6 @@ function firstEl(selectors, root = document) {
           before = adaptiveScrollSnapshot(scroller);
         } catch (_) {}
       }
-      const cards = getJobCards();
-      const last = cards[cards.length - 1];
-      try { last?.scrollIntoView({ block: 'end', behavior: 'instant' }); } catch (_) {}
       try {
         const isDocumentScroller =
           scroller === document.scrollingElement ||
@@ -1493,6 +1549,7 @@ function firstEl(selectors, root = document) {
       await sleep(Math.min(waitMs, remainingMs));
 
       const collected = collectAdaptiveScanJobs(session);
+      for (const job of collected.newJobs) batchJobs.set(String(job.jobId || `${normalizeText(job.title)}|${normalizeText(job.company)}`), job);
       batchAdded += collected.added;
       lastVisibleCount = collected.visibleCount;
       const after = adaptiveScrollSnapshot(scroller);
@@ -1504,7 +1561,8 @@ function firstEl(selectors, root = document) {
       if (collected.added <= 0 && !moved && !visibleChanged) session.stableRounds += 1;
       else session.stableRounds = 0;
       if (collected.added > 0) session.lastGrowthAt = Date.now();
-      if (after.atBottom && collected.added <= 0 && !visibleChanged) session.bottomStableRounds += 1;
+      // 虚拟列表替换节点时可能短暂没有卡片；空 DOM 不能作为“到底”证据。
+      if (after.atBottom && collected.visibleCount > 0 && collected.added <= 0 && !visibleChanged) session.bottomStableRounds += 1;
       else session.bottomStableRounds = 0;
       if (session.bottomStableRounds >= 5 && Date.now() - session.lastGrowthAt >= 3500) {
         session.reachedEnd = true;
@@ -1514,13 +1572,17 @@ function firstEl(selectors, root = document) {
     if (deadlineAt && Date.now() >= deadlineAt) timedOut = true;
     session.lastSignature = lastSignature;
     const snapshot = adaptiveScrollSnapshot(scroller);
-    const jobs = Array.from(session.jobs.values()).map((job, index) => ({ ...job, index }));
+    const allJobs = Array.from(session.jobs.values()).map((job, index) => ({ ...job, index }));
+    const jobs = payload.deltaOnly === true
+      ? Array.from(batchJobs.values())
+      : allJobs;
     return {
       jobs,
-      count: jobs.length,
+      count: allJobs.length,
       scanMeta: {
         sessionId,
-        uniqueCount: jobs.length,
+        uniqueCount: allJobs.length,
+        returnedCount: jobs.length,
         visibleCount: lastVisibleCount,
         batchAdded,
         rounds: session.rounds,
@@ -1537,6 +1599,23 @@ function firstEl(selectors, root = document) {
   function pageInfo() {
     const cards = getJobCards();
     const hasChat = typeof hasUsableChatInput === "function" ? hasUsableChatInput() : Boolean(getChatInput());
+    const savedListCtx = getSavedListCtx();
+    const onList = isListLikePage();
+    const savedHref = getSavedListHref();
+    const savedExpect = String(savedListCtx?.expectLabel || "");
+    const savedHints = Array.isArray(savedListCtx?.filterHints)
+      ? savedListCtx.filterHints.slice(0, 12)
+      : [];
+    const liveExpect = onList ? String(detectSelectedJobExpect() || "") : "";
+    const liveHints = onList ? detectActiveFilterHints() : [];
+    // PING is also used while the source tab is on a detail/chat page. Expose
+    // the last intact list context under both explicit `saved*` names and the
+    // compact aliases consumed by background workers.
+    const listHref = onList ? location.href : savedHref;
+    const listExpectLabel = onList ? (liveExpect || savedExpect) : savedExpect;
+    const listFilterHints = onList
+      ? (liveHints.length ? liveHints : savedHints)
+      : savedHints;
     return {
       href: location.href,
       title: document.title,
@@ -1547,7 +1626,15 @@ function firstEl(selectors, root = document) {
       hasChatBtn: Boolean(firstEl(SELECTORS.chatOnDetail)),
       hasChatInput: hasChat,
       isChatPage: /\/chat/i.test(location.pathname + location.hash),
-      path: location.pathname
+      path: location.pathname,
+      // Expose the last intact list target so the background can open an
+      // isolated scan worker without navigating this tab from a detail/chat page.
+      savedListHref: savedHref,
+      savedListExpectLabel: savedExpect,
+      savedListFilterHints: savedHints,
+      listHref,
+      listExpectLabel,
+      listFilterHints
     };
   }
 
@@ -1580,10 +1667,17 @@ function firstEl(selectors, root = document) {
 
   async function scanJobs(payload = {}) {
     try { rememberListHref(); } catch (_) {}
-    const ensured = await ensureJobList({
-      maxWaitMs: payload.maxWaitMs || 12000,
-      scroll: false
-    });
+    const sessionId = String(payload.scanSessionId || 'default');
+    const continuingSession =
+      payload.resetSession === false &&
+      window.__BHT_SCAN_SESSION__?.id === sessionId &&
+      isListLikePage();
+    const ensured = continuingSession
+      ? { ok: true, via: 'scan-session' }
+      : await ensureJobList({
+        maxWaitMs: payload.maxWaitMs || 12000,
+        scroll: false
+      });
     if (!ensured.ok) {
       debugTrace("scan_jobs_no_list", { href: location.href, error: ensured.error, message: ensured.message }, "warn");
       return {
@@ -1598,15 +1692,23 @@ function firstEl(selectors, root = document) {
         page: pageInfo()
       };
     }
+    // A worker opened from a detail/chat tab has its own sessionStorage and
+    // starts with the default job expectation. Restore the source tab's
+    // expectation once on the first batch; continuation batches must not
+    // click the tab again while the virtual list is being replaced.
+    if (payload.resetSession !== false && payload.listExpectLabel && isListLikePage()) {
+      try { await restoreJobExpectIfNeeded(payload.listExpectLabel); } catch (_) {}
+    }
     const adaptive = await scanAdaptiveJobBatch(payload);
     const cards = getJobCards();
     const jobs = adaptive.jobs;
     debugTrace("scan_jobs_snapshot", {
       cardCount: cards.length,
-      parsedCount: jobs.length,
+      parsedCount: adaptive.count,
+      returnedCount: jobs.length,
       missingCompanyCount: jobs.filter((job) => !job.company).length,
       page: pageInfo(),
-      jobs: jobs.slice(0, 80).map((job) => ({
+      jobs: jobs.slice(0, 5).map((job) => ({
         index: job.index,
         jobId: job.jobId,
         title: job.title,
@@ -1618,7 +1720,7 @@ function firstEl(selectors, root = document) {
     }, jobs.some((job) => !job.company) ? "warn" : "debug");
     try{rememberListHref();}catch(_){} return { ok: true, listHref: (typeof getSavedListHref==="function"?getSavedListHref():"")||location.href, listExpectLabel: (typeof detectSelectedJobExpect==="function"?detectSelectedJobExpect():"")||"", listFilterHints: (typeof detectActiveFilterHints==="function"?detectActiveFilterHints():[]), page: pageInfo(),
       jobs,
-      count: jobs.length,
+      count: adaptive.count,
       scanMeta: adaptive.scanMeta,
       diagnose: {
         cardCount: cards.length,
@@ -4274,21 +4376,15 @@ async function runOpByType(type, payload = {}) {
     if (type === MSG.CANCEL_OP) {
       const opId = String(payload?.opId || "");
       debugTrace("operation_cancel_received", { opId, reason: payload?.reason || "任务已停止" }, "warn");
-      if (opId) window.__BHT_OP_CANCELLED__[opId] = true;
+      if (!opId) {
+        sendResponse({ ok: true, cancelled: false, opId: "" });
+        return true;
+      }
+      window.__BHT_OP_CANCELLED__[opId] = true;
       if (opId && window.__BHT_OP_INFLIGHT__?.[opId]) {
         window.__BHT_OP_INFLIGHT__[opId].cancelled = true;
       }
-      try {
-        chrome.storage.local.set({
-          ["bht_op_" + opId]: {
-            status: "cancelled",
-            opId,
-            reason: payload?.reason || "任务已停止",
-            at: Date.now(),
-            contentVersion: BHT_CONTENT_VERSION
-          }
-        });
-      } catch (_) {}
+      markOperationCancelled(opId, payload?.reason || "任务已停止", false);
       sendResponse({ ok: true, cancelled: Boolean(opId), opId });
       return true;
     }
@@ -4321,47 +4417,56 @@ async function runOpByType(type, payload = {}) {
       (async () => {
         if (opId) inflight[opId] = { opType, opPayload, at: Date.now() };
 
-        // 若 storage 已是 done，不再重跑
-        try {
-          if (opId) {
+        const isOperationCancelled = () => Boolean(opId && window.__BHT_OP_CANCELLED__?.[opId]);
+        const markSettledCancellation = async (reason = "任务已停止") => {
+          if (opId) await markOperationCancelled(opId, reason, true);
+          if (opId) delete inflight[opId];
+        };
+
+        // Background owns the pending row. Content must never rewrite it:
+        // doing so could overwrite a cancellation tombstone that arrived
+        // between two async bootstrap steps. Yield once for a queued CANCEL_OP,
+        // then re-check memory and storage immediately before dispatch.
+        const dispatchGate = globalThis.BHTOperationDispatchGate?.awaitOperationDispatchPermit;
+        if (typeof dispatchGate !== "function") {
+          await markSettledCancellation("页面操作取消门禁未加载，请刷新 BOSS 页面后重试");
+          return;
+        }
+        const permit = await dispatchGate({
+          isCancelled: isOperationCancelled,
+          readOperationState: async () => {
+            if (!opId) return null;
             const bag = await chrome.storage.local.get("bht_op_" + opId);
-            const row = bag && bag["bht_op_" + opId];
-            if (row && row.status === "done") {
-              log("RUN_OP skip already done", opId, row.result?.error || row.result?.ok);
-              delete inflight[opId];
-              return;
-            }
+            return bag && bag["bht_op_" + opId];
+          },
+          settleCancellation: async (reason) => {
+            if (opId) window.__BHT_OP_CANCELLED__[opId] = true;
+            await markSettledCancellation(reason);
+          },
+          finishCompleted: async (row) => {
+            log("RUN_OP skip already done", opId, row?.result?.error || row?.result?.ok);
+            if (opId) delete inflight[opId];
           }
-        } catch (_) {}
+        });
+        if (!permit.ok) return;
 
-        try {
-          await chrome.storage.local.set({
-            ["bht_op_" + opId]: {
-              status: "pending",
-              opType,
-              at: Date.now(),
-              contentVersion: BHT_CONTENT_VERSION
-            }
-          });
-        } catch (_) {}
-
-        // START_CHAT 允许更长；超时不强制清锁抢跑，由 finally 统一释放
-        const opTimeoutMs = /START_CHAT/.test(String(opType || ""))
-          ? 45000
-          : /TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SCAN_JOBS/.test(String(opType || ""))
-            ? 30000
-            : 15000;
+        // 后台统一计算页面操作预算；页面只执行该预算，不再维护另一套冲突的固定超时。
+        const requestedOperationTimeoutMs = Number(opPayload?.__bhtOperationTimeoutMs || 0);
+        const opTimeoutMs = Number.isFinite(requestedOperationTimeoutMs) && requestedOperationTimeoutMs > 0
+          ? Math.max(1000, requestedOperationTimeoutMs)
+          : 15000;
 
         let result;
         let timedOut = false;
         let workPromise;
         try {
           window.__BHT_ACTIVE_OP_ID__ = opId || null;
+          window.__BHT_ACTIVE_OP_TYPE__ = opType || null;
           debugTrace("operation_dispatch_begin", {
             opId,
             opType,
             timeoutMs: opTimeoutMs,
-            payloadKeys: Object.keys(opPayload || {}).filter((key) => key !== "__bhtDebugEnabled")
+            payloadKeys: Object.keys(opPayload || {}).filter((key) => !key.startsWith("__bht"))
           });
           workPromise = (async () => {
             const opResult = await runOpByType(opType, opPayload);
@@ -4376,18 +4481,20 @@ async function runOpByType(type, payload = {}) {
               debugTrace("operation_return_undefined", undefinedResult, "error");
               return undefinedResult;
             }
-            debugTrace("operation_dispatch_return", { opId, opType, result: opResult }, opResult?.ok ? "debug" : "warn");
+            debugTrace("operation_dispatch_return", { opId, opType, result: summarizeOperationResult(opResult) }, opResult?.ok ? "debug" : "warn");
             return opResult;
           })();
           let innerTimeoutId = null;
           const innerTimeoutPromise = new Promise((resolve) => {
             innerTimeoutId = setTimeout(() => {
               timedOut = true;
+              if (opId) window.__BHT_OP_CANCELLED__[opId] = true;
+              if (opId) window.__BHT_OP_TIMED_OUT__[opId] = true;
               debugTrace("operation_inner_timeout", { opId, opType, timeoutMs: opTimeoutMs }, "error");
               resolve({
                 ok: false,
-                error: "OP_INNER_TIMEOUT",
-                message: "页面内操作超时",
+                error: "OP_DEADLINE_EXCEEDED",
+                message: "页面操作超过统一时间预算，已终止",
                 contentVersion: BHT_CONTENT_VERSION
               });
             }, opTimeoutMs);
@@ -4400,18 +4507,16 @@ async function runOpByType(type, payload = {}) {
           } finally {
             if (innerTimeoutId != null) clearTimeout(innerTimeoutId);
           }
-          // 超时后仍等原任务收尾（最多再 15s），避免锁被提前清掉后并发
+          // 超时后通知所有可取消等待尽快收尾，只给锁释放留短暂宽限。
           if (timedOut && workPromise) {
-            log("RUN_OP timed out, waiting work settle", opId, opType);
+            log("RUN_OP deadline exceeded, cancelling work", opId, opType);
             try {
-              const late = await Promise.race([
-                workPromise,
-                sleep(15000).then(() => null)
+              await Promise.race([
+                workPromise.catch(() => null),
+                new Promise((resolve) => setTimeout(resolve, 2500))
               ]);
-              if (late && late.ok) result = late;
             } catch (e) {
               debugTrace("operation_late_settle_error", { opId, opType, error: serializeDebugError(e) }, "error");
-              if (!result) result = { ok: false, error: String(e?.message || e), contentVersion: BHT_CONTENT_VERSION };
             }
           }
         } catch (err) {
@@ -4424,6 +4529,7 @@ async function runOpByType(type, payload = {}) {
           };
         } finally {
           if (window.__BHT_ACTIVE_OP_ID__ === opId) window.__BHT_ACTIVE_OP_ID__ = null;
+          if (window.__BHT_ACTIVE_OP_TYPE__ === opType) window.__BHT_ACTIVE_OP_TYPE__ = null;
         }
         if (!result) {
           result = { ok: false, error: "EMPTY_RESULT", contentVersion: BHT_CONTENT_VERSION };
@@ -4447,13 +4553,13 @@ async function runOpByType(type, payload = {}) {
           }
         } catch (_) {}
 
-        const wasCancelled = Boolean(opId && window.__BHT_OP_CANCELLED__?.[opId]);
+        const wasCancelled = Boolean(!timedOut && opId && isOperationCancelled());
         if (wasCancelled) {
           result = { ok: false, error: "OP_CANCELLED", message: "任务已停止，页面操作已取消", contentVersion: BHT_CONTENT_VERSION };
         }
         try {
           if (wasCancelled) {
-            await chrome.storage.local.remove("bht_op_" + opId);
+            await markOperationCancelled(opId, result.message || "任务已停止，页面操作已取消", true);
           } else {
             await chrome.storage.local.set({
               ["bht_op_" + opId]: {
@@ -4473,13 +4579,23 @@ async function runOpByType(type, payload = {}) {
           opType,
           timedOut,
           wasCancelled,
-          result
+          result: summarizeOperationResult(result)
         }, result?.ok ? "debug" : "warn");
         try {
-          chrome.runtime.sendMessage({ type: "BHT_OP_DONE", payload: { opId, result } }).catch(() => {});
+          chrome.runtime.sendMessage({ type: "BHT_OP_DONE", payload: { opId, result: summarizeOperationResult(result) } }).catch(() => {});
         } catch (_) {}
         if (opId) delete inflight[opId];
-        if (opId) delete window.__BHT_OP_CANCELLED__[opId];
+        if (opId) {
+          if (timedOut || window.__BHT_OP_TIMED_OUT__?.[opId]) {
+            // 原操作可能还在收尾；保留取消墓碑，避免迟到的 sleep/DOM 步骤重新继续。
+            setTimeout(() => {
+              delete window.__BHT_OP_CANCELLED__[opId];
+              delete window.__BHT_OP_TIMED_OUT__[opId];
+            }, 60000);
+          } else {
+            delete window.__BHT_OP_CANCELLED__[opId];
+          }
+        }
       })();
       return true;
     }
@@ -4513,6 +4629,20 @@ async function runOpByType(type, payload = {}) {
     try {
       const updates = {};
       for (const [opId, inflight] of Object.entries(window.__BHT_OP_INFLIGHT__ || {})) {
+        // Do not turn a cancelled/timed-out operation into a synthetic
+        // navigation success. The background owns the cancellation tombstone
+        // and will either observe the settled marker or expire it safely.
+        if (window.__BHT_OP_CANCELLED__?.[opId] || window.__BHT_OP_TIMED_OUT__?.[opId] || inflight?.cancelled) {
+          updates["bht_op_" + opId] = {
+            status: "cancelled",
+            opId,
+            reason: "任务已停止，页面操作已取消",
+            at: Date.now(),
+            settled: true,
+            contentVersion: BHT_CONTENT_VERSION
+          };
+          continue;
+        }
         const recoveredTrigger = buildTriggerNavigationRecovery(inflight);
         updates["bht_op_" + opId] = {
           status: "done",

@@ -5,9 +5,16 @@ import { planMessageSegments } from "../extension/shared/message-planner.js";
 import { MESSAGE_MODES } from "../extension/shared/constants.js";
 
 console.log("8) delivery flow contracts");
+const registeredTests = [];
 function test(name, fn) {
-  try { fn(); console.log("  PASS", name); }
-  catch (e) { console.error("  FAIL", name, e.message); process.exitCode = 1; }
+  registeredTests.push({ name, fn });
+}
+
+async function runRegisteredTests() {
+  for (const { name, fn } of registeredTests) {
+    try { await fn(); console.log("  PASS", name); }
+    catch (e) { console.error("  FAIL", name, e.message); process.exitCode = 1; }
+  }
 }
 
 test("content exposes return/ensure/close handlers", () => {
@@ -38,7 +45,10 @@ test("preview auto-recovers non-list pages without silent zero results", () => {
   assert.ok(background.includes("scan?.error === 'NAVIGATED'"));
   assert.ok(background.includes("scan_navigation_detected"));
   assert.ok(background.includes("didContentDocumentChange"));
-  assert.ok(background.includes("type === MSG.SCAN_JOBS ? 38000 : 90000"));
+  assert.ok(background.includes("resolvePageOperationTimeoutMs"));
+  assert.ok(background.includes("resolveBridgeTimeoutMs"));
+  assert.ok(background.includes("OP_BRIDGE_TIMEOUT"));
+  assert.ok(!background.includes("扫描等待超过 38 秒"));
   assert.ok(background.includes("scan?.shouldNavigate === true"));
   assert.ok(panel.includes("非列表页会自动跳转"));
   assert.ok(panel.includes("下方暂时仍是上一次预览"));
@@ -155,12 +165,167 @@ test("preview accumulates virtualized jobs until bottom or the 60 second deadlin
   assert.ok(content.includes("deadlineAt"));
   assert.ok(content.includes("timedOut"));
   assert.ok(content.includes("scroller.scrollTop = scroller.scrollHeight"));
-  assert.ok(background.includes("maxScanMs || 60000"));
-  assert.ok(background.includes("只有确认到底或达到 60 秒边界后才执行筛选"));
+  assert.ok(content.includes("payload.deltaOnly === true"));
+  assert.ok(content.includes("returnedCount"));
+  assert.ok(content.includes("continuingSession"));
+  const continuationStart = content.indexOf("const continuingSession =");
+  const continuationEnd = content.indexOf("const ensured = continuingSession", continuationStart);
+  const continuationGuard = content.slice(continuationStart, continuationEnd);
+  assert.ok(continuationGuard.includes("isListLikePage()"));
+  assert.ok(!continuationGuard.includes("jobs?.size > 0"));
+  assert.ok(!continuationGuard.includes("getJobCards().length"));
+  assert.ok(content.includes("只按 pathname 判断"));
+  assert.ok(content.includes("collected.visibleCount > 0"));
+  assert.ok(background.includes("maxScanMs || OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS"));
+  assert.ok(background.includes("mergePreviewJobBatch"));
+  assert.ok(background.includes("deltaOnly: true"));
+  assert.ok(background.includes("payload.batchRounds || 3"));
+  assert.ok(background.includes("滚动阶段只采集和去重；确认到底或到达统一截止时间后，才执行一次筛选"));
   assert.ok(!background.includes("targetPass"));
   assert.ok(!background.includes("maxScanJobs"));
-  assert.ok(background.includes("scanning_more"));
+  assert.ok(background.includes("collecting"));
+  assert.ok(background.includes("scanStartedAt + maxElapsedMs"));
+  assert.ok(background.includes("resolvePreviewScanStop"));
+  assert.ok(background.includes("滚动阶段只采集和去重"));
+  assert.ok(background.includes("SCAN_WORKER_OPEN_FAILED"));
+  assert.ok(!background.includes("临时页初次扫描失败，回退原职位页"));
   assert.ok(panel.includes("到达列表底部或 60 秒"));
+});
+
+test("page operations consume the background budget and keep timeout terminal states distinct", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const dispatchGate = fs.readFileSync("extension/shared/operation-dispatch-gate.js", "utf8");
+  const policy = fs.readFileSync("extension/shared/operation-timeouts.js", "utf8");
+  assert.ok(policy.includes("PREVIEW_SCROLL_MS: 60000"));
+  assert.ok(policy.includes("BRIDGE_GRACE_MS: 5000"));
+  assert.ok(policy.includes("BRIDGE_CANCEL_SETTLE_MS: 3000"));
+  assert.ok(background.includes("__bhtOperationTimeoutMs: pageOperationTimeoutMs"));
+  assert.ok(background.includes("操作结果通道超过统一预算，取消页面内旧操作"));
+  assert.ok(background.includes("waitForBridgeCancellationSettlement"));
+  assert.ok(background.includes("removeStorage: bridgeSettled"));
+  assert.ok(background.includes("operations.delete(bridgeOpId)"));
+  assert.ok(background.includes("more?.error === 'OP_DEADLINE_EXCEEDED'"));
+  assert.ok(!background.includes("['OP_DEADLINE_EXCEEDED', 'OP_BRIDGE_TIMEOUT']"));
+  assert.ok(content.includes("requestedOperationTimeoutMs"));
+  assert.ok(content.includes("__BHT_ACTIVE_OP_TYPE__ === MSG.SCAN_JOBS"));
+  assert.ok(content.includes("原操作可能还在收尾；保留取消墓碑"));
+  assert.ok(!content.includes("if (window.__BHT_DEBUG_ENABLED__ !== true || !window.__BHT_ACTIVE_OP_ID__) return;"));
+  assert.ok(content.includes('error: "OP_DEADLINE_EXCEEDED"'));
+  assert.ok(content.includes("!timedOut && opId"));
+  assert.ok(content.includes("markSettledCancellation"));
+  const gateStart = content.indexOf("const dispatchGate");
+  const bootstrapEnd = content.indexOf("const requestedOperationTimeoutMs", gateStart);
+  const bootstrap = content.slice(gateStart, bootstrapEnd);
+  assert.ok(bootstrap.includes("await dispatchGate"));
+  assert.ok(bootstrap.includes("readOperationState"));
+  assert.ok(bootstrap.includes("settleCancellation"));
+  assert.ok(!bootstrap.includes('status: "pending"'));
+  assert.ok(bootstrap.indexOf("if (!permit.ok) return") < content.indexOf("workPromise =", gateStart));
+  assert.ok(dispatchGate.includes('row?.status === "cancelled"'));
+  assert.ok(content.includes('settled: true'));
+  assert.ok(!content.includes('error: "OP_INNER_TIMEOUT"'));
+  assert.ok(!content.includes("sleep(15000).then"));
+});
+
+test("cancelled preview generations cannot filter or publish late results", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const runPreviewStart = background.indexOf("async function runPreview");
+  const runPreviewEnd = background.indexOf("function itemErrorHint", runPreviewStart);
+  const runPreview = background.slice(runPreviewStart, runPreviewEnd);
+  const stopStart = background.indexOf("case MSG.STOP_TASK");
+  const stopEnd = background.indexOf("case MSG.SKIP_CURRENT", stopStart);
+  const stop = background.slice(stopStart, stopEnd);
+  assert.ok(background.includes("previewRunId"));
+  assert.ok(background.includes("isPreviewRunActive"));
+  assert.ok(runPreview.includes("if (!isActive()) return cancelled();"));
+  assert.ok(runPreview.includes("const results = evaluatePreviewResults"));
+  assert.ok(runPreview.indexOf("if (!isActive()) return cancelled();", runPreview.indexOf("const todayStats")) > -1);
+  assert.ok(runPreview.includes("await publishPreviewTask(task, previewRunId"));
+  assert.ok(background.includes("task.previewRunId = previewRunId"));
+  assert.ok(background.includes("discardCancelledPreviewTask(previewRunId"));
+  const previewPublisherStart = background.indexOf("async function publishPreviewTask");
+  const previewPublisherEnd = background.indexOf("async function withRunnerAdmission", previewPublisherStart);
+  const previewPublisher = background.slice(previewPublisherStart, previewPublisherEnd);
+  assert.ok(previewPublisher.indexOf("task.previewRunId = previewRunId") < previewPublisher.indexOf("await publishTask(task)"));
+  assert.ok(stop.includes("const cancelledPreviewRunId = runner.previewRunId"));
+  assert.ok(stop.includes("const previousPreviewTask = runner.previewPreviousTask"));
+  assert.ok(stop.includes("const previewRunPromise = activePreviewRun?.id === cancelledPreviewRunId"));
+  assert.ok(stop.indexOf("await cancelActiveOperations('用户取消扫描预览')") < stop.indexOf("await discardCancelledPreviewTask(cancelledPreviewRunId, previousPreviewTask)"));
+  assert.ok(stop.indexOf("await previewRunPromise") < stop.indexOf("await discardCancelledPreviewTask(cancelledPreviewRunId, previousPreviewTask)"));
+  assert.ok(background.includes("String(current?.previewRunId || '') !== String(previewRunId)"));
+  assert.ok(background.includes("authoritative: true"));
+  assert.ok(background.includes("preview_cancel_rollback"));
+  assert.ok(panel.includes("authoritativeTask"));
+  assert.ok(panel.includes("msg.authoritative === true"));
+  assert.ok(panel.includes("Object.prototype.hasOwnProperty.call(res, 'task')"));
+  assert.ok(stop.indexOf("runner.previewRunId = ''") < stop.indexOf("await cancelActiveOperations"));
+  assert.ok(stop.indexOf("runner.previewing = false") > stop.indexOf("await discardCancelledPreviewTask"));
+  const sendStart = background.indexOf("async function sendToBoss");
+  const sendEnd = background.indexOf("async function assertBossContext", sendStart);
+  const sendToBoss = background.slice(sendStart, sendEnd);
+  assert.ok(sendToBoss.includes("const runKind = previewRunId ? 'preview'"));
+  const workerStart = background.indexOf("async function openPreviewScanWorker");
+  const workerEnd = background.indexOf("async function closePreviewScanWorker", workerStart);
+  const worker = background.slice(workerStart, workerEnd);
+  assert.ok(worker.includes("if (previewRunId && !isPreviewRunActive(previewRunId))"));
+  assert.ok(worker.indexOf("await sleep(250)") < worker.lastIndexOf("if (previewRunId && !isPreviewRunActive(previewRunId))"));
+  assert.ok(runPreview.indexOf("await openPreviewScanWorker") < runPreview.indexOf("if (!isActive())", runPreview.indexOf("await openPreviewScanWorker")));
+});
+
+test("preview scanning isolates DOM work and uses lightweight one-second status updates", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const host = fs.readFileSync("extension/content/floating-host.js", "utf8");
+  const debugLog = fs.readFileSync("extension/shared/debug-log.js", "utf8");
+  assert.ok(background.includes("openPreviewScanWorker"));
+  assert.ok(background.includes("active: false"));
+  assert.ok(background.includes("sourcePage?.savedListHref"));
+  assert.ok(background.includes("listExpectLabel: scanWorkerTab.savedListExpectLabel ||"));
+  assert.ok(background.includes("const workerCandidates"));
+  assert.ok(background.includes("sourcePageHref"));
+  assert.ok(background.includes("taskListHref"));
+  assert.ok(background.includes("workerUrl = workerListHref || resolveBossJobListUrl"));
+  assert.ok(background.includes("if (!sourceTab?.id) return null"));
+  assert.ok(content.includes("savedListHref: savedHref"));
+  assert.ok(content.includes("savedListFilterHints"));
+  assert.ok(content.includes("listHref,"));
+  assert.ok(content.includes("listFilterHints"));
+  assert.ok(content.includes("payload.listExpectLabel && isListLikePage()"));
+  assert.ok(background.includes("closePreviewScanWorker"));
+  assert.ok(background.includes("isolatedWorker: scanWorkerUsed"));
+  assert.ok(background.includes("GET_RUNNER_STATE"));
+  assert.ok(background.includes("pause/abort/skip 只能来自上一轮残留"));
+  assert.ok(panel.includes("refreshRunnerState"));
+  assert.ok(panel.includes("}, 1000)"));
+  assert.ok(panel.includes("isPollingRequest"));
+  assert.ok(panel.includes("lastPreviewRenderKey"));
+  assert.ok(panel.includes("document.createDocumentFragment"));
+  assert.ok(panel.includes("lastLogRenderKey"));
+  assert.ok(panel.includes("lastHistoryRenderKey"));
+  assert.ok(host.includes("sessionStorage.setItem(STORAGE_OPEN"));
+  assert.ok(host.includes("cmd: \"suspend\""));
+  assert.ok(content.includes("summarizeOperationResult"));
+  assert.ok(background.includes("summarizeBossOperationResult"));
+  assert.ok(debugLog.includes("items omitted"));
+  assert.ok(!content.includes("jobs.slice(0, 80)"));
+});
+
+test("preview never falls back to scrolling the source tab", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const runStart = background.indexOf("async function runPreview");
+  const runEnd = background.indexOf("function itemErrorHint", runStart);
+  const run = background.slice(runStart, runEnd);
+  assert.ok(run.includes("openPreviewScanWorker(sourcePreviewTab, previewRunId"));
+  assert.ok(run.includes("if (!scanWorkerTab)"));
+  assert.ok(run.includes("SCAN_WORKER_OPEN_FAILED"));
+  assert.ok(run.includes("previewTab = scanWorkerTab"));
+  assert.ok(!run.includes("scanWorkerTab || sourcePreviewTab"));
+  assert.ok(!run.includes("previewTab = sourcePreviewTab || previewTab"));
+  assert.ok(run.includes("listHref: payload.listHref || taskListHref"));
+  assert.ok(run.includes("listExpectLabel: payload.listExpectLabel || taskListExpectLabel"));
 });
 
 test("panel and background reject mixed extension versions before delivery", () => {
@@ -201,6 +366,7 @@ test("background modal dismiss flag + cancellable conversation trigger", () => {
   assert.ok(s.includes("uiErrorDismissed"));
   assert.ok(s.includes("MSG.TRIGGER_CONVERSATION"));
   assert.ok(s.includes("cancelActiveOperations"));
+  assert.ok(s.includes("active.map((operation) => cancelBridgeOperation({ ...operation, reason }))"));
   assert.ok(s.includes("DISMISS_ERROR_MODAL"));
 });
 
@@ -376,6 +542,8 @@ test("retry resumes after chat trigger without clicking the list twice", () => {
   assert.ok(content.includes("clearTimeout(innerTimeoutId)"), "completed operations must cancel their timeout timer");
   assert.ok(!content.includes("sleep(opTimeoutMs).then"), "completed operations must not emit a later false timeout");
 });
+
+await runRegisteredTests();
 
 if (!process.exitCode) console.log("flow contract tests ok");
 

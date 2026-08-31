@@ -21,7 +21,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.13";
+const BHT_UI_VERSION = "1.7.14";
 const VERSION_GUARDED_API_MESSAGES = new Set([
   MSG.RUN_PREVIEW,
   MSG.CONFIRM_AND_START,
@@ -50,10 +50,14 @@ const state = {
   activeProfileId: null,
   draftBindings: [],
   lastCompletionSignalId: '',
+  lastPreviewRenderKey: '',
+  lastLogRenderKey: '',
+  lastHistoryRenderKey: '',
   theme: 'dark',
   runtimeVersionChecked: false,
   runtimeVersionMismatch: true,
   runtimeVersion: '',
+  hostSuspended: false,
   bossGreeting: {
     ok: false,
     enabled: null,
@@ -280,7 +284,8 @@ document.addEventListener('click', (event) => {
 
 async function api(type, payload) {
   const startedAt = Date.now();
-  if (type !== MSG.DEBUG_EVENT) panelDebug('api_request', { type, payload: summarizeApiPayload(payload) });
+  const isPollingRequest = type === MSG.GET_STATE || type === MSG.GET_RUNNER_STATE;
+  if (type !== MSG.DEBUG_EVENT && !isPollingRequest) panelDebug('api_request', { type, payload: summarizeApiPayload(payload) });
   try {
     if (!globalThis.chrome?.runtime?.id) throw new Error(extContextHint());
     if (VERSION_GUARDED_API_MESSAGES.has(type) && (!state.runtimeVersionChecked || state.runtimeVersionMismatch)) {
@@ -293,7 +298,7 @@ async function api(type, payload) {
     if (res == null) {
       throw new Error(type + ' 未收到后台响应');
     }
-    if (type !== MSG.DEBUG_EVENT) {
+    if (type !== MSG.DEBUG_EVENT && !isPollingRequest) {
       panelDebug('api_response', {
         type,
         elapsedMs: Date.now() - startedAt,
@@ -1228,15 +1233,19 @@ function updateTaskUI(task, runner = {}) {
   const phase = describeTaskPhase(task, status);
   if ($('taskStatus')) {
     if (runner.previewing) {
-      const elapsedSeconds = runner.previewStartedAt
-        ? Math.max(0, Math.floor((Date.now() - Number(runner.previewStartedAt)) / 1000))
+      const isCollecting = Boolean(runner.previewScanStartedAt) && ['collecting', 'filtering'].includes(runner.previewPhase);
+      const clockStartedAt = isCollecting ? runner.previewScanStartedAt : runner.previewStartedAt;
+      const elapsedSeconds = clockStartedAt
+        ? Math.max(0, Math.floor((Date.now() - Number(clockStartedAt)) / 1000))
         : 0;
       const previewPhaseText = {
+        opening_worker: '正在准备临时扫描页',
         locating_list: '正在定位职位列表',
         navigating: '正在自动跳转职位列表',
         waiting_navigation: '正在等待新页面加载',
         scanning_cards: '正在读取岗位卡片',
         scanning_more: '正在向下加载更多岗位',
+        collecting: '正在滚动采集岗位',
         filtering: '正在应用筛选规则'
       }[runner.previewPhase] || '正在读取岗位';
       const progressText = Number(runner.previewScanned || 0) > 0
@@ -1244,7 +1253,7 @@ function updateTaskUI(task, runner = {}) {
           ? ` · 已扫 ${runner.previewScanned} / 通过 ${runner.previewPass || 0}`
           : ` · 已累计 ${runner.previewScanned} 岗`)
         : '';
-      $('taskStatus').textContent = `状态：扫描中 · ${elapsedSeconds} 秒 · ${previewPhaseText}${progressText}`;
+      $('taskStatus').textContent = `状态：扫描中 · ${isCollecting ? '滚动' : '准备'} ${elapsedSeconds} 秒 · ${previewPhaseText}${progressText}`;
       $('taskStatus').dataset.status = 'previewing';
     } else {
       const pauseBit = status === 'paused' && task?.pauseReason ? '' : (task?.pauseReason && status !== 'paused' ? `（${task.pauseReason}）` : '');
@@ -1384,19 +1393,36 @@ function formatPreviewReasonLine(code, count, settings = {}) {
 }
 
 function renderPreview(task) {
+  const settings = state.config?.settings || {};
+  const renderKey = JSON.stringify([
+    task?.id || '',
+    task?.revision || 0,
+    task?.updatedAt || 0,
+    task?.status || '',
+    task?.results?.length || 0,
+    task?.summary?.pass || 0,
+    task?.summary?.reject || 0,
+    (task?.warnings || []).join('|'),
+    settings.companyDailyMax,
+    settings.dailyMaxCommunicate,
+    settings.taskMaxCommunicate,
+    settings.bossCooldownDays,
+    settings.neverRepeatJob
+  ]);
+  if (renderKey === state.lastPreviewRenderKey) return;
+  state.lastPreviewRenderKey = renderKey;
   if (!task?.summary) {
     $('summaryBox').textContent = '尚未扫描';
     $('previewList').innerHTML = '';
     return;
   }
   const s = task.summary;
-  const settings = state.config?.settings || {};
   const lines = [
     `扫描岗位：${s.scanned}`,
     `符合规则：${s.pass}`,
     `将被排除：${s.reject}`,
     task.scanMeta
-      ? `扫描策略：自适应滚动 ${task.scanMeta.rounds || 0} 轮 · 用时 ${(Number(task.scanMeta.elapsedMs || 0) / 1000).toFixed(1)} 秒 · ${task.scanMeta.stopMessage || task.scanMeta.stopReason || '完成'}`
+      ? `扫描方式：${task.scanMeta.isolatedWorker ? '临时页' : '当前页'}滚动 ${task.scanMeta.rounds || 0} 轮 · 滚动用时 ${(Number(task.scanMeta.scrollElapsedMs ?? task.scanMeta.elapsedMs ?? 0) / 1000).toFixed(1)} 秒 · ${task.scanMeta.stopMessage || task.scanMeta.stopReason || '完成'}`
       : '',
     '',
     '排除原因（冒号后数字 = 被排除岗位数，不是设置上限）：'
@@ -1427,6 +1453,7 @@ const list = $('previewList');
     (task.results || []).filter((r) => r.selected && r.decision === 'pass').map((r) => r.job.jobId)
   );
 
+  const fragment = document.createDocumentFragment();
   (task.results || []).forEach((r) => {
     const div = document.createElement('div');
     div.className = `item ${r.decision}`;
@@ -1447,16 +1474,19 @@ const list = $('previewList');
     )}</div>
       <div class="r">${escapeHtml(previewReasonLines(r).join('；'))}</div>
     `;
-    list.appendChild(div);
+    fragment.appendChild(div);
   });
-
-  list.querySelectorAll('input[data-job]').forEach((input) => {
-    input.addEventListener('change', () => {
+  list.appendChild(fragment);
+  if (!list.__bhtSelectionBound) {
+    list.__bhtSelectionBound = true;
+    list.addEventListener('change', (event) => {
+      const input = event.target?.closest?.('input[data-job]');
+      if (!input) return;
       const id = input.getAttribute('data-job');
       if (input.checked) state.selected.add(id);
       else state.selected.delete(id);
     });
-  });
+  }
 }
 
 function escapeHtml(s) {
@@ -1473,8 +1503,12 @@ function escapeAttr(s) {
 
 function renderLogs(logs = []) {
   const box = $('logList');
+  const sorted = sortLogsNewestFirst(logs).slice(0, 100);
+  const renderKey = `${logs.length}|${sorted[0]?.id || sorted[0]?.ts || ''}|${sorted[0]?.message || ''}`;
+  if (renderKey === state.lastLogRenderKey) return;
+  state.lastLogRenderKey = renderKey;
   box.innerHTML = '';
-  sortLogsNewestFirst(logs).slice(0, 100).forEach((l) => {
+  sorted.forEach((l) => {
     const div = document.createElement('div');
     div.className = `log ${l.level || 'info'}`;
     const time = formatLogTimestamp(l.ts, { includeDate: true });
@@ -1488,6 +1522,9 @@ function renderHistory(history = []) {
   const box = $('historyList');
   if (!box) return;
   const filter = $('historyFilter')?.value || 'all';
+  const renderKey = `${filter}|${history.length}|${history[0]?.id || history[0]?.ts || ''}|${history[0]?.status || ''}`;
+  if (renderKey === state.lastHistoryRenderKey) return;
+  state.lastHistoryRenderKey = renderKey;
   const filtered = filterHistoryRows(history, filter);
 
   const total = history.length;
@@ -1531,6 +1568,8 @@ function isEditingForm() {
 /** soft: 仅刷新任务/连接/日志，不覆盖正在编辑的表单 */
 async function refresh(options = {}) {
   const soft = options.soft === true;
+  const authoritativeTask = options.authoritativeTask === true;
+  lastFullRefreshAt = Date.now();
   const res = await api(MSG.GET_STATE);
   if (!res?.ok) return;
   state.runtimeVersion = String(res.runtimeVersion || '');
@@ -1538,7 +1577,7 @@ async function refresh(options = {}) {
   state.runtimeVersionMismatch = state.runtimeVersion !== BHT_UI_VERSION;
   if (state.runtimeVersionMismatch) showRuntimeMismatchBanner(state.runtimeVersion);
   const currentTask = state.config?.task;
-  if (!shouldAcceptTaskSnapshot(currentTask, res.task)) res.task = currentTask;
+  if (!shouldAcceptTaskSnapshot(currentTask, res.task, { authoritative: authoritativeTask })) res.task = currentTask;
   const prevTemplate = state.config?.messageTemplate;
   const prevSettings = state.config?.settings;
   const prevFilters = state.config?.filters;
@@ -1607,6 +1646,30 @@ async function refresh(options = {}) {
     setBossMode(false, reason);
   }
   if (isBoss) updateTaskUI(res.task, res.runner);
+}
+
+let runnerPollPromise = null;
+let lastFullRefreshAt = Date.now();
+async function refreshRunnerState() {
+  if (runnerPollPromise) return runnerPollPromise;
+  runnerPollPromise = (async () => {
+    const res = await api(MSG.GET_RUNNER_STATE);
+    if (!res?.ok) return null;
+    state.runtimeVersion = String(res.runtimeVersion || '');
+    state.runtimeVersionChecked = true;
+    state.runtimeVersionMismatch = state.runtimeVersion !== BHT_UI_VERSION;
+    if (state.runtimeVersionMismatch) {
+      showRuntimeMismatchBanner(state.runtimeVersion);
+      setConn(false, '版本不一致 · 已锁定');
+      setBossMode(false, `扩展界面 ${BHT_UI_VERSION} 与后台 ${state.runtimeVersion || '未知'} 不一致`);
+      return res;
+    }
+    if (!state.config) state.config = {};
+    state.config.runner = res.runner || {};
+    updateTaskUI(state.config.task, state.config.runner);
+    return res;
+  })().finally(() => { runnerPollPromise = null; });
+  return runnerPollPromise;
 }
 
 async function saveFilters(opts = {}) {
@@ -2213,6 +2276,15 @@ function bindEvents() {
 
   window.addEventListener('message', (event) => {
     const data = event.data || {};
+    if (data.source === 'bht-host') {
+      if (data.cmd === 'suspend') state.hostSuspended = true;
+      if (data.cmd === 'resume') {
+        state.hostSuspended = false;
+        lastFullRefreshAt = Date.now();
+        refresh({ soft: true }).catch(() => {});
+      }
+      return;
+    }
     if (data.source !== 'bht-agent') return;
     const ack = (extra = {}) => {
       try {
@@ -2355,7 +2427,18 @@ function bindEvents() {
     $('btnPreview').disabled = true;
     $('taskStatus').textContent = '状态：扫描中…';
     try {
-      await saveFilters();
+      await saveFilters({ refresh: false });
+      state.formDirty = false;
+      if (!state.config) state.config = {};
+      state.config.runner = {
+        ...(state.config.runner || {}),
+        previewing: true,
+        previewStartedAt: Date.now(),
+        previewPhase: 'locating_list',
+        previewScanned: 0,
+        previewPass: 0
+      };
+      updateTaskUI(state.config.task, state.config.runner);
       const res = await api(MSG.RUN_PREVIEW, { scroll: true, maxScanMs: 60000 });
       if (!res?.ok) {
         if (res?.error === 'OP_CANCELLED') {
@@ -2656,7 +2739,7 @@ function bindEvents() {
 
 globalThis.chrome?.runtime?.onMessage?.addListener((msg) => {
   if (msg?.type === MSG.TASK_EVENT) {
-    if (!shouldAcceptTaskSnapshot(state.config?.task, msg.payload)) return;
+    if (!shouldAcceptTaskSnapshot(state.config?.task, msg.payload, { authoritative: msg.authoritative === true })) return;
     if (state.config) state.config.task = msg.payload;
     updateTaskUI(msg.payload, state.config?.runner || {});
     announceTaskCompletion(msg.payload);
@@ -2782,11 +2865,13 @@ function wireControlButtons() {
     if (res?.ok === false) {
       toast(res.message || '停止失败', 'error');
     } else if (res?.previewCancelled) {
+      if (state.config) state.config.task = Object.prototype.hasOwnProperty.call(res, 'task') ? res.task : null;
+      updateTaskUI(state.config?.task || null, state.config?.runner || {});
       toast('已取消本次扫描，上一次预览结果已保留', 'warn', 3500);
     } else if (res?.task) {
       announceTaskCompletion(res.task);
     }
-    await refresh({ soft: true });
+    await refresh({ soft: true, authoritativeTask: res?.previewCancelled === true });
   });
 }
 
@@ -2809,6 +2894,17 @@ try { wireAutosave();
 try { wireResumeFilePreview(); } catch (_) {} } catch (_) {}
 refresh().catch(() => {});
 setInterval(() => {
+  if (state.hostSuspended) return;
   refreshControlEnablement();
-  refresh({ soft: true }).catch(() => {});
-}, 3000);
+  const runnerState = state.config?.runner || {};
+  if (runnerState.previewing) {
+    // 计时每秒本地刷新；后台只取轻量 runner，不再搬运任务/历史/简历/日志。
+    updateTaskUI(state.config?.task, runnerState);
+    refreshRunnerState().catch(() => {});
+    return;
+  }
+  if (Date.now() - lastFullRefreshAt >= 5000) {
+    lastFullRefreshAt = Date.now();
+    refresh({ soft: true }).catch(() => {});
+  }
+}, 1000);

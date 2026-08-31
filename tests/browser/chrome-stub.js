@@ -106,7 +106,7 @@
   state.settings = { ...state.settings, ...(storage.bht_settings || {}) };
 
   function stateResponse() {
-    return { ok: true, runtimeVersion: "1.7.13", ...clone(state) };
+    return { ok: true, runtimeVersion: "1.7.14", ...clone(state) };
   }
 
   function persistStorage() {
@@ -172,6 +172,9 @@
     await recordCall(type, payload);
 
     if (type === "BHT_GET_STATE") return stateResponse();
+    if (type === "BHT_GET_RUNNER_STATE") {
+      return { ok: true, runtimeVersion: "1.7.14", now: Date.now(), runner: clone(state.runner) };
+    }
     if (type === "BHT_GET_BOSS_GREETING") return clone(state.bossGreeting);
     if (type === "BHT_SET_BOSS_GREETING") {
       state.bossGreeting = {

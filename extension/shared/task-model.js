@@ -53,7 +53,8 @@ const STATUS_PRIORITY = Object.freeze({
   stopped: 7
 });
 
-export function shouldAcceptTaskSnapshot(current, incoming) {
+export function shouldAcceptTaskSnapshot(current, incoming, { authoritative = false } = {}) {
+  if (authoritative) return true;
   if (!current) return true;
   if (!incoming) return false;
   if (current.id !== incoming.id) {

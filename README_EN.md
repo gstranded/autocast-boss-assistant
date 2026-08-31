@@ -99,7 +99,7 @@ Safety limits are first-class features. The panel supports persistent light and 
    - Edge: `edge://extensions`
 5. Enable **Developer mode**
 6. Click **Load unpacked**
-7. Select the **`extension`** folder
+7. Select the extracted root folder that directly contains **`manifest.json`**
 8. Open the BOSS job list page and sign in
 
 ### Option C: Install from source

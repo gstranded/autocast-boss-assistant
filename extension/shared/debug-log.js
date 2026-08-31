@@ -28,6 +28,10 @@ export function sanitizeDebugValue(value, depth = 0, seen = new WeakSet()) {
 
   const out = {};
   for (const [key, item] of Object.entries(value).slice(0, 160)) {
+    if (/^(jobs|results)$/i.test(key) && Array.isArray(item)) {
+      out[key] = `[${item.length} items omitted]`;
+      continue;
+    }
     if (/dataUrl|base64|attachmentData|imageData/i.test(key)) {
       out[key] = typeof item === 'string' ? `[binary omitted, ${item.length} chars]` : '[binary omitted]';
       continue;

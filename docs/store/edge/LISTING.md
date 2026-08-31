@@ -2,7 +2,7 @@
 
 商店页：https://microsoftedge.microsoft.com/addons/detail/boss-%E6%B5%B7%E6%8A%95%E5%8A%A9%E6%89%8B/dgmfdkboghlfdcbgoapehjhjgmldnmod  
 产品 ID：`dgmfdkboghlfdcbgoapehjhjgmldnmod`  
-包：`dist/autocast-boss-haitou-v1.7.13.zip`
+包：`dist/autocast-boss-haitou-v1.7.14.zip`
 商店图：`docs/store/edge/assets/`（按 Partner Center 尺寸出好，见下方对照）
 
 不要新建扩展，只更新这一条 listing。
@@ -90,18 +90,21 @@ AutoCast-Boss海投助手帮你在 BOSS 直聘网页端一键海投：先按规�
 ## 本次更新说明（Notes for certification / What’s new）
 
 ```text
-更新现有扩展，不是新产品。版本 1.7.2。
+更新现有扩展，不是新产品。版本 1.7.14。
 
 变化：
-- 名称改为 AutoCast-Boss海投助手
-- 更换粉色公文包图标
-- 强调一键海投：先筛选，再自动批量投递
+- 扫描改在不激活的临时职位页执行，不滚动或跳转用户正在使用的职位页，保留筛选、详情和滚动位置
+- 临时页持续滚动到底；超过 60 秒时停止滚动，并用已累计岗位正常开始筛选
+- 跨批次累计 BOSS 虚拟列表岗位，每批只回传新增岗位，修复扫描数量停在首批及长列表越来越卡的问题
+- 扫描计时每秒本地更新，扫描期间不再每 3 秒读取和重绘完整任务数据
+- 统一页面操作与结果通道的超时、取消和迟到结果处理，取消后旧扫描不会重新发布预览队列
 
 测试：
 1. 打开 https://www.zhipin.com/web/geek/jobs 并登录
 2. 刷新后点右侧悬浮按钮
-3. 扫描预览，确认有通过/排除原因
-4. 可用「投递一份」验证发送
+3. 扫描预览，确认出现临时扫描页且原职位页保持不动
+4. 等待滚动到底或达到 60 秒，确认预览显示累计岗位及通过/排除原因
+5. 可用「投递一份」验证发送
 
 无法提供公共测试账号，需要审核员自己的 BOSS 登录态。配置只保存在本机。
 ```
