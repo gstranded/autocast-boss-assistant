@@ -2399,6 +2399,14 @@ function bindEvents() {
           status: state.config?.task?.status || '',
           pass: (state.config?.task?.results || []).filter((r) => r.decision === 'pass').length,
           reject: (state.config?.task?.results || []).filter((r) => r.decision === 'reject').length,
+          scanMeta: state.config?.task?.scanMeta || null,
+          activitySample: (state.config?.task?.results || []).slice(0, 12).map((row) => ({
+            title: row?.job?.title || '',
+            activeText: row?.job?.activeText || '',
+            requiresActiveCheck: row?.requiresActiveCheck === true,
+            passReasons: row?.passReasons || [],
+            reasonTexts: row?.reasonTexts || []
+          })),
           currentJobId: state.config?.task?.currentJobId || '',
           pauseReason: state.config?.task?.pauseReason || '',
           testedJobIds: state.config?.task?.testedJobIds || [],

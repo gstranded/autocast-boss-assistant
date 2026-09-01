@@ -450,6 +450,9 @@ test("preview accumulates virtualized jobs until bottom or the 60 second deadlin
   assert.ok(background.includes("滚动阶段只采集和去重"));
   assert.ok(!background.includes("SCAN_WORKER_OPEN_FAILED"));
   assert.ok(background.includes("正在当前职位页向下加载岗位"));
+  assert.ok(background.includes("SCAN_PROGRESS"));
+  assert.ok(content.includes("reportScanProgress"));
+  assert.ok(content.includes("SCAN_PROGRESS: \"BHT_SCAN_PROGRESS\""));
   assert.ok(!panel.includes("到达列表底部或 60 秒"));
   assert.ok(!panel.includes("滚动用时"));
   assert.ok(panel.includes("elapsedSeconds"));
@@ -786,6 +789,8 @@ test("preview navigation recovery and scan bridge failures share the hard deadli
     "remainingDeadlineMs(\n      scanPayload.deadlineAt,\n      OPERATION_TIMEOUTS.PREVIEW_LIST_NAV_MS"
   ));
   assert.ok(scanPreview.includes("deadlineAt: scanPayload.deadlineAt"));
+  assert.ok(scanPreview.includes("setPreviewPhase('collecting', previewRunId)"));
+  assert.ok(!scanPreview.includes("setPreviewPhase('locating_list'"));
   assert.ok(scanPreview.includes("scanPayload.deadlineAt\n    )"));
   assert.ok(scanPreview.includes("error: 'OP_DEADLINE_EXCEEDED'") ||
     scanPreview.includes("previewScanDeadlineResult()"));

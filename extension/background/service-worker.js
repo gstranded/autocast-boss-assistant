@@ -1793,7 +1793,7 @@ async function scanPreviewJobs(payload, previewTab, previewRunId = '') {
     deadlineAt: Math.max(0, Number(payload.deadlineAt || 0))
   };
   let navigation = null;
-  setPreviewPhase('locating_list', previewRunId);
+  setPreviewPhase('collecting', previewRunId);
   let scan = await sendToBoss(MSG.SCAN_JOBS, scanPayload, {
     tabId: previewTab?.id || null,
     previewRunId
@@ -4026,6 +4026,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             logs: await getSessionDebugLogs()
           };
         }
+      case MSG.SCAN_PROGRESS: {
+        const count = Math.max(0, Number(payload?.count || 0));
+        if (!runner.previewing || !count) return { ok: true, ignored: true };
+        setPreviewPhase('collecting');
+        setPreviewProgress(count, runner.previewPass || 0);
+        return { ok: true };
+      }
       case MSG.DEBUG_EVENT:
         if (!debugLoggingEnabled) return { ok: true, recorded: false };
         await appendSessionDebugLog({

@@ -2,6 +2,7 @@
   const MSG = {
     PING: "BHT_PING",
     SCAN_JOBS: "BHT_SCAN_JOBS",
+    SCAN_PROGRESS: "BHT_SCAN_PROGRESS",
     START_CHAT: "BHT_START_CHAT",
     TRIGGER_CONVERSATION: "BHT_TRIGGER_CONVERSATION",
     INSPECT_JOB_DETAIL: "BHT_INSPECT_JOB_DETAIL",
@@ -1766,6 +1767,18 @@ function firstEl(selectors, root = document) {
     let lastSignature = '';
     const deadlineAt = Math.max(0, Number(payload.deadlineAt || 0));
     let timedOut = false;
+    let lastProgressAt = 0;
+    const reportScanProgress = (count) => {
+      const now = Date.now();
+      if (now - lastProgressAt < 250) return;
+      lastProgressAt = now;
+      try {
+        chrome.runtime.sendMessage({
+          type: MSG.SCAN_PROGRESS,
+          payload: { count: Number(count || 0), at: now }
+        }).catch(() => {});
+      } catch (_) {}
+    };
     const collectWindow = () => {
       const sizeBefore = session.jobs.size;
       const collected = collectAdaptiveScanJobs(session);
@@ -1779,6 +1792,7 @@ function firstEl(selectors, root = document) {
         session.lastGrowthAt = Date.now();
         session.growthEvents += 1;
       }
+      reportScanProgress(session.jobs.size);
       return collected;
     };
     const isScanStopError = (error) => error?.code === "OP_CANCELLED";
