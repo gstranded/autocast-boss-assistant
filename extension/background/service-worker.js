@@ -691,6 +691,19 @@ async function setSplitTabZoom(tabId) {
   }
 }
 
+// 分屏窗口可能因创建时未聚焦而被系统隐藏或最小化（坐标更新无效、state 更新有效）。
+// 显式恢复 normal 并依次前置：先消息窗后列表窗；两窗不重叠，前置后左右都可见。
+async function raiseSplitWindows(listWindowId, messageWindowId) {
+  if (messageWindowId != null) {
+    await chrome.windows.update(messageWindowId, { state: 'normal' }).catch(() => {});
+    await chrome.windows.update(messageWindowId, { focused: true }).catch(() => {});
+  }
+  if (listWindowId != null) {
+    await chrome.windows.update(listWindowId, { state: 'normal' }).catch(() => {});
+    await chrome.windows.update(listWindowId, { focused: true }).catch(() => {});
+  }
+}
+
 export async function prepareSplitWorkspace(task, settings = {}) {
   if (!task.execution) task.execution = {};
   if (settings.splitViewEnabled === false) {
@@ -730,7 +743,7 @@ export async function prepareSplitWorkspace(task, settings = {}) {
       task.execution.splitBounds = bounds;
       task.execution.phase = 'SPLIT_WORKSPACE_READY';
       await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
-      await chrome.windows.update(prevListWin.id, { focused: true }).catch(() => {});
+      await raiseSplitWindows(prevListWin.id, prevMsgWin.id);
       await debugLog('background.split', 'pair_reused', {
         listWindowId: prevListWin.id,
         messageWindowId: prevMsgWin.id,
@@ -814,12 +827,12 @@ export async function prepareSplitWorkspace(task, settings = {}) {
     task.execution.phase = 'SPLIT_WORKSPACE_READY';
 
     await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
-    await chrome.windows.update(listWindowId, { focused: true }).catch(() => {});
-    await debugLog('background.split', 'windows_created', {
-      listWindowId,
-      messageWindowId: messageWindow.id,
-      bounds,
-      messageTabId: messageTab.id
+    await raiseSplitWindows(listWindowId, messageWindow.id);
+    const listWinState = await chrome.windows.get(listWindowId).catch(() => null);
+    const msgWinState = await chrome.windows.get(messageWindow.id).catch(() => null);
+    await debugLog('background.split', 'windows_state', {
+      list: listWinState ? { id: listWinState.id, state: listWinState.state, left: listWinState.left, top: listWinState.top, width: listWinState.width, height: listWinState.height } : null,
+      message: msgWinState ? { id: msgWinState.id, state: msgWinState.state, left: msgWinState.left, top: msgWinState.top, width: msgWinState.width, height: msgWinState.height } : null
     });
     return {
       ok: true,
