@@ -60,6 +60,7 @@
       bossTitle: String(firstDefined(raw.bossTitle, bossInfo.title, '') || '').trim(),
       brandName: String(firstDefined(raw.brandName, bossInfo.brandName, '') || '').trim(),
       bossOnline,
+      goldHunter: raw.goldHunter === true || raw.goldHunter === 1 || bossInfo.goldHunter === 1,
       activeText: bossOnline ? '在线' : activeTimeDesc,
       source
     };

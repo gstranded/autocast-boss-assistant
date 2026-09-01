@@ -79,9 +79,10 @@ function evalLocation(location, locationRules = {}) {
   return { pass: true, reasonCodes: [], reasonTexts: [] };
 }
 
-function looksHunter(job) {
-  const blob = `${job.title || ''} ${job.company || ''} ${job.hrName || ''} ${job.jd || ''}`;
-  return /猎头|招聘顾问|人才中介|人力资源公司|RPO/i.test(blob);
+export function looksHunter(job) {
+  if (job?.goldHunter === true || job?.goldHunter === 1) return true;
+  const blob = `${job.hrName || ''} ${job.hrTitle || ''} ${job.company || ''}`;
+  return /猎头/.test(blob);
 }
 
 function looksOutsource(job) {
@@ -89,33 +90,65 @@ function looksOutsource(job) {
   return /外包|驻场|外派|人力外包|IT外包/.test(blob);
 }
 
-// BOSS 直聘 HR 活跃标签 → 筛选桶。BOSS 对同一 HR 只展示一个标签，直接按标签归类。
-const ACTIVE_PATTERNS = {
-  just: /刚刚活跃|当前在线|在线/,
-  today: /今日活跃/,
-  '3d': /3日内|两日内|昨日/,
-  week: /本周|一周内|7日内|近7日/,
-  month: /本月|近30日|30日内|近一月/
+// 数字越大越久。筛选项是单选上限：选「本周内」收下在线到本周。
+const ACTIVE_RANK = {
+  online: 0,
+  just: 1,
+  today: 2,
+  '3d': 3,
+  week: 4,
+  '2w': 5,
+  month: 6,
+  '2m': 7,
+  '3m': 8,
+  '4m': 9,
+  half: 10,
+  year: 11
 };
 
+export const ACTIVE_CEILING_KEYS = ['online', 'just', 'today', '3d', 'week', '2w', 'month', 'half'];
+
+export function classifyActive(activeText) {
+  const t = String(activeText || '').replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  if (/刚刚活跃/.test(t)) return 'just';
+  if (/今日活跃/.test(t)) return 'today';
+  if (/3日内活跃/.test(t)) return '3d';
+  if (/\d+日前活跃/.test(t)) return '3d';
+  if (/两周内活跃|(^|[^0-9])2周内活跃/.test(t)) return '2w';
+  if (/本周活跃/.test(t)) return 'week';
+  if (/本月活跃/.test(t)) return 'month';
+  if (/(^|[^0-9])2月内活跃/.test(t)) return '2m';
+  if (/(^|[^0-9])3月内活跃/.test(t)) return '3m';
+  if (/(^|[^0-9])4月内活跃/.test(t)) return '4m';
+  if (/半年前活跃|半年内活跃/.test(t)) return 'half';
+  if (/一年前活跃|1年前活跃/.test(t)) return 'year';
+  if (/当前在线/.test(t) || /(^|[^0-9\u4e00-\u9fff])在线([^0-9\u4e00-\u9fff]|$)/.test(t)) return 'online';
+  return '';
+}
+
+function coerceActiveKey(key) {
+  if (ACTIVE_CEILING_KEYS.includes(key)) return key;
+  if (key === '2m' || key === '3m' || key === '4m' || key === 'year') return 'half';
+  return '';
+}
+
 export function normalizeActiveWithin(value) {
-  // 兼容旧版单选字符串配置：'' | today | 3d | week
-  if (Array.isArray(value)) return value;
-  if (!value) return [];
-  if (value === 'today') return ['today'];
-  if (value === '3d') return ['3d'];
-  if (value === 'week') return ['week'];
-  return [];
+  const keys = Array.isArray(value) ? value : (value ? [value] : []);
+  const coerced = keys.map(coerceActiveKey).filter(Boolean);
+  if (!coerced.length) return [];
+  coerced.sort((a, b) => ACTIVE_RANK[a] - ACTIVE_RANK[b]);
+  return [coerced[coerced.length - 1]];
 }
 
 export function matchActive(activeText, activeWithin) {
   const selected = normalizeActiveWithin(activeWithin);
   if (!selected.length) return true;
-  const t = activeText || '';
-  return selected.some((key) => {
-    const re = ACTIVE_PATTERNS[key];
-    return re ? re.test(t) : false;
-  });
+  const ceiling = ACTIVE_RANK[selected[0]];
+  if (!Number.isFinite(ceiling)) return true;
+  const bucket = classifyActive(activeText);
+  if (!bucket || !Number.isFinite(ACTIVE_RANK[bucket])) return false;
+  return ACTIVE_RANK[bucket] <= ceiling;
 }
 
 /**
@@ -240,8 +273,9 @@ export function evaluateJob(job, filters, lists = {}, settings = {}, options = {
   if (normalizeActiveWithin(filters.activeWithin).length) {
     const activeText = String(job.activeText || '').trim();
     if (!activeText && options.deferUnknownActive === true) {
-      // 列表卡通常不展示 HR 活跃标签；临时详情页会在点击沟通前完成强校验。
+      // 列表经常没有活跃文案。预览不点卡，投递时在临时详情页再核对。
       requiresActiveCheck = true;
+      passReasons.push('HR 活跃：投递时核对');
     } else if (!matchActive(activeText, filters.activeWithin)) {
       return {
         decision: 'reject',

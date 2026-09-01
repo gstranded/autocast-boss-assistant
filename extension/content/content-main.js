@@ -26,7 +26,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.16";
+  const BHT_CONTENT_VERSION = "1.7.17";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -69,6 +69,7 @@
       bossOnline: typeof raw.bossOnline === 'boolean'
         ? raw.bossOnline
         : previous.bossOnline === true,
+      goldHunter: raw.goldHunter === true || raw.goldHunter === 1 || previous.goldHunter === true,
       receivedAt: Date.now()
     };
     jobNetworkMetadata.set(jobId, next);
@@ -1119,6 +1120,7 @@ const SELECTORS = {
                 bossTitle: String(value.bossTitle || bossInfo.title || "").trim(),
                 brandName: String(value.brandName || bossInfo.brandName || "").trim(),
                 bossOnline,
+                goldHunter: value.goldHunter === true || value.goldHunter === 1 || bossInfo.goldHunter === 1,
                 activeText: bossOnline ? "在线" : String(value.activeTimeDesc || bossInfo.activeTimeDesc || "").trim()
               };
             }
@@ -1508,6 +1510,8 @@ function firstEl(selectors, root = document) {
       salary,
       location: locationText,
       activeText,
+      goldHunter: networkMeta.goldHunter === true || componentMeta.goldHunter === true,
+      hrTitle: String(networkMeta.bossTitle || componentMeta.bossTitle || "").trim(),
       tags,
       jd,
       href: href.startsWith("http") ? href : href ? new URL(href, globalThis.location.origin).href : "",
@@ -2022,45 +2026,16 @@ function firstEl(selectors, root = document) {
 
   async function enrichJobActivities(payload = {}) {
     const requested = Array.isArray(payload.jobs) ? payload.jobs : [];
-    const jobs = requested
-      .filter((job) => job?.jobId && job?.securityId && job?.lid && !job?.activeText)
-      .slice(0, Math.max(0, Math.min(20, Number(payload.maxJobs || 20))));
-    const maxMs = Math.max(500, Math.min(12000, Number(payload.maxMs || 10000)));
-    const deadlineAt = Math.min(
-      Number(payload.deadlineAt || Infinity),
-      Date.now() + maxMs
-    );
-    const concurrency = Math.max(1, Math.min(2, Number(payload.concurrency || 2)));
-    const activities = [];
-    let cursor = 0;
-    let halted = false;
-    let haltError = '';
-
-    const worker = async () => {
-      while (!halted && cursor < jobs.length && Date.now() < deadlineAt) {
-        const job = jobs[cursor++];
-        const result = await fetchJobActivityDetail(job, deadlineAt);
-        if (result.ok) activities.push(result);
-        if (result.halt) {
-          halted = true;
-          haltError = result.error || 'ACTIVITY_HALTED';
-          break;
-        }
-        if (!halted && cursor < jobs.length && Date.now() < deadlineAt) {
-          await sleep(300 + Math.floor(Math.random() * 201));
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: concurrency }, () => worker()));
     return {
       ok: true,
-      activities,
+      activities: [],
       requestedCount: requested.length,
-      eligibleCount: jobs.length,
-      checkedCount: activities.length,
-      halted,
-      haltError,
-      timedOut: Date.now() >= deadlineAt
+      eligibleCount: 0,
+      checkedCount: 0,
+      halted: false,
+      haltError: "",
+      skipped: true,
+      source: "preview-no-click"
     };
   }
 
@@ -3825,14 +3800,124 @@ async function startChat(job, opts = {}) {
     return "";
   }
 
+  function parseBossActiveLabel(text = "") {
+    const t = String(text || "").replace(/\s+/g, " ").trim();
+    if (!t) return "";
+    const match = t.match(/((?:刚刚|今日|本周|本月|两周内|半年前|半年内|一年前|1年前|\d+日前|\d+日内|\d+周内|\d+月内)活跃|当前在线)/);
+    if (match) return match[1] === "当前在线" ? "在线" : match[1];
+    if (/(^|[^0-9\u4e00-\u9fff])在线([^0-9\u4e00-\u9fff]|$)/.test(t) && !/活跃/.test(t)) return "在线";
+    return "";
+  }
+
   function extractDetailActiveText(scope) {
     const root =
       scope ||
       firstEl(SELECTORS.detailRoot) ||
       document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
       document;
-    return textOf(firstEl(SELECTORS.activeText, root)) ||
-      (firstEl(SELECTORS.online, root) ? "在线" : "");
+    const boss = root.querySelector?.(".job-boss-info") || root;
+    return parseBossActiveLabel(textOf(boss.querySelector?.(".boss-online-tag, .online-tag"))) ||
+      parseBossActiveLabel(textOf(boss.querySelector?.(".boss-active-time"))) ||
+      parseBossActiveLabel(textOf(firstEl(SELECTORS.activeText, root))) ||
+      parseBossActiveLabel(textOf(boss));
+  }
+
+  function extractDetailHunter(scope) {
+    const root =
+      scope ||
+      firstEl(SELECTORS.detailRoot) ||
+      document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+      document;
+    const attr = textOf(root.querySelector?.(".job-boss-info .boss-info-attr, .boss-info-attr"));
+    const html = String(root.querySelector?.(".job-boss-info")?.innerHTML || "");
+    const goldHunter = /猎头/.test(attr) || /gold-hunter|goldHunter|icon-gold-hunter/.test(html);
+    return {
+      goldHunter,
+      hrTitle: attr.split(/[·|｜]/).slice(1).join(" · ").trim() || attr
+    };
+  }
+
+  function findJobCard(job = {}) {
+    const jobId = String(job.jobId || "");
+    const title = normalizeText(job.title || "");
+    const cards = getJobCards();
+    for (const card of cards) {
+      const href = card.querySelector?.("a.job-name[href], a[href*='job_detail']")?.href ||
+        card.getAttribute?.("data-jobid") ||
+        "";
+      const cardId = extractJobIdFromHref(href) ||
+        card.getAttribute?.("data-jobid") ||
+        card.getAttribute?.("data-job-id") ||
+        "";
+      if (jobId && cardId && String(cardId) === jobId) return card;
+    }
+    for (const card of cards) {
+      const cardTitle = normalizeText(textOf(card.querySelector?.("a.job-name, .job-name")));
+      if (title && cardTitle && cardTitle === title) return card;
+    }
+    return null;
+  }
+
+  async function inspectListSideDetail(job = {}, deadlineAt = 0) {
+    const card = findJobCard(job);
+    if (!card) return { ok: false, skipped: true, error: "JOB_CARD_NOT_FOUND" };
+    const clickTarget = card.querySelector("a.job-name, .job-name") || card;
+    clickLikeHuman(clickTarget);
+    const expectedJobId = String(job.jobId || "");
+    const expectedTitle = normalizeText(job.title || "");
+    let last = null;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      if (deadlineAt && Date.now() >= deadlineAt) break;
+      const root =
+        firstEl(SELECTORS.detailRoot) ||
+        document.querySelector(".job-detail-box, .job-detail-container, .job-detail");
+      const detailTitle = textOf(firstEl(SELECTORS.title, root || document)) ||
+        textOf(document.querySelector(".job-detail-box .job-name, .job-detail .job-name, h1.job-name"));
+      const detailHref =
+        root?.querySelector?.("a.more-job-btn[href*='job_detail'], a[href*='job_detail']")?.href || "";
+      const actualJobId = extractJobIdFromHref(detailHref);
+      const identityMatches = Boolean(
+        root && (
+          (expectedJobId && actualJobId && expectedJobId === actualJobId) ||
+          (expectedTitle && normalizeText(detailTitle) === expectedTitle)
+        )
+      );
+      const network = jobNetworkMetadata.get(expectedJobId) || {};
+      const hunter = extractDetailHunter(root || document);
+      const activeText = identityMatches
+        ? (extractDetailActiveText(root) || network.activeText || "")
+        : String(network.activeText || "");
+      last = { identityMatches, activeText, hunter, actualJobId, detailTitle };
+      const activeLabel = parseBossActiveLabel(activeText);
+      if (identityMatches && (activeLabel || hunter.goldHunter)) {
+        const hrName = extractDetailHrName(root) || job.hrName || job.bossName || "";
+        rememberJobNetworkMetadata({
+          jobId: expectedJobId || actualJobId,
+          activeText: activeLabel,
+          goldHunter: hunter.goldHunter,
+          bossTitle: hunter.hrTitle,
+          bossName: hrName,
+          source: "list-side-detail"
+        });
+        return {
+          ok: true,
+          jobId: expectedJobId || actualJobId,
+          activeText: activeLabel,
+          bossOnline: activeLabel === "在线",
+          bossName: hrName,
+          goldHunter: hunter.goldHunter === true || network.goldHunter === true,
+          hrTitle: hunter.hrTitle || network.bossTitle || "",
+          source: "list-side-detail"
+        };
+      }
+      await sleep(80);
+    }
+    return {
+      ok: false,
+      error: last?.identityMatches ? "DETAIL_ACTIVE_UNKNOWN" : "DETAIL_IDENTITY_MISMATCH",
+      activeText: last?.activeText || "",
+      jobId: last?.actualJobId || expectedJobId
+    };
   }
 
   function extractDetailCompany(scope) {
@@ -3858,8 +3943,8 @@ async function startChat(job, opts = {}) {
         firstEl(SELECTORS.detailRoot) ||
         document.querySelector(".job-detail, .job-detail-box, .job-detail-container");
       const detailHref =
-        root?.querySelector?.("a.more-job-btn[href*='job_detail'], a[href*='job_detail']")?.href ||
-        (/\/job_detail\//i.test(location.pathname) ? location.href : "");
+        (/\/job_detail\//i.test(location.pathname) ? location.href : "") ||
+        (root?.querySelector?.("a.more-job-btn[href*='job_detail'], a[href*='job_detail']")?.href || "");
       const actualJobId = extractJobIdFromHref(detailHref);
       const detailTitle = textOf(firstEl(SELECTORS.title, root || document)) ||
         textOf(document.querySelector(".job-detail .job-name, .job-detail-box .job-name, h1.job-name"));
@@ -4858,7 +4943,9 @@ async function runOpByType(type, payload = {}) {
       case MSG.SCAN_JOBS:
         return await scanJobs(payload || {});
       case MSG.INSPECT_JOB_DETAIL:
-        return await inspectWorkerJobDetail(payload?.job || {});
+        return isListLikePage()
+          ? await inspectListSideDetail(payload?.job || {})
+          : await inspectWorkerJobDetail(payload?.job || {});
       case MSG.ENRICH_JOB_ACTIVITY:
         return await enrichJobActivities(payload || {});
       case MSG.TRIGGER_CONVERSATION:

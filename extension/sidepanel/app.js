@@ -1,7 +1,7 @@
 import { MSG } from '../shared/messaging.js';
 import { parseKeywords, uid } from '../shared/text-utils.js';
 import { reasonText } from '../shared/reason-codes.js';
-import { previewReasonLines } from '../shared/filter-engine.js';
+import { previewReasonLines, normalizeActiveWithin } from '../shared/filter-engine.js';
 import { MESSAGE_SEGMENT_KINDS, STORAGE_KEYS } from '../shared/constants.js';
 import { mergeResumeImages } from '../shared/resume-images.js';
 import {
@@ -21,7 +21,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.16";
+const BHT_UI_VERSION = "1.7.17";
 const VERSION_GUARDED_API_MESSAGES = new Set([
   MSG.RUN_PREVIEW,
   MSG.CONFIRM_AND_START,
@@ -430,27 +430,21 @@ function intervalMsFromBase(baseSec) {
 }
 
 function normalizeActiveSelection(value) {
-  // 兼容旧版单选字符串：'' | today | 3d | week
-  if (Array.isArray(value)) return value.filter(Boolean);
-  if (!value) return [];
-  if (value === 'today') return ['today'];
-  if (value === '3d') return ['3d'];
-  if (value === 'week') return ['week'];
-  return [];
+  return normalizeActiveWithin(value);
 }
 
 function setActiveChips(selected) {
-  const chips = document.querySelectorAll('#activeChips .chip');
-  chips.forEach((chip) => {
-    const val = chip.dataset.active;
-    chip.classList.toggle('active', selected.includes(val));
+  const current = normalizeActiveWithin(selected)[0] || 'all';
+  document.querySelectorAll('#activeChips .chip').forEach((chip) => {
+    chip.classList.toggle('active', chip.dataset.active === current);
   });
 }
 
 function readActiveChips() {
-  const chips = document.querySelectorAll('#activeChips .chip.active');
-  const values = [...chips].map((chip) => chip.dataset.active).filter((v) => v !== 'all');
-  return values;
+  const chip = document.querySelector('#activeChips .chip.active');
+  const val = chip?.dataset.active;
+  if (!val || val === 'all') return [];
+  return [val];
 }
 
 function fillFilters(filters, lists, settings) {
@@ -1432,7 +1426,7 @@ function renderPreview(task) {
   lines.push(
     `生效设置：同公司每天最多 ${settings.companyDailyMax ?? '—'} · 每日最多 ${settings.dailyMaxCommunicate ?? '—'} · 本次最多 ${settings.taskMaxCommunicate ?? '—'} · 同HR冷却 ${settings.bossCooldownDays ?? '—'} 天 · 永不重复 ${settings.neverRepeatJob ? '开' : '关'}`
   );
-  lines.push('说明：「本次/每日最多沟通」在正式投递时拦截，预览阶段主要做筛选词、永不重复、同公司已达今日上限等判断。');
+  lines.push('说明：「本次/每日最多沟通」和缺文案的 HR 活跃在正式投递时拦截；预览阶段主要做筛选词、永不重复、同公司已达今日上限等判断。');
   if (Array.isArray(task.warnings) && task.warnings.length) {
     lines.push('');
     lines.push('提示：' + task.warnings.join('；'));
@@ -2090,16 +2084,9 @@ function showErrorModal(title, body, { showRetry = true, force = false } = {}) {
 
 function bindEvents() {
   bindImageLightbox();
-  // HR 活跃多选 chips：选“不限”清空其它；选了具体项则取消“不限”
   document.querySelectorAll('#activeChips .chip').forEach((chip) => {
     chip.addEventListener('click', () => {
-      const isAll = chip.dataset.active === 'all';
-      if (isAll) {
-        document.querySelectorAll('#activeChips .chip').forEach((c) => c.classList.toggle('active', c === chip));
-      } else {
-        chip.classList.toggle('active');
-        document.querySelector('#activeChips .chip[data-active="all"]')?.classList.remove('active');
-      }
+      document.querySelectorAll('#activeChips .chip').forEach((c) => c.classList.toggle('active', c === chip));
     });
   });
 
@@ -2309,6 +2296,18 @@ function bindEvents() {
       Promise.resolve(saveFilters({ refresh: false })).catch(() => {});
       ack({ titleOr: $('titleOr')?.value || '' });
     }
+    if (data.cmd === 'set-active') {
+      const values = (Array.isArray(data.values) ? data.values : [data.value]).map((v) => String(v || '')).filter(Boolean);
+      const wantAll = !values.length || values.includes('all');
+      document.querySelectorAll('#activeChips .chip').forEach((chip) => {
+        const key = chip.dataset.active;
+        chip.classList.toggle('active', wantAll ? key === 'all' : values.includes(key));
+      });
+      Promise.resolve(saveFilters({ refresh: false })).catch(() => {});
+      ack({
+        selected: [...document.querySelectorAll('#activeChips .chip.active')].map((chip) => chip.dataset.active)
+      });
+    }
     if (data.cmd === 'set-history-filter') {
       if ($('historyFilter')) $('historyFilter').value = String(data.value || 'all');
       $('historyFilter')?.dispatchEvent(new Event('change', { bubbles: true }));
@@ -2339,6 +2338,10 @@ function bindEvents() {
       window.__bhtAgentDump = {
         ts: Date.now(),
         tab: document.querySelector('#tabs button.active')?.dataset?.tab || '',
+        activeChips: [...document.querySelectorAll('#activeChips .chip')].map((chip) => ({
+          value: chip.dataset.active,
+          active: chip.classList.contains('active')
+        })),
         status: $('taskStatus')?.textContent || '',
         counters: $('taskCounters')?.textContent || '',
         hint: $('taskHint')?.textContent || '',
@@ -2407,6 +2410,17 @@ function bindEvents() {
             passReasons: row?.passReasons || [],
             reasonTexts: row?.reasonTexts || []
           })),
+          unknownPass: (state.config?.task?.results || []).filter((row) => (
+            row?.decision === 'pass' &&
+            (row?.requiresActiveCheck === true || !String(row?.job?.activeText || '').trim())
+          )).length,
+          rejectReasons: (state.config?.task?.results || [])
+            .filter((row) => row?.decision === 'reject')
+            .reduce((acc, row) => {
+              const key = String((row?.reasonTexts || [])[0] || '未知原因');
+              acc[key] = (acc[key] || 0) + 1;
+              return acc;
+            }, {}),
           currentJobId: state.config?.task?.currentJobId || '',
           pauseReason: state.config?.task?.pauseReason || '',
           testedJobIds: state.config?.task?.testedJobIds || [],

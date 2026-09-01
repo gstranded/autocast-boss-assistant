@@ -2,6 +2,7 @@ import assert from "assert";
 import {
   evaluateJob,
   matchActive,
+  classifyActive,
   normalizeActiveWithin,
   summarizePreview,
   previewReasonLines
@@ -232,10 +233,46 @@ test("HR active / hunter / outsource / whitelist-only", () => {
   assert.ok(active.reasonCodes.includes(REASON.FILTER_ACTIVE));
   assert.equal(matchActive("本周活跃", ["week"]), true);
   assert.equal(matchActive("本周活跃", ["today"]), false);
+  assert.equal(matchActive("刚刚活跃", ["week"]), true);
+  assert.equal(matchActive("刚刚活跃", ["just"]), true);
+  assert.equal(matchActive("在线", ["just"]), true);
+  assert.equal(matchActive("在线", ["online"]), true);
+  assert.equal(matchActive("今日活跃", ["week"]), true);
+  assert.equal(matchActive("两周内活跃", ["2w"]), true);
+  assert.equal(matchActive("2周内活跃", ["2w"]), true);
+  assert.equal(matchActive("3日内活跃", ["3d"]), true);
+  assert.equal(matchActive("2月内活跃", ["half"]), true);
+  assert.equal(matchActive("3月内活跃", ["half"]), true);
+  assert.equal(matchActive("4月内活跃", ["half"]), true);
+  assert.equal(matchActive("半年前活跃", ["half"]), true);
+  assert.equal(matchActive("半年前活跃", ["month"]), false);
+  assert.equal(matchActive("本月活跃", ["week"]), false);
+  assert.equal(matchActive("一年前活跃", ["half"]), false);
+  assert.equal(matchActive("", ["week"]), false);
+  assert.equal(classifyActive("在线"), "online");
+  assert.equal(classifyActive("刚刚活跃"), "just");
+  assert.equal(classifyActive("本周活跃"), "week");
+  assert.equal(classifyActive("两周内活跃"), "2w");
+  assert.equal(classifyActive("3日内活跃"), "3d");
+  assert.equal(classifyActive("2月内活跃"), "2m");
+  assert.equal(classifyActive("3月内活跃"), "3m");
+  assert.equal(classifyActive("4月内活跃"), "4m");
+  assert.equal(classifyActive("半年前活跃"), "half");
+  assert.equal(classifyActive("一年前活跃"), "year");
+  assert.equal(classifyActive("3日前活跃"), "3d");
+  assert.equal(matchActive("3日前活跃", ["3d"]), true);
+  assert.equal(matchActive("3日前活跃", ["today"]), false);
   assert.deepEqual(normalizeActiveWithin("week"), ["week"]);
-  const hunter = evaluateJob({ ...passJob, hrName: "猎头顾问" }, filters, {}, {});
+  assert.deepEqual(normalizeActiveWithin(["just", "week"]), ["week"]);
+  assert.deepEqual(normalizeActiveWithin(["2m"]), ["half"]);
+  const hunter = evaluateJob({ ...passJob, hrTitle: "猎头顾问" }, filters, {}, {});
   assert.equal(hunter.decision, "reject");
   assert.ok(hunter.reasonCodes.includes(REASON.FILTER_HUNTER));
+  const recruiter = evaluateJob({ ...passJob, hrTitle: "招聘专员" }, filters, {}, {});
+  assert.equal(recruiter.decision, "pass");
+  const goldHunter = evaluateJob({ ...passJob, goldHunter: 1 }, filters, {}, {});
+  assert.equal(goldHunter.decision, "reject");
+  assert.ok(goldHunter.reasonCodes.includes(REASON.FILTER_HUNTER));
   const out = evaluateJob(
     { ...passJob, company: "某某人力外包" },
     { ...filters, jd: { or: [], and: [], not: [] } },
@@ -268,6 +305,28 @@ test("unknown HR activity is deferred only for preview and remains strict by def
   );
   assert.equal(known.decision, "pass");
   assert.equal(known.requiresActiveCheck, false);
+
+  const nearer = evaluateJob(
+    { ...passJob, activeText: "刚刚活跃" },
+    activeFilters,
+    {},
+    {}
+  );
+  assert.equal(nearer.decision, "pass");
+  const exactWeek = evaluateJob(
+    { ...passJob, activeText: "本周活跃" },
+    activeFilters,
+    {},
+    {}
+  );
+  assert.equal(exactWeek.decision, "pass");
+  const olderMonth = evaluateJob(
+    { ...passJob, activeText: "本月活跃" },
+    activeFilters,
+    {},
+    {}
+  );
+  assert.equal(olderMonth.decision, "reject");
 });
 test("disabled company OR and JD NOT ignore stored keywords", () => {
   const companyOff = evaluateJob(
@@ -856,6 +915,31 @@ test("UI exposes themes, help tips and filter switches", () => {
     "locIncludeEnabled",
     "locExcludeEnabled"
   ]) assert.ok(html.includes(`id="${id}"`), `missing ${id}`);
+  for (const chip of [
+    'data-active="online"',
+    'data-active="just"',
+    'data-active="today"',
+    'data-active="3d"',
+    'data-active="week"',
+    'data-active="2w"',
+    'data-active="month"',
+    'data-active="half"'
+  ]) assert.ok(html.includes(chip), `missing ${chip}`);
+  assert.ok(!html.includes('data-active="2m"'));
+  assert.ok(!html.includes('data-active="3m"'));
+  assert.ok(!html.includes('data-active="4m"'));
+  assert.ok(!html.includes('data-active="3d_ago"'));
+  assert.ok(!html.includes('data-active="year"'));
+  assert.ok(html.includes(">刚刚<"));
+  assert.ok(html.includes(">今日内<"));
+  assert.ok(html.includes(">3日内<"));
+  assert.ok(html.includes(">本周内<"));
+  assert.ok(html.includes(">2周内<"));
+  assert.ok(html.includes(">本月内<"));
+  assert.ok(html.includes(">半年内<"));
+  assert.ok(html.includes(">单选<"));
+  assert.ok(!html.includes("3日前活跃"));
+  assert.ok(!html.includes("一年前活跃"));
 });
 test("resume files are only imported by an explicit save", () => {
   const sidepanel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
@@ -1368,6 +1452,72 @@ test("collectDoneJobIds merges items queue and extra", () => {
     ["z"]
   );
   assert.ok(s.has("x") && s.has("y") && s.has("z"));
+});
+
+test("投递一份 skip chain advances in order, no repeats, and stops after success", () => {
+  // 复刻后台队列循环在 testDelivery 模式下的顺延机制：
+  // 跳过 → 记入 items/queue/testedJobIds → pickNextTestDeliveryJob 取下一个 → 重复
+  const results = [
+    { decision: "pass", selected: true, job: { jobId: "a", title: "岗a" } },
+    { decision: "pass", selected: true, job: { jobId: "b", title: "岗b" } },
+    { decision: "pass", selected: true, job: { jobId: "c", title: "岗c" } },
+    { decision: "pass", selected: true, job: { jobId: "d", title: "岗d" } }
+  ];
+  const state = { items: [], queue: [], testedJobIds: [] };
+  const pickNext = () =>
+    pickNextTestDeliveryJob({
+      results,
+      items: state.items,
+      queue: state.queue,
+      extraDoneIds: state.testedJobIds
+    });
+  const markSkipped = (id) => {
+    state.items.push({ jobId: id, state: "SKIPPED" });
+    state.queue.push({ jobId: id, status: "skipped" });
+    state.testedJobIds.push(id);
+  };
+
+  // a、b 活跃不满足跳过；c 也不算，跳过；d 满足 → 成功停止
+  const chain = [];
+  for (;;) {
+    const r = pickNext();
+    if (!r.ok) break;
+    chain.push(r.onlyId);
+    if (r.onlyId === "d") break;
+    markSkipped(r.onlyId);
+  }
+  assert.deepEqual(chain, ["a", "b", "c", "d"]);
+  assert.equal(new Set(chain).size, 4, "no duplicate picks in chain");
+
+  // 结束后再取：全部已处理 → ALL_TESTED（不会重复点回 a/b/c）
+  const allDone = pickNextTestDeliveryJob({
+    results,
+    items: [...state.items, { jobId: "d", state: "COMPLETED" }],
+    queue: [...state.queue, { jobId: "d", status: "done" }],
+    extraDoneIds: [...state.testedJobIds, "d"]
+  });
+  assert.equal(allDone.ok, false);
+  assert.equal(allDone.error, "ALL_TESTED");
+
+  // 队列被清空（重新点投递一份会重建 queue）但 testedJobIds 仍在：不会重投已跳过岗位
+  const afterWipe = pickNextTestDeliveryJob({
+    results,
+    items: state.items.map((x) => ({ jobId: x.jobId, state: "SKIPPED" })),
+    queue: [],
+    extraDoneIds: [...state.testedJobIds, "d"]
+  });
+  assert.equal(afterWipe.ok, false);
+  assert.equal(afterWipe.error, "ALL_TESTED");
+
+  // 部分跳过 + 剩余未投：顺延落在第一个未处理岗
+  const partial = pickNextTestDeliveryJob({
+    results: results.slice(0, 3),
+    items: [{ jobId: "a", state: "SKIPPED" }],
+    queue: [{ jobId: "a", status: "skipped" }],
+    extraDoneIds: ["a"]
+  });
+  assert.equal(partial.ok, true);
+  assert.equal(partial.onlyId, "b");
 });
 
 console.log("13) task model + cancellation contract");

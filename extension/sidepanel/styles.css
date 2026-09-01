@@ -317,6 +317,8 @@ select:disabled { cursor: not-allowed; opacity: 0.46; }
   font-size: 10px;
   font-weight: 800;
   line-height: 1;
+  color: var(--muted);
+  background: var(--chip);
 }
 .logic-tag.or { color: var(--primary); background: var(--primary-soft); }
 .logic-tag.and { color: var(--success); background: var(--success-soft); }

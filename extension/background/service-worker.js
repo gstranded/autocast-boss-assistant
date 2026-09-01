@@ -25,7 +25,8 @@ import {
   evaluateJob,
   matchActive,
   normalizeActiveWithin,
-  summarizePreview
+  summarizePreview,
+  looksHunter
 } from '../shared/filter-engine.js';
 import { checkDedup, checkLimits, jobIdempotencyKey, resumeIdempotencyKey } from '../shared/dedup.js';
 import { planMessageSegments } from '../shared/message-planner.js';
@@ -1047,18 +1048,12 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
     let activityInspection = null;
     let activityAccepted = null;
     try {
-      workerTab = await openConversationWorkerTab(task, attempt, messageTab, job);
-      await log('info', '[执行页] 已在后台打开岗位，不会操作左侧职位列表', {
-        jobId: job.jobId,
-        workerTabId: workerTab.id,
-        mode: attempt.mode,
-        url: String(attempt.url || '').slice(0, 180)
-      });
       if (selectedActiveBuckets.length) {
+        // 活跃度在左侧职位页点该岗位卡片核对（BOSS 原生渲染），不打开新标签页
         activityInspection = await sendToBoss(
           MSG.INSPECT_JOB_DETAIL || 'BHT_INSPECT_JOB_DETAIL',
           { job },
-          { tabId: workerTab.id }
+          { tabId: listTabId }
         );
         if (operationAborted(activityInspection)) {
           result = activityInspection;
@@ -1070,6 +1065,12 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
             activeText &&
             matchActive(activeText, selectedActiveBuckets)
           );
+          await log('info', `[列表页] 已点卡片核对 HR 活跃度：${activeText || '未知'}（${activityAccepted ? '满足' : '不满足'}）`, {
+            jobId: job.jobId,
+            activeText,
+            activityAccepted,
+            inspectError: activityInspection?.error || ''
+          });
           if (!activityAccepted) {
             result = {
               ok: false,
@@ -1083,6 +1084,13 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
         }
       }
       if (!result) {
+        workerTab = await openConversationWorkerTab(task, attempt, messageTab, job);
+        await log('info', '[执行页] 已在后台打开岗位，不会操作左侧职位列表', {
+          jobId: job.jobId,
+          workerTabId: workerTab.id,
+          mode: attempt.mode,
+          url: String(attempt.url || '').slice(0, 180)
+        });
         triggerStarted = true;
         result = await sendToBoss(
           MSG.TRIGGER_CONVERSATION || 'BHT_TRIGGER_CONVERSATION',
@@ -1110,9 +1118,11 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
       };
       attemptResults.push({ mode: attempt.mode, url: attempt.url, ok: false, error: result.error });
     } finally {
-      await closeConversationWorkerTab(task, workerTab?.id || task.execution?.workerTabId, {
-        reason: '本岗位沟通触发结束'
-      });
+      if (workerTab?.id) {
+        await closeConversationWorkerTab(task, workerTab.id, {
+          reason: '本岗位沟通触发结束'
+        });
+      }
     }
 
     if (result?.ok || result?.filtered || operationAborted(result)) break;
@@ -1934,7 +1944,7 @@ function evaluatePreviewResults(jobs = [], config = {}, todayStats = {}) {
   return results;
 }
 
-function applyPreviewActivityEnrichment(results = [], activities = [], activeWithin = []) {
+function applyPreviewActivityEnrichment(results = [], activities = [], activeWithin = [], excludeHunter = true) {
   const byJobId = new Map(
     (activities || [])
       .filter((item) => item?.jobId)
@@ -1946,17 +1956,27 @@ function applyPreviewActivityEnrichment(results = [], activities = [], activeWit
     if (row?.decision !== 'pass' || row?.requiresActiveCheck !== true) continue;
     const activity = byJobId.get(String(row.job?.jobId || ''));
     const activeText = String(activity?.activeText || '').trim();
-    if (!activeText) continue;
+    const goldHunter = activity?.goldHunter === true || row.job?.goldHunter === true;
+    const hrTitle = activity?.hrTitle || row.job?.hrTitle || '';
+    if (!activeText && !goldHunter) continue;
     row.job = {
       ...(row.job || {}),
       activeText,
       online: activity?.bossOnline === true,
+      goldHunter: activity?.goldHunter === true || row.job?.goldHunter === true,
+      hrTitle: activity?.hrTitle || row.job?.hrTitle || '',
       bossId: activity?.bossId || row.job?.bossId || '',
       hrName: activity?.bossName || row.job?.hrName || ''
     };
     row.requiresActiveCheck = false;
     resolved += 1;
-    if (matchActive(activeText, activeWithin)) {
+    if (excludeHunter && looksHunter(row.job)) {
+      row.decision = 'reject';
+      row.selected = false;
+      row.reasonCodes = [REASON.FILTER_HUNTER];
+      row.reasonTexts = [reasonText(REASON.FILTER_HUNTER)];
+      rejected += 1;
+    } else if (matchActive(activeText, activeWithin)) {
       row.passReasons = [...(row.passReasons || []), `HR 活跃：${activeText}`];
     } else {
       row.decision = 'reject';
@@ -1967,6 +1987,13 @@ function applyPreviewActivityEnrichment(results = [], activities = [], activeWit
     }
   }
   return { resolved, rejected };
+}
+
+function finalizePreviewActivityDecisions(results = [], activeWithin = []) {
+  // 预览不点列表卡、不拉详情。未知活跃留给投递时的临时详情页核对。
+  void results;
+  void activeWithin;
+  return { rejected: 0 };
 }
 
 function mergePreviewJobBatch(target, jobs = []) {
@@ -2124,52 +2151,17 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
     const todayStats = await getTodayStats();
     if (!isActive()) return cancelled();
     const results = evaluatePreviewResults(Array.from(collectedJobs.values()), config, todayStats);
-    const activityCandidates = results
-      .filter((row) => row.decision === 'pass' && row.requiresActiveCheck === true)
-      .map((row) => row.job)
-      .filter((job) => job?.securityId && job?.lid && !job?.activeText);
-    let activityMeta = {
-      requested: activityCandidates.length,
+    const activityMeta = {
+      requested: 0,
       eligible: 0,
       checked: 0,
       resolved: 0,
       rejected: 0,
       halted: false,
-      haltError: ''
+      haltError: '',
+      deferredToDelivery: results.filter((row) => row.decision === 'pass' && row.requiresActiveCheck === true).length
     };
-    const activityBudgetMs = Math.min(10000, Math.max(0, previewDeadlineAt - Date.now() - 700));
-    if (activityCandidates.length && activityBudgetMs >= 800) {
-      setPreviewPhase('checking_activity', previewRunId);
-      const activityResult = await sendToBoss(MSG.ENRICH_JOB_ACTIVITY, {
-        jobs: activityCandidates.slice(0, 20),
-        maxJobs: 20,
-        concurrency: 2,
-        maxMs: activityBudgetMs,
-        timeoutMs: activityBudgetMs + 500,
-        deadlineAt: Date.now() + activityBudgetMs
-      }, {
-        tabId: sourcePreviewTab.id,
-        previewRunId
-      });
-      if (!isActive() || operationAborted(activityResult)) return cancelled();
-      if (activityResult?.ok) {
-        const applied = applyPreviewActivityEnrichment(
-          results,
-          activityResult.activities || [],
-          config.filters?.activeWithin || []
-        );
-        activityMeta = {
-          requested: activityCandidates.length,
-          eligible: Number(activityResult.eligibleCount || 0),
-          checked: Number(activityResult.checkedCount || 0),
-          resolved: applied.resolved,
-          rejected: applied.rejected,
-          halted: activityResult.halted === true,
-          haltError: activityResult.haltError || ''
-        };
-      }
-      setPreviewPhase('filtering', previewRunId);
-    }
+    finalizePreviewActivityDecisions(results, config.filters?.activeWithin || []);
     const summary = summarizePreview(results);
     setPreviewProgress(summary.scanned, summary.pass, previewRunId);
     const previewListHref = scan.listHref || '';
@@ -2539,9 +2531,16 @@ async function processOneJob(task, resultRow, config) {
     if (!trig?.ok) {
       if (trig?.filtered === true && trig?.error === REASON.FILTER_ACTIVE) {
         job.activeText = String(trig.activeText || '');
+        // 预览行同步为「投递跳过」：该岗位在投递时因 HR 活跃不匹配被跳过，不被计入投递
+        const skipReason = `投递跳过：HR活跃度为「${job.activeText || '未知'}」不匹配`;
         resultRow.job = job;
+        const previewRow = (task.results || []).find((r) => r.job?.jobId === job.jobId);
+        if (previewRow) {
+          previewRow.job = { ...previewRow.job, ...job };
+          previewRow.passReasons = [skipReason];
+        }
         item.state = 'SKIPPED';
-        item.reasons = [trig.message || reasonText(REASON.FILTER_ACTIVE, job.activeText || '未知')];
+        item.reasons = [skipReason];
         task.counters.skipped += 1;
         await bumpDailyStat('skip');
         await log('info', `${job.title} - ${item.reasons[0]}`, {
@@ -3231,6 +3230,47 @@ async function runTaskLoop(taskId) {
         await log('info', '队列项结果：' + (row.job?.title || '') + ' → ' + outcome + '（' + (qi + 1) + '/' + queue.length + '）', { jobId: row.job?.jobId });
       } catch (_) {}
 
+      // 投递一份：跳过（含 HR 活跃不满足）不算投递，自动顺延下一个待投；遇到满足的投递成功即停
+      if (task.testDelivery && outcome === 'skipped') {
+        const nextPick = pickNextTestDeliveryJob({
+          results: task.results || [],
+          items: task.items || [],
+          queue: task.queue || [],
+          extraDoneIds: task.testedJobIds || []
+        });
+        if (nextPick.ok && nextPick.pick?.job?.jobId) {
+          const nextId = String(nextPick.pick.job.jobId);
+          task.queue = [...(task.queue || [])];
+          if (!task.queue.some((x) => String(x.jobId || '') === nextId)) {
+            task.queue.push({
+              index: task.queue.length,
+              jobId: nextId,
+              title: nextPick.pick.job.title || '',
+              company: nextPick.pick.job.company || '',
+              href: nextPick.pick.job.href || '',
+              securityId: nextPick.pick.job.securityId || '',
+              status: 'pending'
+            });
+          }
+          queue.push({
+            decision: 'pass',
+            selected: true,
+            job: {
+              jobId: nextId,
+              title: nextPick.pick.job.title || '',
+              company: nextPick.pick.job.company || '',
+              href: nextPick.pick.job.href || '',
+              securityId: nextPick.pick.job.securityId || '',
+              listHref: task.listHref
+            }
+          });
+          await publishTask(task);
+          await log('info', `[投递一份] 已跳过（不计入投递），顺延下一岗「${nextPick.pick.job.title || ''}」@ ${nextPick.pick.job.company || ''}`, { jobId: nextId });
+          continue;
+        }
+      }
+      if (task.testDelivery && outcome === 'success') break;
+
       // 失败后等待用户：关闭=保持暂停不自动继续；重试=重置当前岗位后再跑一次
       while (outcome === 'failed') {
         if (runner.abort) {
@@ -3758,7 +3798,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             (pick.job?.company || '') +
             '；剩余未投 ' +
             remain +
-            ' 岗（再点将自动投下一个）',
+            ' 岗（活跃度不满足将自动顺延，投成功 1 岗后停止）',
           { jobId: onlyId, remain }
         );
         runTaskLoop(task.id);

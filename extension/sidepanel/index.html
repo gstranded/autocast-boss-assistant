@@ -111,16 +111,19 @@
           </div>
           <div class="card">
             <div class="card-title row">
-              <span data-help-title="HR 活跃" data-help="只投最近活跃时间符合条件的 HR。可多选，命中任意一个即可通过；不选表示不限。页面没有可靠活跃信息时按不符合处理。">HR 活跃</span>
-              <span class="logic-tag or">多选</span>
+              <span data-help-title="HR 活跃" data-help="单选上限。选「本周内」包含在线、刚刚、今日、3日内和本周。预览不点列表卡；正式投递时在左侧列表点该岗位卡片核对 BOSS 自己加载的活跃标签。">HR 活跃</span>
+              <span class="logic-tag">单选</span>
             </div>
             <div class="active-chips" id="activeChips">
               <button type="button" class="chip" data-active="all">不限</button>
-              <button type="button" class="chip" data-active="just">刚刚活跃</button>
-              <button type="button" class="chip" data-active="today">今日活跃</button>
-              <button type="button" class="chip" data-active="3d">3 日内活跃</button>
-              <button type="button" class="chip" data-active="week">本周活跃</button>
-              <button type="button" class="chip" data-active="month">本月活跃</button>
+              <button type="button" class="chip" data-active="online">在线</button>
+              <button type="button" class="chip" data-active="just">刚刚</button>
+              <button type="button" class="chip" data-active="today">今日内</button>
+              <button type="button" class="chip" data-active="3d">3日内</button>
+              <button type="button" class="chip" data-active="week">本周内</button>
+              <button type="button" class="chip" data-active="2w">2周内</button>
+              <button type="button" class="chip" data-active="month">本月内</button>
+              <button type="button" class="chip" data-active="half">半年内</button>
             </div>
           </div>
           <div class="card">

@@ -335,6 +335,7 @@ test("HR activity is inspected on the temporary detail before any conversation c
   assert.ok(worker.includes("result?.filtered"));
   assert.ok(background.includes("{ deferUnknownActive: true }"));
   assert.ok(background.includes("requiresActiveCheck: decision === 'pass' && requiresActiveCheck"));
+  assert.ok(background.includes("finalizePreviewActivityDecisions"));
   assert.ok(content.includes("async function inspectWorkerJobDetail"));
   assert.ok(content.includes("extractDetailActiveText"));
   assert.ok(content.includes('case MSG.INSPECT_JOB_DETAIL'));
@@ -354,12 +355,20 @@ test("preview captures native job metadata and bounds read-only HR activity enri
   assert.ok(hook.includes("activeTimeDesc"));
   assert.ok(hook.includes("job-metadata-request"));
   assert.ok(content.includes("extractJobMetadataFromComponent"));
-  assert.ok(content.includes("fetchJobActivityDetail"));
-  assert.ok(content.includes("slice(0, Math.max(0, Math.min(20"));
-  assert.ok(content.includes("concurrency = Math.max(1, Math.min(2"));
-  assert.ok(content.includes("任意非零响应都立即熔断"));
+  assert.ok(content.includes("inspectListSideDetail"));
+  assert.ok(content.includes("extractDetailHunter"));
+  assert.ok(content.includes("source: \"preview-no-click\""));
   assert.ok(background.includes("applyPreviewActivityEnrichment"));
-  assert.ok(background.includes("activityCandidates.slice(0, 20)"));
+  assert.ok(background.includes("finalizePreviewActivityDecisions"));
+  assert.ok(background.includes("deferredToDelivery"));
+  assert.ok(!background.includes("activityCandidates.slice(0, 80)"));
+  assert.ok(content.includes("parseBossActiveLabel"));
+  assert.ok(content.includes(".boss-online-tag"));
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  assert.ok(html.includes('data-active="half"'));
+  assert.ok(html.includes(">半年内<"));
+  assert.ok(html.includes(">单选<"));
+  assert.ok(!html.includes("3日前活跃"));
   assert.ok(messaging.includes("ENRICH_JOB_ACTIVITY: 'BHT_ENRICH_JOB_ACTIVITY'"));
 });
 
