@@ -1346,8 +1346,8 @@ try {
     .filter((call) => call.api === "tabs.setZoomSettings")
     .every((call) => call.settings.mode === "automatic" && call.settings.scope === "per-tab"));
   assert.ok(windowCalls.some((call) => call.api === "windows.create" && call.options.left === 960));
-  assert.ok(windowCalls.some((call) => call.api === "windows.update" && call.windowId === 1 && call.patch.width === 960));
-  assert.ok(windowCalls.some((call) => call.api === "windows.update" && call.windowId === 1 && call.patch.focused === true));
+  assert.ok(windowCalls.some((call) => call.api === "windows.create" && call.options.tabId === listTab.id && call.options.left === 0));
+  assert.ok(windowCalls.some((call) => call.api === "windows.update" && call.windowId === 2 && call.patch.focused === true));
 
   const createsBeforeFallback = windowCalls.filter((call) => call.api === "windows.create").length;
   displayWidth = 900;

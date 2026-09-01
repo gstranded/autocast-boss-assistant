@@ -707,7 +707,6 @@ export async function prepareSplitWorkspace(task, settings = {}) {
   }
 
   task.execution.listTabId = listTab.id;
-  task.execution.listWindowId = listTab.windowId;
   const display = await getDisplayMetrics(listTab.id);
   const bounds = computeSideBySideBounds(display || {}, { minWidth: 520, minHeight: 600 });
   if (!bounds) {
@@ -715,25 +714,66 @@ export async function prepareSplitWorkspace(task, settings = {}) {
     return { ok: false, error: 'DISPLAY_TOO_SMALL', message: '当前屏幕空间不足，已回退为普通消息标签页' };
   }
 
-  let originalWindow = null;
-  try { originalWindow = await chrome.windows.get(listTab.windowId); } catch (_) {}
-  try {
-    await setNormalWindowBounds(listTab.windowId, bounds.left);
-
-    let messageTab = null;
-    if (task.execution.messageTabId) {
-      messageTab = await chrome.tabs.get(task.execution.messageTabId).catch(() => null);
+  // 1) 复用上一对分屏窗口：两个窗口和对应标签都在就只做尽力摆放，不再新建窗口
+  if (task.execution.splitViewActive && task.execution.listWindowId && task.execution.messageWindowId) {
+    const prevListWin = await chrome.windows.get(task.execution.listWindowId).catch(() => null);
+    const prevMsgWin = await chrome.windows.get(task.execution.messageWindowId).catch(() => null);
+    const listTabNow = await chrome.tabs.get(task.execution.listTabId).catch(() => null);
+    const msgTabNow = await chrome.tabs.get(task.execution.messageTabId).catch(() => null);
+    if (
+      prevListWin && prevMsgWin && listTabNow && msgTabNow &&
+      listTabNow.windowId === prevListWin.id && msgTabNow.windowId === prevMsgWin.id
+    ) {
+      // 部分平台 windows.update 会静默忽略坐标，失败不影响已有窗口位置
+      await setNormalWindowBounds(prevListWin.id, bounds.left).catch(() => {});
+      await setNormalWindowBounds(prevMsgWin.id, bounds.right).catch(() => {});
+      task.execution.splitBounds = bounds;
+      task.execution.phase = 'SPLIT_WORKSPACE_READY';
+      await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
+      await chrome.windows.update(prevListWin.id, { focused: true }).catch(() => {});
+      await debugLog('background.split', 'pair_reused', {
+        listWindowId: prevListWin.id,
+        messageWindowId: prevMsgWin.id,
+        bounds
+      });
+      return {
+        ok: true,
+        reused: true,
+        listTabId: listTab.id,
+        messageTabId: msgTabNow.id,
+        bounds,
+        zoomFactor: SPLIT_ZOOM_FACTOR,
+        zoomApplied: false
+      };
     }
+  }
+
+  try {
+    // 2) 左窗：把职位列表标签搬进按左半边创建的新窗口。
+    //    create({ tabId }) 在 windows.update 不生效的平台上也可靠，位置由创建参数保证。
+    const listWindow = await chrome.windows.create({
+      tabId: listTab.id,
+      type: 'normal',
+      focused: false,
+      ...bounds.left
+    });
+    const listWindowId = listWindow.id;
+    task.execution.listWindowId = listWindowId;
+
+    // 3) 右窗：优先找现有聊天标签搬过去，没有就新建聊天窗口
+    const savedMsgTab = task.execution.messageTabId
+      ? await chrome.tabs.get(task.execution.messageTabId).catch(() => null)
+      : null;
+    let messageTab = savedMsgTab && savedMsgTab.windowId !== listWindowId ? savedMsgTab : null;
     if (!messageTab?.id) {
       const bossTabs = await chrome.tabs.query({ url: BOSS_MATCH_PATTERNS });
-      messageTab = bossTabs.find((tab) => tab.id !== listTab.id && /\/chat/i.test(tab.url || tab.pendingUrl || '')) || null;
+      messageTab = bossTabs.find(
+        (tab) => tab.id !== listTab.id && tab.windowId !== listWindowId && /\/chat/i.test(tab.url || tab.pendingUrl || '')
+      ) || null;
     }
 
     let messageWindow;
-    const existingWindowTabs = messageTab?.windowId != null
-      ? await chrome.tabs.query({ windowId: messageTab.windowId })
-      : [];
-    if (messageTab?.id && (messageTab.windowId === listTab.windowId || existingWindowTabs.length > 1)) {
+    if (messageTab?.id) {
       messageWindow = await chrome.windows.create({
         tabId: messageTab.id,
         type: 'normal',
@@ -741,9 +781,6 @@ export async function prepareSplitWorkspace(task, settings = {}) {
         ...bounds.right
       });
       messageTab = messageWindow.tabs?.[0] || await chrome.tabs.get(messageTab.id);
-    } else if (messageTab?.id) {
-      await setNormalWindowBounds(messageTab.windowId, bounds.right);
-      messageWindow = await chrome.windows.get(messageTab.windowId, { populate: true });
     } else {
       messageWindow = await chrome.windows.create({
         url: 'https://www.zhipin.com/web/geek/chat',
@@ -757,7 +794,6 @@ export async function prepareSplitWorkspace(task, settings = {}) {
     if (!messageTab?.id) throw new Error('消息窗口已创建，但未获得标签页');
     task.execution.messageTabId = messageTab.id;
     task.execution.messageWindowId = messageWindow.id;
-    await setNormalWindowBounds(messageWindow.id, bounds.right);
     if (!/\/chat/i.test(messageTab.url || messageTab.pendingUrl || '')) {
       messageTab = await chrome.tabs.update(messageTab.id, {
         url: 'https://www.zhipin.com/web/geek/chat',
@@ -778,7 +814,13 @@ export async function prepareSplitWorkspace(task, settings = {}) {
     task.execution.phase = 'SPLIT_WORKSPACE_READY';
 
     await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
-    await chrome.windows.update(listTab.windowId, { focused: true }).catch(() => {});
+    await chrome.windows.update(listWindowId, { focused: true }).catch(() => {});
+    await debugLog('background.split', 'windows_created', {
+      listWindowId,
+      messageWindowId: messageWindow.id,
+      bounds,
+      messageTabId: messageTab.id
+    });
     return {
       ok: true,
       listTabId: listTab.id,
@@ -790,16 +832,8 @@ export async function prepareSplitWorkspace(task, settings = {}) {
   } catch (error) {
     task.execution.splitViewActive = false;
     task.execution.splitViewError = String(error?.message || error);
-    if (originalWindow?.width && originalWindow?.height) {
-      await setNormalWindowBounds(listTab.windowId, {
-        left: originalWindow.left || 0,
-        top: originalWindow.top || 0,
-        width: originalWindow.width,
-        height: originalWindow.height
-      }).catch(() => {});
-    }
     await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
-    await chrome.windows.update(listTab.windowId, { focused: true }).catch(() => {});
+    await chrome.windows.update(task.execution.listWindowId || listTab.windowId, { focused: true }).catch(() => {});
     return {
       ok: false,
       error: 'SPLIT_VIEW_FAILED',
