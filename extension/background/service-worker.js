@@ -2194,6 +2194,11 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
     const collectionFinishedAt = Number(scan.scanMeta?.collectionFinishedAt || 0) ||
       Math.min(collectionResultReceivedAt, deadlineAt);
     runner.previewScanFinishedAt = Math.min(collectionFinishedAt, deadlineAt);
+    // 扫描结束回顶：投递从队列开头开始，把职位列表滚回顶部方便用户直接核对队首岗位
+    await sendToBoss(MSG.SCROLL_LIST_TOP, {}, {
+      tabId: sourcePreviewTab?.id || previewTab?.id || null,
+      previewRunId
+    }).catch(() => {});
     setPreviewPhase('filtering', previewRunId);
     const todayStats = await getTodayStats();
     if (!isActive()) return cancelled();

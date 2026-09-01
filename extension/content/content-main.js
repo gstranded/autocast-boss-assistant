@@ -19,6 +19,7 @@
     HIGHLIGHT_JOBS: "BHT_HIGHLIGHT_JOBS",
     ENSURE_JOB_LIST: "BHT_ENSURE_JOB_LIST",
     RETURN_TO_LIST: "BHT_RETURN_TO_LIST",
+    SCROLL_LIST_TOP: "BHT_SCROLL_LIST_TOP",
     CLOSE_CHAT: "BHT_CLOSE_CHAT",
     DIAGNOSE: "BHT_DIAGNOSE",
     RUN_OP: "BHT_RUN_OP",
@@ -26,7 +27,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.17";
+  const BHT_CONTENT_VERSION = "1.7.18";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -1573,6 +1574,35 @@ function firstEl(selectors, root = document) {
       } catch (_) {}
     }
     return document.scrollingElement || document.documentElement;
+  }
+
+  function scrollListToTop() {
+    const apply = () => {
+      try {
+        const scroller = getAdaptiveScanScroller();
+        if (
+          scroller &&
+          scroller !== document.scrollingElement &&
+          scroller !== document.documentElement &&
+          scroller !== document.body
+        ) {
+          scroller.scrollTop = 0;
+        }
+        window.scrollTo(0, 0);
+      } catch (_) {}
+    };
+    const read = () => {
+      const scroller = getAdaptiveScanScroller();
+      const isDoc = scroller === document.scrollingElement || scroller === document.documentElement || scroller === document.body;
+      return {
+        containerTop: scroller && !isDoc ? Number(scroller.scrollTop || 0) : 0,
+        windowTop: Number(window.scrollY || 0)
+      };
+    };
+    apply();
+    // BOSS SPA 会在列表就绪后异步恢复滚动位置，稍后补一次确保停在顶部
+    setTimeout(apply, 400);
+    return { ok: true, ...read() };
   }
 
   function describeAdaptiveScanScroller(scroller) {
@@ -4981,6 +5011,8 @@ async function runOpByType(type, payload = {}) {
         return await ensureJobList(payload || {});
       case MSG.RETURN_TO_LIST:
         return await returnToJobList(payload || {});
+      case MSG.SCROLL_LIST_TOP:
+        return scrollListToTop();
       default:
         return { ok: false, error: "UNKNOWN_TYPE", type };
     }
