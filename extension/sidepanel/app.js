@@ -21,7 +21,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.15";
+const BHT_UI_VERSION = "1.7.16";
 const VERSION_GUARDED_API_MESSAGES = new Set([
   MSG.RUN_PREVIEW,
   MSG.CONFIRM_AND_START,
@@ -1234,19 +1234,22 @@ function updateTaskUI(task, runner = {}) {
   if ($('taskStatus')) {
     if (runner.previewing) {
       const previewPhaseText = {
-        opening_worker: '正在准备职位列表',
-        locating_list: '正在定位职位列表',
-        navigating: '正在自动跳转职位列表',
-        waiting_navigation: '正在等待新页面加载',
-        scanning_cards: '正在读取岗位卡片',
-        scanning_more: '正在加载更多岗位',
-        collecting: '正在加载更多岗位',
+        opening_worker: '正在准备岗位',
+        locating_list: '正在准备岗位',
+        navigating: '正在准备岗位',
+        waiting_navigation: '正在加载岗位',
+        scanning_cards: '正在加载岗位',
+        scanning_more: '正在加载岗位',
+        collecting: '正在加载岗位',
+        checking_activity: '正在核对 HR 状态',
         filtering: '正在筛选岗位'
-      }[runner.previewPhase] || '正在读取岗位';
-      const progressText = Number(runner.previewScanned || 0) > 0
-        ? ` · 已加载 ${runner.previewScanned} 岗`
-        : '';
-      $('taskStatus').textContent = `状态：扫描中 · ${previewPhaseText}${progressText}`;
+      }[runner.previewPhase] || '正在加载岗位';
+      const timerStartedAt = Number(runner.previewScanStartedAt || runner.previewStartedAt || 0);
+      const timerFinishedAt = Number(runner.previewScanFinishedAt || 0);
+      const elapsedSeconds = timerStartedAt
+        ? Math.max(0, Math.floor(((timerFinishedAt || Date.now()) - timerStartedAt) / 1000))
+        : 0;
+      $('taskStatus').textContent = `状态：扫描中 · ${previewPhaseText} · ${elapsedSeconds} 秒`;
       $('taskStatus').dataset.status = 'previewing';
     } else {
       const pauseBit = status === 'paused' && task?.pauseReason ? '' : (task?.pauseReason && status !== 'paused' ? `（${task.pauseReason}）` : '');
@@ -1268,7 +1271,7 @@ function updateTaskUI(task, runner = {}) {
   if ($('taskHint')) {
     let hint = '';
     if (runner.previewing) {
-      hint = '正在加载更多岗位，完成后会自动筛选。';
+      hint = '正在加载岗位…';
     }
     else if (status === 'running') hint = '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
     else if (status === 'paused') hint = '已暂停：点「继续」恢复当前队列；或「停止」后重新批量投递。';
@@ -2295,6 +2298,10 @@ function bindEvents() {
       tab?.click();
       ack({ has: !!tab, tab: data.tab });
     }
+    if (data.cmd === 'scroll-y' && typeof data.y === 'number') {
+      document.querySelector('main')?.scrollTo(0, data.y);
+      ack({ y: document.querySelector('main')?.scrollTop || 0 });
+    }
     if (data.cmd === 'set-title-or') {
       if ($('titleOr')) $('titleOr').value = String(data.value || '');
       if ($('titleOrEnabled')) $('titleOrEnabled').checked = true;
@@ -2412,7 +2419,7 @@ function bindEvents() {
 
   $('btnPreview').addEventListener('click', async () => {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
-    toast('正在加载更多岗位，完成后自动筛选…', 'warn', 3500);
+    toast('正在扫描岗位…', 'warn', 2500);
     $('btnPreview').disabled = true;
     $('taskStatus').textContent = '状态：扫描中…';
     try {
@@ -2423,6 +2430,8 @@ function bindEvents() {
         ...(state.config.runner || {}),
         previewing: true,
         previewStartedAt: Date.now(),
+        previewScanStartedAt: Date.now(),
+        previewScanFinishedAt: 0,
         previewPhase: 'locating_list',
         previewScanned: 0,
         previewPass: 0

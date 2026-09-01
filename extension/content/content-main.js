@@ -5,6 +5,7 @@
     START_CHAT: "BHT_START_CHAT",
     TRIGGER_CONVERSATION: "BHT_TRIGGER_CONVERSATION",
     INSPECT_JOB_DETAIL: "BHT_INSPECT_JOB_DETAIL",
+    ENRICH_JOB_ACTIVITY: "BHT_ENRICH_JOB_ACTIVITY",
     GET_CONVERSATION_SNAPSHOT: "BHT_GET_CONVERSATION_SNAPSHOT",
     WAIT_OPEN_CONVERSATION: "BHT_WAIT_OPEN_CONVERSATION",
     WAIT_CHAT_EDITOR: "BHT_WAIT_CHAT_EDITOR",
@@ -24,7 +25,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.15";
+  const BHT_CONTENT_VERSION = "1.7.16";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -47,10 +48,45 @@
   window.__BHT_CONTENT_LOADED__ = true;
   window.__BHT_LAST_TRIGGER_CLICK__ = null;
   const nativeGreetingReceipts = [];
+  const jobNetworkMetadata = new Map();
+
+  function rememberJobNetworkMetadata(raw = {}) {
+    const jobId = String(raw.jobId || '').trim();
+    if (!jobId) return null;
+    const previous = jobNetworkMetadata.get(jobId) || {};
+    const next = {
+      ...previous,
+      ...raw,
+      jobId,
+      securityId: String(raw.securityId || previous.securityId || ''),
+      lid: String(raw.lid || previous.lid || ''),
+      bossId: String(raw.bossId || previous.bossId || ''),
+      bossName: String(raw.bossName || previous.bossName || '').trim(),
+      bossTitle: String(raw.bossTitle || previous.bossTitle || '').trim(),
+      brandName: String(raw.brandName || previous.brandName || '').trim(),
+      activeText: String(raw.activeText || previous.activeText || '').trim(),
+      bossOnline: typeof raw.bossOnline === 'boolean'
+        ? raw.bossOnline
+        : previous.bossOnline === true,
+      receivedAt: Date.now()
+    };
+    jobNetworkMetadata.set(jobId, next);
+    if (jobNetworkMetadata.size > 2000) {
+      const oldest = jobNetworkMetadata.keys().next().value;
+      if (oldest) jobNetworkMetadata.delete(oldest);
+    }
+    return next;
+  }
+
   window.addEventListener("message", (event) => {
     if (event.source !== window || event.origin !== location.origin) return;
     const data = event.data;
-    if (!data || data.source !== "bht-page-network-hook" || data.type !== "friend-add-receipt") return;
+    if (!data || data.source !== "bht-page-network-hook") return;
+    if (data.type === "job-metadata") {
+      for (const job of Array.isArray(data.jobs) ? data.jobs : []) rememberJobNetworkMetadata(job);
+      return;
+    }
+    if (data.type !== "friend-add-receipt") return;
     nativeGreetingReceipts.push({
       at: Number(data.at || Date.now()),
       jobId: String(data.jobId || ""),
@@ -63,6 +99,9 @@
     if (nativeGreetingReceipts.length > 30) nativeGreetingReceipts.splice(0, nativeGreetingReceipts.length - 30);
     debugTrace("friend_add_receipt", nativeGreetingReceipts[nativeGreetingReceipts.length - 1]);
   });
+  try {
+    window.postMessage({ source: 'bht-content', type: 'job-metadata-request' }, location.origin);
+  } catch (_) {}
 
   function isBossHost(hostname) {
     const host = String(hostname || "").toLowerCase();
@@ -892,8 +931,18 @@ const SELECTORS = {
   }
 
   function classifyPuaDigit(ch, font) {
+    // Salary glyphs are reused across every BOSS card.  Rendering the same
+    // private-use glyph and all ten reference digits for every card made a
+    // later scan batch grow quadratically (the 90-card continuation took
+    // nearly 40 seconds in the 2026-09-01 diagnostic).  Keep a small per-page
+    // cache so only genuinely new glyph/font pairs hit canvas.
+    const cacheKey = String(font || "") + "\u0000" + String(ch || "");
+    if (puaDigitCache.has(cacheKey)) return puaDigitCache.get(cacheKey);
     const target = renderGlyphMatrix(ch, font);
-    if (!target) return null;
+    if (!target) {
+      rememberBoundedCache(puaDigitCache, cacheKey, null, 256);
+      return null;
+    }
     // Cross-font shape match: BOSS PUA glyphs look like digits.
     const fonts = [
       font,
@@ -906,7 +955,12 @@ const SELECTORS = {
     let bestScore = Infinity;
     for (const f of fonts) {
       for (let d = 0; d <= 9; d++) {
-        const ref = renderGlyphMatrix(String(d), f);
+        const referenceKey = String(f) + "\u0000" + String(d);
+        let ref = puaReferenceCache.get(referenceKey);
+        if (!ref) {
+          ref = renderGlyphMatrix(String(d), f);
+          if (ref) rememberBoundedCache(puaReferenceCache, referenceKey, ref, 64);
+        }
         if (!ref) continue;
         const sc = matrixScore(target, ref);
         if (sc < bestScore) {
@@ -916,8 +970,24 @@ const SELECTORS = {
       }
     }
     // threshold: 24x32=768 cells; good matches usually << 220
-    if (best != null && bestScore < 260) return best;
-    return null;
+    const result = best != null && bestScore < 260 ? best : null;
+    rememberBoundedCache(puaDigitCache, cacheKey, result, 256);
+    return result;
+  }
+
+  // These caches intentionally live only for the current content document;
+  // a BOSS navigation creates a fresh script instance and cannot retain stale
+  // font or DOM assumptions.
+  const puaDigitCache = new Map();
+  const puaReferenceCache = new Map();
+  const salaryTextCache = new Map();
+  function rememberBoundedCache(cache, key, value, limit = 512) {
+    cache.set(key, value);
+    if (cache.size > limit) {
+      const oldest = cache.keys().next().value;
+      if (oldest !== undefined) cache.delete(oldest);
+    }
+    return value;
   }
 
   function decodeBossSalaryText(raw, salaryEl) {
@@ -937,6 +1007,9 @@ const SELECTORS = {
     try {
       if (salaryEl) font = window.getComputedStyle(salaryEl).font || font;
     } catch (_) {}
+
+    const cacheKey = String(font) + "\u0000" + s;
+    if (salaryTextCache.has(cacheKey)) return salaryTextCache.get(cacheKey);
 
     // A) canvas shape classify (most reliable when font available)
     for (const ch of puaList) {
@@ -970,8 +1043,9 @@ const SELECTORS = {
     }
 
     const decoded = chars.map((ch) => (digitMap[ch] != null ? digitMap[ch] : ch)).join("");
-    if (/[0-9]/.test(decoded)) return decoded;
-    return s.replace(/[\uE000-\uF8FF]/g, "?");
+    const result = /[0-9]/.test(decoded) ? decoded : s.replace(/[\uE000-\uF8FF]/g, "?");
+    rememberBoundedCache(salaryTextCache, cacheKey, result, 512);
+    return result;
   }
 
   function extractSalaryFromComponent(card) {
@@ -1005,6 +1079,54 @@ const SELECTORS = {
       } catch (_) {}
     }
     return "";
+  }
+
+  function extractJobMetadataFromComponent(card) {
+    const nodes = [card, card?.firstElementChild, card?.querySelector?.("a.job-name")].filter(Boolean);
+    for (const node of nodes) {
+      try {
+        for (const key of Object.keys(node || {})) {
+          if (!/^__(reactFiber|reactInternalInstance|vueParentComponent|vue__)/.test(key) && key !== "__vueParentComponent" && key !== "__vue__") continue;
+          let cur = node[key];
+          for (let depth = 0; depth < 12 && cur; depth++) {
+            const props = cur.memoizedProps || cur.pendingProps || cur.props || cur.$props || cur.data || cur.ctx || null;
+            const candidates = [
+              props?.data,
+              props?.job,
+              props?.jobInfo,
+              props?.item,
+              props,
+              cur?.data,
+              cur?.ctx?.data,
+              cur?.ctx?.job,
+              cur?.ctx?.jobInfo
+            ].filter((value) => value && typeof value === "object");
+            for (const value of candidates) {
+              const jobInfo = value.jobInfo || {};
+              const bossInfo = value.bossInfo || {};
+              const jobId = String(value.encryptJobId || value.encryptId || value.jobId || jobInfo.encryptId || "");
+              const securityId = String(value.securityId || "");
+              const lid = String(value.lid || "");
+              if (!jobId && !securityId && !lid) continue;
+              const bossOnline = value.bossOnline === true || value.bossOnline === 1 || bossInfo.bossOnline === true || bossInfo.bossOnline === 1;
+              return {
+                jobId,
+                securityId,
+                lid,
+                bossId: String(value.encryptBossId || value.bossId || bossInfo.encryptBossId || ""),
+                bossName: String(value.bossName || bossInfo.name || "").trim(),
+                bossTitle: String(value.bossTitle || bossInfo.title || "").trim(),
+                brandName: String(value.brandName || bossInfo.brandName || "").trim(),
+                bossOnline,
+                activeText: bossOnline ? "在线" : String(value.activeTimeDesc || bossInfo.activeTimeDesc || "").trim()
+              };
+            }
+            cur = cur.return || cur.parent || cur._ || cur.$parent || null;
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
   }
 
   function extractSalary(card, salaryEl) {
@@ -1303,6 +1425,7 @@ function firstEl(selectors, root = document) {
     const locationEl = firstEl(SELECTORS.location, card);
     const activeEl = firstEl(SELECTORS.activeText, card);
     const tags = allEl(SELECTORS.tags, card).map(textOf).filter(Boolean).slice(0, 12);
+    const componentMeta = extractJobMetadataFromComponent(card) || {};
 
     const linkEl =
       (titleEl && titleEl.tagName === "A" ? titleEl : null) ||
@@ -1328,15 +1451,23 @@ function firstEl(selectors, root = document) {
       card.dataset?.jid ||
       linkEl?.getAttribute?.("data-jobid") ||
       linkEl?.getAttribute?.("data-jid") ||
-      extractJobIdFromHref(href);
+      extractJobIdFromHref(href) ||
+      componentMeta.jobId ||
+      "";
+
+    const networkMeta = jobNetworkMetadata.get(String(jobId || '')) || {};
+    if (!href && jobId) href = absolutizeHref("/job_detail/" + jobId + ".html");
 
     // securityId 可能在详情 more link，卡片阶段先空
-    let securityId = extractSecurityId(href);
+    let securityId = extractSecurityId(href) || networkMeta.securityId || componentMeta.securityId || "";
+    const lid = String(networkMeta.lid || componentMeta.lid || "");
 
     const bossId =
       card.getAttribute?.("data-uid") ||
       card.getAttribute?.("data-bossid") ||
       card.getAttribute?.("data-boss-id") ||
+      networkMeta.bossId ||
+      componentMeta.bossId ||
       "";
 
     // 列表卡上通常没有沟通按钮，沟通在右侧详情
@@ -1349,10 +1480,15 @@ function firstEl(selectors, root = document) {
     const btnText = textOf(btn);
     const communicated = /继续沟通|沟通中/.test(btnText);
     const title = textOf(titleEl) || textOf(card).slice(0, 40);
-    const company = textOf(companyEl);
+    const company = textOf(companyEl) || networkMeta.brandName || componentMeta.brandName || "";
     const salary = extractSalary(card, salaryEl);
     const locationText = textOf(locationEl);
-    const activeText = textOf(activeEl) || (firstEl(SELECTORS.online, card) ? "在线" : "");
+    const online = Boolean(
+      firstEl(SELECTORS.online, card) ||
+      networkMeta.bossOnline === true ||
+      componentMeta.bossOnline === true
+    );
+    const activeText = textOf(activeEl) || networkMeta.activeText || componentMeta.activeText || (online ? "在线" : "");
     const jd = [textOf(card), tags.join(" ")].join(" ");
 
     if (!jobId) {
@@ -1364,6 +1500,7 @@ function firstEl(selectors, root = document) {
       index,
       jobId,
       securityId,
+      lid,
       bossId,
       title,
       company,
@@ -1386,7 +1523,7 @@ function firstEl(selectors, root = document) {
             ".recruiter-name",
             ".hr-name",
             "[data-role='recruiter-name']"
-          ], scope));
+          ], scope)) || networkMeta.bossName || componentMeta.bossName || "";
           hr = globalThis.BHTConversationMatch?.cleanHrIdentity
             ? globalThis.BHTConversationMatch.cleanHrIdentity(hr)
             : String(hr || "").split(/[·|｜]/)[0].replace(/\s+/g, " ").trim();
@@ -1394,7 +1531,7 @@ function firstEl(selectors, root = document) {
           return hr;
         } catch (_) { return ""; }
       })(),
-      online: Boolean(firstEl(SELECTORS.online, card))
+      online
     };
   }
 
@@ -1480,16 +1617,90 @@ function firstEl(selectors, root = document) {
   function nextAdaptiveScrollTop(snapshot) {
     const viewport = Math.max(1, Number(snapshot?.viewport || 0));
     const maxTop = Math.max(0, Number(snapshot?.height || 0) - viewport);
-    return maxTop;
+    // 85% 视口步进保留重叠窗口：append-only 列表仍然很快，虚拟列表也不会
+    // 因为直接从顶部跳到尾部而漏掉中间岗位。
+    const step = Math.max(240, Math.floor(viewport * 0.85));
+    return Math.min(maxTop, Math.max(0, Number(snapshot?.top || 0)) + step);
+  }
+
+  function pulseAdaptiveScrollBottom(scroller, snapshot) {
+    const viewport = Math.max(1, Number(snapshot?.viewport || 0));
+    const maxTop = Math.max(0, Number(snapshot?.height || 0) - viewport);
+    const pullback = Math.max(80, Math.min(180, Math.floor(viewport * 0.16)));
+    setAdaptiveScrollTop(scroller, Math.max(0, maxTop - pullback));
+    // 两次不同 scrollTop 会重新触发只监听 scroll 事件的懒加载器。
+    setAdaptiveScrollTop(scroller, maxTop);
+  }
+
+  function hasExplicitJobListEnd(scroller) {
+    const root = scroller?.querySelector ? scroller : document;
+    try {
+      const marker = root.querySelector(
+        ".loadmore-end, .load-more-end, .list-end, .job-list-end, [data-list-end='true'], [data-has-more='false']"
+      );
+      if (marker) return true;
+      const tail = String(root.textContent || '').replace(/\s+/g, ' ').trim().slice(-160);
+      return /没有更多(?:职位|岗位)?|暂无更多(?:职位|岗位)?|已加载全部/.test(tail);
+    } catch (_) {
+      return false;
+    }
   }
 
   function collectAdaptiveScanJobs(session) {
     const cards = getJobCards();
+    // BOSS keeps already loaded cards in the DOM while appending the next
+    // result page.  Re-parsing every card on every scroll round made the scan
+    // O(n^2), and the encrypted salary decoder amplified that cost with many
+    // canvas renders.  Cache by DOM node plus a cheap identity fingerprint;
+    // virtualized lists that recycle a node are still re-parsed when its job
+    // id, link, title, activity or button changes.
+    const cardCache = session.cardCache || (session.cardCache = new WeakMap());
+    const cardIdentity = (card) => {
+      try {
+        const id = String(
+          card.getAttribute?.("data-jobid") ||
+          card.getAttribute?.("data-job-id") ||
+          card.getAttribute?.("data-jid") ||
+          card.dataset?.jobid ||
+          card.dataset?.jid ||
+          ""
+        );
+        const link = card.querySelector?.("a.job-name[href], a[href*='job_detail'], a[href*='jobId='], a[href*='jid=']");
+        const href = String(link?.getAttribute?.("href") || link?.href || "");
+        const metadataId = id || extractJobIdFromHref(href);
+        const metadata = jobNetworkMetadata.get(String(metadataId || '')) || {};
+        const title = String(card.querySelector?.("a.job-name, .job-name")?.textContent || "")
+          .replace(/\s+/g, " ").trim();
+        const active = String(card.querySelector?.(".boss-active-time, .boss-info .time, .active-time")?.textContent || "")
+          .replace(/\s+/g, " ").trim();
+        const button = String(card.querySelector?.("a.op-btn-chat, .op-btn-chat, a.op-btn")?.textContent || "")
+          .replace(/\s+/g, " ").trim();
+        return [
+          id,
+          href,
+          title,
+          active,
+          button,
+          metadata.securityId || '',
+          metadata.lid || '',
+          metadata.activeText || '',
+          metadata.bossOnline === true ? '1' : '0'
+        ].join("\u0001");
+      } catch (_) {
+        return "";
+      }
+    };
     const visibleKeys = [];
     const newJobs = [];
     let added = 0;
     cards.forEach((card, index) => {
-      const job = parseJobCard(card, index);
+      const identity = cardIdentity(card);
+      const cached = cardCache.get(card);
+      let job = cached && cached.identity === identity ? cached.job : null;
+      if (!job) {
+        job = parseJobCard(card, index);
+        cardCache.set(card, { identity, job });
+      }
       const key = String(job.jobId || `${normalizeText(job.title || '')}|${normalizeText(job.company || '')}`);
       if (!key) return;
       visibleKeys.push(key);
@@ -1499,6 +1710,11 @@ function firstEl(selectors, root = document) {
         ...job,
         company: job.company || previous?.company || '',
         href: job.href || previous?.href || '',
+        securityId: job.securityId || previous?.securityId || '',
+        lid: job.lid || previous?.lid || '',
+        bossId: job.bossId || previous?.bossId || '',
+        hrName: job.hrName || previous?.hrName || '',
+        activeText: job.activeText || previous?.activeText || '',
         index: previous?.index ?? session.jobs.size
       };
       if (!previous) {
@@ -1522,6 +1738,7 @@ function firstEl(selectors, root = document) {
       session = window.__BHT_SCAN_SESSION__ = {
         id: sessionId,
         jobs: new Map(),
+        cardCache: new WeakMap(),
         rounds: 0,
         stableRounds: 0,
         bottomStableRounds: 0,
@@ -1564,7 +1781,26 @@ function firstEl(selectors, root = document) {
       }
       return collected;
     };
+    const isScanStopError = (error) => error?.code === "OP_CANCELLED";
+    const sleepUntilScanStop = async (ms) => {
+      const remainingMs = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : ms;
+      if (deadlineAt && remainingMs <= 0) {
+        timedOut = true;
+        return;
+      }
+      try {
+        await sleep(Math.min(ms, remainingMs));
+      } catch (error) {
+        if (isScanStopError(error)) {
+          timedOut = true;
+          return;
+        }
+        throw error;
+      }
+      if (deadlineAt && Date.now() >= deadlineAt) timedOut = true;
+    };
 
+    try {
     // Preserve the current virtual window before returning to the top. BOSS
     // currently appends cards, but this also covers a future recycled list.
     collectWindow();
@@ -1574,12 +1810,11 @@ function firstEl(selectors, root = document) {
         let topStableRounds = 0;
         let previousTopSignature = '';
         for (let attempt = 0; attempt < 6; attempt++) {
-          const remainingMs = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : 80;
-          if (deadlineAt && remainingMs <= 0) {
+          if (deadlineAt && Date.now() >= deadlineAt) {
             timedOut = true;
             break;
           }
-          await sleep(Math.min(80, remainingMs));
+          await sleepUntilScanStop(80);
           scroller = session.scroller?.isConnected
             ? session.scroller
             : getAdaptiveScanScroller();
@@ -1589,21 +1824,32 @@ function firstEl(selectors, root = document) {
           if (topSnapshot.top <= 8 && topWindow.signature === previousTopSignature) topStableRounds += 1;
           else topStableRounds = 0;
           previousTopSignature = topWindow.signature;
-          if (topStableRounds >= 2) break;
+          if (topStableRounds >= 2 || timedOut) break;
           if (topSnapshot.top > 8) setAdaptiveScrollTop(scroller, 0);
         }
-      } catch (_) {}
+      } catch (error) {
+        if (!isScanStopError(error)) throw error;
+        timedOut = true;
+      }
     }
     if (session.scanStartTop == null) session.scanStartTop = adaptiveScrollSnapshot(scroller).top;
     const requestedRounds = Number(payload.maxRounds);
+    const continuous = payload.continuous === true;
+    // A preview normally owns one content operation for the whole collection
+    // window.  Do not cap that operation at the old eight-round batch; the
+    // shared deadline below is the real stop condition.  Keep a generous
+    // iteration guard for pages that never report a usable bottom.
     const maxRounds = payload.scroll === false
       ? 0
-      : Math.max(1, Math.min(16, Number.isFinite(requestedRounds) ? requestedRounds : 8));
+      : continuous
+        ? Math.max(1, Math.min(512, Number.isFinite(requestedRounds) ? requestedRounds : 512))
+        : Math.max(1, Math.min(64, Number.isFinite(requestedRounds) ? requestedRounds : 24));
     const requestedWaitMs = Number(payload.scrollWaitMs);
-    const waitMs = Math.max(200, Math.min(1000, Number.isFinite(requestedWaitMs) ? requestedWaitMs : 300));
+    const waitMs = Math.max(70, Math.min(500, Number.isFinite(requestedWaitMs) ? requestedWaitMs : 100));
+    const bottomWaitMs = Math.max(260, Math.min(600, waitMs * 3));
 
     for (let round = 0; round < maxRounds && !session.reachedEnd; round++) {
-      if (deadlineAt && Date.now() >= deadlineAt) {
+      if (timedOut || (deadlineAt && Date.now() >= deadlineAt)) {
         timedOut = true;
         break;
       }
@@ -1613,12 +1859,11 @@ function firstEl(selectors, root = document) {
       session.scroller = scroller;
       const before = adaptiveScrollSnapshot(scroller);
       try {
-        // BOSS appends each lazy-loaded batch. Jumping to the current tail is
-        // both faster and the event that requests the next batch.
-        setAdaptiveScrollTop(scroller, nextAdaptiveScrollTop(before));
+        if (before.atBottom) pulseAdaptiveScrollBottom(scroller, before);
+        else setAdaptiveScrollTop(scroller, nextAdaptiveScrollTop(before));
       } catch (_) {}
-      const remainingMs = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : waitMs;
-      await sleep(Math.min(waitMs, remainingMs));
+      const settleMs = before.atBottom ? bottomWaitMs : waitMs;
+      await sleepUntilScanStop(settleMs);
 
       scroller = session.scroller?.isConnected
         ? session.scroller
@@ -1630,24 +1875,37 @@ function firstEl(selectors, root = document) {
       const moved = Math.abs(after.top - before.top) > 8 || after.height !== before.height;
       const visibleChanged = Boolean(collected.signature && collected.signature !== previousSignature);
       session.rounds += 1;
-      const deadlineReached = Boolean(deadlineAt && Date.now() >= deadlineAt);
-      if (deadlineReached) timedOut = true;
+      if (deadlineAt && Date.now() >= deadlineAt) timedOut = true;
 
       if (collected.added <= 0 && !moved && !visibleChanged) session.stableRounds += 1;
       else session.stableRounds = 0;
       // 虚拟列表替换节点时可能短暂没有卡片；空 DOM 不能作为“到底”证据。
       if (after.atBottom && collected.visibleCount > 0 && collected.added <= 0 && !visibleChanged) session.bottomStableRounds += 1;
       else session.bottomStableRounds = 0;
-      if (!timedOut && session.bottomStableRounds >= 5 && Date.now() - session.lastGrowthAt >= 1400) {
+      const explicitEnd = after.atBottom && hasExplicitJobListEnd(scroller);
+      if (
+        !timedOut &&
+        (
+          explicitEnd ||
+          (session.bottomStableRounds >= 8 && Date.now() - session.lastGrowthAt >= 3000)
+        )
+      ) {
         session.reachedEnd = true;
       }
       if (timedOut) break;
+    }
+    } catch (error) {
+      if (!isScanStopError(error)) throw error;
+      timedOut = true;
+      try { collectWindow(); } catch (_) {}
     }
 
     if (!session.reachedEnd && deadlineAt && Date.now() >= deadlineAt) timedOut = true;
     if (timedOut) session.reachedEnd = false;
     session.lastSignature = lastSignature;
     const snapshot = adaptiveScrollSnapshot(scroller);
+    // timedOut 表示采集在 deadlineAt 截止；随后仅允许构造快照和写回结果。
+    const collectionFinishedAt = timedOut && deadlineAt ? deadlineAt : Date.now();
     const scrollerInfo = describeAdaptiveScanScroller(scroller);
     const allJobs = Array.from(session.jobs.values()).map((job, index) => ({ ...job, index }));
     const jobs = payload.deltaOnly === true
@@ -1677,8 +1935,118 @@ function firstEl(selectors, root = document) {
         scrollViewport: snapshot.viewport,
         scroller: scrollerInfo,
         lastGrowthAgoMs: Math.max(0, Date.now() - session.lastGrowthAt),
-        elapsedMs: Date.now() - session.startedAt
+        collectionFinishedAt,
+        elapsedMs: collectionFinishedAt - session.startedAt
       }
+    };
+  }
+
+  async function fetchJobActivityDetail(job = {}, deadlineAt = 0) {
+    const securityId = String(job.securityId || '');
+    const lid = String(job.lid || '');
+    if (!securityId || !lid) return { ok: false, skipped: true, error: 'DETAIL_PARAMS_MISSING' };
+    const remainingMs = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : 1800;
+    if (remainingMs < 250) return { ok: false, skipped: true, error: 'ACTIVITY_DEADLINE' };
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), Math.min(1800, remainingMs));
+    try {
+      const url = new URL('/wapi/zpgeek/job/detail.json', location.origin);
+      url.searchParams.set('securityId', securityId);
+      url.searchParams.set('lid', lid);
+      const response = await fetch(url.href, {
+        credentials: 'include',
+        cache: 'no-store',
+        signal: controller.signal,
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+      });
+      if (!response.ok) {
+        return {
+          ok: false,
+          halt: response.status === 429 || response.status === 403,
+          error: 'ACTIVITY_HTTP_' + response.status
+        };
+      }
+      const payload = await response.json();
+      const code = Number(payload?.code);
+      if (code !== 0) {
+        // 任意非零响应都立即熔断，不重试，不放大 BOSS 风控。
+        return { ok: false, halt: true, code, error: 'ACTIVITY_API_' + code };
+      }
+      const zpData = payload?.zpData || {};
+      const actualJobId = String(zpData?.jobInfo?.encryptId || '');
+      const expectedJobId = String(job.jobId || '');
+      if (actualJobId && expectedJobId && actualJobId !== expectedJobId) {
+        return { ok: false, halt: true, error: 'ACTIVITY_JOB_MISMATCH' };
+      }
+      const bossInfo = zpData?.bossInfo || {};
+      const bossOnline = bossInfo.bossOnline === true || bossInfo.bossOnline === 1;
+      const activeText = bossOnline ? '在线' : String(bossInfo.activeTimeDesc || '').trim();
+      const metadata = rememberJobNetworkMetadata({
+        jobId: actualJobId || expectedJobId,
+        securityId,
+        lid,
+        bossId: String(bossInfo.encryptBossId || job.bossId || ''),
+        bossName: String(bossInfo.name || job.hrName || '').trim(),
+        bossTitle: String(bossInfo.title || '').trim(),
+        brandName: String(bossInfo.brandName || job.company || '').trim(),
+        bossOnline,
+        activeText,
+        source: 'activity-prefetch'
+      });
+      return { ok: true, ...(metadata || {}), activeText, bossOnline };
+    } catch (error) {
+      return {
+        ok: false,
+        halt: error?.name !== 'AbortError',
+        error: error?.name === 'AbortError' ? 'ACTIVITY_TIMEOUT' : 'ACTIVITY_FETCH_FAILED'
+      };
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  async function enrichJobActivities(payload = {}) {
+    const requested = Array.isArray(payload.jobs) ? payload.jobs : [];
+    const jobs = requested
+      .filter((job) => job?.jobId && job?.securityId && job?.lid && !job?.activeText)
+      .slice(0, Math.max(0, Math.min(20, Number(payload.maxJobs || 20))));
+    const maxMs = Math.max(500, Math.min(12000, Number(payload.maxMs || 10000)));
+    const deadlineAt = Math.min(
+      Number(payload.deadlineAt || Infinity),
+      Date.now() + maxMs
+    );
+    const concurrency = Math.max(1, Math.min(2, Number(payload.concurrency || 2)));
+    const activities = [];
+    let cursor = 0;
+    let halted = false;
+    let haltError = '';
+
+    const worker = async () => {
+      while (!halted && cursor < jobs.length && Date.now() < deadlineAt) {
+        const job = jobs[cursor++];
+        const result = await fetchJobActivityDetail(job, deadlineAt);
+        if (result.ok) activities.push(result);
+        if (result.halt) {
+          halted = true;
+          haltError = result.error || 'ACTIVITY_HALTED';
+          break;
+        }
+        if (!halted && cursor < jobs.length && Date.now() < deadlineAt) {
+          await sleep(300 + Math.floor(Math.random() * 201));
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    return {
+      ok: true,
+      activities,
+      requestedCount: requested.length,
+      eligibleCount: jobs.length,
+      checkedCount: activities.length,
+      halted,
+      haltError,
+      timedOut: Date.now() >= deadlineAt
     };
   }
 
@@ -4455,7 +4823,7 @@ async function startChat(job, opts = {}) {
 
 async function runOpByType(type, payload = {}) {
     const lockKey = String(type || '');
-    const needLock = /START_CHAT|INSPECT_JOB_DETAIL|TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SCAN_JOBS/.test(lockKey);
+    const needLock = /START_CHAT|INSPECT_JOB_DETAIL|ENRICH_JOB_ACTIVITY|TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SCAN_JOBS/.test(lockKey);
     if (needLock) {
       if (window.__BHT_OP_LOCK__) {
         return { ok: false, error: 'OP_BUSY', message: '已有操作进行中', contentVersion: BHT_CONTENT_VERSION };
@@ -4477,6 +4845,8 @@ async function runOpByType(type, payload = {}) {
         return await scanJobs(payload || {});
       case MSG.INSPECT_JOB_DETAIL:
         return await inspectWorkerJobDetail(payload?.job || {});
+      case MSG.ENRICH_JOB_ACTIVITY:
+        return await enrichJobActivities(payload || {});
       case MSG.TRIGGER_CONVERSATION:
         return payload?.workerDetail
           ? await triggerConversationOnWorkerDetail(payload.job || {})
@@ -4632,6 +5002,9 @@ async function runOpByType(type, payload = {}) {
               debugTrace("operation_return_undefined", undefinedResult, "error");
               return undefinedResult;
             }
+            if (opResult?.scanMeta && typeof opResult.scanMeta === "object") {
+              opResult.scanMeta = { ...opResult.scanMeta, workCompletedAt: Date.now() };
+            }
             debugTrace("operation_dispatch_return", { opId, opType, result: summarizeOperationResult(opResult) }, opResult?.ok ? "debug" : "warn");
             return opResult;
           })();
@@ -4662,10 +5035,19 @@ async function runOpByType(type, payload = {}) {
           if (timedOut && workPromise) {
             log("RUN_OP deadline exceeded, cancelling work", opId, opType);
             try {
-              await Promise.race([
-                workPromise.catch(() => null),
-                new Promise((resolve) => setTimeout(resolve, 2500))
+              const late = await Promise.race([
+                workPromise.then((value) => ({ value })).catch((error) => ({ error })),
+                new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), 2500))
               ]);
+              const lateResult = late?.value;
+              if (
+                opType === MSG.SCAN_JOBS &&
+                lateResult &&
+                Array.isArray(lateResult.jobs) &&
+                lateResult.jobs.length
+              ) {
+                result = lateResult;
+              }
             } catch (e) {
               debugTrace("operation_late_settle_error", { opId, opType, error: serializeDebugError(e) }, "error");
             }

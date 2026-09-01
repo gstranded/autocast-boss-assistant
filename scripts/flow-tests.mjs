@@ -31,13 +31,14 @@ function createVirtualScanHarness({
   initialTop = 0,
   replaceScrollerAfterSleeps = 0,
   initialLoadedJobs = totalJobs,
-  appendBatchSize = 0
+  appendBatchSize = 0,
+  cancelAfterSleeps = 0
 } = {}) {
   const content = fs.readFileSync("extension/content/content-main.js", "utf8");
   const functionSource = extractFunctionSource(
     content,
     "async function scanAdaptiveJobBatch",
-    "function pageInfo()"
+    "async function fetchJobActivityDetail"
   );
   const itemHeight = 100;
   const viewport = visibleJobs * itemHeight;
@@ -89,7 +90,7 @@ function createVirtualScanHarness({
   const scrollHelpers = new Function(
     "window",
     "document",
-    `${scrollHelperSource}; return { setAdaptiveScrollTop, nextAdaptiveScrollTop };`
+    `${scrollHelperSource}; return { setAdaptiveScrollTop, nextAdaptiveScrollTop, pulseAdaptiveScrollBottom, hasExplicitJobListEnd };`
   )(window, document);
 
   function adaptiveScrollSnapshot(scroller) {
@@ -149,6 +150,11 @@ function createVirtualScanHarness({
       scrollerGeneration += 1;
       activeScroller = makeScroller(previous.scrollTop, scrollerGeneration);
     }
+    if (cancelAfterSleeps > 0 && sleepCount === cancelAfterSleeps) {
+      const error = new Error("任务已停止，页面操作已取消");
+      error.code = "OP_CANCELLED";
+      throw error;
+    }
   };
   const getAdaptiveScanScroller = () => activeScroller;
   const describeAdaptiveScanScroller = (scroller) => ({
@@ -172,6 +178,8 @@ function createVirtualScanHarness({
     "Date",
     "setAdaptiveScrollTop",
     "nextAdaptiveScrollTop",
+    "pulseAdaptiveScrollBottom",
+    "hasExplicitJobListEnd",
     `return (${functionSource});`
   )(
     window,
@@ -184,7 +192,9 @@ function createVirtualScanHarness({
     sleep,
     FakeDate,
     scrollHelpers.setAdaptiveScrollTop,
-    scrollHelpers.nextAdaptiveScrollTop
+    scrollHelpers.nextAdaptiveScrollTop,
+    scrollHelpers.pulseAdaptiveScrollBottom,
+    scrollHelpers.hasExplicitJobListEnd
   );
 
   return {
@@ -232,7 +242,7 @@ test("preview auto-recovers non-list pages without silent zero results", () => {
   assert.ok(background.includes("OP_BRIDGE_TIMEOUT"));
   assert.ok(!background.includes("扫描等待超过 38 秒"));
   assert.ok(background.includes("scan?.shouldNavigate === true"));
-  assert.ok(panel.includes("正在加载更多岗位，完成后自动筛选"));
+  assert.ok(panel.includes("正在扫描岗位"));
   assert.ok(!panel.includes("下方暂时仍是上一次预览"));
   assert.ok(panel.includes("取消本次扫描（保留上一次预览结果）"));
   assert.ok(panel.includes("已连接 BOSS · 列表未就绪"));
@@ -331,6 +341,28 @@ test("HR activity is inspected on the temporary detail before any conversation c
   assert.ok(messaging.includes("INSPECT_JOB_DETAIL: 'BHT_INSPECT_JOB_DETAIL'"));
 });
 
+test("preview captures native job metadata and bounds read-only HR activity enrichment", () => {
+  const hook = fs.readFileSync("extension/content/page-network-hook.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const messaging = fs.readFileSync("extension/shared/messaging.js", "utf8");
+  assert.ok(hook.includes("/wapi\\/zpgeek\\/(?:search\\/joblist|pc\\/recommend\\/job\\/list"));
+  assert.ok(hook.includes("/wapi\\/zpgeek\\/job\\/detail"));
+  assert.ok(hook.includes("securityId"));
+  assert.ok(hook.includes("lid"));
+  assert.ok(hook.includes("bossOnline"));
+  assert.ok(hook.includes("activeTimeDesc"));
+  assert.ok(hook.includes("job-metadata-request"));
+  assert.ok(content.includes("extractJobMetadataFromComponent"));
+  assert.ok(content.includes("fetchJobActivityDetail"));
+  assert.ok(content.includes("slice(0, Math.max(0, Math.min(20"));
+  assert.ok(content.includes("concurrency = Math.max(1, Math.min(2"));
+  assert.ok(content.includes("任意非零响应都立即熔断"));
+  assert.ok(background.includes("applyPreviewActivityEnrichment"));
+  assert.ok(background.includes("activityCandidates.slice(0, 20)"));
+  assert.ok(messaging.includes("ENRICH_JOB_ACTIVITY: 'BHT_ENRICH_JOB_ACTIVITY'"));
+});
+
 test("message conversation matching performs a second real reload after propagation delay", () => {
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const branchStart = background.indexOf("首次刷新后暂未出现新会话");
@@ -361,22 +393,34 @@ test("preview accumulates virtualized jobs until bottom or the 60 second deadlin
   const content = fs.readFileSync("extension/content/content-main.js", "utf8");
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const timeouts = fs.readFileSync("extension/shared/operation-timeouts.js", "utf8");
   assert.ok(content.includes("scanAdaptiveJobBatch"));
   assert.ok(content.includes("window.__BHT_SCAN_SESSION__"));
   assert.ok(content.includes("session.jobs = new Map") || content.includes("jobs: new Map()"));
   assert.ok(content.includes("visibleChanged"));
   assert.ok(content.includes("bottomStableRounds"));
   assert.ok(content.includes("lastGrowthAt"));
-  assert.ok(!content.includes("先轻微回拉再触底"));
+  assert.ok(content.includes("pulseAdaptiveScrollBottom"));
   assert.ok(content.includes("nextAdaptiveScrollTop"));
   assert.ok(content.includes("setAdaptiveScrollTop(scroller, nextAdaptiveScrollTop(before))"));
   assert.ok(content.includes("deadlineAt"));
   assert.ok(content.includes("timedOut"));
-  assert.ok(content.includes("return maxTop"));
-  assert.ok(content.includes("Number.isFinite(requestedWaitMs) ? requestedWaitMs : 300"));
+  assert.ok(content.includes("Math.floor(viewport * 0.85)"));
+  assert.ok(content.includes("Number.isFinite(requestedWaitMs) ? requestedWaitMs : 100"));
   assert.ok(content.includes("payload.deltaOnly === true"));
   assert.ok(content.includes("returnedCount"));
+  assert.ok(content.includes("payload.continuous === true"));
+  assert.ok(content.includes("collectionFinishedAt"));
+  assert.ok(content.includes("workCompletedAt"));
+  assert.ok(content.includes("session.cardCache"));
+  assert.ok(content.includes("puaDigitCache"));
   assert.ok(content.includes("continuingSession"));
+  assert.ok(content.includes("sleepUntilScanStop"));
+  assert.ok(content.includes("isScanStopError"));
+  assert.ok(content.includes("opType === MSG.SCAN_JOBS"));
+  assert.ok(content.includes("lateResult.jobs.length"));
+  assert.ok(background.includes("scanDeadlinePartial"));
+  assert.ok(background.includes("continuous: true"));
   const continuationStart = content.indexOf("const continuingSession =");
   const continuationEnd = content.indexOf("const ensured = continuingSession", continuationStart);
   const continuationGuard = content.slice(continuationStart, continuationEnd);
@@ -390,12 +434,16 @@ test("preview accumulates virtualized jobs until bottom or the 60 second deadlin
   assert.ok(background.includes("Math.min(OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS, requestedMaxScanMs)"));
   assert.ok(background.includes("mergePreviewJobBatch"));
   assert.ok(background.includes("deltaOnly: true"));
-  assert.ok(background.includes("payload.batchRounds || 8"));
+  assert.ok(background.includes("continuous: payload.continuous === true"));
+  assert.ok(background.includes("maxRounds: payload.maxRounds || 24"));
+  assert.ok(background.includes("scanDeadlineAt + OPERATION_TIMEOUTS.PREVIEW_RESULT_GRACE_MS"));
+  assert.ok(timeouts.includes("result?.scanMeta?.collectionFinishedAt"));
+  assert.ok(timeouts.includes("result?.scanMeta?.workCompletedAt"));
   assert.ok(background.includes("滚动阶段只采集和去重；确认到底或到达统一截止时间后，才执行一次筛选"));
   assert.ok(!background.includes("targetPass"));
   assert.ok(!background.includes("maxScanJobs"));
   assert.ok(background.includes("collecting"));
-  assert.ok(background.includes("scanStartedAt + maxElapsedMs"));
+  assert.ok(background.includes("const previewDeadlineAt = scanStartedAt + maxElapsedMs"));
   assert.ok(background.includes("scrollElapsedMs: collectionFinishedAt - scanStartedAt"));
   assert.ok(!background.includes("scrollElapsedMs: Math.min"));
   assert.ok(background.includes("resolvePreviewScanStop"));
@@ -404,11 +452,38 @@ test("preview accumulates virtualized jobs until bottom or the 60 second deadlin
   assert.ok(background.includes("正在当前职位页向下加载岗位"));
   assert.ok(!panel.includes("到达列表底部或 60 秒"));
   assert.ok(!panel.includes("滚动用时"));
-  assert.ok(!panel.includes("elapsedSeconds"));
-  assert.ok(panel.includes("正在加载更多岗位，完成后会自动筛选。"));
+  assert.ok(panel.includes("elapsedSeconds"));
+  assert.ok(panel.includes("previewScanFinishedAt"));
+  assert.ok(panel.includes("正在加载岗位…"));
+  assert.ok(!panel.includes("滚动已达到 60 秒上限"));
+  assert.ok(!panel.includes("已加载 ${runner.previewScanned} 岗"));
 });
 
-test("virtual preview preserves the starting window and jumps to the current bottom", async () => {
+test("continuous preview does not stop at the legacy 16-round cap", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 600,
+    visibleJobs: 5,
+    initialLoadedJobs: 15,
+    appendBatchSize: 15
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "continuous-large-list",
+    resetSession: true,
+    deltaOnly: false,
+    continuous: true,
+    scroll: true,
+    maxRounds: 512,
+    scrollWaitMs: 100,
+    deadlineAt: 60000
+  });
+
+  assert.equal(result.count, 600);
+  assert.equal(result.scanMeta.reachedEnd, true);
+  assert.equal(result.scanMeta.timedOut, false);
+  assert.ok(result.scanMeta.rounds > 16, `expected >16 rounds, got ${result.scanMeta.rounds}`);
+});
+
+test("virtual preview preserves the starting window and walks every overlapping viewport", async () => {
   const harness = createVirtualScanHarness({
     totalJobs: 12,
     visibleJobs: 4,
@@ -419,8 +494,8 @@ test("virtual preview preserves the starting window and jumps to the current bot
     resetSession: true,
     deltaOnly: false,
     scroll: true,
-    maxRounds: 12,
-    scrollWaitMs: 300,
+    maxRounds: 24,
+    scrollWaitMs: 100,
     deadlineAt: 60000
   });
 
@@ -446,7 +521,26 @@ test("virtual preview preserves the starting window and jumps to the current bot
 
   const firstForwardScroll = harness.assignments.find((entry) => entry.actual > 0);
   assert.ok(firstForwardScroll, "the scan should move down after resetting to the top");
-  assert.equal(firstForwardScroll.actual, 800, "each round should jump to the current tail");
+  assert.equal(firstForwardScroll.actual, 340, "each round should advance by 85% of one viewport");
+});
+
+test("large virtual preview does not skip middle windows", async () => {
+  const harness = createVirtualScanHarness({ totalJobs: 100, visibleJobs: 5 });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "virtual-100",
+    resetSession: true,
+    deltaOnly: false,
+    continuous: true,
+    scroll: true,
+    maxRounds: 256,
+    scrollWaitMs: 100,
+    deadlineAt: 60000
+  });
+  assert.equal(result.count, 100);
+  assert.deepEqual(
+    result.jobs.map((job) => job.jobId).sort(),
+    Array.from({ length: 100 }, (_, index) => `job-${index}`).sort()
+  );
 });
 
 test("append-only preview loads 15 to 50 jobs at the fast cadence", async () => {
@@ -461,8 +555,8 @@ test("append-only preview loads 15 to 50 jobs at the fast cadence", async () => 
     resetSession: true,
     deltaOnly: false,
     scroll: true,
-    maxRounds: 12,
-    scrollWaitMs: 300,
+    maxRounds: 32,
+    scrollWaitMs: 100,
     deadlineAt: 60000
   });
 
@@ -473,7 +567,31 @@ test("append-only preview loads 15 to 50 jobs at the fast cadence", async () => 
   assert.equal(result.count, 50);
   assert.equal(result.scanMeta.reachedEnd, true);
   assert.equal(result.scanMeta.timedOut, false);
-  assert.ok(harness.clock <= 3000, `fast lazy loading took ${harness.clock}ms in the fake clock`);
+  assert.ok(harness.clock <= 7000, `fast lazy loading took ${harness.clock}ms in the fake clock`);
+});
+
+test("preview keeps already collected jobs when a wait is cancelled", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 90,
+    visibleJobs: 5,
+    initialLoadedJobs: 60,
+    appendBatchSize: 15,
+    cancelAfterSleeps: 1
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "keep-jobs-on-cancel",
+    resetSession: true,
+    deltaOnly: false,
+    continuous: true,
+    scroll: true,
+    maxRounds: 64,
+    scrollWaitMs: 100,
+    deadlineAt: 60000
+  });
+
+  assert.ok(result.count >= 60, `deadline cancel must keep the already loaded jobs; got ${result.count}`);
+  assert.equal(result.scanMeta.timedOut, true);
+  assert.equal(result.scanMeta.reachedEnd, false);
 });
 
 test("preview collection stops exactly at a mid-round deadline", async () => {
@@ -616,6 +734,7 @@ test("page operations consume the background budget and keep timeout terminal st
   assert.ok(content.includes("原操作可能还在收尾；保留取消墓碑"));
   assert.ok(!content.includes("if (window.__BHT_DEBUG_ENABLED__ !== true || !window.__BHT_ACTIVE_OP_ID__) return;"));
   assert.ok(content.includes('error: "OP_DEADLINE_EXCEEDED"'));
+  assert.ok(content.includes("if (opId && window.__BHT_OP_CANCELLED__?.[opId])"));
   assert.ok(content.includes("!timedOut && opId"));
   assert.ok(content.includes("markSettledCancellation"));
   const gateStart = content.indexOf("const dispatchGate");
@@ -748,7 +867,7 @@ test("preview scans the current SPA list and uses lightweight one-second status 
   assert.ok(content.includes("listFilterHints"));
   assert.ok(content.includes("describeAdaptiveScanScroller"));
   assert.ok(content.includes("growthEvents"));
-  assert.ok(content.includes("bottomStableRounds >= 5"));
+  assert.ok(content.includes("bottomStableRounds >= 8"));
   assert.ok(content.includes("if (timedOut) session.reachedEnd = false"));
   assert.ok(background.includes("GET_RUNNER_STATE"));
   assert.ok(background.includes("pause/abort/skip 只能来自上一轮残留"));
@@ -774,10 +893,13 @@ test("preview continuously collects on the source tab and filters once afterward
   const run = background.slice(runStart, runEnd);
   assert.ok(run.includes("previewTab = sourcePreviewTab"));
   assert.ok(run.includes("const collectedJobs = new Map()"));
-  assert.ok(run.includes("mergePreviewJobBatch(collectedJobs, more.jobs || [])"));
+  assert.ok(run.includes("mergePreviewJobBatch(collectedJobs, more?.jobs || [])"));
   assert.ok(run.indexOf("while (scan.scanMeta?.reachedEnd") < run.indexOf("const results = evaluatePreviewResults"));
   assert.equal((run.match(/evaluatePreviewResults\(/g) || []).length, 1);
-  assert.ok(run.includes("deadlineAt: scanStartedAt + maxElapsedMs") || run.includes("const deadlineAt = scanStartedAt + maxElapsedMs"));
+  assert.ok(run.includes("const previewDeadlineAt = scanStartedAt + maxElapsedMs"));
+  assert.ok(run.includes("previewDeadlineAt - OPERATION_TIMEOUTS.PREVIEW_RESULT_GRACE_MS"));
+  assert.ok(run.includes("scanDeadlinePartial"));
+  assert.ok(run.includes("continuous: true"));
   assert.ok(!run.includes("listExpectLabel: scanWorkerTab"));
 });
 

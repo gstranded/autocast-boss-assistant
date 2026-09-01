@@ -33,7 +33,9 @@ export function resolvePreviewScanStop({
     return {
       done: true,
       reason: PREVIEW_SCAN_STOP.TIMEOUT,
-      message: `已达到 ${Math.round(Number(maxElapsedMs || 0) / 1000)} 秒滚动上限，开始筛选当前累计岗位`
+      // Keep the exact deadline in scanMeta/debug logs; the panel only needs
+      // to communicate the next user-visible phase.
+      message: '正在筛选已加载岗位'
     };
   }
 
@@ -41,7 +43,7 @@ export function resolvePreviewScanStop({
     return {
       done: true,
       reason: PREVIEW_SCAN_STOP.REACHED_END,
-      message: '已滚动到职位列表底部，开始筛选'
+      message: '正在筛选已加载岗位'
     };
   }
 
@@ -49,7 +51,7 @@ export function resolvePreviewScanStop({
     return {
       done: true,
       reason: PREVIEW_SCAN_STOP.BATCH_ERROR,
-      message: String(batchError)
+      message: '加载岗位时遇到问题，正在筛选已加载岗位'
     };
   }
 

@@ -52,6 +52,7 @@ import {
 } from "../extension/shared/task-model.js";
 import { createOperationRegistry } from "../extension/background/operation-registry.js";
 import {
+  isScanResultWithinFinalizationWindow,
   OPERATION_TIMEOUTS,
   resolveBridgeTimeoutMs,
   resolvePageOperationTimeoutMs
@@ -1400,14 +1401,17 @@ test("operation registry returns and clears every active content operation", () 
   assert.equal(registry.size, 0);
 });
 
-test("preview collection uses a hard deadline while other bridges retain cleanup grace", () => {
+test("preview collection stops at its deadline and keeps a separate result grace", () => {
   const now = 1_000_000;
   const scanDeadline = now + OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS;
   const scanPageMs = resolvePageOperationTimeoutMs("BHT_SCAN_JOBS", { deadlineAt: scanDeadline }, now);
-  assert.equal(scanPageMs, OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS);
+  assert.equal(
+    scanPageMs,
+    OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS + OPERATION_TIMEOUTS.PREVIEW_RESULT_GRACE_MS
+  );
   assert.equal(
     resolvePageOperationTimeoutMs("BHT_SCAN_JOBS", { deadlineAt: now + 250 }, now),
-    250
+    250 + OPERATION_TIMEOUTS.PREVIEW_RESULT_GRACE_MS
   );
   assert.equal(
     resolveBridgeTimeoutMs(scanPageMs),
@@ -1424,6 +1428,25 @@ test("preview collection uses a hard deadline while other bridges retain cleanup
   assert.equal(resolvePageOperationTimeoutMs("BHT_RETURN_TO_LIST", {}, now), 30000);
   assert.equal(OPERATION_TIMEOUTS.BRIDGE_CANCEL_SETTLE_MS, 3000);
   assert.equal(OPERATION_TIMEOUTS.BRIDGE_CANCEL_POLL_MS, 100);
+  assert.equal(isScanResultWithinFinalizationWindow({ scanMeta: {} }, {
+    collectionDeadlineAt: now + 1000,
+    bridgeDeadlineAt: now + 4000,
+    storageCompletedAt: now + 900
+  }), true);
+  assert.equal(isScanResultWithinFinalizationWindow({
+    scanMeta: { collectionFinishedAt: now + 950, workCompletedAt: now + 1800 }
+  }, {
+    collectionDeadlineAt: now + 1000,
+    bridgeDeadlineAt: now + 4000,
+    storageCompletedAt: now + 2200
+  }), true);
+  assert.equal(isScanResultWithinFinalizationWindow({
+    scanMeta: { collectionFinishedAt: now + 1050, workCompletedAt: now + 1800 }
+  }, {
+    collectionDeadlineAt: now + 1000,
+    bridgeDeadlineAt: now + 4000,
+    storageCompletedAt: now + 2200
+  }), false);
 });
 
 test("operation dispatch gate observes cancellation before side effects start", async () => {
