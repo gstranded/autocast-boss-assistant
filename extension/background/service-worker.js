@@ -71,6 +71,7 @@ import {
   PREVIEW_SCAN_STOP,
   resolvePreviewScanStop
 } from '../shared/preview-scan-policy.js';
+import { isEnvironmentalFailure } from '../shared/environment-failures.js';
 
 const SPLIT_ZOOM_FACTOR = 0.8;
 const BHT_RUNTIME_VERSION = String(chrome.runtime.getManifest?.().version || 'unknown');
@@ -578,34 +579,45 @@ function previewScanDeadlineResult(extra = {}) {
   };
 }
 
+// 渲染进程繁忙/冻结时 executeScript 可能长时间不返回（日志里曾有 60-90s 黑洞）；
+// 用竞速限时包一层：超时返回 false，由调用方走失败快路径而不是无限等待。
+async function injectWithBudget(executePromise, budgetMs = 25000) {
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), budgetMs);
+  });
+  try {
+    return await Promise.race([
+      executePromise.then(() => true).catch(() => false),
+      timeout
+    ]);
+  } finally {
+    if (timer != null) clearTimeout(timer);
+  }
+}
+
 async function forceInjectContent(tabId, { deadlineAt = 0 } = {}) {
   if (deadlineReached(deadlineAt)) return false;
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["content/page-network-hook.js"],
-      world: "MAIN",
-      injectImmediately: true
-    });
-  } catch (_) {
-    // 受限页面可能拒绝 MAIN world；隔离世界仍可继续走设置与 DOM 兜底。
-  }
+  // MAIN 世界钩子失败可容忍（受限页面拒绝时隔离世界仍可走 DOM 兜底），只检查是否超时截止
+  await injectWithBudget(chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["content/page-network-hook.js"],
+    world: "MAIN",
+    injectImmediately: true
+  }), 20000);
   if (deadlineReached(deadlineAt)) return false;
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: [
-        "shared/trigger-navigation-recovery.js",
-        "shared/conversation-match.js",
-        "shared/operation-dispatch-gate.js",
-        "content/content-main.js"
-      ],
-      injectImmediately: true
-    });
-    return await sleepWithinDeadline(120, deadlineAt);
-  } catch (_) {
-    return false;
-  }
+  const isolatedOk = await injectWithBudget(chrome.scripting.executeScript({
+    target: { tabId },
+    files: [
+      "shared/trigger-navigation-recovery.js",
+      "shared/conversation-match.js",
+      "shared/operation-dispatch-gate.js",
+      "content/content-main.js"
+    ],
+    injectImmediately: true
+  }), 25000);
+  if (!isolatedOk) return false;
+  return await sleepWithinDeadline(120, deadlineAt);
 }
 
 
@@ -1037,34 +1049,72 @@ async function closeConversationWorkerTab(task, tabId, { reason = '', publish = 
   return { ok: true, tabId: workerTabId, closed: Boolean(workerTabId) };
 }
 
+// 从岗位详情 href 提取 jobId（/job_detail/<id>.html）；非详情页返回 ''
+function detailJobIdFromHref(href) {
+  try {
+    const path = String(href || '').split('#')[0];
+    const match = /\/job_detail\/([^/?#]+)/i.exec(path);
+    return match ? String(match[1]) : '';
+  } catch (_) {
+    return '';
+  }
+}
+
 async function openConversationWorkerTab(task, attempt, messageTab, job) {
   if (!task.execution) task.execution = {};
-  if (task.execution.workerTabId) {
-    await closeConversationWorkerTab(task, task.execution.workerTabId, {
-      reason: '创建新执行页前清理旧执行页',
-      publish: false
-    });
+  // 复用上一岗的执行页：直接导航新岗位，避免每岗新建冷加载标签页
+  // （减少 BOSS 限流触发、后台标签页冻结/慢加载，也避免用户看到新标签页反复弹出）。
+  let tab = null;
+  const previousTabId = task.execution.workerTabId || null;
+  if (previousTabId != null) {
+    try { tab = await chrome.tabs.get(previousTabId); } catch (_) { tab = null; }
   }
-  const createOptions = {
-    url: attempt.url,
-    active: false
-  };
-  const targetWindowId = messageTab?.windowId || task.execution.messageWindowId || null;
-  if (targetWindowId != null) createOptions.windowId = targetWindowId;
-  if (messageTab?.id) createOptions.openerTabId = messageTab.id;
-  const tab = await chrome.tabs.create(createOptions);
-  if (!tab?.id) throw new Error('临时沟通执行页创建失败');
+  let reused = Boolean(tab?.id);
+  if (reused) {
+    try {
+      await chrome.tabs.update(tab.id, { url: attempt.url, active: false });
+    } catch (_) {
+      tab = null;
+      reused = false;
+    }
+  }
+  if (!reused) {
+    const createOptions = {
+      url: attempt.url,
+      active: false
+    };
+    const targetWindowId = messageTab?.windowId || task.execution.messageWindowId || null;
+    if (targetWindowId != null) createOptions.windowId = targetWindowId;
+    if (messageTab?.id) createOptions.openerTabId = messageTab.id;
+    tab = await chrome.tabs.create(createOptions);
+    if (!tab?.id) throw new Error('临时沟通执行页创建失败');
+  }
+  // autoDiscardable 仅支持 tabs.update：创建后统一设置为不可被内存优化回收
+  try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (_) {}
   task.execution.workerTabId = tab.id;
   task.execution.workerMode = attempt.mode;
   task.execution.workerUrl = attempt.url;
   task.updatedAt = Date.now();
   await publishTask(task);
-  const ready = await waitTabComplete(tab.id, 30000);
+  // 复用导航给更长预算：SPA 冷加载在后台标签页可能超过 30s
+  const ready = await waitTabComplete(tab.id, reused ? 45000 : 30000);
   const readyUrl = ready?.url || ready?.pendingUrl || '';
   if (!ready?.id || !isBossUrl(readyUrl)) {
     throw new Error('临时沟通执行页未能加载 BOSS 岗位：' + String(readyUrl || attempt.url));
   }
-  await forceInjectContent(tab.id);
+  // 复用安全护栏：若导航未提交、waitTabComplete 把「上一岗位详情页」判为就绪，
+  // 后续会误点上一岗位的「立即沟通」。两页都是岗位详情且 jobId 不同 → 立即失败跳过。
+  if (reused) {
+    const expectJobId = detailJobIdFromHref(attempt.url);
+    const readyJobId = detailJobIdFromHref(readyUrl);
+    if (expectJobId && readyJobId && expectJobId !== readyJobId) {
+      throw new Error('临时沟通执行页导航未生效（仍停留在上一岗位详情），已跳过该岗位以防误点');
+    }
+  }
+  const injected = await forceInjectContent(tab.id);
+  if (!injected) {
+    throw new Error('临时沟通执行页内容脚本注入超时（页面可能繁忙或被冻结），已跳过该岗位');
+  }
   await sleep(250);
   return ready;
 }
@@ -1165,15 +1215,12 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
       };
       attemptResults.push({ mode: attempt.mode, url: attempt.url, ok: false, error: result.error });
     } finally {
-      if (workerTab?.id) {
-        await closeConversationWorkerTab(task, workerTab.id, {
-          reason: '本岗位沟通触发结束'
-        });
-      }
+      // 执行页跨岗位复用：不随岗位关闭；任务结束/停止时统一清理（见 closeConversationWorkerTab 调用点）
     }
 
     if (result?.ok || result?.filtered || operationAborted(result)) break;
-    const safeToFallback = /WORKER_CHAT_BUTTON_NOT_FOUND|WORKER_TAB_FAILED|CONTENT_INJECT_FAIL|TARGET_TAB_CLOSED/.test(
+    // 详情页环境失败可落 list 模式兜底（左侧卡片仍是真实源）；页面已跳转（NAVIGATED）不兜底，避免对已失效岗位重复触发
+    const safeToFallback = /WORKER_CHAT_BUTTON_NOT_FOUND|WORKER_PAGE_NOT_READY|WORKER_CHAT_CLICK_NO_EFFECT|WORKER_TAB_FAILED|CONTENT_INJECT_FAIL|TARGET_TAB_CLOSED/.test(
       String(result?.error || '')
     );
     if (!safeToFallback) break;
@@ -1192,7 +1239,9 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
   return {
     ...(result || { ok: false, error: 'WORKER_TRIGGER_EMPTY', message: '临时沟通执行页没有返回结果' }),
     workerMode: attemptResults[attemptResults.length - 1]?.mode || '',
-    workerTabClosed: true,
+    workerTabClosed: false,
+    // 环境类异常（页面未就绪/点击无效果/执行页失败/超时）：队列自动继续，不阻塞等待用户
+    environmental: isEnvironmentalFailure(result),
     listPreserved,
     listBefore,
     listAfter,
@@ -1302,7 +1351,18 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
   if (needInject) {
     if (isCancelled()) return cancelledResult();
     if (scanDeadlineAt && Date.now() >= scanDeadlineAt) return scanDeadlineResult();
-    await forceInjectContent(tab.id, { deadlineAt: scanDeadlineAt });
+    const injectedOk = await forceInjectContent(tab.id, { deadlineAt: scanDeadlineAt });
+    if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) return scanDeadlineResult();
+    if (isCancelled()) return cancelledResult();
+    if (!injectedOk) {
+      // 注入超时/失败：立即走环境失败快路径，不等 ping 再绕一轮
+      return {
+        ok: false,
+        error: 'CONTENT_INJECT_FAIL',
+        message: 'BOSS 页面脚本注入失败或超时（页面可能繁忙/被冻结），已自动跳过该岗位',
+        tabId: tab.id
+      };
+    }
     if (!await sleepWithinDeadline(180, scanDeadlineAt)) return scanDeadlineResult();
     if (isCancelled()) return cancelledResult();
     if (scanDeadlineAt && Date.now() >= scanDeadlineAt) return scanDeadlineResult();
@@ -2565,7 +2625,7 @@ async function processOneJob(task, resultRow, config) {
       trig?.ok ? 'success' : (trig?.filtered ? 'info' : 'error'),
       trig?.ok
         ? ('[执行页] 已触发沟通 btn=' + (trig.buttonText || '') +
-          (trig.navigated ? ' · BOSS 跳转发生在临时页（已关闭）' : (trig.stayed ? ' · 已点留在此页' : ' · 无需留在此页弹窗')) +
+          (trig.navigated ? ' · BOSS 跳转在临时页完成' : (trig.stayed ? ' · 已点留在此页' : ' · 无需留在此页弹窗')) +
           (trig.listPreserved ? ' · 左侧筛选保持' : ' · 左侧页面需检查') +
           (trig.already ? ' · 继续沟通' : ''))
         : (trig?.filtered
@@ -2608,6 +2668,11 @@ async function processOneJob(task, resultRow, config) {
         task.counters.skipped += 1;
         await appendHistory({ jobId: job.jobId, title: job.title, company: job.company, status: 'skipped_list', taskId: task.id });
         return 'skipped';
+      }
+      // 环境类失败（岗位页未就绪/点击无效果/执行页异常等）：队列自动继续，不阻塞等待用户
+      if (trig?.environmental === true || isEnvironmentalFailure(trig)) {
+        resultRow.envAutoSkip = true;
+        item.reasons = [trig?.message || trig?.error || '岗位页面环境异常'];
       }
       task.counters.failed += 1;
       task.consecutiveFails += 1;
@@ -3075,6 +3140,8 @@ async function processOneJob(task, resultRow, config) {
           item.reasons = [reasonText(REASON.EXEC_SEND_IMAGE_FAIL, imgRes?.message || imgRes?.error || '图片发送未确认')];
           task.pauseReason = item.reasons[0];
           task.lastErrorDetail = '岗位：' + (job.title || '') + ' @ ' + (job.company || '') + '\n图片简历发送未确认';
+          // 图片发送失败属环境类异常（上传慢/未确认）：标记失败并自动继续下一岗，不暂停整批
+          resultRow.envAutoSkip = true;
           task.counters.failed += 1;
           task.consecutiveFails += 1;
           await bumpDailyStat('fail');
@@ -3198,6 +3265,11 @@ async function runTaskLoop(taskId) {
       config = await getAllConfig();
       task = config.task;
       if (!task) break;
+      // 唤醒即恢复运行状态（手动暂停/失败暂停后继续或跳过都可能带旧 paused 快照）
+      if (task.status === TASK_STATUS.PAUSED) {
+        task.status = TASK_STATUS.RUNNING;
+        task.pauseReason = '';
+      }
 
       // 持久化游标：queue 状态优先（SW 重启后仍能续跑）
       const qMeta = (task.queue || [])[qi] || (task.queue || []).find((x) => x.jobId === row.job?.jobId);
@@ -3277,6 +3349,8 @@ async function runTaskLoop(taskId) {
             const prev = Array.isArray(task.testedJobIds) ? task.testedJobIds.map(String) : [];
             if (!prev.includes(id)) task.testedJobIds = [...prev, id];
           }
+          // 跳过（HR 活跃不满足等）证明队列健康：打断连续失败计数，失败与跳过穿插时不再误熔断
+          if (outcome === 'skipped') task.consecutiveFails = 0;
           await publishTask(task);
         }
         await log('info', '队列项结果：' + (row.job?.title || '') + ' → ' + outcome + '（' + (qi + 1) + '/' + queue.length + '）', { jobId: row.job?.jobId });
@@ -3329,6 +3403,49 @@ async function runTaskLoop(taskId) {
           outcome = 'aborted';
           break;
         }
+        // 环境类失败（页面加载/触发/图片/首段发送等基础设施问题）：自动继续下一岗，
+        // 只连续达到阈值才暂停，避免单个慢页面卡住整批并反复暂停等待用户。
+        if (row?.envAutoSkip === true) {
+          delete row.envAutoSkip;
+          // 图片/首段发送类环境失败可能仍在会话页：先回列表再继续，避免下一岗状态错乱
+          try { await softReturnToList(task); } catch (_) {}
+          const threshold = Math.max(1, Number(config?.settings?.consecutiveFailPause || 3));
+          if (task.consecutiveFails >= threshold) {
+            task.status = TASK_STATUS.PAUSED;
+            task.pauseReason = reasonText(REASON.EXEC_CONSECUTIVE_FAIL);
+            task.awaitingUserRetry = true;
+            task.uiErrorDismissed = false;
+            task.retryCurrent = false;
+            task.errorKey = [task.id || '', row.job?.jobId || '', task.pauseReason || ''].join('|');
+            task.lastErrorDetail = ['岗位：' + (row.job?.title || ''), '公司：' + (row.job?.company || ''), '原因：' + ((task.items.find((x) => x.jobId === row.job.jobId) || {}).reasons || []).join('；')].filter(Boolean).join('\n');
+            runner.pause = true;
+            await publishTask(task);
+            if (!runner.pauseLogged) { runner.pauseLogged = true; await log('error', task.pauseReason); }
+            await waitWhilePaused();
+            if (runner.abort) {
+              outcome = 'aborted';
+              break;
+            }
+            config = await getAllConfig();
+            task = config.task;
+            if (!task) break;
+            task.status = TASK_STATUS.RUNNING;
+            task.pauseReason = '';
+            task.awaitingUserRetry = false;
+            task.consecutiveFails = 0;
+            task.retryCurrent = false;
+            await publishTask(task);
+            break;
+          }
+          task.awaitingUserRetry = false;
+          task.status = TASK_STATUS.RUNNING;
+          task.pauseReason = '';
+          await log('warn', `[自动跳过] 岗位页面环境异常，已自动继续（连续失败 ${task.consecutiveFails}/${threshold} 次，达到 ${threshold} 次将暂停）：` + (itemErrorHint(task, row) || '页面未就绪'), {
+            jobId: row.job?.jobId || ''
+          });
+          await publishTask(task);
+          break;
+        }
         // 回列表，避免卡在会话页
         try { await softReturnToList(task); } catch (_) {}
         await sleep(400);
@@ -3355,6 +3472,10 @@ async function runTaskLoop(taskId) {
         config = await getAllConfig();
         task = config.task;
         if (!task) break;
+        // 唤醒即恢复运行状态：RESUME_TASK 的 RUNNING 写入可能与循环的旧快照发布竞态，
+        // 若循环带着 paused 状态继续发布，面板会一直显示「已暂停」（后台实际仍在投递）。
+        task.status = TASK_STATUS.RUNNING;
+        task.pauseReason = '';
         const it = task.items?.find((x) => x.jobId === row.job.jobId);
         if (it && it.state === 'NOT_STARTED' && task.retryCurrent === true) {
           // 用户点了重试：再试当前岗位
@@ -3953,12 +4074,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return guard;
           }
         }
-        runner.pause = false;
-        runner.abort = false;
         const all = await getAllConfig();
         if (!all.task) return { ok: false, error: 'NO_TASK' };
+        // 先把状态写回 RUNNING 再释放暂停：循环唤醒后读到的才是新状态，
+        // 避免循环用旧 paused 快照发布导致面板一直显示「已暂停」。
         all.task.status = TASK_STATUS.RUNNING;
+        all.task.pauseReason = '';
         await publishTask(all.task);
+        runner.pause = false;
+        runner.abort = false;
         if (!runner.running) runTaskLoop(all.task.id);
         await log('info', payload?.retry ? '重试当前岗位' : '继续任务');
         return { ok: true };

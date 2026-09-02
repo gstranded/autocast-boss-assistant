@@ -27,7 +27,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.18";
+  const BHT_CONTENT_VERSION = "1.7.19";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -121,8 +121,16 @@
 
   const log = (...args) => console.log("[BHT content]", ...args);
 
-  function debugTrace(event, data = {}, level = "debug") {
+  const debugTraceThrottles = Object.create(null);
+  function debugTrace(event, data = {}, level = "debug", throttleMs = 0) {
     if (window.__BHT_DEBUG_ENABLED__ !== true) return;
+    // 高频事件（DOM 变更/事件）按事件名限流，避免日志洪水挤占运行时消息通道
+    if (throttleMs > 0) {
+      const nowMs = Date.now();
+      const prevMs = Number(debugTraceThrottles[event] || 0);
+      if (nowMs - prevMs < throttleMs) return;
+      debugTraceThrottles[event] = nowMs;
+    }
     try {
       chrome.runtime.sendMessage({
         type: MSG.DEBUG_EVENT,
@@ -208,6 +216,8 @@
         !window.__BHT_ACTIVE_OP_ID__ ||
         window.__BHT_ACTIVE_OP_TYPE__ === MSG.SCAN_JOBS
       ) return;
+      // mousedown/mouseup/input/change 每操作数十条；只留 click/submit 且限流，日志洪峰不再挤占通道
+      if (event.type !== "click" && event.type !== "submit") return;
       debugTrace("dom_event", {
         type: event.type,
         isTrusted: Boolean(event.isTrusted),
@@ -222,7 +232,7 @@
           shift: Boolean(event.shiftKey)
         },
         target: describeDebugElement(event.target)
-      });
+      }, "debug", 300);
     };
     eventTypes.forEach((type) => document.addEventListener(type, onDomEvent, true));
 
@@ -273,7 +283,7 @@
             addedCount,
             removedCount,
             samples: mutationSamples
-          });
+          }, "debug", 400);
           mutationTimer = 0;
           mutationCount = 0;
           addedCount = 0;
@@ -3614,7 +3624,8 @@ async function startChat(job, opts = {}) {
   async function waitForImageSendConfirm(before, via) {
     let after = before;
     let confirmedVia = "";
-    for (let i = 0; i < 24; i++) {
+    // 图片上传比文本慢：15 秒内轮询，命中即返回（正常 1~2 秒内确认）
+    for (let i = 0; i < 60; i++) {
       await sleep(250);
       after = getSelfMediaSignature(30);
       confirmedVia = confirmImageSent(before, after);
@@ -3739,7 +3750,18 @@ async function startChat(job, opts = {}) {
       input.dispatchEvent(new Event("change", { bubbles: true }));
       input.dispatchEvent(new Event("input", { bubbles: true }));
       await sleep(1000);
-      const sendBtn = findSendButton();
+      // BOSS 的发送按钮在附件未就绪时会处于 disabled：先等按钮真正可用再点，
+      // 避免点击被吞导致图片从未送出（class 恒带 disabled 字样，只能看属性）。
+      const btnReady = (btn) =>
+        Boolean(btn) &&
+        btn.disabled !== true &&
+        btn.getAttribute("disabled") == null &&
+        btn.getAttribute("aria-disabled") !== "true";
+      let sendBtn = findSendButton();
+      for (let i = 0; i < 10 && !btnReady(sendBtn); i++) {
+        await sleep(400);
+        sendBtn = findSendButton();
+      }
       if (sendBtn) clickLikeHuman(sendBtn);
       const confirm = Array.from(document.querySelectorAll("button,a,.btn")).find(
         (el) => /发送|确定|完成/.test(textOf(el)) && !/取消|关闭/.test(textOf(el))
@@ -4020,6 +4042,12 @@ async function startChat(job, opts = {}) {
     return result;
   }
 
+  // 岗位详情页内点击「立即沟通」后，BOSS 会 SPA 跳转/整页刷新到会话页；
+  // 检测是否已开始离开详情页（此时应由导航恢复逻辑收尾，本页不再重复操作）。
+  function isConversationNavigationStarted() {
+    return !/\/job_detail\//i.test(location.pathname) || document.readyState === "loading";
+  }
+
   async function triggerConversationOnWorkerDetail(job = {}) {
     debugTrace("worker_detail_trigger_begin", {
       job: {
@@ -4041,40 +4069,135 @@ async function startChat(job, opts = {}) {
     const nativeReceiptStartedAt = Date.now();
     let clicked = { ok: false, buttonText: "", already: false };
     let detailTitle = "";
-    for (let i = 0; i < 18; i++) {
-      const scope =
-        firstEl(SELECTORS.detailRoot) ||
-        document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
-        document;
-      detailTitle =
-        textOf(firstEl(SELECTORS.title, scope)) ||
-        textOf(document.querySelector(".job-detail .job-name, .job-detail-box .job-name, h1.job-name")) ||
-        detailTitle;
-      const btn = findConversationActionButton(scope);
-      if (btn) {
-        const buttonText = textOf(btn);
-        const clickOk = clickLikeHuman(btn);
-        clicked = { ok: clickOk, buttonText, already: /继续沟通/.test(buttonText) };
-        window.__BHT_LAST_TRIGGER_CLICK__ = {
-          at: Date.now(),
-          jobId: String(job.jobId || job.encryptJobId || ""),
-          buttonText,
-          already: clicked.already,
-          detailTitle: detailTitle || job.title || "",
-          hrName: extractDetailHrName(scope) || job.hrName || job.bossName || "",
-          company: extractDetailCompany(scope) || job.company || "",
-          title: detailTitle || job.title || "",
-          listHref: job.listHref || ""
-        };
-        debugTrace("worker_detail_chat_button_clicked", {
-          buttonText,
-          clickOk,
-          button: describeDebugElement(btn),
-          page: pageInfo()
-        }, clickOk ? "debug" : "error");
+
+    // 就绪门：岗位详情是重型 SPA，按钮 DOM 可能先于 BOSS 事件绑定出现；
+    // 页面未渲染完整时点击只会无效，随后苦等超时「卡住」。页面就绪判据：
+    //  1) 岗位标题 + 按钮同时出现（最可靠）；或
+    //  2) 文档加载完成且按钮连续存在 ≥1.5s（标题选择器未命中的布局兜底）。
+    // 非详情页（复用标签停在旧页/已跳转）稳定 ≥1.5s 快速失败，不空等 12s。
+    const renderGateAt = Date.now();
+    const RENDER_GATE_MS = 12000;
+    const BUTTON_STABLE_MS = 1500;
+    const WRONG_PAGE_GRACE_MS = 1500;
+    let pageUsable = false;
+    let scopeRoot = document;
+    let gateBtn = null;
+    let btnFirstSeenAt = 0;
+    let nonDetailAt = 0;
+    for (;;) {
+      const isDetailPage = /\/job_detail\//i.test(location.pathname);
+      const nowMs = Date.now();
+      if (isDetailPage) {
+        nonDetailAt = 0;
+        const scope =
+          firstEl(SELECTORS.detailRoot) ||
+          document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+          document;
+        const title = textOf(firstEl(SELECTORS.title, scope)) ||
+          textOf(document.querySelector(".job-detail .job-name, .job-detail-box .job-name, h1.job-name")) ||
+          "";
+        gateBtn = findConversationActionButton(scope);
+        if (gateBtn && !btnFirstSeenAt) btnFirstSeenAt = nowMs;
+        const loginHit = typeof detectLoginModal === "function" ? detectLoginModal() : null;
+        if (loginHit?.ok) {
+          return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+        }
+        const btnStable = gateBtn && (nowMs - btnFirstSeenAt) >= BUTTON_STABLE_MS;
+        if (document.readyState === "complete" && gateBtn && (title || btnStable)) {
+          pageUsable = true;
+          scopeRoot = scope;
+          detailTitle = title;
+          break;
+        }
+      } else if (!nonDetailAt) {
+        nonDetailAt = nowMs;
+      }
+      // 稳定非详情页（旧页/跳转后页）：宽限 1.5s 后立即失败，交给兜底/导航恢复
+      if (!isDetailPage && nonDetailAt && (nowMs - nonDetailAt) >= WRONG_PAGE_GRACE_MS) {
         break;
       }
+      if (nowMs - renderGateAt >= RENDER_GATE_MS) {
+        if (!isDetailPage) {
+          // 点击已触发页面跳转：交给导航恢复逻辑，不在此报错
+          break;
+        }
+        const notReady = {
+          ok: false,
+          error: "WORKER_PAGE_NOT_READY",
+          message: "岗位详情页长时间未渲染完成（页面加载慢或可能被 BOSS 限流），已自动跳过该岗位",
+          detailTitle,
+          href: location.href,
+          page: pageInfo(),
+          contentVersion: BHT_CONTENT_VERSION
+        };
+        debugTrace("worker_detail_page_not_ready", notReady, "warn");
+        return notReady;
+      }
       await sleep(250);
+    }
+    if (!pageUsable) {
+      // 页面已跳转（点击前）：无按钮可点，交给导航恢复；直接返回未知态避免卡死
+      if (!clicked.ok) {
+        const unknown = {
+          ok: false,
+          error: "WORKER_CHAT_BUTTON_NOT_FOUND",
+          message: "临时执行页已离开岗位详情（可能已跳转），等待导航恢复",
+          detailTitle,
+          href: location.href,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+        debugTrace("worker_detail_chat_button_not_found", unknown, "warn");
+        return unknown;
+      }
+    } else {
+      const btn = gateBtn || findConversationActionButton(scopeRoot);
+      if (!btn) {
+        const missing = {
+          ok: false,
+          error: "WORKER_CHAT_BUTTON_NOT_FOUND",
+          message: "临时执行页未找到「立即沟通」按钮",
+          detailTitle,
+          href: location.href,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+        debugTrace("worker_detail_chat_button_not_found", missing, "warn");
+        return missing;
+      }
+      const buttonText = textOf(btn);
+      const clickOk = clickLikeHuman(btn);
+      clicked = { ok: clickOk, buttonText, already: /继续沟通/.test(buttonText) };
+      window.__BHT_LAST_TRIGGER_CLICK__ = {
+        at: Date.now(),
+        jobId: String(job.jobId || job.encryptJobId || ""),
+        buttonText,
+        already: clicked.already,
+        detailTitle: detailTitle || job.title || "",
+        hrName: extractDetailHrName(scopeRoot) || job.hrName || job.bossName || "",
+        company: extractDetailCompany(scopeRoot) || job.company || "",
+        title: detailTitle || job.title || "",
+        listHref: job.listHref || ""
+      };
+      debugTrace("worker_detail_chat_button_clicked", {
+        buttonText,
+        clickOk,
+        button: describeDebugElement(btn),
+        page: pageInfo()
+      }, clickOk ? "debug" : "error");
+    }
+
+    const isDetailPageNow = () => /\/job_detail\//i.test(location.pathname);
+    if (!clicked.ok && !isDetailPageNow()) {
+      // 点击后页面已跳转：无按钮可点，交给导航恢复
+      const unknown = {
+        ok: false,
+        error: "WORKER_CHAT_BUTTON_NOT_FOUND",
+        message: "临时执行页已离开岗位详情（可能已跳转），等待导航恢复",
+        detailTitle,
+        href: location.href,
+        contentVersion: BHT_CONTENT_VERSION
+      };
+      debugTrace("worker_detail_chat_button_not_found", unknown, "warn");
+      return unknown;
     }
 
     if (!clicked.ok) {
@@ -4103,22 +4226,65 @@ async function startChat(job, opts = {}) {
       if (!stay.ok) await sleep(50);
     }
     dismissCommonDialogs();
-    const nativeGreeting = clicked.already
+    let nativeGreeting = clicked.already
       ? { available: false, showGreeting: null, text: "", source: "already-contacted" }
       : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 3200);
+
     if (!clicked.already && !nativeGreeting.available) {
-      const unconfirmed = {
-        ok: false,
-        error: "CONVERSATION_CREATE_NOT_CONFIRMED",
-        message: "已尝试点击「立即沟通」，但未收到 BOSS 创建会话成功回执；已停止，避免误报成功",
-        buttonText: clicked.buttonText,
-        detailTitle: detailTitle || job.title || "",
-        href: location.href,
-        nativeGreeting,
-        contentVersion: BHT_CONTENT_VERSION
-      };
-      debugTrace("worker_detail_trigger_unconfirmed", unconfirmed, "error");
-      return unconfirmed;
+      // 无回执且页面既未跳转也未弹窗：BOSS 事件绑定可能晚于 DOM 出现，补点一次后仍无效果才快速失败
+      const retryScope =
+        firstEl(SELECTORS.detailRoot) ||
+        document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+        document;
+      const retryBtn = findConversationActionButton(retryScope);
+      const retryText = retryBtn ? textOf(retryBtn) : "";
+      const noDialog = typeof detectLoginModal !== "function" || !detectLoginModal().ok;
+      const stillOnDetail = isDetailPageNow() && !isConversationNavigationStarted();
+      if (retryBtn && retryText === clicked.buttonText && noDialog && stillOnDetail) {
+        debugTrace("worker_detail_click_retry", {
+          reason: "no-receipt-no-navigation",
+          buttonText: retryText,
+          page: pageInfo()
+        }, "warn");
+        clickLikeHuman(retryBtn);
+        // afterTs 与首次等待尾部重叠，避免回执恰好在两次等待之间到达被漏掉
+        const retryGreeting = await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt + 2500, 4200);
+        if (retryGreeting.available) {
+          nativeGreeting = retryGreeting;
+        } else if (!stillOnDetail || isConversationNavigationStarted()) {
+          // 补点后开始跳转：由导航恢复收尾，本页按成功进入下一阶段（消息页会做最终核对）
+          nativeGreeting = { available: true, showGreeting: null, text: "", source: "navigation-recovery" };
+        } else {
+          const noEffect = {
+            ok: false,
+            error: "WORKER_CHAT_CLICK_NO_EFFECT",
+            message: "已点击「立即沟通」但 BOSS 一直未响应（页面加载未完成或触发未生效），已自动跳过该岗位",
+            buttonText: clicked.buttonText,
+            detailTitle: detailTitle || job.title || "",
+            href: location.href,
+            page: pageInfo(),
+            contentVersion: BHT_CONTENT_VERSION
+          };
+          debugTrace("worker_detail_click_no_effect", noEffect, "error");
+          return noEffect;
+        }
+      } else if (!stillOnDetail) {
+        // 点击后开始跳转：由导航恢复收尾，本页不返回失败
+        nativeGreeting = { available: true, showGreeting: null, text: "", source: "navigation-recovery" };
+      } else {
+        const unconfirmed = {
+          ok: false,
+          error: "CONVERSATION_CREATE_NOT_CONFIRMED",
+          message: "已尝试点击「立即沟通」，但未收到 BOSS 创建会话成功回执；已停止，避免误报成功",
+          buttonText: clicked.buttonText,
+          detailTitle: detailTitle || job.title || "",
+          href: location.href,
+          nativeGreeting,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+        debugTrace("worker_detail_trigger_unconfirmed", unconfirmed, "error");
+        return unconfirmed;
+      }
     }
     const result = {
       ok: true,

@@ -1,9 +1,11 @@
 const DEBUG_LOG_KEY = 'bht_debug_logs_session';
 const MAX_ENTRIES = 5000;
-const MAX_SERIALIZED_BYTES = 5 * 1024 * 1024;
+const MAX_SERIALIZED_BYTES = 3 * 1024 * 1024;
+const FLUSH_INTERVAL_MS = 600;
+const MAX_PENDING_ENTRIES = 20000;
 let writeChain = Promise.resolve();
 let pendingEntries = [];
-let flushPromise = null;
+let flushScheduled = false;
 
 function cleanString(value, maxLength = 8000) {
   const text = String(value ?? '');
@@ -46,39 +48,53 @@ function trimToBudget(entries) {
   while (rows.length > 100) {
     const bytes = new Blob([JSON.stringify(rows)]).size;
     if (bytes <= MAX_SERIALIZED_BYTES) break;
-    rows = rows.slice(Math.max(1, Math.floor(rows.length * 0.1)));
+    // 超过预算优先丢最旧 40%，保证每次落盘成本可控（3MB 以内）。
+    rows = rows.slice(Math.max(1, Math.floor(rows.length * 0.6)));
   }
   return rows;
 }
 
-function ensureFlush() {
-  if (flushPromise) return flushPromise;
-  flushPromise = new Promise((resolve) => setTimeout(resolve, 120)).then(async () => {
-    const batch = pendingEntries.splice(0);
-    writeChain = writeChain.then(async () => {
-      if (!batch.length || !globalThis.chrome?.storage?.session) return null;
-      const bag = await chrome.storage.session.get(DEBUG_LOG_KEY);
-      const current = Array.isArray(bag?.[DEBUG_LOG_KEY]) ? bag[DEBUG_LOG_KEY] : [];
-      const next = trimToBudget([...current, ...batch]);
-      await chrome.storage.session.set({ [DEBUG_LOG_KEY]: next });
-      return next[next.length - 1] || null;
-    }).catch(() => null);
-    const result = await writeChain;
-    flushPromise = null;
-    if (pendingEntries.length) await ensureFlush();
-    return result;
-  });
-  return flushPromise;
+async function writeBatch(batch) {
+  if (!batch.length || !globalThis.chrome?.storage?.session) return null;
+  const bag = await chrome.storage.session.get(DEBUG_LOG_KEY);
+  const current = Array.isArray(bag?.[DEBUG_LOG_KEY]) ? bag[DEBUG_LOG_KEY] : [];
+  const next = trimToBudget([...current, ...batch]);
+  await chrome.storage.session.set({ [DEBUG_LOG_KEY]: next });
+  return next[next.length - 1] || null;
 }
 
+function scheduleFlush() {
+  if (flushScheduled || !pendingEntries.length) return;
+  flushScheduled = true;
+  setTimeout(async () => {
+    flushScheduled = false;
+    const batch = pendingEntries.splice(0);
+    if (batch.length) {
+      // 统一串行写，保证顺序；但调用方绝不等待这条链——日志写入不得阻塞任务主流程。
+      writeChain = writeChain.then(() => writeBatch(batch)).catch(() => null);
+    }
+    // 极端高频时丢弃最旧一半，防止内存无界增长
+    if (pendingEntries.length > MAX_PENDING_ENTRIES) {
+      pendingEntries.splice(0, pendingEntries.length - Math.floor(MAX_PENDING_ENTRIES / 2));
+    }
+  }, FLUSH_INTERVAL_MS);
+}
+
+// 立即入队并返回：日志落盘在后台批量完成，任何 await 都不会等待 storage。
 export function appendSessionDebugLog(entry) {
   pendingEntries.push(sanitizeDebugValue(entry));
-  return ensureFlush().then(() => entry).catch(() => null);
+  scheduleFlush();
+  return Promise.resolve(entry);
 }
 
 export async function getSessionDebugLogs() {
-  if (pendingEntries.length) await ensureFlush();
+  // 导出一致性：等待已排队写入完成；若有新进条目，再同步批量落盘一次。
   await writeChain;
+  if (pendingEntries.length) {
+    const batch = pendingEntries.splice(0);
+    writeChain = writeChain.then(() => writeBatch(batch)).catch(() => null);
+    await writeChain;
+  }
   if (!globalThis.chrome?.storage?.session) return [];
   const bag = await chrome.storage.session.get(DEBUG_LOG_KEY);
   return Array.isArray(bag?.[DEBUG_LOG_KEY]) ? bag[DEBUG_LOG_KEY] : [];

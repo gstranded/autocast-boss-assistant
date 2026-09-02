@@ -1,5 +1,5 @@
 (() => {
-  const BHT_FLOAT_HOST_VERSION = "1.7.18";
+  const BHT_FLOAT_HOST_VERSION = "1.7.19";
   if (window.__BHT_FLOAT_HOST_VERSION__ === BHT_FLOAT_HOST_VERSION && window.__BHT_FLOAT_HOST__) return;
   window.__BHT_FLOAT_HOST_VERSION__ = BHT_FLOAT_HOST_VERSION;
   window.__BHT_FLOAT_HOST__ = true;
@@ -128,8 +128,8 @@
     if (open) {
       if (frame) {
         // FORCE_IFRAME_RELOAD: 每次打开都带版本号，避免浮窗卡在旧 UI
-        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=1.7.17");
-        if (!frame.src || !frame.src.includes("v=1.7.17")) {
+        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=" + BHT_FLOAT_HOST_VERSION);
+        if (!frame.src || !frame.src.includes("v=" + BHT_FLOAT_HOST_VERSION)) {
           frame.src = next;
         }
         try { frame.contentWindow?.postMessage({ source: "bht-host", cmd: "resume" }, "*"); } catch (_) {}
@@ -457,7 +457,15 @@
         if (/invalidated|Receiving end does not exist|message port closed/i.test(err)) {
           // Receiving end 可能只是 SW 休眠，不一律当失效
           if (/invalidated/i.test(err)) markContextDead(err);
+          return;
         }
+        // 自愈：面板打开状态因页面重载/宿主重建而丢时（分屏搬移窗口等），探测到运行时可用后自动恢复
+        try {
+          if (sessionStorage.getItem(STORAGE_OPEN) === "1") {
+            const panel = document.getElementById("bht-panel");
+            if (panel && panel.hidden) setOpen(true);
+          }
+        } catch (_) {}
       });
     } catch (e) {
       markContextDead(String(e?.message || e));

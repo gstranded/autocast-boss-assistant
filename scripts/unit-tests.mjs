@@ -52,6 +52,8 @@ import {
   shouldAcceptTaskSnapshot
 } from "../extension/shared/task-model.js";
 import { createOperationRegistry } from "../extension/background/operation-registry.js";
+import { isEnvironmentalFailure, ENV_AUTO_CONTINUE_ERRORS } from "../extension/shared/environment-failures.js";
+import { appendSessionDebugLog, getSessionDebugLogs } from "../extension/shared/debug-log.js";
 import {
   isScanResultWithinFinalizationWindow,
   OPERATION_TIMEOUTS,
@@ -1680,6 +1682,89 @@ test("legacy persistent worker-tab delivery path stays removed", () => {
   assert.ok(!background.includes("function openQueueJobOnWorker"));
   assert.ok(background.includes("buildDeliveryQueue"));
   assert.ok(background.includes("collectDoneJobIds"));
+});
+
+console.log("13) v1.7.19 environment failure auto-skip classification");
+test("env auto-continue classifies infrastructure errors only", () => {
+  const envErrors = [
+    "WORKER_PAGE_NOT_READY",
+    "WORKER_CHAT_CLICK_NO_EFFECT",
+    "WORKER_CHAT_BUTTON_NOT_FOUND",
+    "WORKER_TAB_FAILED",
+    "WORKER_TRIGGER_EXCEPTION",
+    "WORKER_TRIGGER_EMPTY",
+    "WORKER_TARGET_MISSING",
+    "TARGET_TAB_CLOSED",
+    "RUN_OP_NOT_SUPPORTED",
+    "CONTENT_INJECT_FAIL",
+    "OP_BRIDGE_TIMEOUT",
+    "OP_DEADLINE_EXCEEDED",
+    "NO_BOSS_TAB",
+    "NAVIGATED"
+  ];
+  for (const error of envErrors) {
+    assert.ok(ENV_AUTO_CONTINUE_ERRORS.has(error), 'env set must contain ' + error);
+    assert.equal(isEnvironmentalFailure({ ok: false, error }), true, error);
+  }
+  // 需要用户确认/真实业务失败仍走原暂停流程
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "LOGIN_REQUIRED" }), false, "login still pauses");
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "CONVERSATION_CREATE_NOT_CONFIRMED" }), false, "unconfirmed receipt still pauses");
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "FILTER_ACTIVE" }), false, "filter skip is separate");
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "SEND_NOT_CONFIRMED" }), false, "mid-send failure still pauses");
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "DETAIL_IDENTITY_MISMATCH" }), false, "identity mismatch still pauses");
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "NAVIGATED" }), true, "temp page navigation interrupt is env");
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "IMAGE_SEND_NOT_CONFIRMED" }), false, "image confirm miss is stamped via envAutoSkip flag path");
+  assert.equal(isEnvironmentalFailure({ ok: true, error: "" }), false, "success is never env");
+  assert.equal(isEnvironmentalFailure(null), false);
+  assert.equal(isEnvironmentalFailure(undefined), false);
+  assert.equal(isEnvironmentalFailure({ ok: false }), false, "missing error key is not env");
+});
+
+console.log("14) v1.7.19 debug log never blocks the runner");
+test("debug log append is non-blocking and bursts coalesce into one flush", async () => {
+  let setCalls = 0;
+  const store = new Map();
+  globalThis.chrome = globalThis.chrome || {};
+  globalThis.chrome.storage = globalThis.chrome.storage || {};
+  globalThis.chrome.storage.session = {
+    get: async (key) => ({ [key]: store.get(key) }),
+    set: async (obj) => {
+      for (const [k, v] of Object.entries(obj)) store.set(k, v);
+      setCalls += 1;
+    }
+  };
+  const t0 = Date.now();
+  for (let i = 0; i < 300; i++) {
+    await appendSessionDebugLog({ ts: i, level: "debug", scope: "test", event: "bulk_" + i, data: { n: i } });
+  }
+  const appendMs = Date.now() - t0;
+  assert.ok(appendMs < 700, "appends must not wait for storage flush, took " + appendMs + "ms");
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  const bag = await getSessionDebugLogs();
+  assert.equal(bag.length, 300, "all entries persisted");
+  assert.ok(setCalls <= 2, "burst coalesced into few flushes, got " + setCalls);
+  assert.equal(bag[bag.length - 1].event, "bulk_299", "newest entry survives");
+});
+
+test("debug log trims to budget keeping newest entries", async () => {
+  for (let i = 0; i < 6000; i++) {
+    await appendSessionDebugLog({ ts: 100000 + i, level: "debug", scope: "test", event: "trim_" + i });
+  }
+  const trimmed = await getSessionDebugLogs();
+  assert.ok(trimmed.length <= 5000, "trimmed to max entries, got " + trimmed.length);
+  assert.equal(trimmed[trimmed.length - 1].event, "trim_5999", "newest kept after trim");
+  assert.ok(!trimmed.some((entry) => entry.event === "bulk_0"), "oldest dropped after trim");
+});
+
+test("debug log never blocks a caller even while a flush is in flight", async () => {
+  const t0 = Date.now();
+  await Promise.all([
+    appendSessionDebugLog({ ts: 1, event: "inflight_a" }),
+    appendSessionDebugLog({ ts: 2, event: "inflight_b" }),
+    appendSessionDebugLog({ ts: 3, event: "inflight_c" })
+  ]);
+  const elapsedMs = Date.now() - t0;
+  assert.ok(elapsedMs < 300, "concurrent appends must not serialize on storage, took " + elapsedMs + "ms");
 });
 
 

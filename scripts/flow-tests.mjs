@@ -1132,9 +1132,10 @@ test("retry resumes after chat trigger without clicking the list twice", () => {
   assert.ok(!content.includes("sleep(opTimeoutMs).then"), "completed operations must not emit a later false timeout");
 });
 
-await runRegisteredTests();
 
-if (!process.exitCode) console.log("flow contract tests ok");
+
+
+
 
 
 {
@@ -1151,3 +1152,156 @@ if (!process.exitCode) console.log("flow contract tests ok");
   assert.ok(!html.includes("投递一份测试"));
   console.log("  PASS test delivery picks next untested job helper");
 }
+
+test("v1.7.19 worker tab reuse, inject budget and env auto-skip are wired", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const debugLog = fs.readFileSync("extension/shared/debug-log.js", "utf8");
+  const envFail = fs.readFileSync("extension/shared/environment-failures.js", "utf8");
+
+  // 执行页跨岗位复用：命中既有 workerTabId 时导航复用，而不是每岗新建+关闭
+  assert.ok(background.includes("autoDiscardable"), "worker tab must not be memory-recycled");
+  assert.ok(background.includes("await chrome.tabs.update(tab.id, { url: attempt.url, active: false })"), "reuse navigates existing worker tab");
+  assert.ok(background.includes("let reused = Boolean(tab?.id)"), "reuse flag computed");
+  assert.ok(!background.includes("本岗位沟通触发结束"), "worker tab is no longer closed per job");
+
+  // 注入/加载硬预算：繁忙渲染进程不再造成 60-90s 黑洞
+  assert.ok(background.includes("injectWithBudget"), "inject budget helper present");
+  assert.ok(background.includes("临时沟通执行页内容脚本注入超时"), "inject timeout fails fast");
+
+  // 渲染就绪门 + 点击补偿 + 快速失败
+  assert.ok(content.includes("RENDER_GATE_MS"), "render gate present");
+  assert.ok(content.includes('error: "WORKER_PAGE_NOT_READY"'), "not-ready fast fail present");
+  assert.ok(content.includes('error: "WORKER_CHAT_CLICK_NO_EFFECT"'), "no-effect fast fail present");
+  assert.ok(content.includes("worker_detail_click_retry"), "click compensation retry present");
+  assert.ok(content.includes("isConversationNavigationStarted"), "navigation detection helper present");
+
+  // 调试日志限频 + 非阻塞
+  assert.ok(content.includes("debugTraceThrottles"), "content debug throttle map present");
+  assert.ok(debugLog.includes("FLUSH_INTERVAL_MS"), "coalesced flush interval present");
+  const floatHost = fs.readFileSync("extension/content/floating-host.js", "utf8");
+  assert.ok(floatHost.includes("自愈：面板打开状态因页面重载"), "float auto-reopens after page reload");
+  assert.ok(debugLog.includes("Promise.resolve(entry)"), "append never awaits storage flush");
+
+  // 环境失败分类共享模块接入后台
+  assert.ok(envFail.includes("ENV_AUTO_CONTINUE_ERRORS"), "env set exported");
+  assert.ok(background.includes("from '../shared/environment-failures.js'"), "background imports env classifier");
+  assert.ok(background.includes("CONTENT_INJECT_FAIL"), "inject timeout fails fast with env error");
+  assert.ok(background.includes("BOSS 页面脚本注入失败或超时"), "inject failure message present");
+  assert.ok(background.includes("envAutoSkip"), "queue stamps env skip flag");
+  assert.ok(background.includes("[自动跳过]"), "queue logs auto skip");
+  assert.ok(background.includes("row?.envAutoSkip === true"), "queue skips confirm loop for env failures");
+});
+
+
+
+
+
+test("v1.7.19 openConversationWorkerTab reuses one worker tab across jobs", async () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const source = extractFunctionSource(
+    background,
+    "function detailJobIdFromHref",
+    "async function openConversationWorkerTab"
+  ) + "\n" + extractFunctionSource(
+    background,
+    "async function openConversationWorkerTab",
+    "async function triggerConversationInWorker"
+  );
+  let seq = 1;
+  const tabs = [];
+  const calls = { create: 0, update: [] };
+  const chromeStub = {
+    tabs: {
+      get: async (id) => {
+        const found = tabs.find((t) => t.id === id);
+        if (!found) throw new Error("No tab with id: " + id);
+        return found;
+      },
+      create: async (opts) => {
+        calls.create += 1;
+        const t = { id: 1000 + seq++, url: opts.url, windowId: 1, active: opts.active };
+        tabs.push(t);
+        return t;
+      },
+      update: async (id, props) => {
+        const t = tabs.find((x) => x.id === id);
+        if (!t) throw new Error("no tab " + id);
+        calls.update.push({ id, props });
+        Object.assign(t, props);
+        return t;
+      }
+    }
+  };
+  const budgetLog = [];
+  const waitTabComplete = async (tabId, budgetMs) => {
+    budgetLog.push({ tabId, budgetMs });
+    // 模拟真实导航：返回最近一次 tabs.update 的目标 URL（无导航时回退到底站）
+    const lastNav = [...calls.update].reverse().find((u) => u.props.url);
+    const url = lastNav ? lastNav.props.url : "https://www.zhipin.com/job_detail/feedfacefeedfacefeed.html";
+    return { id: tabId, url, status: "complete" };
+  };
+  const forceInjectContent = async () => true;
+  const sleep = async () => {};
+  const publishTask = async () => {};
+  const factory = new Function(
+    "chrome",
+    "waitTabComplete",
+    "forceInjectContent",
+    "sleep",
+    "publishTask",
+    "isBossUrl",
+    source + "; return openConversationWorkerTab;"
+  );
+  const open = factory(chromeStub, waitTabComplete, forceInjectContent, sleep, publishTask, isBossUrl);
+  const task = { execution: {} };
+  const messageTab = { id: 7, windowId: 3 };
+  const job = { jobId: "j1", title: "T" };
+  const attempt = { mode: "detail", url: "https://www.zhipin.com/job_detail/feedfacefeedfacefeed.html" };
+
+  // 第 1 岗：无历史执行页 → 新建
+  const first = await open(task, attempt, messageTab, job);
+  assert.equal(calls.create, 1, "first job creates one tab");
+  assert.equal(first.id, task.execution.workerTabId, "execution tracks the created tab");
+  assert.equal(calls.update[0].props.autoDiscardable, false, "created tab protected from memory recycle");
+  assert.deepEqual(budgetLog[0], { tabId: first.id, budgetMs: 30000 }, "first load uses default 30s budget");
+
+  // 第 2 岗：执行页存在 → 复用导航，不再新建
+  const secondAttempt = { ...attempt, url: "https://www.zhipin.com/job_detail/feedfacefeedfacefeed2.html" };
+  const second = await open(task, secondAttempt, messageTab, job);
+  assert.equal(calls.create, 1, "second job reuses instead of creating");
+  assert.equal(second.id, first.id, "reuse keeps the same tab id");
+  const navUpdate = calls.update.find((u) => u.props.url === secondAttempt.url);
+  assert.ok(navUpdate && navUpdate.id === first.id, "navigation goes to the same tab");
+  assert.deepEqual(budgetLog[1], { tabId: first.id, budgetMs: 45000 }, "reused navigation gets the longer 45s budget");
+
+  // 第 3 场：复用导航未提交（waitTabComplete 仍返回上一岗位详情）→ 防误点护栏拒绝
+  const staleOpen = factory(
+    chromeStub,
+    async (tabId) => ({ id: tabId, url: "https://www.zhipin.com/job_detail/OLDJOBOLDJOBOLDJOB.html", status: "complete" }),
+    forceInjectContent,
+    sleep,
+    publishTask,
+    isBossUrl
+  );
+  const staleTask = { execution: { workerTabId: first.id } };
+  let staleError = null;
+  try { await staleOpen(staleTask, secondAttempt, messageTab, job); } catch (e) { staleError = String((e && e.message) || e); }
+  assert.ok(staleError && staleError.includes('导航未生效'), "stale old detail page must be rejected, got " + staleError);
+
+  // 第 3 岗：执行页被外部关闭 → 重建
+  const closedId = first.id;
+  const idx = tabs.findIndex((t) => t.id === closedId);
+  tabs.splice(idx, 1);
+  // 保留 execution.workerTabId：模拟「执行页被外部关闭」而非执行字段被清空，
+  // 真正走 tabs.get 抛错 → 重建路径
+  // （delete task.execution.workerTabId;）
+  const third = await open(task, attempt, messageTab, job);
+  assert.equal(calls.create, 2, "closed worker tab is recreated");
+  assert.notEqual(third.id, closedId, "new tab id after recreate");
+  assert.deepEqual(budgetLog[2], { tabId: third.id, budgetMs: 30000 }, "recreated load uses default budget");
+});
+
+await runRegisteredTests();
+
+if (!process.exitCode) console.log("flow contract tests ok");
