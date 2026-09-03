@@ -1382,10 +1382,11 @@ test("preview filters HR activity via network metadata and marks current deliver
   assert.ok(background.includes("HR 活跃度核对（列表接口元数据"), "preview activity summary logged");
   // 预览项带 jobId，供投递时高亮定位
   assert.ok(app.includes("div.dataset.job = String(r.job.jobId || '')"), "preview item carries jobId");
-  // 当前投递岗：橙色描边 + 投递中徽标 + 滚动定位（岗位变化时滚动一次）
+  // 当前投递岗：橙色描边 + 投递中徽标 + 只滚容器内的滚动条（主滚动条不动）
   assert.ok(app.includes("markCurrentDeliveryJob()"), "panel polls current job marker");
   assert.ok(app.includes("current-delivery") && app.includes("delivery-badge") && app.includes("投递中"), "highlight markers present");
-  assert.ok(app.includes("scrollIntoView({ block: 'center'") && app.includes("lastDeliveryScrollJob"), "auto scroll once per job");
+  assert.ok(app.includes("scroller.scrollTo({ top: y") && app.includes("lastDeliveryScrollJob"), "container-only scroll once per job");
+  assert.ok(app.includes("主页面/外层滚动条保持不动"), "outer scrollbar untouched by design");
   assert.ok(styles.includes(".item.current-delivery") && styles.includes("#ff8c00"), "orange outline style present");
 });
 

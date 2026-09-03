@@ -1522,10 +1522,23 @@ function markCurrentDeliveryJob() {
   }
   if (target && state.lastDeliveryScrollJob !== currentId) {
     state.lastDeliveryScrollJob = currentId;
+    // 只滚动「预览列表」自身的滚动条（#previewList），主页面/外层滚动条保持不动，
+    // 用户停留在哪一屏都不影响，向下滑即可看到当前投递中的岗位。
+    const scroller = document.getElementById('previewList');
     try {
-      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      if (scroller) {
+        const boxRect = scroller.getBoundingClientRect();
+        const elRect = target.getBoundingClientRect();
+        const targetTop = scroller.scrollTop + (elRect.top - boxRect.top);
+        const y = Math.max(0, targetTop + elRect.height / 2 - boxRect.height / 2);
+        if (typeof scroller.scrollTo === 'function') {
+          scroller.scrollTo({ top: y, behavior: 'smooth' });
+        } else {
+          scroller.scrollTop = y;
+        }
+      }
     } catch (_) {
-      target.scrollIntoView();
+      // 兜底：仅尝试滚动，不影响高亮
     }
   }
   if (!target && state.lastDeliveryScrollJob) state.lastDeliveryScrollJob = '';
