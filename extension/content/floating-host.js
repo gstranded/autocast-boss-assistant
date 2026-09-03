@@ -1,5 +1,5 @@
 (() => {
-  const BHT_FLOAT_HOST_VERSION = "1.7.21";
+  const BHT_FLOAT_HOST_VERSION = "1.7.22";
   if (window.__BHT_FLOAT_HOST_VERSION__ === BHT_FLOAT_HOST_VERSION && window.__BHT_FLOAT_HOST__) return;
   window.__BHT_FLOAT_HOST_VERSION__ = BHT_FLOAT_HOST_VERSION;
   window.__BHT_FLOAT_HOST__ = true;

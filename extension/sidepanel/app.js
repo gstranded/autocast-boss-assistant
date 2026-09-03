@@ -22,7 +22,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.21";
+const BHT_UI_VERSION = "1.7.22";
 const VERSION_GUARDED_API_MESSAGES = new Set([
   MSG.RUN_PREVIEW,
   MSG.CONFIRM_AND_START,
