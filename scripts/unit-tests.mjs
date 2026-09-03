@@ -829,6 +829,17 @@ test("allowRepublishedJob escape also applies to idempotency book", () => {
   const legacyNoEvidence = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S2" },
     legacyCtx([], { ts: 1, jobId: "abc" }));
   assert.equal(legacyNoEvidence.reasonCodes.includes(REASON.DEDUP_JOB), true, "no securityId evidence blocks republish");
+  // 终审 P3：history 成功行缺 securityId（旧数据）时，回退用幂等簿条目的 securityId 作重发证据
+  const hitNoSid = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S2" },
+    legacyCtx([{ jobId: "abc", status: "success" }], { ts: 1, securityId: "S1" }));
+  assert.equal(hitNoSid.ok, true, "history row without securityId falls back to idem entry securityId");
+  const hitNoSidSame = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S1" },
+    legacyCtx([{ jobId: "abc", status: "success" }], { ts: 1, securityId: "S1" }));
+  assert.equal(hitNoSidSame.reasonCodes.includes(REASON.DEDUP_JOB), true, "fallback evidence still blocks same securityId");
+  // 证据分歧（history=S1、幂等簿=S2、新岗=S2）：任一来源相同即拦（绝不重复优先）
+  const divergent = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S2" },
+    legacyCtx([{ jobId: "abc", status: "success", securityId: "S1" }], { ts: 1, securityId: "S2" }));
+  assert.equal(divergent.reasonCodes.includes(REASON.DEDUP_JOB), true, "any matching evidence blocks republish");
 });
 
 test("checkLimits treats dailyMaxCommunicate 0 as unlimited", () => {

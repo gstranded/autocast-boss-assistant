@@ -34,36 +34,32 @@ export function checkDedup(job, ctx) {
     const hit = jobId
       ? history.find((h) => h.jobId === jobId && h.status === 'success')
       : null;
-    if (hit) {
-      if (!(settings.allowRepublishedJob && job.securityId && hit.securityId && job.securityId !== hit.securityId)) {
-        return {
-          ok: false,
-          reasonCodes: [REASON.DEDUP_JOB],
-          reasonTexts: [reasonText(REASON.DEDUP_JOB)]
-        };
-      }
-    }
-    // 幂等簿命中同样检查：与 history 一致地允许「重新发布」岗（securityId 变化视为重发）
     const idemEntry = idempotency[jobIdempotencyKey(job)];
-    if (idemEntry) {
-      // 旧版本写入的幂等记录没有 securityId：回退用同岗 history 成功记录中的 securityId 作为证据；
-      // 两边都拿不到 securityId 时无法证明是重发，按「绝不重复」保守拦截。
-      const knownSecurityId = idemEntry.securityId
-        ? String(idemEntry.securityId)
-        : hit?.status === 'success' ? String(hit.securityId || '') : '';
-      const republished = Boolean(
-        settings.allowRepublishedJob &&
-        job.securityId &&
-        knownSecurityId &&
-        String(job.securityId) !== knownSecurityId
-      );
-      if (!republished) {
-        return {
-          ok: false,
-          reasonCodes: [REASON.DEDUP_JOB],
-          reasonTexts: [reasonText(REASON.DEDUP_JOB)]
-        };
-      }
+    // 重发证据：history 成功记录与幂等簿条目的 securityId 都可能缺失（旧版本数据）；
+    // 汇总全部可用证据——任一来源的 securityId 与新岗相同即视为同一岗位（绝不重复），
+    // 所有来源的 securityId 都不同于新岗时，才允许「重新发布」放行；无任何证据时保守拦截。
+    const evidence = [hit?.securityId, idemEntry?.securityId]
+      .filter((sid) => sid !== undefined && sid !== null && sid !== '')
+      .map((sid) => String(sid));
+    const republished = Boolean(
+      settings.allowRepublishedJob &&
+      job.securityId &&
+      evidence.length > 0 &&
+      evidence.every((sid) => String(job.securityId) !== sid)
+    );
+    if (hit && !republished) {
+      return {
+        ok: false,
+        reasonCodes: [REASON.DEDUP_JOB],
+        reasonTexts: [reasonText(REASON.DEDUP_JOB)]
+      };
+    }
+    if (idemEntry && !republished) {
+      return {
+        ok: false,
+        reasonCodes: [REASON.DEDUP_JOB],
+        reasonTexts: [reasonText(REASON.DEDUP_JOB)]
+      };
     }
   }
 
