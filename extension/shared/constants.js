@@ -67,6 +67,8 @@ export const DEFAULT_SETTINGS = {
   resumeSendTiming: 'after_text', // after_text | manual
   splitViewEnabled: true,
   debugLoggingEnabled: false,
+  scheduledDeliveryEnabled: false,
+  scheduledDeliveryDays: [1, 2, 3, 4, 5],
   whitelistOnly: false
 };
 

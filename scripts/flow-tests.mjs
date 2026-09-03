@@ -1083,6 +1083,43 @@ test("delivery hardening contracts", () => {
   assert.ok(c.includes("waitForImageSendConfirm"));
 });
 
+test("scheduled delivery pauses at queue boundaries and only auto-resumes schedule pauses", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const manifest = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const gateStart = background.indexOf("async function waitForRunnableQueueBoundary");
+  const gateEnd = background.indexOf("async function enforceDeliverySchedule", gateStart);
+  const gate = background.slice(gateStart, gateEnd);
+  const waitIndex = gate.indexOf("await waitWhilePaused()");
+  const recheckIndex = gate.indexOf("pauseAtDeliveryScheduleBoundary", waitIndex);
+  const loopStart = background.indexOf("async function runTaskLoop");
+  const loopEnd = background.indexOf("chrome.runtime.onMessage.addListener", loopStart);
+  const runLoop = background.slice(loopStart, loopEnd);
+  const queueGateEnd = runLoop.indexOf("// 持久化游标");
+  const queueGate = runLoop.slice(runLoop.indexOf("for (let qi"), queueGateEnd);
+  const schedulePauseHintIndex = panel.indexOf("else if (status === 'running' && task?.schedulePauseRequested)");
+  const intervalHintIndex = panel.indexOf("else if (waitingInterval)");
+  assert.ok(manifest.permissions.includes("alarms"));
+  assert.ok(gateStart >= 0 && gateEnd > gateStart);
+  assert.ok(waitIndex >= 0 && recheckIndex > waitIndex, "schedule must be rechecked after a pause wakes");
+  assert.ok(gate.includes("if (task.status === TASK_STATUS.PAUSED)"));
+  assert.ok(gate.includes("runner.pause = true"));
+  assert.ok(queueGate.includes("waitForRunnableQueueBoundary(taskId)"));
+  assert.ok(!queueGate.includes("task.status = TASK_STATUS.RUNNING"), "queue wake must not force PAUSED to RUNNING");
+  assert.ok(runLoop.includes("if (!task || await pauseAtDeliveryScheduleBoundary(task, config.settings || {}, new Date())) break;"));
+  assert.ok(background.includes("runner.abort || runner.pause || runner.schedulePauseRequested"));
+  assert.ok(background.includes("task.pauseSource !== 'schedule'"));
+  assert.ok(background.includes("isBossTab(tab) && isBossJobListUrl(tab.url || '')"));
+  assert.ok(background.includes("当前岗位完成后暂停"));
+  assert.ok(background.includes("已进入定时投递时段，自动恢复任务"));
+  assert.ok(background.includes("chrome.alarms?.onAlarm?.addListener"));
+  assert.ok(panel.includes("scheduledDeliveryEnabled"));
+  assert.ok(panel.includes("readScheduledDeliveryDays"));
+  assert.ok(schedulePauseHintIndex >= 0 && intervalHintIndex > schedulePauseHintIndex,
+    "schedule-ended status must take priority over the normal interval countdown");
+  assert.ok(panel.includes("投递间隔结束后自动暂停"));
+});
+
 test("preview UI falls back to reasonTexts and shows pass-rate warnings", () => {
   const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
   const engine = fs.readFileSync("extension/shared/filter-engine.js", "utf8");

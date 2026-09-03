@@ -77,8 +77,13 @@ import {
   canFallbackWorkerMode,
   WORKER_TRIGGER_RETRY
 } from '../shared/environment-failures.js';
+import {
+  evaluateDeliverySchedule,
+  formatDeliveryScheduleStatus
+} from '../shared/delivery-schedule.js';
 
 const SPLIT_ZOOM_FACTOR = 0.8;
+const DELIVERY_SCHEDULE_ALARM = 'bht_delivery_schedule';
 const BHT_RUNTIME_VERSION = String(chrome.runtime.getManifest?.().version || 'unknown');
 const VERSION_GUARDED_MESSAGES = new Set([
   MSG.RUN_PREVIEW,
@@ -115,6 +120,7 @@ let runner = {
   previewPreviousTask: null,
   abort: false,
   pause: false,
+  schedulePauseRequested: false,
   skipCurrent: false,
   pauseLogged: false,
   consecutiveUnknownActive: 0
@@ -216,6 +222,7 @@ function runnerSnapshot() {
     previewScanned: runner.previewScanned || 0,
     previewPass: runner.previewPass || 0,
     pause: runner.pause && !runner.abort,
+    schedulePauseRequested: runner.schedulePauseRequested === true,
     stopping: runner.running && runner.abort,
     intervalWaitUntil: Number(runner.intervalWaitUntil || 0),
     intervalWaitMs: Number(runner.intervalWaitMs || 0),
@@ -236,7 +243,7 @@ async function waitDeliveryInterval(task, waitMs) {
   }
   try {
     while (Date.now() < until) {
-      if (runner.abort || runner.pause) break;
+      if (runner.abort || runner.pause || runner.schedulePauseRequested) break;
       const remaining = until - Date.now();
       await sleep(Math.min(350, Math.max(0, remaining)));
     }
@@ -446,6 +453,197 @@ async function cancelBridgeOperation(operation = {}) {
   return waitForBridgeCancellationSettlement(operation);
 }
 
+function clearDeliverySchedulePause(task) {
+  if (!task) return;
+  if (task.pauseSource === 'schedule') delete task.pauseSource;
+  delete task.schedulePaused;
+  delete task.schedulePausedAt;
+  delete task.schedulePauseRequested;
+  delete task.scheduleNextStartAt;
+}
+
+function markDeliverySchedulePaused(task, settings, now = new Date()) {
+  const schedule = evaluateDeliverySchedule(settings, now);
+  task.status = TASK_STATUS.PAUSED;
+  task.pauseSource = 'schedule';
+  task.schedulePaused = true;
+  task.schedulePausedAt = task.schedulePausedAt || now.getTime();
+  delete task.schedulePauseRequested;
+  task.scheduleNextStartAt = schedule.nextStart?.getTime() || null;
+  task.pauseReason = '定时投递：' + formatDeliveryScheduleStatus(settings, now);
+  task.updatedAt = Date.now();
+  return schedule;
+}
+
+function stageTaskForDeliverySchedule(task, settings, now = new Date()) {
+  const schedule = evaluateDeliverySchedule(settings, now);
+  clearDeliverySchedulePause(task);
+  delete task.pauseSource;
+  if (schedule.enabled && !schedule.allowed) {
+    markDeliverySchedulePaused(task, settings, now);
+    return { waiting: true, schedule };
+  }
+  task.status = TASK_STATUS.RUNNING;
+  return { waiting: false, schedule };
+}
+
+async function configureDeliveryScheduleAlarm(settings = null) {
+  if (!chrome.alarms?.create) return;
+  const resolved = settings || (await getAllConfig()).settings || {};
+  const schedule = evaluateDeliverySchedule(resolved, new Date());
+  await chrome.alarms.clear(DELIVERY_SCHEDULE_ALARM);
+  if (!schedule.enabled || !schedule.days.length) return;
+  const when = schedule.allowed
+    ? Date.now() + 1000
+    : Math.max(Date.now() + 1000, schedule.nextStart?.getTime() || Date.now() + 60000);
+  chrome.alarms.create(DELIVERY_SCHEDULE_ALARM, { when, periodInMinutes: 1 });
+}
+
+async function hasScheduleResumeTab(task) {
+  const listTabId = task?.execution?.listTabId;
+  if (listTabId == null) return false;
+  try {
+    const tab = await chrome.tabs.get(listTabId);
+    return isBossTab(tab) && isBossJobListUrl(tab.url || '');
+  } catch (_) {
+    return false;
+  }
+}
+
+async function pauseAtDeliveryScheduleBoundary(task, settings, now = new Date()) {
+  const schedule = evaluateDeliverySchedule(settings, now);
+  if (!schedule.enabled || schedule.allowed) {
+    runner.schedulePauseRequested = false;
+    if (task) delete task.schedulePauseRequested;
+    return false;
+  }
+  if (task?.status === TASK_STATUS.PAUSED && task.pauseSource !== 'schedule') return false;
+
+  runner.schedulePauseRequested = false;
+  runner.pause = true;
+  markDeliverySchedulePaused(task, settings, now);
+  await publishTask(task);
+  await log('warn', task.pauseReason, { taskId: task.id, pauseSource: 'schedule' });
+  return true;
+}
+
+async function waitForRunnableQueueBoundary(taskId) {
+  while (!runner.abort) {
+    let all = await getAllConfig();
+    let task = all.task;
+    if (!task || task.id !== taskId) return { ok: false, error: 'TASK_NOT_FOUND' };
+
+    if (await pauseAtDeliveryScheduleBoundary(task, all.settings || {}, new Date())) {
+      return { ok: false, scheduled: true, config: all, task };
+    }
+
+    await waitWhilePaused();
+    if (runner.abort) return { ok: false, error: 'ABORTED' };
+
+    // 单独收到唤醒信号不足以放行：设置保存或 alarm 可能与队列循环并发。
+    // 必须重新读取持久化状态并再次检查时间窗，才允许进入下一岗。
+    all = await getAllConfig();
+    task = all.task;
+    if (!task || task.id !== taskId) return { ok: false, error: 'TASK_NOT_FOUND' };
+    if (await pauseAtDeliveryScheduleBoundary(task, all.settings || {}, new Date())) {
+      return { ok: false, scheduled: true, config: all, task };
+    }
+
+    if (task.status === TASK_STATUS.PAUSED) {
+      runner.pause = true;
+      continue;
+    }
+    return { ok: true, config: all, task };
+  }
+  return { ok: false, error: 'ABORTED' };
+}
+
+async function enforceDeliverySchedule(source = 'alarm', now = new Date()) {
+  const all = await getAllConfig();
+  const settings = all.settings || {};
+  const schedule = evaluateDeliverySchedule(settings, now);
+  const task = all.task;
+
+  if (!schedule.enabled) {
+    runner.schedulePauseRequested = false;
+    let changed = false;
+    if (task?.schedulePaused) {
+      clearDeliverySchedulePause(task);
+      task.pauseReason = '定时投递已关闭，任务保持暂停；点击「继续」可立即恢复。';
+      changed = true;
+    } else if (task?.schedulePauseRequested) {
+      delete task.schedulePauseRequested;
+      delete task.scheduleNextStartAt;
+      changed = true;
+    }
+    if (task && changed) {
+      task.updatedAt = Date.now();
+      await publishTask(task);
+    }
+    return { ok: true, action: 'disabled', schedule };
+  }
+  if (!task || [TASK_STATUS.COMPLETED, TASK_STATUS.STOPPED, TASK_STATUS.FAILED].includes(task.status)) {
+    return { ok: true, action: 'idle', schedule };
+  }
+
+  if (!schedule.allowed) {
+    if (task.status === TASK_STATUS.RUNNING && runner.running) {
+      if (!runner.schedulePauseRequested) {
+        runner.schedulePauseRequested = true;
+        task.schedulePauseRequested = true;
+        task.scheduleNextStartAt = schedule.nextStart?.getTime() || null;
+        task.updatedAt = Date.now();
+        await publishTask(task);
+        await log('warn', '定时投递时段已结束，将在当前岗位完成后暂停', {
+          taskId: task.id,
+          source,
+          nextStartAt: task.scheduleNextStartAt
+        });
+      }
+      return { ok: true, action: 'pause_requested', schedule };
+    }
+    if (task.status === TASK_STATUS.RUNNING || task.pauseSource === 'schedule') {
+      markDeliverySchedulePaused(task, settings, now);
+      await publishTask(task);
+      return { ok: true, action: 'paused', schedule };
+    }
+    return { ok: true, action: 'unchanged', schedule };
+  }
+
+  runner.schedulePauseRequested = false;
+  if (task.schedulePauseRequested) {
+    delete task.schedulePauseRequested;
+    task.updatedAt = Date.now();
+    await publishTask(task);
+  }
+  if (task.status !== TASK_STATUS.PAUSED || task.pauseSource !== 'schedule') {
+    return { ok: true, action: 'allowed', schedule };
+  }
+  if (!(await hasScheduleResumeTab(task))) {
+    const reason = '定时投递已进入运行时段，但原职位列表页已关闭或已离开职位列表；请打开 BOSS 职位列表后点「继续」。';
+    if (task.pauseReason !== reason) {
+      task.pauseReason = reason;
+      task.updatedAt = Date.now();
+      await publishTask(task);
+      await log('warn', reason, { taskId: task.id, source });
+    }
+    return { ok: false, action: 'waiting_for_tab', schedule };
+  }
+
+  clearDeliverySchedulePause(task);
+  task.status = TASK_STATUS.RUNNING;
+  task.pauseReason = '';
+  task.updatedAt = Date.now();
+  runner.abort = false;
+  let split = null;
+  if (!runner.running) split = await prepareSplitWorkspace(task, settings);
+  await publishTask(task);
+  runner.pause = false;
+  await log('info', '已进入定时投递时段，自动恢复任务', { taskId: task.id, source });
+  if (!runner.running) runTaskLoop(task.id);
+  return { ok: true, action: 'resumed', schedule, splitView: split };
+}
+
 async function reconcileStaleRunningTask(reason = '扩展后台已重启') {
   try {
     const all = await getAllConfig();
@@ -476,8 +674,13 @@ async function reconcileStaleRunningTask(reason = '扩展后台已重启') {
       return;
     }
     if (task.status === TASK_STATUS.RUNNING) {
-      task.status = TASK_STATUS.PAUSED;
-      task.pauseReason = reason + '，任务已安全暂停。请确认页面后点「继续」恢复队列。';
+      const schedule = evaluateDeliverySchedule(all.settings || {}, new Date());
+      if (schedule.enabled && !schedule.allowed) {
+        markDeliverySchedulePaused(task, all.settings || {}, new Date());
+      } else {
+        task.status = TASK_STATUS.PAUSED;
+        task.pauseReason = reason + '，任务已安全暂停。请确认页面后点「继续」恢复队列。';
+      }
       task.updatedAt = Date.now();
       await publishTask(task);
       await log('warn', task.pauseReason, { taskId: task.id || null });
@@ -499,7 +702,9 @@ async function clearStaleOperationArtifacts() {
 async function recoverBackgroundState(reason) {
   await syncDebugLoggingSetting();
   await clearStaleOperationArtifacts();
+  await configureDeliveryScheduleAlarm();
   await reconcileStaleRunningTask(reason);
+  await enforceDeliverySchedule('background_recovery');
 }
 
 // MV3 service worker 冷启动时内存 runner 为空；避免 storage 仍显示 running 造成假运行
@@ -514,6 +719,11 @@ chrome.runtime.onInstalled.addListener(async () => {
   await recoverBackgroundState('扩展更新/重载后后台已重建');
   // side panel disabled: using floating panel + action popup
   await refreshSidePanelForAllTabs();
+});
+
+chrome.alarms?.onAlarm?.addListener((alarm) => {
+  if (alarm?.name !== DELIVERY_SCHEDULE_ALARM) return;
+  enforceDeliverySchedule('alarm').catch(() => {});
 });
 
 async function setSidePanelForTab(tabId, url) {
@@ -3470,6 +3680,7 @@ async function runTaskLoop(taskId) {
   runner.running = true;
   runner.abort = false;
   runner.pause = false;
+  runner.schedulePauseRequested = false;
   runner.skipCurrent = false;
   runner.pauseLogged = false;
   runner.pausePublished = false;
@@ -3479,6 +3690,10 @@ async function runTaskLoop(taskId) {
     let task = config.task;
     if (!task || task.id !== taskId) {
       return { ok: false, error: 'TASK_NOT_FOUND' };
+    }
+
+    if (await pauseAtDeliveryScheduleBoundary(task, config.settings || {}, new Date())) {
+      return { ok: true, task, scheduled: true };
     }
 
     task.status = TASK_STATUS.RUNNING;
@@ -3528,18 +3743,10 @@ async function runTaskLoop(taskId) {
 
     for (let qi = 0; qi < queue.length; qi++) {
       const row = queue[qi];
-      await waitWhilePaused();
-      if (runner.abort) break;
-
-      // refresh config each item for live setting changes
-      config = await getAllConfig();
-      task = config.task;
-      if (!task) break;
-      // 唤醒即恢复运行状态（手动暂停/失败暂停后继续或跳过都可能带旧 paused 快照）
-      if (task.status === TASK_STATUS.PAUSED) {
-        task.status = TASK_STATUS.RUNNING;
-        task.pauseReason = '';
-      }
+      const boundary = await waitForRunnableQueueBoundary(taskId);
+      if (!boundary.ok) break;
+      config = boundary.config;
+      task = boundary.task;
 
       // 持久化游标：queue 状态优先（SW 重启后仍能续跑）
       const qMeta = (task.queue || [])[qi] || (task.queue || []).find((x) => x.jobId === row.job?.jobId);
@@ -3583,6 +3790,11 @@ async function runTaskLoop(taskId) {
           break;
         }
       }
+
+      // 页面检查可能跨过时间窗边界；在当前岗位产生副作用前再检查一次。
+      config = await getAllConfig();
+      task = config.task;
+      if (!task || await pauseAtDeliveryScheduleBoundary(task, config.settings || {}, new Date())) break;
       let outcome = await processOneJob(task, row, config);
       // processOneJob 会更新 item/reasons/counters；必须先持久化再重新读取配置，
       // 否则失败计数和具体原因会被旧 storage 快照覆盖成 0/空。
@@ -3790,6 +4002,11 @@ async function runTaskLoop(taskId) {
         break;
       }
 
+      // 当前岗位已处理完；若期间越过时间窗，立即暂停，不再等待普通投递间隔。
+      config = await getAllConfig();
+      task = config.task || task;
+      if (await pauseAtDeliveryScheduleBoundary(task, config.settings || {}, new Date())) break;
+
       // minJobInterval guard：未触发沟通的跳过（HR活跃/去重/环境异常等）不算投递，
       // 不等待投递间隔直接继续；已触发「立即沟通」的跳过（如会话未确认
       // conversation_not_found）仍保留间隔，避免对 BOSS 连续触发；
@@ -3867,6 +4084,7 @@ async function runTaskLoop(taskId) {
       }
     } catch (_) {}
     runner.running = false;
+    runner.schedulePauseRequested = false;
   }
 }
 
@@ -3971,9 +4189,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MSG.SAVE_SETTINGS:
         await saveSettings(payload);
         await syncDebugLoggingSetting(payload);
+        await configureDeliveryScheduleAlarm(payload);
+        await enforceDeliverySchedule('settings_changed');
         await debugLog('background.settings', 'saved', {
           debugLoggingEnabled,
-          splitViewEnabled: payload?.splitViewEnabled !== false
+          splitViewEnabled: payload?.splitViewEnabled !== false,
+          scheduledDeliveryEnabled: payload?.scheduledDeliveryEnabled === true
         });
         return { ok: true };
       case MSG.SAVE_FILTERS:
@@ -4105,8 +4326,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         task.uiErrorDismissed = false;
         task.retryCurrent = false;
         task.consecutiveFails = 0;
-        task.status = TASK_STATUS.RUNNING;
-        const split = await prepareSplitWorkspace(task, all.settings || {});
+        const scheduledStart = stageTaskForDeliverySchedule(task, all.settings || {}, new Date());
+        const split = scheduledStart.waiting
+          ? { ok: false, skipped: true, reason: 'waiting_for_schedule' }
+          : await prepareSplitWorkspace(task, all.settings || {});
         await publishTask(task);
         if (split.ok) {
           await log('success', '[分屏] 职位列表在左侧，消息中心在右侧', {
@@ -4116,10 +4339,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } else if (!split.skipped) {
           await log('warn', '[分屏] ' + (split.message || '自动分屏不可用，已回退为普通标签页'));
         }
-        await log('info', '批量投递启动：待投 ' + selectedIds.length + ' 岗（已跳过已完成 ' + doneIds.size + '）');
-        // async loop
-        runTaskLoop(task.id);
-        return { ok: true, taskId: task.id, splitView: split, pending: selectedIds.length };
+        if (scheduledStart.waiting) {
+          await log('info', task.pauseReason + '；待投 ' + selectedIds.length + ' 岗', {
+            taskId: task.id,
+            nextStartAt: task.scheduleNextStartAt
+          });
+        } else {
+          await log('info', '批量投递启动：待投 ' + selectedIds.length + ' 岗（已跳过已完成 ' + doneIds.size + '）');
+          // async loop
+          runTaskLoop(task.id);
+        }
+        return {
+          ok: true,
+          taskId: task.id,
+          splitView: split,
+          pending: selectedIds.length,
+          scheduled: scheduledStart.waiting,
+          nextStartAt: task.scheduleNextStartAt || null
+        };
         });
       }
       case MSG.RUN_TEST_DELIVERY:
@@ -4229,10 +4466,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         task.testDelivery = true;
         task.testJobId = onlyId;
         task.testedJobIds = Array.from(new Set([...(task.testedJobIds || []).map(String), ...extraForPick]));
-        task.status = TASK_STATUS.RUNNING;
         task.pauseReason = '';
         task.awaitingUserRetry = false;
-        const split = await prepareSplitWorkspace(task, all.settings || {});
+        const scheduledStart = stageTaskForDeliverySchedule(task, all.settings || {}, new Date());
+        const split = scheduledStart.waiting
+          ? { ok: false, skipped: true, reason: 'waiting_for_schedule' }
+          : await prepareSplitWorkspace(task, all.settings || {});
         await publishTask(task);
         if (split.ok) {
           await log('success', '[分屏] 投递一份已打开左右工作区', {
@@ -4242,33 +4481,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } else if (!split.skipped) {
           await log('warn', '[分屏] ' + (split.message || '自动分屏不可用，已回退为普通标签页'));
         }
-        await log(
-          'info',
-          '投递一份启动：本轮只投 1 岗「' +
-            (pick.job?.title || '') +
-            '」@ ' +
-            (pick.job?.company || '') +
-            '；剩余未投 ' +
-            remain +
-            ' 岗（活跃度不满足将自动顺延，投成功 1 岗后停止）',
-          { jobId: onlyId, remain }
-        );
-        runTaskLoop(task.id);
+        await log('info', scheduledStart.waiting
+          ? task.pauseReason + '；已排队「' + (pick.job?.title || '') + '」'
+          : '投递一份启动：本轮只投 1 岗「' +
+              (pick.job?.title || '') +
+              '」@ ' +
+              (pick.job?.company || '') +
+              '；剩余未投 ' +
+              remain +
+              ' 岗（活跃度不满足将自动顺延，投成功 1 岗后停止）',
+        { jobId: onlyId, remain, nextStartAt: task.scheduleNextStartAt || null });
+        if (!scheduledStart.waiting) runTaskLoop(task.id);
         return {
           ok: true,
           testJobId: onlyId,
           job: pick.job,
           remain,
-          splitView: split
+          splitView: split,
+          scheduled: scheduledStart.waiting,
+          nextStartAt: task.scheduleNextStartAt || null
         };
         });
       }
 
       case MSG.PAUSE_TASK:
         runner.pause = true;
+        runner.schedulePauseRequested = false;
         {
           const all = await getAllConfig();
           if (all.task) {
+            clearDeliverySchedulePause(all.task);
+            all.task.pauseSource = 'user';
             all.task.status = TASK_STATUS.PAUSED;
             all.task.pauseReason = reasonText(REASON.EXEC_USER_PAUSE);
             await publishTask(all.task);
@@ -4357,6 +4600,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!all.task) return { ok: false, error: 'NO_TASK' };
         // 先把状态写回 RUNNING 再释放暂停：循环唤醒后读到的才是新状态，
         // 避免循环用旧 paused 快照发布导致面板一直显示「已暂停」。
+        const scheduledResume = stageTaskForDeliverySchedule(all.task, all.settings || {}, new Date());
+        if (scheduledResume.waiting) {
+          runner.pause = true;
+          await publishTask(all.task);
+          await log('info', all.task.pauseReason, {
+            taskId: all.task.id,
+            nextStartAt: all.task.scheduleNextStartAt
+          });
+          return {
+            ok: true,
+            scheduled: true,
+            nextStartAt: all.task.scheduleNextStartAt || null,
+            message: all.task.pauseReason
+          };
+        }
         all.task.status = TASK_STATUS.RUNNING;
         all.task.pauseReason = '';
         await publishTask(all.task);
@@ -4398,6 +4656,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         runner.abort = true;
         runner.pause = false;
+        runner.schedulePauseRequested = false;
         await cancelActiveOperations('用户停止任务');
         {
           const all = await getAllConfig();
@@ -4471,7 +4730,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MSG.EXPORT_CONFIG:
         return { ok: true, data: await exportAll() };
       case MSG.IMPORT_CONFIG:
-        await importAll(payload?.data || payload);
+        {
+          const imported = await importAll(payload?.data || payload);
+          await syncDebugLoggingSetting(imported.settings || {});
+          await configureDeliveryScheduleAlarm(imported.settings || {});
+          await enforceDeliverySchedule('config_imported');
+        }
         return { ok: true };
       case MSG.GET_DEBUG_LOGS:
         {

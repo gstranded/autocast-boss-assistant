@@ -65,9 +65,9 @@ Different tracks use different resumes.
 
 ![Resume panel](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/screenshots/04-resume.png)
 
-### 5) Settings: rate limits + local config
+### 5) Settings: schedule + rate limits + local config
 
-Safety limits are first-class features. The panel supports persistent light and dark themes, and the `i` controls beside features open contextual explanations on hover or click.
+Scheduled delivery can be enabled for selected weekdays with fixed local-time windows at `09:00-12:00` and `14:00-17:00`. Outside those windows, a queued task waits or pauses after the current job and resumes automatically in the next window. Chrome must remain open, and manual/error pauses are never resumed by the schedule. Safety limits remain first-class features. The panel supports persistent light and dark themes, and the `i` controls beside features open contextual explanations on hover or click.
 
 ![Settings panel](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/screenshots/05-settings.png)
 

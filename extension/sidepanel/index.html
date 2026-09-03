@@ -366,6 +366,35 @@
 
         <!-- SETTINGS -->
         <section class="panel" id="tab-settings">
+          <div class="card schedule-card">
+            <div class="card-title" data-help-title="定时投递" data-help="开启后，投递任务只在选定日期的固定时段运行。时段结束会在当前岗位完成后暂停，下一时段自动继续。">定时投递</div>
+            <div class="schedule-toggle-row">
+              <div>
+                <div class="source-label">启用定时投递</div>
+                <div class="source-meta">关闭时保持现有的手动投递方式</div>
+              </div>
+              <label class="switch" title="启用或关闭定时投递">
+                <input id="scheduledDeliveryEnabled" type="checkbox" />
+                <span></span>
+              </label>
+            </div>
+            <div id="deliveryScheduleConfig" class="schedule-config">
+              <div class="schedule-windows" aria-label="固定投递时段">
+                <span>09:00-12:00</span>
+                <span>14:00-17:00</span>
+              </div>
+              <div class="schedule-days" aria-label="选择运行日">
+                <label title="周一"><input type="checkbox" data-schedule-day="1" aria-label="周一" /><span>一</span></label>
+                <label title="周二"><input type="checkbox" data-schedule-day="2" aria-label="周二" /><span>二</span></label>
+                <label title="周三"><input type="checkbox" data-schedule-day="3" aria-label="周三" /><span>三</span></label>
+                <label title="周四"><input type="checkbox" data-schedule-day="4" aria-label="周四" /><span>四</span></label>
+                <label title="周五"><input type="checkbox" data-schedule-day="5" aria-label="周五" /><span>五</span></label>
+                <label title="周六"><input type="checkbox" data-schedule-day="6" aria-label="周六" /><span>六</span></label>
+                <label title="周日"><input type="checkbox" data-schedule-day="0" aria-label="周日" /><span>日</span></label>
+              </div>
+              <div id="deliveryScheduleStatus" class="schedule-status" data-state="disabled">定时投递已关闭</div>
+            </div>
+          </div>
           <div class="card">
             <div class="card-title" data-help-title="频率与上限" data-help="这些限制用于控制单次、每日、公司和 HR 维度的沟通数量。达到限制时任务会暂停。">频率与上限</div>
             <div class="grid-2">
