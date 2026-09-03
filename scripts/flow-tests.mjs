@@ -1368,6 +1368,16 @@ test("history clear/export/date-guard UX", () => {
   assert.ok(app.includes("结束日期不能早于开始日期"), "guard surfaces a toast");
 });
 
+test("skip does not wait job interval and waits are logged", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  // 跳过项不等待投递间隔
+  assert.ok(background.includes("outcome === 'skipped'") && background.includes("无需等待投递间隔"), "skipped items skip the interval wait");
+  // 等待前把间隔写进日志
+  assert.ok(background.includes("等待投递间隔") && background.includes("秒后继续下一岗"), "interval wait is logged with seconds");
+  // 批次最后一岗不再额外等待
+  assert.ok(background.includes("qi >= queue.length - 1"), "last queue item does not wait");
+});
+
 
 await runRegisteredTests();
 

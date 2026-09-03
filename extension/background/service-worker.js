@@ -3532,11 +3532,18 @@ async function runTaskLoop(taskId) {
         break;
       }
 
-      // minJobInterval guard
-      {
+      // minJobInterval guard：跳过（未投递）不算次数，不等待投递间隔，直接继续下一岗；
+      // 等待前把间隔写入日志，用户可清楚看到当前在等多久；批次最后一岗无需再等。
+      if (qi >= queue.length - 1) {
+        // 最后一项：批次结束
+      } else if (outcome === 'skipped') {
+        await log('info', '[队列] 跳过（未投递），无需等待投递间隔，继续下一岗…');
+      } else {
         let iv = config.settings.jobIntervalMs || [4000, 6000];
         if (Array.isArray(iv) && iv[0] < 1000) iv = [4000, 6000];
-        await sleep(randomBetween(iv));
+        const waitMs = randomBetween(iv);
+        await log('info', `[队列] 等待投递间隔 ${Math.max(1, Math.round(waitMs / 1000))} 秒后继续下一岗…`);
+        await sleep(waitMs);
       }
     }
 
