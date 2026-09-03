@@ -2071,7 +2071,8 @@ function firstEl(selectors, root = document) {
     // BOSS 风控码（如 code 37）立即熔断，避免破坏会话触发投递侧风控。
     const requested = Array.isArray(payload.jobs) ? payload.jobs : [];
     const deadlineAt = Number(payload.deadlineAt) || (Date.now() + 60000);
-    const maxChecks = Math.min(12, Number(payload.maxChecks) || 12);
+    const maxChecksRaw = Number(payload.maxChecks);
+    const maxChecks = Math.min(12, maxChecksRaw > 0 ? maxChecksRaw : 12);
     const activities = [];
     let eligibleCount = 0;
     let checkedCount = 0;
