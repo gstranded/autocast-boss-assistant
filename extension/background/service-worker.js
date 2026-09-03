@@ -2714,6 +2714,16 @@ async function processOneJob(task, resultRow, config) {
       listPreserved: trig.listPreserved === true,
       contentVersion: trig.contentVersion || ''
     };
+    // 防重复：沟通一旦发起（含「继续沟通」已有会话），立即在幂等簿记录 job:<id>；
+    // 此后任何新任务/新预览都不会再投该岗（当前任务内的重试走检查点不受影响）。
+    try {
+      await markIdempotent(jobIdempotencyKey(job), {
+        jobId: job.jobId || '',
+        bossId: job.bossId || '',
+        phase: 'triggered',
+        trust: 'trigger-success'
+      });
+    } catch (_) {}
     resultRow.job = job;
     task.updatedAt = Date.now();
     await publishTask(task);

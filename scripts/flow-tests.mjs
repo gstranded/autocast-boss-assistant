@@ -1088,7 +1088,11 @@ test("history/config controls and image-only resume stay on shipped paths", () =
   const content = fs.readFileSync("extension/content/content-main.js", "utf8");
   const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
   const css = fs.readFileSync("extension/sidepanel/styles.css", "utf8");
-  assert.ok(app.includes("filterHistoryRows(history, filter)"));
+  assert.ok(app.includes("filterHistoryByDate(history, fromTs, toTs)"), "history date filter wired");
+  assert.ok(app.includes("filterHistoryRows(byDate, filter)"), "status filter applies after date filter");
+  assert.ok(app.includes("historyToday"), "today counter line present");
+  assert.ok(app.includes("今日已投"), "today counter label present");
+  assert.ok(app.includes("dailyMaxCommunicate"), "today counter uses daily limit");
   assert.ok(app.includes("btnExportHistory"));
   assert.ok(app.includes("JSON.stringify(history"));
   assert.ok(app.includes("CLEAR_HISTORY"));
@@ -1301,6 +1305,30 @@ test("v1.7.19 openConversationWorkerTab reuses one worker tab across jobs", asyn
   assert.notEqual(third.id, closedId, "new tab id after recreate");
   assert.deepEqual(budgetLog[2], { tabId: third.id, budgetMs: 30000 }, "recreated load uses default budget");
 });
+
+
+test("v1.7.20 history date filter, full config import and trigger dedup mark are wired", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  const storage = fs.readFileSync("extension/shared/storage.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const historyView = fs.readFileSync("extension/shared/history-view.js", "utf8");
+  // 日期筛选与今日计数
+  assert.ok(html.includes('id="historyFrom"') && html.includes('id="historyTo"'), "date inputs present");
+  assert.ok(html.includes('id="historyToday"'), "today counter line present");
+  assert.ok(app.includes("filterHistoryByDate(history, fromTs, toTs)"), "date filter applied");
+  assert.ok(app.includes("summarizeHistory(filtered)"), "stats reflect filtered rows");
+  assert.ok(historyView.includes("startOfLocalDay") && historyView.includes("endOfLocalDay"), "day boundary helpers");
+  // 全量导出/导入
+  assert.ok(storage.includes("dailyStats: STORAGE_KEYS.DAILY_STATS"), "dailyStats exported");
+  assert.ok(storage.includes("idempotency: STORAGE_KEYS.IDEMPOTENCY"), "idempotency exported");
+  assert.ok(storage.includes("task: STORAGE_KEYS.TASK"), "task exported");
+  assert.ok(storage.includes("sanitizeImportedTask"), "imported task sanitized");
+  // 触发即防重复
+  assert.ok(background.includes("markIdempotent(jobIdempotencyKey(job)") &&
+    background.includes("防重复：沟通一旦发起"), "job marked idempotent at trigger");
+});
+
 
 await runRegisteredTests();
 

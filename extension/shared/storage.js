@@ -217,8 +217,40 @@ export const IMPORT_CONFIG_KEYS = {
   resumes: STORAGE_KEYS.RESUMES,
   bindings: STORAGE_KEYS.BINDINGS,
   lists: STORAGE_KEYS.LISTS,
-  history: STORAGE_KEYS.HISTORY
+  history: STORAGE_KEYS.HISTORY,
+  dailyStats: STORAGE_KEYS.DAILY_STATS,
+  idempotency: STORAGE_KEYS.IDEMPOTENCY,
+  task: STORAGE_KEYS.TASK
 };
+
+// 导入任务时的安全化：只接受「预览/待确认」类任务快照；运行中/已暂停的任务
+// 统一降为 awaiting_confirm（导入绝不自动开始投递），并清掉运行时执行痕迹。
+export function sanitizeImportedTask(task) {
+  if (!task || typeof task !== 'object') return null;
+  if (!Array.isArray(task.results) || !task.results.length) {
+    // 没有预览数据的任务没有意义（可能是运行中垃圾态），不导入
+    return null;
+  }
+  const copy = {
+    ...task,
+    status: 'awaiting_confirm',
+    awaitingUserRetry: false,
+    uiErrorDismissed: true,
+    retryCurrent: false,
+    pauseReason: '',
+    lastErrorDetail: '',
+    errorKey: '',
+    execution: {},
+    previewRunId: null,
+    nextJobId: null,
+    currentJobId: null,
+    queueCursor: 0,
+    consecutiveFails: 0,
+    completionSignal: null,
+    updatedAt: Date.now()
+  };
+  return copy;
+}
 
 export function buildExportPayload(all = {}, now = new Date()) {
   return {
@@ -234,8 +266,16 @@ export function importConfigPatch(payload) {
   if (!payload || typeof payload !== 'object') throw new Error('无效配置文件');
   const put = {};
   for (const [key, storageKey] of Object.entries(IMPORT_CONFIG_KEYS)) {
-    if (payload[key] != null) {
-      put[storageKey] = key === 'settings' ? normalizeSettings(payload[key]) : payload[key];
+    if (payload[key] == null) continue;
+    if (key === 'settings') {
+      put[storageKey] = normalizeSettings(payload[key]);
+    } else if (key === 'task') {
+      const sanitized = sanitizeImportedTask(payload[key]);
+      if (sanitized) put[storageKey] = sanitized;
+    } else if (key === 'idempotency' || key === 'dailyStats') {
+      put[storageKey] = payload[key] && typeof payload[key] === 'object' && !Array.isArray(payload[key]) ? payload[key] : {};
+    } else {
+      put[storageKey] = payload[key];
     }
   }
   return put;

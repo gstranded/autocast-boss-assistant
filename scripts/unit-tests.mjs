@@ -17,9 +17,9 @@ import {
 } from "../extension/shared/greeting-policy.js";
 import { checkDedup, checkLimits, segmentIdempotencyKey, jobIdempotencyKey } from "../extension/shared/dedup.js";
 import { renderTemplate, pickResumeProfile } from "../extension/shared/template.js";
-import { filterHistoryRows } from "../extension/shared/history-view.js";
+import { filterHistoryRows, filterHistoryByDate, summarizeHistory, startOfLocalDay, endOfLocalDay } from "../extension/shared/history-view.js";
 import { planResumeSend } from "../extension/shared/resume-policy.js";
-import { buildExportPayload, importConfigPatch, IMPORT_CONFIG_KEYS, normalizeSettings } from "../extension/shared/storage.js";
+import { buildExportPayload, importConfigPatch, IMPORT_CONFIG_KEYS, sanitizeImportedTask, normalizeSettings } from "../extension/shared/storage.js";
 import { isBossUrl, isBossHostname, isBossTab, bossUrlGuardMessage } from "../extension/shared/boss-url.js";
 import {
   didContentDocumentChange,
@@ -751,6 +751,68 @@ test("export payload round-trips settings filters template and bindings", () => 
   assert.deepEqual(patch[STORAGE_KEYS.MESSAGE_TEMPLATE], exported.messageTemplate);
   assert.deepEqual(patch[STORAGE_KEYS.BINDINGS], exported.bindings);
   assert.equal(Object.keys(IMPORT_CONFIG_KEYS).includes("settings"), true);
+});
+
+test("export carries daily stats, idempotency and task; import sanitizes task", () => {
+  const all = {
+    settings: { dailyMaxCommunicate: 150, taskMaxCommunicate: 1 },
+    filters: { activeWithin: ["week"] },
+    dailyStats: { "2026-09-02": { communicate: 5, success: 5, skip: 0, fail: 0, byCompany: {} } },
+    idempotency: { "job:abc": { ts: 1, phase: "triggered" } },
+    task: {
+      id: "task_x", status: "running", results: [{ decision: "pass", job: { jobId: "a", title: "T", href: "h" } }],
+      queue: [], items: [], execution: { listTabId: 7, workerTabId: 9 }, previewRunId: "p1", consecutiveFails: 3
+    },
+    history: [{ status: "success", title: "T1" }],
+    logs: []
+  };
+  const exported = buildExportPayload(all, new Date("2026-09-02T10:00:00Z"));
+  assert.equal(exported.dailyStats["2026-09-02"].communicate, 5, "daily stats exported");
+  assert.equal(exported.idempotency["job:abc"].phase, "triggered", "idempotency exported");
+  assert.equal(exported.task.status, "running", "task exported");
+
+  const patch = importConfigPatch(exported);
+  assert.equal(patch[STORAGE_KEYS.DAILY_STATS]["2026-09-02"].communicate, 5, "daily stats restored");
+  assert.equal(patch[STORAGE_KEYS.IDEMPOTENCY]["job:abc"].phase, "triggered", "idempotency restored");
+  // 任务导入必须安全化：绝不以 running 状态进入，运行时痕迹清空
+  const importedTask = patch[STORAGE_KEYS.TASK];
+  assert.ok(importedTask, "task imported when it has results");
+  assert.equal(importedTask.status, "awaiting_confirm", "running task downgraded to awaiting_confirm");
+  assert.deepEqual(importedTask.execution, {}, "execution traces cleared");
+  assert.equal(importedTask.previewRunId, null);
+  assert.equal(importedTask.consecutiveFails, 0);
+  assert.equal(importedTask.completionSignal, null);
+
+  // 无预览数据的任务不导入
+  const noResults = importConfigPatch({ task: { id: "bad", status: "running", results: [] } });
+  assert.equal(noResults[STORAGE_KEYS.TASK], null, "task without results skipped") || assert.equal(noResults[STORAGE_KEYS.TASK], undefined, "task without results skipped");
+  assert.equal(sanitizeImportedTask(null), null);
+  assert.equal(sanitizeImportedTask({ results: [] }), null);
+  // 非法类型防护
+  const badShapes = importConfigPatch({ dailyStats: [1, 2], idempotency: "x" });
+  assert.deepEqual(badShapes[STORAGE_KEYS.DAILY_STATS], {}, "array dailyStats dropped to {}");
+  assert.deepEqual(badShapes[STORAGE_KEYS.IDEMPOTENCY], {}, "string idempotency dropped to {}");
+});
+
+test("history date filter boundaries and summary", () => {
+  const day = new Date("2026-09-02T12:00:00");
+  const rows = [
+    { id: "a", ts: new Date("2026-09-01T23:59:59").getTime(), status: "success", title: "before" },
+    { id: "b", ts: new Date("2026-09-02T00:00:00").getTime(), status: "success", title: "boundary-from" },
+    { id: "c", ts: new Date("2026-09-02T23:59:59").getTime(), status: "skipped_list", title: "boundary-to" },
+    { id: "d", ts: new Date("2026-09-03T00:00:00").getTime(), status: "failed", title: "after" }
+  ];
+  const from = new Date("2026-09-02T00:00:00");
+  const to = new Date("2026-09-02T00:00:00");
+  const inDay = filterHistoryByDate(rows, from.getTime(), to.getTime());
+  assert.deepEqual(inDay.map((r) => r.id), ["b", "c"], "local-day boundaries inclusive");
+  assert.equal(filterHistoryByDate(rows, 0, 0).length, 4, "no range returns all");
+  assert.equal(filterHistoryByDate(rows, 0, new Date("2026-09-02T12:00:00").getTime()).length, 3, "only end bound");
+  assert.equal(startOfLocalDay(day.getTime()) < day.getTime(), true, "startOfLocalDay before noon");
+  assert.ok(endOfLocalDay(day.getTime()) > day.getTime(), "endOfLocalDay after noon");
+  const s = summarizeHistory(rows);
+  assert.deepEqual(s, { total: 4, success: 2, skipped: 1, failed: 1 });
+  assert.deepEqual(summarizeHistory([]), { total: 0, success: 0, skipped: 0, failed: 0 });
 });
 
 console.log("6) boss-url guard");

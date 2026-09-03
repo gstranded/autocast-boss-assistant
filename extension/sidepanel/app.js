@@ -10,7 +10,8 @@ import {
   countPendingPassJobs,
   shouldAcceptTaskSnapshot
 } from '../shared/task-model.js';
-import { HISTORY_STATUS_MAP, filterHistoryRows } from '../shared/history-view.js';
+import { HISTORY_STATUS_MAP, filterHistoryRows, filterHistoryByDate, summarizeHistory } from '../shared/history-view.js';
+import { todayKey } from '../shared/text-utils.js';
 import {
   formatLogTimestamp,
   mergeRuntimeLog,
@@ -21,7 +22,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.19";
+const BHT_UI_VERSION = "1.7.20";
 const VERSION_GUARDED_API_MESSAGES = new Set([
   MSG.RUN_PREVIEW,
   MSG.CONFIRM_AND_START,
@@ -1508,19 +1509,34 @@ function renderHistory(history = []) {
   const box = $('historyList');
   if (!box) return;
   const filter = $('historyFilter')?.value || 'all';
-  const renderKey = `${filter}|${history.length}|${history[0]?.id || history[0]?.ts || ''}|${history[0]?.status || ''}`;
+  const fromVal = $('historyFrom')?.value || '';
+  const toVal = $('historyTo')?.value || '';
+  const renderKey = `${filter}|${fromVal}|${toVal}|${history.length}|${history[0]?.id || history[0]?.ts || ''}|${history[0]?.status || ''}`;
   if (renderKey === state.lastHistoryRenderKey) return;
   state.lastHistoryRenderKey = renderKey;
-  const filtered = filterHistoryRows(history, filter);
+  // 日期范围（含边界）+ 状态筛选
+  const fromTs = fromVal ? new Date(fromVal + 'T00:00:00').getTime() : 0;
+  const toTs = toVal ? new Date(toVal + 'T00:00:00').getTime() : 0;
+  const byDate = filterHistoryByDate(history, fromTs, toTs);
+  const filtered = filterHistoryRows(byDate, filter);
+  const stats = summarizeHistory(filtered);
 
-  const total = history.length;
-  const successCount = history.filter((h) => h.status === 'success').length;
-  const skipCount = history.filter((h) => (HISTORY_STATUS_MAP[h.status] || {}).cls === 'skipped').length;
-  const failCount = total - successCount - skipCount;
+  // 顶部今日行：今日已投 x / 每日上限（x 与每日限制使用同一计数器 communicate）
+  const todayEl = $('historyToday');
+  if (todayEl) {
+    const dailyMax = Number(state.config?.settings?.dailyMaxCommunicate || 0);
+    const dayKey = todayKey();
+    const stat = (state.config?.dailyStats || {})[dayKey] || {};
+    const used = Number(stat.communicate || 0);
+    todayEl.innerHTML = dailyMax > 0
+      ? `今日已投 <b>${used}</b> / ${dailyMax}`
+      : `今日已投 <b>${used}</b>（未设上限）`;
+  }
+
   const statsEl = $('historyStats');
   if (statsEl) {
-    statsEl.textContent = total
-      ? `共 ${total} 条 · 成功 ${successCount} · 跳过 ${skipCount} · 失败 ${failCount}`
+    statsEl.textContent = stats.total
+      ? `共 ${stats.total} 条 · 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed}`
       : '尚无记录';
   }
 
@@ -2682,6 +2698,18 @@ function bindEvents() {
   });
 
   $('historyFilter')?.addEventListener('change', () => {
+    renderHistory(state.config?.history || []);
+  });
+
+  $('historyFrom')?.addEventListener('change', () => {
+    renderHistory(state.config?.history || []);
+  });
+  $('historyTo')?.addEventListener('change', () => {
+    renderHistory(state.config?.history || []);
+  });
+  $('btnHistoryDateReset')?.addEventListener('click', () => {
+    if ($('historyFrom')) $('historyFrom').value = '';
+    if ($('historyTo')) $('historyTo').value = '';
     renderHistory(state.config?.history || []);
   });
 

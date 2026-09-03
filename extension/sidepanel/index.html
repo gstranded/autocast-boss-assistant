@@ -342,18 +342,23 @@
         <section class="panel" id="tab-history">
           <div class="card">
             <div class="card-title row">
-              <span data-help-title="投递记录" data-help="保存在浏览器本地，可按成功、跳过、失败筛选，也可以导出或清空。">投递记录</span>
-              <div class="btn-row" style="gap:6px">
+              <span data-help-title="投递记录" data-help="保存在浏览器本地，可按成功、跳过、失败筛选，也可以按日期范围筛选；顶部显示今日已投份数与每日上限。记录与全部配置都可导出/导入。">投递记录</span>
+              <div class="btn-row" style="gap:6px;flex-wrap:wrap">
                 <select id="historyFilter" class="tiny-select">
                   <option value="all">全部</option>
                   <option value="success">成功</option>
                   <option value="skipped">跳过</option>
                   <option value="failed">失败</option>
                 </select>
+                <input type="date" id="historyFrom" class="tiny-input" title="开始日期">
+                <span class="tiny-muted">~</span>
+                <input type="date" id="historyTo" class="tiny-input" title="结束日期">
+                <button id="btnHistoryDateReset" class="btn tiny">全部日期</button>
                 <button id="btnExportHistory" class="btn tiny">导出</button>
                 <button id="btnClearHistory" class="btn tiny">清空</button>
               </div>
             </div>
+            <div id="historyToday" class="summary today-line">今日已投 0 / 0</div>
             <div id="historyStats" class="summary">尚无记录</div>
             <div id="historyList" class="list history-list"></div>
           </div>
