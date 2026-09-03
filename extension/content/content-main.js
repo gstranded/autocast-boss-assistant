@@ -2067,9 +2067,11 @@ function firstEl(selectors, root = document) {
   async function enrichJobActivities(payload = {}) {
     // 预览期核对 HR 活跃度：直连列表 detail API（BOSS 原生接口，带登录态），
     // 不点卡片、不导航、不离开列表页（与「左侧职位页保持原样」一致）。
-    // 逐岗限时抓取；遇到 429/403 立即熔断，避免触发风控。
+    // 限频保护：单次最多核对 12 岗、每岗间隔至少 900ms；遇到 429/403 或
+    // BOSS 风控码（如 code 37）立即熔断，避免破坏会话触发投递侧风控。
     const requested = Array.isArray(payload.jobs) ? payload.jobs : [];
     const deadlineAt = Number(payload.deadlineAt) || (Date.now() + 60000);
+    const maxChecks = Math.min(12, Number(payload.maxChecks) || 12);
     const activities = [];
     let eligibleCount = 0;
     let checkedCount = 0;
@@ -2081,11 +2083,16 @@ function firstEl(selectors, root = document) {
         haltError = "ACTIVITY_DEADLINE";
         break;
       }
+      if (checkedCount >= maxChecks) {
+        halted = true;
+        haltError = "ACTIVITY_BUDGET_" + maxChecks;
+        break;
+      }
       eligibleCount += 1;
       const res = await fetchJobActivityDetail(job, deadlineAt);
       if (res?.halt) {
         halted = true;
-        haltError = res.error || res.message || "";
+        haltError = res.error || res.message || "ACTIVITY_HALT";
         break;
       }
       if (res?.ok) {
@@ -2100,6 +2107,8 @@ function firstEl(selectors, root = document) {
         });
         checkedCount += 1;
       }
+      // 每岗之间限频，避免 detail API 突发触发 BOSS 风控（code 37）
+      await sleep(900);
     }
     return {
       ok: true,

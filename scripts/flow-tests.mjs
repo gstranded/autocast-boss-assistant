@@ -1390,6 +1390,22 @@ test("preview filters HR activity via network metadata and marks current deliver
   assert.ok(styles.includes(".item.current-delivery") && styles.includes("#ff8c00"), "orange outline style present");
 });
 
+test("left-list anomaly protection pauses instead of cascade-skipping", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  // 列表页外部变化（刷新/风控）→ 恢复列表并暂停，而不是跳过
+  assert.ok(background.includes("trig.listPreserved === false") && background.includes("岗位与页面可能对不上"), "list change pauses with reason");
+  assert.ok(background.includes("await softReturnToList(task)") && background.includes("return 'limited'"), "restores list before pausing");
+  // 连续 N 岗活跃度未知 → 暂停
+  assert.ok(background.includes("runner.consecutiveUnknownActive") && background.includes("连续 ") && background.includes("无法读取 HR 活跃度"), "consecutive unknown pauses");
+  assert.ok(background.includes("runner.consecutiveUnknownActive = 0"), "counter resets on success and batch start");
+  // 锚点缺 city 时告警
+  assert.ok(background.includes("锚点 URL 缺少 city 参数"), "anchor missing city warns");
+  // 预览 enrich 限频防风控
+  assert.ok(content.includes("maxChecks") && content.includes("await sleep(900)"), "enrich throttles per-job calls");
+  assert.ok(content.includes("ACTIVITY_BUDGET"), "enrich caps checks per scan");
+});
+
 test("skip does not wait job interval and waits are logged", () => {
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   // 未触发沟通的跳过项不等待投递间隔（已触发「立即沟通」的跳过仍保留间隔）

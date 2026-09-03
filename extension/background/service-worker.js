@@ -111,7 +111,8 @@ let runner = {
   abort: false,
   pause: false,
   skipCurrent: false,
-  pauseLogged: false
+  pauseLogged: false,
+  consecutiveUnknownActive: 0
 };
 const operations = createOperationRegistry();
 let debugLoggingEnabled = false;
@@ -2677,8 +2678,7 @@ async function processOneJob(task, resultRow, config) {
     );
     if (operationAborted(trig)) return 'aborted';
     await log(
-      trig?.ok ? 'success' : (trig?.filtered ? 'info' : 'error'),
-      trig?.ok
+      trig?.ok ? 'success' : (trig?.filtered ? 'info' : 'error'),      trig?.ok
         ? ('[执行页] 已触发沟通 btn=' + (trig.buttonText || '') +
           (trig.navigated ? ' · BOSS 跳转在临时页完成' : (trig.stayed ? ' · 已点留在此页' : ' · 无需留在此页弹窗')) +
           (trig.listPreserved ? ' · 左侧筛选保持' : ' · 左侧页面需检查') +
@@ -2695,6 +2695,7 @@ async function processOneJob(task, resultRow, config) {
         workerAttempts: trig?.workerAttempts
       }
     );
+    if (trig?.ok) runner.consecutiveUnknownActive = 0;
     if (!trig?.ok) {
       if (trig?.filtered === true && trig?.error === REASON.FILTER_ACTIVE) {
         job.activeText = String(trig.activeText || '');
@@ -2705,6 +2706,43 @@ async function processOneJob(task, resultRow, config) {
         if (previewRow) {
           previewRow.job = { ...previewRow.job, ...job };
           previewRow.passReasons = [skipReason];
+        }
+        // 防级联①：本次尝试中左侧列表页发生了外部变化（URL/内容脚本实例变化：
+        // 页面被刷新/导航/风控改动），岗位与页面可能对不上 —— 恢复列表后立即暂停，
+        // 让用户确认列表状态，绝不静默跳过整批。
+        if (trig.listPreserved === false) {
+          try { await softReturnToList(task); } catch (_) {}
+          runner.pause = true;
+          task.status = TASK_STATUS.PAUSED;
+          task.awaitingUserRetry = true;
+          task.pauseReason = `左侧职位列表页面发生变化（可能被刷新/导航或风控改动），岗位与页面可能对不上；请检查左侧列表后继续`;
+          await log('warn', '[列表页] ' + task.pauseReason + '：' + (job.title || ''), {
+            jobId: job.jobId,
+            activeText: job.activeText || '',
+            listPreserved: trig.listPreserved
+          });
+          await publishTask(task);
+          return 'limited';
+        }
+        // 防级联②：连续 N 岗读不到 HR 活跃度（未知）→ 左侧列表大概率已失效，
+        // 暂停而不是继续空转跳过。
+        if (job.activeText) {
+          runner.consecutiveUnknownActive = 0;
+        } else {
+          runner.consecutiveUnknownActive = (runner.consecutiveUnknownActive || 0) + 1;
+          if (runner.consecutiveUnknownActive >= 3) {
+            try { await softReturnToList(task); } catch (_) {}
+            runner.pause = true;
+            task.status = TASK_STATUS.PAUSED;
+            task.awaitingUserRetry = true;
+            task.pauseReason = `连续 ${runner.consecutiveUnknownActive} 岗无法读取 HR 活跃度，左侧列表可能已失效（刷新/筛选变化）；请检查左侧列表后继续`;
+            await log('warn', task.pauseReason, { jobId: job.jobId, activeText: job.activeText || '' });
+            await publishTask(task);
+            return 'limited';
+          }
+          await log('warn', `[列表页] HR 活跃度未读取到（${runner.consecutiveUnknownActive}/3），将先回列表恢复状态再核对下一岗`, {
+            jobId: job.jobId
+          });
         }
         item.state = 'SKIPPED';
         item.reasons = [skipReason];
@@ -3322,6 +3360,13 @@ async function runTaskLoop(taskId) {
       };
     });
     await log('info', '开始队列投递：共 ' + queue.length + ' 岗；锚点 ' + String(task.listHref || '无').slice(0, 120) + (task.listExpectLabel ? ('；求职期望 ' + String(task.listExpectLabel).slice(0, 40)) : ''));
+    if (task.listHref && /web\/geek\/jobs/.test(String(task.listHref)) && !/city=/.test(String(task.listHref))) {
+      await log('warn', '[列表页] 锚点 URL 缺少 city 参数，返回列表时可能丢失城市/筛选，投递中将持续核对左侧列表状态', {
+        href: String(task.listHref).slice(0, 160)
+      });
+    }
+    // 连续「活跃度未知」计数从本次批次开始
+    runner.consecutiveUnknownActive = 0;
 
     for (let qi = 0; qi < queue.length; qi++) {
       const row = queue[qi];
