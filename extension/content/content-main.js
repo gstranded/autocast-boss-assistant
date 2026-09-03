@@ -27,7 +27,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.20";
+  const BHT_CONTENT_VERSION = "1.7.21";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
