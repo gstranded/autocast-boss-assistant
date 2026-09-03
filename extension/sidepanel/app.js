@@ -18,11 +18,16 @@ import {
   sortLogsNewestFirst,
   sortLogsOldestFirst
 } from '../shared/log-order.js';
+import {
+  evaluateDeliverySchedule,
+  formatDeliveryScheduleStatus,
+  normalizeDeliveryScheduleDays
+} from '../shared/delivery-schedule.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.22";
+const BHT_UI_VERSION = "1.7.23";
 const VERSION_GUARDED_API_MESSAGES = new Set([
   MSG.RUN_PREVIEW,
   MSG.CONFIRM_AND_START,
@@ -546,7 +551,41 @@ function fillSettings(settings) {
   $('neverRepeatJob').checked = settings.neverRepeatJob !== false;
   $('splitViewEnabled').checked = settings.splitViewEnabled !== false;
   $('debugLoggingEnabled').checked = settings.debugLoggingEnabled === true;
+  $('scheduledDeliveryEnabled').checked = settings.scheduledDeliveryEnabled === true;
+  const scheduledDays = new Set(normalizeDeliveryScheduleDays(settings.scheduledDeliveryDays));
+  document.querySelectorAll('[data-schedule-day]').forEach((input) => {
+    input.checked = scheduledDays.has(Number(input.dataset.scheduleDay));
+  });
+  updateDeliveryScheduleUi(settings);
   updateDebugUi(settings);
+}
+
+function readScheduledDeliveryDays() {
+  return [...document.querySelectorAll('[data-schedule-day]:checked')]
+    .map((input) => Number(input.dataset.scheduleDay))
+    .filter((day) => Number.isInteger(day));
+}
+
+function updateDeliveryScheduleUi(settings = null) {
+  const enabled = settings
+    ? settings.scheduledDeliveryEnabled === true
+    : $('scheduledDeliveryEnabled')?.checked === true;
+  const resolved = settings || {
+    scheduledDeliveryEnabled: enabled,
+    scheduledDeliveryDays: readScheduledDeliveryDays()
+  };
+  const dayInputs = document.querySelectorAll('[data-schedule-day]');
+  dayInputs.forEach((input) => { input.disabled = !enabled; });
+  $('deliveryScheduleConfig')?.classList.toggle('is-disabled', !enabled);
+  if ($('deliveryScheduleStatus')) {
+    const schedule = evaluateDeliverySchedule(resolved, new Date());
+    $('deliveryScheduleStatus').textContent = formatDeliveryScheduleStatus(resolved, new Date());
+    $('deliveryScheduleStatus').dataset.state = !schedule.enabled
+      ? 'disabled'
+      : schedule.allowed
+        ? 'active'
+        : 'paused';
+  }
 }
 
 function updateDebugUi(settings = {}) {
@@ -574,6 +613,8 @@ function readSettingsPatch(base) {
     neverRepeatJob: $('neverRepeatJob').checked,
     splitViewEnabled: $('splitViewEnabled').checked,
     debugLoggingEnabled: $('debugLoggingEnabled').checked,
+    scheduledDeliveryEnabled: $('scheduledDeliveryEnabled').checked,
+    scheduledDeliveryDays: readScheduledDeliveryDays(),
     whitelistOnly: $('whitelistOnly').checked
   };
 }
@@ -1286,7 +1327,9 @@ function updateTaskUI(task, runner = {}) {
     if (runner.previewing) {
       hint = '正在加载岗位…';
     }
+    else if (status === 'running' && task?.schedulePauseRequested) hint = '当前投递时段已结束：完成当前岗位后自动暂停。';
     else if (status === 'running') hint = '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
+    else if (status === 'paused' && task?.pauseSource === 'schedule') hint = `${task.pauseReason || '等待下一个投递时段'}；进入时段后自动继续。`;
     else if (status === 'paused') hint = '已暂停：点「继续」恢复当前队列；或「停止」后重新批量投递。';
     else if (status === 'awaiting_confirm') hint = '预览已就绪：可「投递一份」试投，或「批量投递」勾选岗位。';
     else if (status === 'completed' || status === 'stopped') {
@@ -1313,7 +1356,9 @@ function updateTaskUI(task, runner = {}) {
   setControlArmed('btnResume', {
     enabled: onBoss && isPaused,
     armed: isPaused,
-    title: isPaused ? '继续当前任务' : '仅在暂停后可继续'
+    title: isPaused
+      ? (task?.pauseSource === 'schedule' ? '当前由定时规则暂停，进入时段后会自动继续' : '继续当前任务')
+      : '仅在暂停后可继续'
   });
   setControlArmed('btnSkip', {
     enabled: onBoss && activeRun,
@@ -2073,6 +2118,9 @@ function wireAutosave() {
     scheduleAutosave({ bumpRevision: false });
   }, true);
   root.addEventListener('change', (e) => {
+    if (e.target?.id === 'scheduledDeliveryEnabled' || e.target?.matches?.('[data-schedule-day]')) {
+      updateDeliveryScheduleUi();
+    }
     if (shouldAutosaveTarget(e.target)) scheduleAutosave();
   }, true);
   root.addEventListener('compositionstart', (e) => {
@@ -2610,11 +2658,12 @@ function bindEvents() {
       toast(res?.message || res?.error || '启动失败', 'error', 3500);
       showErrorModal('启动失败', res?.message || res?.error || '无法开始任务', { showRetry: false });
     } else {
-      toast(
-        res.splitView?.ok ? '已开始投递 · 已打开左右分屏' : '已开始投递 · 消息页使用普通标签',
-        res.splitView?.ok ? 'success' : 'warn',
-        2600
-      );
+      const message = res.scheduled
+        ? '已加入定时队列，将在下一个投递时段自动开始'
+        : res.splitView?.ok
+          ? '已开始投递 · 已打开左右分屏'
+          : '已开始投递 · 消息页使用普通标签';
+      toast(message, res.scheduled || !res.splitView?.ok ? 'warn' : 'success', res.scheduled ? 4200 : 2600);
     }
     await refresh({ soft: true });
   });
@@ -2676,7 +2725,9 @@ function bindEvents() {
       toast(res?.message || res?.error || '投递一份启动失败', 'error', 3500);
       showErrorModal('投递一份失败', res?.message || res?.error || '无法启动', { showRetry: false });
     } else {
-      const suffix = res.splitView?.ok ? ' · 已左右分屏' : ' · 普通标签模式';
+      const suffix = res.scheduled
+        ? ' · 已加入定时队列'
+        : res.splitView?.ok ? ' · 已左右分屏' : ' · 普通标签模式';
       const remainTxt = typeof res.remain === 'number' ? (' · 还剩 ' + res.remain + ' 个未投') : '';
       toast('投递一份已开始：' + (res.job?.title || selectedJobIds[0]) + suffix + remainTxt, res.splitView?.ok ? 'success' : 'warn', 3200);
     }
@@ -2956,7 +3007,14 @@ function wireControlButtons() {
     if (modal) modal.hidden = true;
     toast('继续任务…', 'warn', 1200);
     const res = await api(MSG.RESUME_TASK);
-    toast(res?.ok === false ? (res.message || res.error || '继续失败') : '已继续投递', res?.ok === false ? 'error' : 'success');
+    toast(
+      res?.ok === false
+        ? (res.message || res.error || '继续失败')
+        : res?.scheduled
+          ? '当前不在投递时段，已等待自动恢复'
+          : '已继续投递',
+      res?.ok === false ? 'error' : res?.scheduled ? 'warn' : 'success'
+    );
     await refresh({ soft: true });
   });
 
@@ -3010,6 +3068,7 @@ refresh().catch(() => {});
 setInterval(() => {
   if (state.hostSuspended) return;
   refreshControlEnablement();
+  if (state.config?.settings) updateDeliveryScheduleUi(state.config.settings);
   const runnerState = state.config?.runner || {};
   if (runnerState.previewing) {
     // 计时每秒本地刷新；后台只取轻量 runner，不再搬运任务/历史/简历/日志。
