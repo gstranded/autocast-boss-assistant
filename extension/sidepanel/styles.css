@@ -622,3 +622,23 @@ html.float-mode main { overflow: auto; max-height: calc(100vh - 112px); }
   border-color: color-mix(in srgb, var(--primary) 45%, var(--line-strong));
 }
 .today-line b { color: var(--primary); }
+
+/* 预览列表：当前投递岗位高亮（橙色描边 + 徽标） */
+.item.current-delivery {
+  outline: 2px solid #ff8c00;
+  outline-offset: -2px;
+  border-radius: 8px;
+  background: rgba(255, 140, 0, 0.10);
+}
+.delivery-badge {
+  display: inline-block;
+  background: #ff8c00;
+  color: #fff;
+  font-size: 11px;
+  line-height: 1.4;
+  border-radius: 4px;
+  padding: 1px 7px;
+  margin-right: 6px;
+  vertical-align: middle;
+  white-space: nowrap;
+}

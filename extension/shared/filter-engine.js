@@ -121,6 +121,16 @@ export function classifyActive(activeText) {
   if (/(^|[^0-9])2月内活跃/.test(t)) return '2m';
   if (/(^|[^0-9])3月内活跃/.test(t)) return '3m';
   if (/(^|[^0-9])4月内活跃/.test(t)) return '4m';
+  {
+    // 其余「N月内活跃」：1月内→本月档；5月及以上→半年前档（此前只能匹配 2-4 月，
+    // 5月内/6月内 等会落入「无法归类→恒不满足」，宽松筛选也被误拒）
+    const monthMatch = t.match(/(\d+)月内活跃/);
+    if (monthMatch) {
+      const n = Number(monthMatch[1]);
+      if (n === 1) return 'month';
+      if (n >= 5) return 'half';
+    }
+  }
   if (/半年前活跃|半年内活跃/.test(t)) return 'half';
   if (/一年前活跃|1年前活跃/.test(t)) return 'year';
   if (/当前在线/.test(t) || /(^|[^0-9\u4e00-\u9fff])在线([^0-9\u4e00-\u9fff]|$)/.test(t)) return 'online';

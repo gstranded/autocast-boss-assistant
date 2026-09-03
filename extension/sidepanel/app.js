@@ -1462,6 +1462,7 @@ const list = $('previewList');
   (task.results || []).forEach((r) => {
     const div = document.createElement('div');
     div.className = `item ${r.decision}`;
+    div.dataset.job = String(r.job.jobId || '');
     const canSelect = r.decision === 'pass';
     div.innerHTML = `
       <div class="row">
@@ -1492,6 +1493,42 @@ const list = $('previewList');
       else state.selected.delete(id);
     });
   }
+  markCurrentDeliveryJob();
+}
+
+// 批量投递时标记「当前正在投递的岗位」：橙色描边 + 「投递中」徽标 + 自动滚动到该岗位。
+// 仅在岗位 id 变化时滚动一次，避免持续抢占用户滚动位置。
+function markCurrentDeliveryJob() {
+  const list = $('previewList');
+  if (!list) return;
+  const task = state.config?.task || {};
+  const currentId = String(task.currentJobId || '');
+  const active = currentId && (task.status === 'running' || task.status === 'paused');
+  let target = null;
+  for (const el of list.querySelectorAll('.item[data-job]')) {
+    const isCurrent = Boolean(active && el.dataset.job === currentId);
+    el.classList.toggle('current-delivery', isCurrent);
+    const badge = el.querySelector('.delivery-badge');
+    if (isCurrent && !badge) {
+      const b = document.createElement('span');
+      b.className = 'delivery-badge';
+      b.textContent = '投递中';
+      const t = el.querySelector('.t');
+      (t || el).prepend(b);
+    } else if (!isCurrent && badge) {
+      badge.remove();
+    }
+    if (isCurrent) target = el;
+  }
+  if (target && state.lastDeliveryScrollJob !== currentId) {
+    state.lastDeliveryScrollJob = currentId;
+    try {
+      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    } catch (_) {
+      target.scrollIntoView();
+    }
+  }
+  if (!target && state.lastDeliveryScrollJob) state.lastDeliveryScrollJob = '';
 }
 
 function escapeHtml(s) {
@@ -3021,4 +3058,6 @@ setInterval(() => {
     lastFullRefreshAt = Date.now();
     refresh({ soft: true }).catch(() => {});
   }
+  // 投递进行中：高亮当前岗位并保持滚动定位
+  markCurrentDeliveryJob();
 }, 1000);

@@ -357,7 +357,9 @@ test("preview captures native job metadata and bounds read-only HR activity enri
   assert.ok(content.includes("extractJobMetadataFromComponent"));
   assert.ok(content.includes("inspectListSideDetail"));
   assert.ok(content.includes("extractDetailHunter"));
-  assert.ok(content.includes("source: \"preview-no-click\""));
+  assert.ok(content.includes("source: \"list-api-detail\""));
+  assert.ok(content.includes("fetchJobActivityDetail(job, deadlineAt)"));
+  assert.ok(!content.includes("preview-no-click"));
   assert.ok(background.includes("applyPreviewActivityEnrichment"));
   assert.ok(background.includes("finalizePreviewActivityDecisions"));
   assert.ok(background.includes("deferredToDelivery"));
@@ -1366,6 +1368,25 @@ test("history clear/export/date-guard UX", () => {
   assert.ok(app.includes("normalizeHistoryDateRange($('historyFrom')?.value"), "from listener guards range");
   assert.ok(app.includes("normalizeHistoryDateRange($('historyFrom')?.value || '', $('historyTo')?.value || '')"), "to listener guards range");
   assert.ok(app.includes("结束日期不能早于开始日期"), "guard surfaces a toast");
+});
+
+test("preview filters HR activity via network metadata and marks current delivery job", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const styles = fs.readFileSync("extension/sidepanel/styles.css", "utf8");
+  // 预览期用列表接口元数据核对活跃度（不点卡片），不满足的岗位在预览即排除
+  assert.ok(background.includes("matchActive(activeText, selected)"), "preview finalize applies matchActive");
+  assert.ok(background.includes("不点卡片"), "preview activity check is network-only");
+  assert.ok(background.includes("ENRICH_JOB_ACTIVITY"), "preview enriches via detail API message");
+  assert.ok(background.includes("applyPreviewActivityEnrichment(results, activities"), "enrichment results applied to preview");
+  assert.ok(background.includes("HR 活跃度核对（列表接口元数据"), "preview activity summary logged");
+  // 预览项带 jobId，供投递时高亮定位
+  assert.ok(app.includes("div.dataset.job = String(r.job.jobId || '')"), "preview item carries jobId");
+  // 当前投递岗：橙色描边 + 投递中徽标 + 滚动定位（岗位变化时滚动一次）
+  assert.ok(app.includes("markCurrentDeliveryJob()"), "panel polls current job marker");
+  assert.ok(app.includes("current-delivery") && app.includes("delivery-badge") && app.includes("投递中"), "highlight markers present");
+  assert.ok(app.includes("scrollIntoView({ block: 'center'") && app.includes("lastDeliveryScrollJob"), "auto scroll once per job");
+  assert.ok(styles.includes(".item.current-delivery") && styles.includes("#ff8c00"), "orange outline style present");
 });
 
 test("skip does not wait job interval and waits are logged", () => {

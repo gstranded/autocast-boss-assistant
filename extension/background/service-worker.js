@@ -2096,11 +2096,39 @@ function applyPreviewActivityEnrichment(results = [], activities = [], activeWit
   return { resolved, rejected };
 }
 
-function finalizePreviewActivityDecisions(results = [], activeWithin = []) {
-  // 预览不点列表卡、不拉详情。未知活跃留给投递时的临时详情页核对。
-  void results;
-  void activeWithin;
-  return { rejected: 0 };
+function finalizePreviewActivityDecisions(results = [], activeWithin = [], logFn = null) {
+  // 预览用「列表接口网络元数据」核对 HR 活跃度：不点卡片、不拉详情，
+  // 与「左侧职位页保持原样」原则一致（列表 API 已被 page-network-hook 捕获，
+  // activeText/在线状态已存在于 job 上）。
+  // 无网络证据的岗位保留 defer（requiresActiveCheck），投递时还会核对一次。
+  const selected = normalizeActiveWithin(activeWithin);
+  let resolved = 0;
+  let rejected = 0;
+  let unknown = 0;
+  for (const row of results || []) {
+    if (row?.decision !== 'pass' || row?.requiresActiveCheck !== true) continue;
+    const activeText = String(row.job?.activeText || '').trim();
+    if (!activeText) {
+      unknown += 1;
+      continue;
+    }
+    row.job = { ...(row.job || {}), activeText };
+    row.requiresActiveCheck = false;
+    if (selected.length && !matchActive(activeText, selected)) {
+      row.decision = 'reject';
+      row.selected = false;
+      row.reasonCodes = [REASON.FILTER_ACTIVE];
+      row.reasonTexts = [reasonText(REASON.FILTER_ACTIVE, activeText)];
+      rejected += 1;
+    } else {
+      row.passReasons = [...(row.passReasons || []), `HR 活跃：${activeText}`];
+      resolved += 1;
+    }
+  }
+  if (logFn && (resolved || rejected || unknown)) {
+    logFn(`[预览] HR 活跃度核对（列表接口元数据，不点卡片）：通过 ${resolved} · 不满足 ${rejected} · 未知保留 ${unknown}（投递时再核对）`);
+  }
+  return { resolved, rejected, unknown };
 }
 
 function mergePreviewJobBatch(target, jobs = []) {
@@ -2263,6 +2291,30 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
     const todayStats = await getTodayStats();
     if (!isActive()) return cancelled();
     const results = evaluatePreviewResults(Array.from(collectedJobs.values()), config, todayStats);
+    // 预览期核对 HR 活跃度：直连列表 detail API（不点卡片、不离开列表页），
+    // 让「预览通过」≈「投递会投」，避免队列尾部混入大量的「投递时才被判跳过」岗位。
+    // 网络元数据（job.activeText）直接过滤；缺失的逐岗抓取 detail API（限时，熔断 429/403）。
+    {
+      const pending = results.filter((row) => row.decision === 'pass' && row.requiresActiveCheck === true);
+      if (pending.length && isActive()) {
+        const enrich = await sendToBoss(
+          MSG.ENRICH_JOB_ACTIVITY,
+          {
+            jobs: pending.slice(0, 80).map((r) => r.job),
+            deadlineAt: Date.now() + 60000
+          },
+          { tabId: sourcePreviewTab?.id || previewTab?.id || null, previewRunId }
+        ).catch(() => null);
+        const activities = Array.isArray(enrich?.activities) ? enrich.activities : [];
+        if (activities.length) {
+          applyPreviewActivityEnrichment(results, activities, config.filters?.activeWithin || []);
+          await log('info', `[预览] HR 活跃度核对（列表接口 detail API，不点卡片）：已核对 ${activities.length}/${pending.length} 岗，不满足的已从队列排除`, { previewRunId });
+        }
+        if (enrich?.halted) {
+          await log('warn', `[预览] HR 活跃度核对提前停止（${enrich.haltError || '未知原因'}），其余岗位保持投递时核对`, { previewRunId });
+        }
+      }
+    }
     const activityMeta = {
       requested: 0,
       eligible: 0,
@@ -2271,9 +2323,12 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
       rejected: 0,
       halted: false,
       haltError: '',
-      deferredToDelivery: results.filter((row) => row.decision === 'pass' && row.requiresActiveCheck === true).length
+      deferredToDelivery: 0
     };
-    finalizePreviewActivityDecisions(results, config.filters?.activeWithin || []);
+    finalizePreviewActivityDecisions(results, config.filters?.activeWithin || [], (msg) =>
+      log('info', msg).catch(() => {})
+    );
+    activityMeta.deferredToDelivery = results.filter((row) => row.decision === 'pass' && row.requiresActiveCheck === true).length;
     const summary = summarizePreview(results);
     setPreviewProgress(summary.scanned, summary.pass, previewRunId);
     const previewListHref = scan.listHref || '';

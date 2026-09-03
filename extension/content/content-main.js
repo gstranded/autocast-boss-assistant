@@ -2065,17 +2065,52 @@ function firstEl(selectors, root = document) {
   }
 
   async function enrichJobActivities(payload = {}) {
+    // 预览期核对 HR 活跃度：直连列表 detail API（BOSS 原生接口，带登录态），
+    // 不点卡片、不导航、不离开列表页（与「左侧职位页保持原样」一致）。
+    // 逐岗限时抓取；遇到 429/403 立即熔断，避免触发风控。
     const requested = Array.isArray(payload.jobs) ? payload.jobs : [];
+    const deadlineAt = Number(payload.deadlineAt) || (Date.now() + 60000);
+    const activities = [];
+    let eligibleCount = 0;
+    let checkedCount = 0;
+    let halted = false;
+    let haltError = "";
+    for (const job of requested) {
+      if (Date.now() >= deadlineAt) {
+        halted = true;
+        haltError = "ACTIVITY_DEADLINE";
+        break;
+      }
+      eligibleCount += 1;
+      const res = await fetchJobActivityDetail(job, deadlineAt);
+      if (res?.halt) {
+        halted = true;
+        haltError = res.error || res.message || "";
+        break;
+      }
+      if (res?.ok) {
+        activities.push({
+          jobId: String(job?.jobId || ""),
+          activeText: String(res.activeText || "").trim(),
+          bossOnline: res.bossOnline === true,
+          goldHunter: res.goldHunter === true,
+          hrTitle: String(res.bossTitle || "").trim(),
+          bossName: String(res.bossName || "").trim(),
+          bossId: String(res.bossId || job?.bossId || "").trim()
+        });
+        checkedCount += 1;
+      }
+    }
     return {
       ok: true,
-      activities: [],
+      activities,
       requestedCount: requested.length,
-      eligibleCount: 0,
-      checkedCount: 0,
-      halted: false,
-      haltError: "",
-      skipped: true,
-      source: "preview-no-click"
+      eligibleCount,
+      checkedCount,
+      halted,
+      haltError,
+      skipped: false,
+      source: "list-api-detail"
     };
   }
 

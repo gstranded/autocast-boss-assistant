@@ -259,6 +259,12 @@ test("HR active / hunter / outsource / whitelist-only", () => {
   assert.equal(classifyActive("2月内活跃"), "2m");
   assert.equal(classifyActive("3月内活跃"), "3m");
   assert.equal(classifyActive("4月内活跃"), "4m");
+  assert.equal(classifyActive("5月内活跃"), "half");
+  assert.equal(classifyActive("6月内活跃"), "half");
+  assert.equal(classifyActive("1月内活跃"), "month");
+  assert.equal(matchActive("5月内活跃", ["half"]), true);
+  assert.equal(matchActive("5月内活跃", ["today"]), false);
+  assert.equal(matchActive("6月内活跃", ["month"]), false);
   assert.equal(classifyActive("半年前活跃"), "half");
   assert.equal(classifyActive("一年前活跃"), "year");
   assert.equal(classifyActive("3日前活跃"), "3d");
