@@ -1370,8 +1370,9 @@ test("history clear/export/date-guard UX", () => {
 
 test("skip does not wait job interval and waits are logged", () => {
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
-  // 跳过项不等待投递间隔
-  assert.ok(background.includes("outcome === 'skipped'") && background.includes("无需等待投递间隔"), "skipped items skip the interval wait");
+  // 未触发沟通的跳过项不等待投递间隔（已触发「立即沟通」的跳过仍保留间隔）
+  assert.ok(background.includes("outcome === 'skipped' && !hasChatCheckpoint(item)"), "untriggered skips skip the interval wait");
+  assert.ok(background.includes("无需等待投递间隔"), "skip no-wait log message present");
   // 等待前把间隔写进日志
   assert.ok(background.includes("等待投递间隔") && background.includes("秒后继续下一岗"), "interval wait is logged with seconds");
   // 批次最后一岗不再额外等待

@@ -3532,11 +3532,13 @@ async function runTaskLoop(taskId) {
         break;
       }
 
-      // minJobInterval guard：跳过（未投递）不算次数，不等待投递间隔，直接继续下一岗；
-      // 等待前把间隔写入日志，用户可清楚看到当前在等多久；批次最后一岗无需再等。
+      // minJobInterval guard：未触发沟通的跳过（HR活跃/去重/环境异常等）不算投递，
+      // 不等待投递间隔直接继续；已触发「立即沟通」的跳过（如会话未确认
+      // conversation_not_found）仍保留间隔，避免对 BOSS 连续触发；
+      // 等待前把间隔写入日志；批次最后一岗不再等待。
       if (qi >= queue.length - 1) {
         // 最后一项：批次结束
-      } else if (outcome === 'skipped') {
+      } else if (outcome === 'skipped' && !hasChatCheckpoint(item)) {
         await log('info', '[队列] 跳过（未投递），无需等待投递间隔，继续下一岗…');
       } else {
         let iv = config.settings.jobIntervalMs || [4000, 6000];

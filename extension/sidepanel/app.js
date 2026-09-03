@@ -2754,7 +2754,7 @@ function bindEvents() {
     const range = normalizeHistoryDateRange($('historyFrom')?.value || '', $('historyTo')?.value || '');
     if (range.adjusted && $('historyTo')) {
       $('historyTo').value = range.toVal;
-      toast('结束日期不能早于开始日期，已自动调整为同一天', 'warn', 3000);
+      toast('结束日期不能早于开始日期，已自动调整为开始日期当天', 'warn', 3000);
     }
     renderHistory(state.config?.history || []);
   });
