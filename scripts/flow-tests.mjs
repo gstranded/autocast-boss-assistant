@@ -1333,6 +1333,20 @@ test("v1.7.20 history date filter, full config import and trigger dedup mark are
   assert.ok(jobMarks.every((m) => m.includes("securityId")), "every job-level mark keeps securityId");
 });
 
+test("resume lightbox avoids session quota and surfaces set failure", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const preview = fs.readFileSync("extension/sidepanel/image-preview.js", "utf8");
+  // 已保存图片：弹窗按 profileId 直接读 storage.local，不再整包写 storage.session
+  assert.ok(app.includes("openImageLightbox({ profileId: profile.id, imageIndex"), "saved images open by profileId");
+  assert.ok(preview.includes("chrome.storage.local.get('bht_resumes')"), "popup reads saved images from local storage");
+  assert.match(preview, /stored\.profileId/, "popup supports profileId payload");
+  // 临时预览：先压缩再展示（原始大图会超 session 配额）
+  assert.ok(app.includes("fileToCompressedDataUrl(f)"), "tmp preview compressed before lightbox");
+  // 写入失败不再静默：给出错误提示且不再尝试开窗
+  assert.ok(app.includes("图片过大，无法打开预览"), "quota failure surfaces a toast");
+  assert.match(app, /catch \(e\) \{\s*console\.warn\('[^']*'?, e\)/, "set failure is caught");
+});
+
 
 await runRegisteredTests();
 

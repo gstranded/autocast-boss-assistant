@@ -1059,18 +1059,34 @@ function renderResumeEditor() {
 // —— 图片简历全屏预览（独立窗口，避免受面板尺寸限制）——
 const IMG_PREVIEW_KEY = 'bht_img_preview';
 
-async function openImageLightbox(profile, index) {
-  const images = (profile?.images || []).filter((i) => i && i.dataUrl);
-  if (!images.length) return;
-  await chrome.storage.session.set({
-    [IMG_PREVIEW_KEY]: {
-      images,
-      index: Math.min(Math.max(0, index || 0), images.length - 1)
-    }
-  });
+async function openImageLightbox(payload) {
+  // payload 两种形态：
+  //  - { profileId, imageIndex }：已保存图片 → 预览窗直接从 storage.local 读方案，
+  //    不走 storage.session，避免「多张/大图」超过 session 10MB 配额导致点击无反应；
+  //  - { images, index }：临时（未保存）图片 → 写入前已压缩为小尺寸 dataUrl。
+  try {
+    await chrome.storage.session.set({ [IMG_PREVIEW_KEY]: payload });
+  } catch (e) {
+    console.warn('[BHT] 图片预览写入失败', e);
+    toast('图片过大，无法打开预览，请压缩后重试', 'error', 3200);
+    return;
+  }
   const url = chrome.runtime.getURL('sidepanel/image-preview.html');
   try {
-    await chrome.windows.create({ url, type: 'popup', state: 'maximized' });
+    // 注意：type:'popup' 时 Chrome 会忽略 state:'maximized'（实测窗口只有 1x33px 隐形细条），
+    // 因此显式给出大尺寸并居中。
+    const availW = globalThis.screen?.availWidth || 1440;
+    const availH = globalThis.screen?.availHeight || 900;
+    const width = Math.max(720, Math.round(availW * 0.86));
+    const height = Math.max(560, Math.round(availH * 0.88));
+    await chrome.windows.create({
+      url,
+      type: 'popup',
+      width,
+      height,
+      left: Math.max(0, Math.round((availW - width) / 2)),
+      top: Math.max(0, Math.round((availH - height) / 2))
+    });
   } catch (_) {
     // 极少数环境不支持弹窗时回退为标签页
     await chrome.tabs.create({ url });
@@ -1081,17 +1097,19 @@ function bindImageLightbox() {
   $('imagePreview').addEventListener('click', (event) => {
     const thumb = event.target.closest('img[data-idx]');
     if (!thumb) return;
-    // 上传后尚未保存的临时预览图：直接读文件展示
+    // 上传后尚未保存的临时预览图：压缩后直接展示（原始大图会撑爆 storage.session 配额）
     if (thumb.dataset.tmp === '1') {
       const files = Array.from($('imageFiles')?.files || []);
       const f = files[Number(thumb.dataset.idx)];
       if (!f) return;
-      const reader = new FileReader();
-      reader.onload = () => openImageLightbox({ images: [{ dataUrl: reader.result, name: f.name }] }, 0);
-      reader.readAsDataURL(f);
+      fileToCompressedDataUrl(f).then((dataUrl) => {
+        openImageLightbox({ images: [{ dataUrl, name: f.name }], index: 0 });
+      });
       return;
     }
-    openImageLightbox(getActiveProfile(), Number(thumb.dataset.idx));
+    const profile = getActiveProfile();
+    if (!profile) return;
+    openImageLightbox({ profileId: profile.id, imageIndex: Number(thumb.dataset.idx) });
   });
 }
 

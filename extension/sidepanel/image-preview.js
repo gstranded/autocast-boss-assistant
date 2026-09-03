@@ -1,10 +1,25 @@
-// 全屏图片简历预览窗口：从 chrome.storage.session 读取图片列表，支持切换与关闭。
+// 全屏图片简历预览窗口：支持切换与关闭。
+// 两种数据来源：
+//  - { images, index }：临时预览（未保存图片，压缩后的 dataUrl）；
+//  - { profileId, imageIndex }：已保存图片 → 直接从 storage.local 读取方案，
+//    不经过 storage.session（避免多张/大图超过 session 10MB 配额导致无法打开）。
 const PREVIEW_KEY = 'bht_img_preview';
 
 (async () => {
   const stored = (await chrome.storage.session.get(PREVIEW_KEY))[PREVIEW_KEY] || {};
-  const images = Array.isArray(stored.images) ? stored.images.filter((i) => i && i.dataUrl) : [];
-  let index = Math.min(Math.max(0, Number(stored.index) || 0), Math.max(0, images.length - 1));
+  let images = Array.isArray(stored.images) ? stored.images.filter((i) => i && i.dataUrl) : [];
+  let requestedIndex = Number(stored.index) || 0;
+  if (!images.length && stored.profileId) {
+    try {
+      const { bht_resumes: resumes } = await chrome.storage.local.get('bht_resumes');
+      const profile = (resumes?.profiles || []).find((p) => p.id === stored.profileId);
+      images = Array.isArray(profile?.images) ? profile.images.filter((i) => i && i.dataUrl) : [];
+      requestedIndex = Number(stored.imageIndex) || 0;
+    } catch (_) {
+      // 读取失败则按空列表处理，页面显示「没有可预览的图片」
+    }
+  }
+  let index = Math.min(Math.max(0, requestedIndex), Math.max(0, images.length - 1));
 
   const img = document.getElementById('preview');
   const info = document.getElementById('info');
