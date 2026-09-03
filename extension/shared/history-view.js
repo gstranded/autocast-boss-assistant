@@ -54,3 +54,14 @@ export function summarizeHistory(history = []) {
   const skipCount = Math.max(0, total - successCount - failCount);
   return { total, success: successCount, skipped: skipCount, failed: failCount };
 }
+
+// 日期筛选容错：开始日期不得晚于结束日期（ISO 字符串 YYYY-MM-DD 可直接比较）。
+// 若结束日期早于开始日期，则把结束日期修正为开始日期，返回 adjusted=true。
+export function normalizeHistoryDateRange(fromVal = '', toVal = '') {
+  let adjusted = false;
+  if (fromVal && toVal && toVal < fromVal) {
+    toVal = fromVal;
+    adjusted = true;
+  }
+  return { fromVal, toVal, adjusted };
+}

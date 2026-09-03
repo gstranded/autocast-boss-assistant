@@ -1094,7 +1094,7 @@ test("history/config controls and image-only resume stay on shipped paths", () =
   assert.ok(app.includes("今日已投"), "today counter label present");
   assert.ok(app.includes("dailyMaxCommunicate"), "today counter uses daily limit");
   assert.ok(app.includes("btnExportHistory"));
-  assert.ok(app.includes("JSON.stringify(history"));
+  assert.ok(app.includes("JSON.stringify(exportData"));
   assert.ok(app.includes("CLEAR_HISTORY"));
   assert.ok(app.includes("$('btnImport')"));
   assert.ok(html.includes('id="btnExport" class="btn"'));
@@ -1345,6 +1345,27 @@ test("resume lightbox avoids session quota and surfaces set failure", () => {
   // 写入失败不再静默：给出错误提示且不再尝试开窗
   assert.ok(app.includes("图片过大，无法打开预览"), "quota failure surfaces a toast");
   assert.match(app, /catch \(e\) \{\s*console\.warn\('[^']*'?, e\)/, "set failure is caught");
+});
+
+test("history clear/export/date-guard UX", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  const historyView = fs.readFileSync("extension/shared/history-view.js", "utf8");
+  // 按钮文案
+  assert.ok(html.includes(">清除筛选</button>"), "reset button relabeled 清除筛选");
+  assert.ok(html.includes(">导出全部记录</button>"), "export button relabeled 导出全部记录");
+  assert.ok(html.includes(">清空全部记录</button>"), "clear button relabeled 清空全部记录");
+  // 清空二次确认
+  assert.ok(app.includes("window.confirm(") && app.includes("确定要清空全部投递记录吗"), "clear requires confirmation");
+  // 导出按筛选：筛选后导出筛选结果，未筛选导出全部
+  assert.ok(app.includes("const { rows, hasFilter } = visibleHistoryRows(history)"), "export uses visible rows");
+  assert.ok(app.includes("hasFilter ? rows : history"), "export respects active filter");
+  assert.ok(app.includes("已导出筛选后的") && app.includes("已导出全部"), "export toasts distinguish filtered/all");
+  // 日期防错：结束早于开始自动修正 + 提示
+  assert.ok(historyView.includes("normalizeHistoryDateRange"), "date guard helper exported");
+  assert.ok(app.includes("normalizeHistoryDateRange($('historyFrom')?.value"), "from listener guards range");
+  assert.ok(app.includes("normalizeHistoryDateRange($('historyFrom')?.value || '', $('historyTo')?.value || '')"), "to listener guards range");
+  assert.ok(app.includes("结束日期不能早于开始日期"), "guard surfaces a toast");
 });
 
 

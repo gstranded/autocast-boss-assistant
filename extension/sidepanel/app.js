@@ -10,7 +10,7 @@ import {
   countPendingPassJobs,
   shouldAcceptTaskSnapshot
 } from '../shared/task-model.js';
-import { HISTORY_STATUS_MAP, filterHistoryRows, filterHistoryByDate, summarizeHistory } from '../shared/history-view.js';
+import { HISTORY_STATUS_MAP, filterHistoryRows, filterHistoryByDate, summarizeHistory, normalizeHistoryDateRange } from '../shared/history-view.js';
 import { todayKey } from '../shared/text-utils.js';
 import {
   formatLogTimestamp,
@@ -1523,6 +1523,22 @@ function renderLogs(logs = []) {
 }
 
 
+// 当前筛选下可见的记录行（与渲染、导出共用同一逻辑，保证口径一致）
+function visibleHistoryRows(history = []) {
+  const filter = $('historyFilter')?.value || 'all';
+  const range = normalizeHistoryDateRange($('historyFrom')?.value || '', $('historyTo')?.value || '');
+  const fromTs = range.fromVal ? new Date(range.fromVal + 'T00:00:00').getTime() : 0;
+  const toTs = range.toVal ? new Date(range.toVal + 'T00:00:00').getTime() : 0;
+  const byDate = filterHistoryByDate(history, fromTs, toTs);
+  return {
+    rows: filterHistoryRows(byDate, filter),
+    filter,
+    fromVal: range.fromVal,
+    toVal: range.toVal,
+    hasFilter: Boolean(range.fromVal || range.toVal || (filter && filter !== 'all'))
+  };
+}
+
 function renderHistory(history = []) {
   const box = $('historyList');
   if (!box) return;
@@ -1537,10 +1553,7 @@ function renderHistory(history = []) {
   if (renderKey === state.lastHistoryRenderKey) return;
   state.lastHistoryRenderKey = renderKey;
   // 日期范围（含边界）+ 状态筛选
-  const fromTs = fromVal ? new Date(fromVal + 'T00:00:00').getTime() : 0;
-  const toTs = toVal ? new Date(toVal + 'T00:00:00').getTime() : 0;
-  const byDate = filterHistoryByDate(history, fromTs, toTs);
-  const filtered = filterHistoryRows(byDate, filter);
+  const filtered = visibleHistoryRows(history).rows;
   const stats = summarizeHistory(filtered);
 
   // 顶部今日行：今日已投 x / 每日上限（x 与每日限制使用同一计数器 communicate）
@@ -2737,18 +2750,33 @@ function bindEvents() {
   });
 
   $('historyFrom')?.addEventListener('change', () => {
+    // 日期防错：开始日期晚于结束日期时，把结束日期修正为同一天
+    const range = normalizeHistoryDateRange($('historyFrom')?.value || '', $('historyTo')?.value || '');
+    if (range.adjusted && $('historyTo')) {
+      $('historyTo').value = range.toVal;
+      toast('结束日期不能早于开始日期，已自动调整为同一天', 'warn', 3000);
+    }
     renderHistory(state.config?.history || []);
   });
   $('historyTo')?.addEventListener('change', () => {
+    const range = normalizeHistoryDateRange($('historyFrom')?.value || '', $('historyTo')?.value || '');
+    if (range.adjusted && $('historyTo')) {
+      $('historyTo').value = range.toVal;
+      toast('结束日期不能早于开始日期，已自动调整为开始日期当天', 'warn', 3000);
+    }
     renderHistory(state.config?.history || []);
   });
   $('btnHistoryDateReset')?.addEventListener('click', () => {
+    // 清除筛选：日期范围与状态一并重置
     if ($('historyFrom')) $('historyFrom').value = '';
     if ($('historyTo')) $('historyTo').value = '';
+    if ($('historyFilter')) $('historyFilter').value = 'all';
     renderHistory(state.config?.history || []);
   });
 
   $('btnClearHistory')?.addEventListener('click', async () => {
+    // 清空全部记录：二次确认，防止误触清空
+    if (!window.confirm('确定要清空全部投递记录吗？此操作不可恢复（不影响每日统计与防重复台账）。')) return;
     try {
       await api(MSG.CLEAR_HISTORY);
       if (state.config) state.config.history = [];
@@ -2762,13 +2790,17 @@ function bindEvents() {
   $('btnExportHistory')?.addEventListener('click', () => {
     const history = state.config?.history || [];
     if (!history.length) { toast('暂无记录可导出', 'warn'); return; }
-    const blob = new Blob([JSON.stringify(history, null, 2)], { type: 'application/json' });
+    // 有筛选（日期范围或状态）导出筛选后的记录；无筛选导出全部
+    const { rows, hasFilter } = visibleHistoryRows(history);
+    if (!rows.length) { toast('当前筛选下没有记录可导出', 'warn'); return; }
+    const exportData = hasFilter ? rows : history;
+    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'boss-haitou-history-' + new Date().toISOString().slice(0, 10) + '.json';
+    a.download = 'boss-haitou-history-' + new Date().toISOString().slice(0, 10) + (hasFilter ? '-filtered' : '') + '.json';
     a.click();
     URL.revokeObjectURL(a.href);
-    toast('已导出 ' + history.length + ' 条记录', 'success');
+    toast(hasFilter ? `已导出筛选后的 ${rows.length} 条记录` : `已导出全部 ${history.length} 条记录`, 'success');
   });
 
   $('selectAllPass').addEventListener('change', () => {

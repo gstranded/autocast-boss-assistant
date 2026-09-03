@@ -17,7 +17,7 @@ import {
 } from "../extension/shared/greeting-policy.js";
 import { checkDedup, checkLimits, segmentIdempotencyKey, jobIdempotencyKey } from "../extension/shared/dedup.js";
 import { renderTemplate, pickResumeProfile } from "../extension/shared/template.js";
-import { filterHistoryRows, filterHistoryByDate, summarizeHistory, startOfLocalDay, endOfLocalDay } from "../extension/shared/history-view.js";
+import { filterHistoryRows, filterHistoryByDate, summarizeHistory, startOfLocalDay, endOfLocalDay, normalizeHistoryDateRange } from "../extension/shared/history-view.js";
 import { planResumeSend } from "../extension/shared/resume-policy.js";
 import { buildExportPayload, importConfigPatch, IMPORT_CONFIG_KEYS, sanitizeImportedTask, normalizeSettings } from "../extension/shared/storage.js";
 import { isBossUrl, isBossHostname, isBossTab, bossUrlGuardMessage } from "../extension/shared/boss-url.js";
@@ -888,6 +888,19 @@ test("history date filter boundaries and summary", () => {
   const s = summarizeHistory(rows);
   assert.deepEqual(s, { total: 4, success: 2, skipped: 1, failed: 1 });
   assert.deepEqual(summarizeHistory([]), { total: 0, success: 0, skipped: 0, failed: 0 });
+});
+
+test("normalizeHistoryDateRange fixes inverted date range", () => {
+  // 正常范围不变
+  assert.deepEqual(normalizeHistoryDateRange("2026-09-01", "2026-09-10"), { fromVal: "2026-09-01", toVal: "2026-09-10", adjusted: false });
+  // 起止同一天
+  assert.deepEqual(normalizeHistoryDateRange("2026-09-05", "2026-09-05"), { fromVal: "2026-09-05", toVal: "2026-09-05", adjusted: false });
+  // 结束早于开始：修正为开始日期当天
+  assert.deepEqual(normalizeHistoryDateRange("2026-09-10", "2026-09-01"), { fromVal: "2026-09-10", toVal: "2026-09-10", adjusted: true });
+  // 单边为空不受影响
+  assert.deepEqual(normalizeHistoryDateRange("2026-09-10", ""), { fromVal: "2026-09-10", toVal: "", adjusted: false });
+  assert.deepEqual(normalizeHistoryDateRange("", "2026-09-01"), { fromVal: "", toVal: "2026-09-01", adjusted: false });
+  assert.deepEqual(normalizeHistoryDateRange("", ""), { fromVal: "", toVal: "", adjusted: false });
 });
 
 console.log("6) boss-url guard");
