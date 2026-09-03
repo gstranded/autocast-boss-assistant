@@ -247,6 +247,13 @@ export function sanitizeImportedTask(task) {
     queueCursor: 0,
     consecutiveFails: 0,
     completionSignal: null,
+    // 计数是上一次运行的展示值；重新开始投递后重新累计更直观
+    counters: {
+      success: 0,
+      skipped: 0,
+      failed: 0,
+      processed: 0
+    },
     updatedAt: Date.now()
   };
   return copy;
@@ -272,6 +279,8 @@ export function importConfigPatch(payload) {
     } else if (key === 'task') {
       const sanitized = sanitizeImportedTask(payload[key]);
       if (sanitized) put[storageKey] = sanitized;
+    } else if (key === 'history') {
+      put[storageKey] = Array.isArray(payload[key]) ? payload[key].slice(0, 5000) : [];
     } else if (key === 'idempotency' || key === 'dailyStats') {
       put[storageKey] = payload[key] && typeof payload[key] === 'object' && !Array.isArray(payload[key]) ? payload[key] : {};
     } else {

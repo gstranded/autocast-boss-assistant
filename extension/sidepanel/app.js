@@ -1425,7 +1425,7 @@ function renderPreview(task) {
   }
   lines.push('');
   lines.push(
-    `生效设置：同公司每天最多 ${settings.companyDailyMax ?? '—'} · 每日最多 ${settings.dailyMaxCommunicate ?? '—'} · 本次最多 ${settings.taskMaxCommunicate ?? '—'} · 同HR冷却 ${settings.bossCooldownDays ?? '—'} 天 · 永不重复 ${settings.neverRepeatJob ? '开' : '关'}`
+    `生效设置：同公司每天最多 ${settings.companyDailyMax ?? '—'} · 每日最多 ${Number(settings.dailyMaxCommunicate) > 0 ? settings.dailyMaxCommunicate : '未设上限'} · 本次最多 ${settings.taskMaxCommunicate ?? '—'} · 同HR冷却 ${settings.bossCooldownDays ?? '—'} 天 · 永不重复 ${settings.neverRepeatJob ? '开' : '关'}`
   );
   lines.push('说明：「本次/每日最多沟通」和缺文案的 HR 活跃在正式投递时拦截；预览阶段主要做筛选词、永不重复、同公司已达今日上限等判断。');
   if (Array.isArray(task.warnings) && task.warnings.length) {
@@ -1511,7 +1511,11 @@ function renderHistory(history = []) {
   const filter = $('historyFilter')?.value || 'all';
   const fromVal = $('historyFrom')?.value || '';
   const toVal = $('historyTo')?.value || '';
-  const renderKey = `${filter}|${fromVal}|${toVal}|${history.length}|${history[0]?.id || history[0]?.ts || ''}|${history[0]?.status || ''}`;
+  const dayKey = todayKey();
+  const dayStat = (state.config?.dailyStats || {})[dayKey] || {};
+  const dailyMax = Number(state.config?.settings?.dailyMaxCommunicate || 0);
+  // renderKey 纳入今日统计与跨日：dailyStats 变化（运行中沟通+1）或跨日时今日行也要刷新
+  const renderKey = `${filter}|${fromVal}|${toVal}|${dayKey}|${dayStat.communicate || 0}|${dailyMax}|${history.length}|${history[0]?.id || history[0]?.ts || ''}|${history[0]?.status || ''}`;
   if (renderKey === state.lastHistoryRenderKey) return;
   state.lastHistoryRenderKey = renderKey;
   // 日期范围（含边界）+ 状态筛选
@@ -1524,10 +1528,7 @@ function renderHistory(history = []) {
   // 顶部今日行：今日已投 x / 每日上限（x 与每日限制使用同一计数器 communicate）
   const todayEl = $('historyToday');
   if (todayEl) {
-    const dailyMax = Number(state.config?.settings?.dailyMaxCommunicate || 0);
-    const dayKey = todayKey();
-    const stat = (state.config?.dailyStats || {})[dayKey] || {};
-    const used = Number(stat.communicate || 0);
+    const used = Number(dayStat.communicate || 0);
     todayEl.innerHTML = dailyMax > 0
       ? `今日已投 <b>${used}</b> / ${dailyMax}`
       : `今日已投 <b>${used}</b>（未设上限）`;
@@ -1535,9 +1536,13 @@ function renderHistory(history = []) {
 
   const statsEl = $('historyStats');
   if (statsEl) {
-    statsEl.textContent = stats.total
+    let text = stats.total
       ? `共 ${stats.total} 条 · 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed}`
       : '尚无记录';
+    if (stats.total > 200) {
+      text = `已显示前 200 条，共 ${stats.total} 条 · 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed}`;
+    }
+    statsEl.textContent = text;
   }
 
   box.innerHTML = '';
@@ -1546,13 +1551,25 @@ function renderHistory(history = []) {
     const div = document.createElement('div');
     div.className = 'history-item ' + info.cls;
     const time = new Date(h.ts || Date.now()).toLocaleString();
-    const title = h.title || '未知岗位';
-    const company = h.company || '';
-    div.innerHTML =
-      '<span class="hist-badge ' + info.cls + '">' + info.label + '</span>' +
-      '<span class="hist-title">' + title + '</span>' +
-      (company ? '<span class="hist-company">' + company + '</span>' : '') +
-      '<span class="hist-time">' + time + '</span>';
+    // DOM API 组装，title/company 作为文本节点，避免内容注入 HTML
+    const badge = document.createElement('span');
+    badge.className = 'hist-badge ' + info.cls;
+    badge.textContent = info.label;
+    const titleEl = document.createElement('span');
+    titleEl.className = 'hist-title';
+    titleEl.textContent = h.title || '未知岗位';
+    const timeEl = document.createElement('span');
+    timeEl.className = 'hist-time';
+    timeEl.textContent = time;
+    div.appendChild(badge);
+    div.appendChild(titleEl);
+    if (h.company) {
+      const companyEl = document.createElement('span');
+      companyEl.className = 'hist-company';
+      companyEl.textContent = String(h.company);
+      div.appendChild(companyEl);
+    }
+    div.appendChild(timeEl);
     box.appendChild(div);
   });
 }

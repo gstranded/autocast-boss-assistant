@@ -1327,6 +1327,10 @@ test("v1.7.20 history date filter, full config import and trigger dedup mark are
   // 触发即防重复
   assert.ok(background.includes("markIdempotent(jobIdempotencyKey(job)") &&
     background.includes("防重复：沟通一旦发起"), "job marked idempotent at trigger");
+  // P1: 触发/完成两条 job 级标记都必须携带 securityId（完成路径不得覆盖掉触发时的重发证据）
+  const jobMarks = background.match(/markIdempotent\(jobIdempotencyKey\(job\), \{[^}]*\}\)/g) || [];
+  assert.ok(jobMarks.length >= 2, "job-level idempotent marks exist at trigger and complete paths");
+  assert.ok(jobMarks.every((m) => m.includes("securityId")), "every job-level mark keeps securityId");
 });
 
 

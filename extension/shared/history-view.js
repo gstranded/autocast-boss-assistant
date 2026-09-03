@@ -44,12 +44,13 @@ export function filterHistoryByDate(history = [], fromTs = 0, toTs = 0) {
   });
 }
 
-// 汇总统计：共 / 成功 / 跳过 / 失败（与记录列表的状态归类一致）
+// 汇总统计：共 / 成功 / 跳过 / 失败（跳过的归类与列表 historyRowClass 一致：
+// unknown 状态按「跳过」处理，保证统计与列表显示不矛盾）
 export function summarizeHistory(history = []) {
   const rows = Array.isArray(history) ? history : [];
   const total = rows.length;
   const successCount = rows.filter((h) => h?.status === 'success').length;
-  const skipCount = rows.filter((h) => (HISTORY_STATUS_MAP[h?.status] || {}).cls === 'skipped').length;
-  const failCount = Math.max(0, total - successCount - skipCount);
+  const failCount = rows.filter((h) => h?.status === 'failed').length;
+  const skipCount = Math.max(0, total - successCount - failCount);
   return { total, success: successCount, skipped: skipCount, failed: failCount };
 }

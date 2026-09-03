@@ -2716,10 +2716,12 @@ async function processOneJob(task, resultRow, config) {
     };
     // 防重复：沟通一旦发起（含「继续沟通」已有会话），立即在幂等簿记录 job:<id>；
     // 此后任何新任务/新预览都不会再投该岗（当前任务内的重试走检查点不受影响）。
+    // securityId 一并记录：开启 allowRepublishedJob 时，同一岗位换 securityId 视为重新发布可再投。
     try {
       await markIdempotent(jobIdempotencyKey(job), {
         jobId: job.jobId || '',
         bossId: job.bossId || '',
+        securityId: job.securityId || '',
         phase: 'triggered',
         trust: 'trigger-success'
       });
@@ -3198,7 +3200,7 @@ async function processOneJob(task, resultRow, config) {
   task.counters.success += 1;
   task.consecutiveFails = 0;
   await bumpDailyStat('success');
-  await markIdempotent(jobIdempotencyKey(job), { jobId: job.jobId });
+  await markIdempotent(jobIdempotencyKey(job), { jobId: job.jobId, securityId: job.securityId || '' });
   await appendHistory({
     jobId: job.jobId,
     bossId: job.bossId,

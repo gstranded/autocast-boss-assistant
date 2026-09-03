@@ -785,13 +785,77 @@ test("export carries daily stats, idempotency and task; import sanitizes task", 
 
   // 无预览数据的任务不导入
   const noResults = importConfigPatch({ task: { id: "bad", status: "running", results: [] } });
-  assert.equal(noResults[STORAGE_KEYS.TASK], null, "task without results skipped") || assert.equal(noResults[STORAGE_KEYS.TASK], undefined, "task without results skipped");
+  assert.equal(noResults[STORAGE_KEYS.TASK], undefined, "task without results skipped");
+  assert.ok(!Object.keys(noResults).includes(STORAGE_KEYS.TASK), "no task key written for empty task");
   assert.equal(sanitizeImportedTask(null), null);
   assert.equal(sanitizeImportedTask({ results: [] }), null);
   // 非法类型防护
   const badShapes = importConfigPatch({ dailyStats: [1, 2], idempotency: "x" });
   assert.deepEqual(badShapes[STORAGE_KEYS.DAILY_STATS], {}, "array dailyStats dropped to {}");
   assert.deepEqual(badShapes[STORAGE_KEYS.IDEMPOTENCY], {}, "string idempotency dropped to {}");
+});
+
+test("allowRepublishedJob escape also applies to idempotency book", () => {
+  const settings = { neverRepeatJob: true, allowRepublishedJob: true, bossCooldownDays: 30, companyDailyMax: 0 };
+  const baseCtx = (idemEntry, jobSecurityId) => ({
+    settings, history: [], idempotency: { "job:abc": idemEntry }, job: { jobId: "abc", bossId: "b1", securityId: jobSecurityId }
+  });
+  // 同一 securityId：幂等命中 → 拦（原漏洞已修：不再无条件放行）
+  const same = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S1" }, baseCtx({ securityId: "S1" }, "S1"));
+  assert.equal(same.reasonCodes.includes(REASON.DEDUP_JOB), true, "same securityId still blocked");
+  // 重发（securityId 变化）：应放行（S1 修复）
+  const republished = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S2" }, baseCtx({ securityId: "S1" }, "S2"));
+  assert.equal(republished.reasonCodes.includes(REASON.DEDUP_JOB), false, "republished job allowed with allowRepublishedJob");
+  assert.equal(republished.ok, true, "republished job passes");
+  // allowRepublishedJob 关闭：幂等命中仍拦
+  const strict = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S2" },
+    { settings: { ...settings, allowRepublishedJob: false }, history: [], idempotency: { "job:abc": { securityId: "S1" } } });
+  assert.equal(strict.reasonCodes.includes(REASON.DEDUP_JOB), true, "strict mode blocks republished");
+  // 无 jobId 岗：按 jobIdempotencyKey 键复核（M6）
+  const noJobId = checkDedup({ jobId: "", bossId: "b1", company: "甲公司", title: "岗位T", securityId: "S1" },
+    { settings: { neverRepeatJob: true, allowRepublishedJob: false, bossCooldownDays: 30, companyDailyMax: 0 }, history: [], idempotency: { ["job:甲公司|岗位t"]: { securityId: "S1" } } });
+  assert.equal(noJobId.reasonCodes.includes(REASON.DEDUP_JOB), true, "no-jobId job checked via key fallback");
+  // P1 兼容：旧版本幂等记录没有 securityId，回退用同岗 history 成功记录的 securityId 作为重发证据
+  const legacyCtx = (historyRows, idemEntry) => ({
+    settings: { ...settings, allowRepublishedJob: true, neverRepeatJob: true },
+    history: historyRows, idempotency: { "job:abc": idemEntry }
+  });
+  const legacyAllowed = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S2" },
+    legacyCtx([{ jobId: "abc", status: "success", securityId: "S1" }], { ts: 1, jobId: "abc" }));
+  assert.equal(legacyAllowed.ok, true, "legacy idem entry falls back to history securityId for republish");
+  const legacySame = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S1" },
+    legacyCtx([{ jobId: "abc", status: "success", securityId: "S1" }], { ts: 1, jobId: "abc" }));
+  assert.equal(legacySame.reasonCodes.includes(REASON.DEDUP_JOB), true, "legacy entry + same securityId blocked");
+  const legacyNoEvidence = checkDedup({ jobId: "abc", bossId: "b1", securityId: "S2" },
+    legacyCtx([], { ts: 1, jobId: "abc" }));
+  assert.equal(legacyNoEvidence.reasonCodes.includes(REASON.DEDUP_JOB), true, "no securityId evidence blocks republish");
+});
+
+test("checkLimits treats dailyMaxCommunicate 0 as unlimited", () => {
+  const ok = checkLimits({ settings: { taskMaxCommunicate: 5, dailyMaxCommunicate: 0 }, taskSuccessCount: 1, todayStats: { communicate: 999 } });
+  assert.equal(ok.ok, true, "0 daily max means no daily limit");
+  const limited = checkLimits({ settings: { taskMaxCommunicate: 5, dailyMaxCommunicate: 3 }, taskSuccessCount: 1, todayStats: { communicate: 3 } });
+  assert.equal(limited.ok, false, "communicate >= positive limit blocks");
+  assert.equal(limited.reasonCodes.includes(REASON.LIMIT_DAILY_MAX), true);
+});
+
+test("history import guards and unknown-status summary", () => {
+  const patch = importConfigPatch({ history: "not-array", dailyStats: [1], idempotency: "x" });
+  assert.deepEqual(patch[STORAGE_KEYS.HISTORY], [], "non-array history dropped to []");
+  assert.deepEqual(patch[STORAGE_KEYS.DAILY_STATS], {}, "non-object dailyStats dropped");
+  assert.deepEqual(patch[STORAGE_KEYS.IDEMPOTENCY], {}, "non-object idempotency dropped");
+  const big = importConfigPatch({ history: new Array(6000).fill({ status: "success" }) });
+  assert.equal(big[STORAGE_KEYS.HISTORY].length, 5000, "history capped to 5000");
+  // unknown status 归类与列表一致（计跳过）
+  const s = summarizeHistory([{ status: "success" }, { status: "whatever-new" }, { status: "failed" }]);
+  assert.deepEqual(s, { total: 3, success: 1, skipped: 1, failed: 1 }, "unknown status counts as skipped like the list");
+});
+
+test("sanitizeImportedTask resets run counters", () => {
+  const t = sanitizeImportedTask({ id: "x", results: [{ decision: "pass", job: { jobId: "a" } }], counters: { success: 9, skipped: 2, failed: 1, processed: 12 }, status: "paused", execution: { listTabId: 1 } });
+  assert.ok(t, "task imported");
+  assert.deepEqual(t.counters, { success: 0, skipped: 0, failed: 0, processed: 0 }, "counters reset for re-run");
+  assert.equal(t.status, "awaiting_confirm");
 });
 
 test("history date filter boundaries and summary", () => {
