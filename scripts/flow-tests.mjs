@@ -1071,6 +1071,20 @@ test("delivery hardening contracts", () => {
   assert.ok(c.includes("waitForImageSendConfirm"));
 });
 
+test("scheduled delivery pauses at queue boundaries and only auto-resumes schedule pauses", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const manifest = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(manifest.permissions.includes("alarms"));
+  assert.ok(background.includes("pauseAtDeliveryScheduleBoundary"));
+  assert.ok(background.includes("task.pauseSource !== 'schedule'"));
+  assert.ok(background.includes("当前岗位完成后暂停"));
+  assert.ok(background.includes("已进入定时投递时段，自动恢复任务"));
+  assert.ok(background.includes("chrome.alarms?.onAlarm?.addListener"));
+  assert.ok(panel.includes("scheduledDeliveryEnabled"));
+  assert.ok(panel.includes("readScheduledDeliveryDays"));
+});
+
 test("preview UI falls back to reasonTexts and shows pass-rate warnings", () => {
   const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
   const engine = fs.readFileSync("extension/shared/filter-engine.js", "utf8");

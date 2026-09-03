@@ -70,6 +70,13 @@ import {
   sortLogsNewestFirst,
   sortLogsOldestFirst
 } from "../extension/shared/log-order.js";
+import {
+  DELIVERY_SCHEDULE_WINDOWS,
+  evaluateDeliverySchedule,
+  formatDeliveryScheduleStatus,
+  nextDeliveryScheduleStart,
+  normalizeDeliveryScheduleDays
+} from "../extension/shared/delivery-schedule.js";
 
 const {
   hasActiveState,
@@ -903,6 +910,44 @@ test("normalizeHistoryDateRange fixes inverted date range", () => {
   assert.deepEqual(normalizeHistoryDateRange("", ""), { fromVal: "", toVal: "", adjusted: false });
 });
 
+console.log("5c) delivery schedule");
+const scheduledWeekdays = {
+  scheduledDeliveryEnabled: true,
+  scheduledDeliveryDays: [1, 2, 3, 4, 5]
+};
+test("delivery schedule uses the two fixed weekday windows", () => {
+  assert.deepEqual(DELIVERY_SCHEDULE_WINDOWS.map((window) => window.label), ["09:00-12:00", "14:00-17:00"]);
+  const monday = (hour, minute) => new Date(2026, 8, 7, hour, minute, 0, 0);
+  assert.equal(monday(8, 59).getDay(), 1);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(8, 59)).allowed, false);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(9, 0)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(11, 59)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(12, 0)).allowed, false);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(14, 0)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(16, 59)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, monday(17, 0)).allowed, false);
+});
+test("delivery schedule stays closed on weekends and honors custom days", () => {
+  const saturday = new Date(2026, 8, 12, 10, 0, 0, 0);
+  assert.equal(saturday.getDay(), 6);
+  assert.equal(evaluateDeliverySchedule(scheduledWeekdays, saturday).allowed, false);
+  assert.equal(evaluateDeliverySchedule({ ...scheduledWeekdays, scheduledDeliveryDays: [6] }, saturday).allowed, true);
+  assert.equal(evaluateDeliverySchedule({ scheduledDeliveryEnabled: false }, saturday).allowed, true);
+});
+test("delivery schedule computes the next weekday start", () => {
+  const fridayClose = new Date(2026, 8, 11, 17, 0, 0, 0);
+  const next = nextDeliveryScheduleStart(scheduledWeekdays, fridayClose);
+  assert.equal(next?.getDay(), 1);
+  assert.equal(next?.getHours(), 9);
+  assert.equal(next?.getMinutes(), 0);
+  assert.ok(formatDeliveryScheduleStatus(scheduledWeekdays, fridayClose).includes("周一 09:00"));
+});
+test("delivery schedule settings normalize imported day values", () => {
+  assert.deepEqual(normalizeDeliveryScheduleDays([5, "1", 5, -1, 8]), [1, 5]);
+  assert.deepEqual(normalizeSettings({}).scheduledDeliveryDays, [1, 2, 3, 4, 5]);
+  assert.equal(normalizeSettings({ scheduledDeliveryEnabled: 1 }).scheduledDeliveryEnabled, false);
+});
+
 console.log("6) boss-url guard");
 test("boss urls accepted", () => {
   assert.equal(isBossUrl("https://www.zhipin.com/web/geek/jobs"), true);
@@ -1041,6 +1086,7 @@ test("manifest version + hosts", () => {
   const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
   assert.equal(m.version, pkg.version);
   assert.ok(m.host_permissions.some((h) => h.includes("zhipin.com")));
+  assert.ok(m.permissions.includes("alarms"));
   assert.ok(m.content_scripts.every((entry) => entry.matches.every((h) => h.includes("zhipin.com") || h.includes("bosszhipin.com"))));
   const mainHook = m.content_scripts.find((entry) => entry.world === "MAIN");
   const isolated = m.content_scripts.find((entry) => !entry.world || entry.world === "ISOLATED");
@@ -1055,6 +1101,8 @@ test("UI exposes themes, help tips and filter switches", () => {
   assert.ok(html.includes('data-theme-value="light"'));
   assert.ok(html.includes('data-theme-value="dark"'));
   assert.ok((html.match(/data-help=/g) || []).length >= 25);
+  assert.ok(html.includes('id="scheduledDeliveryEnabled"'));
+  assert.equal((html.match(/data-schedule-day=/g) || []).length, 7);
   for (const id of [
     "titleOrEnabled",
     "titleAndEnabled",

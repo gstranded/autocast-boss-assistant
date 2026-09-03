@@ -9,6 +9,7 @@ import { deepClone, todayKey, uid } from './text-utils.js';
 import { countResumeImages, normalizeResumes } from './resume-images.js';
 import { normalizeMessageTemplateRoles } from './greeting-policy.js';
 import { mergeRuntimeLog, sortLogsNewestFirst } from './log-order.js';
+import { normalizeDeliveryScheduleDays } from './delivery-schedule.js';
 
 let logWriteChain = Promise.resolve();
 
@@ -17,6 +18,8 @@ export function normalizeSettings(settings = {}) {
   // v1.7.11：BOSS「发简历」受双向回复门禁限制，平台简历自动发送功能已移除。
   delete normalized.autoSendAttachmentResume;
   if (normalized.resumeSendTiming === 'on_request') normalized.resumeSendTiming = 'after_text';
+  normalized.scheduledDeliveryEnabled = normalized.scheduledDeliveryEnabled === true;
+  normalized.scheduledDeliveryDays = normalizeDeliveryScheduleDays(normalized.scheduledDeliveryDays);
   return normalized;
 }
 
