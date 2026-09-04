@@ -26,6 +26,7 @@
 
 - 禁止：在 `main` 上直接改功能、修 bug、升版本。
 - 禁止：在 Chrome 用的 `boss` 目录里开发完不经 `dev` 就发版。
+- 外部 PR 打到 `dev`，不要打旧功能分支或直接打 `main`。`.github/workflows/ci.yml` 会跑 `npm test` 和 `npm run smoke`；发版仍是合进 `main` 后手动打 tag。
 - 大功能可以用 `dev` 上的短命分支（例如 `fix/image-send`），合回 `dev` 后再进 `main`。不要再开一堆长期平行的 `codex/...` 当默认开发线。
 
 ## 版本号必须一起改

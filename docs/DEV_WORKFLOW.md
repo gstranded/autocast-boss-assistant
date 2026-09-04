@@ -42,6 +42,7 @@ Chrome 里继续加载 **`/Users/gaohaizhen/Desktop/boss/extension`**，不要�
 - 不要在 `/Users/gaohaizhen/Desktop/boss` 里改 `extension/`。
 - 不要在 `main` 上直接 commit 功能。
 - 开发中途不要改版本号。
+- PR 请打到 `dev`。GitHub Actions（`.github/workflows/ci.yml`）会在 `dev` / `main` 的 push 和 PR 上跑 `npm test` 与 `npm run smoke`。发版仍按本文第 4 节手动打 tag、上传 ZIP。
 - 扩展重载之后，BOSS 列表页和消息页都要 F5。只重载扩展、不刷新页面，浮窗脚本和 content script 会仍是旧版本。
 
 ## 3. 合并进 main
