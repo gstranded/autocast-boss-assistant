@@ -43,9 +43,15 @@ node scripts/sync-release-notes.mjs --tag v1.5.4 --apply
 
 脚本通过 Node.js 把 UTF-8 JSON 从标准输入交给 GitHub CLI，避免 Windows PowerShell、CMD 或旧脚本把中文按系统代码页传递后变成乱码。
 
+## 和分支的关系
+
+不要在 `main` 上直接开发。日常改动在 `dev`（工作目录 `/Users/gaohaizhen/Desktop/boss-dev`），ego 验证后再合并进 `main`，**然后**在 `main` 上升版本、打 tag、发 Release。目录、浏览器加载和版本号清单见仓库根 [AGENTS.md](../AGENTS.md) 与 [DEV_WORKFLOW.md](./DEV_WORKFLOW.md)。
+
 ## 发布新版本
 
-1. 更新 `extension/manifest.json` 和 `package.json` 的版本号。
+在 `main` 已包含本次 `dev` 改动之后：
+
+1. 按 AGENTS.md 把 Manifest、package.json、面板、content、浮窗宿主、测试桩的版本号改成同一个新版本。
 2. 在 `docs/releases/release-notes.json` 增加对应版本。
 3. 运行 `npm test` 和 `npm run smoke`。
 4. 打包扩展，ZIP 根目录必须直接包含 `manifest.json`。
