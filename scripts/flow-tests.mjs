@@ -1455,6 +1455,7 @@ test("skip does not wait job interval and waits are logged", () => {
   assert.ok(background.includes("无需等待投递间隔"), "skip no-wait log message present");
   // 等待前把间隔写进日志
   assert.ok(background.includes("等待投递间隔") && background.includes("秒后继续下一岗"), "interval wait is logged with seconds");
+  assert.ok(background.includes("waitDeliveryInterval"), "interval wait publishes a visible waiting phase");
   // 批次最后一岗不再额外等待
   assert.ok(background.includes("qi >= queue.length - 1"), "last queue item does not wait");
 });

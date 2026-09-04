@@ -1160,6 +1160,17 @@ test("list job identity requires a real jobId match and ignores similar titles",
     gotTitle: "后端"
   }), "");
 });
+test("delivery interval wait is shown on the running status line", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const css = fs.readFileSync("extension/sidepanel/styles.css", "utf8");
+  assert.ok(background.includes("async function waitDeliveryInterval"));
+  assert.ok(background.includes("intervalWaitUntil"));
+  assert.ok(background.includes("await waitDeliveryInterval(task, waitMs)"));
+  assert.ok(app.includes("投递间隔等待中 · 还剩"));
+  assert.ok(app.includes("intervalWaitRemainingSeconds"));
+  assert.ok(css.includes('data-status="waiting"'));
+});
 test("task start prepares split workspace with fallback", () => {
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   assert.ok(background.includes("prepareSplitWorkspace"));

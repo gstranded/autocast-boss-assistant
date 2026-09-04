@@ -217,8 +217,39 @@ function runnerSnapshot() {
     previewPass: runner.previewPass || 0,
     pause: runner.pause && !runner.abort,
     stopping: runner.running && runner.abort,
+    intervalWaitUntil: Number(runner.intervalWaitUntil || 0),
+    intervalWaitMs: Number(runner.intervalWaitMs || 0),
     activeOperations: operations.size
   };
+}
+
+async function waitDeliveryInterval(task, waitMs) {
+  const duration = Math.max(0, Number(waitMs) || 0);
+  const until = Date.now() + duration;
+  runner.intervalWaitUntil = until;
+  runner.intervalWaitMs = duration;
+  if (task) {
+    task.intervalWaitUntil = until;
+    task.intervalWaitMs = duration;
+    task.updatedAt = Date.now();
+    await publishTask(task);
+  }
+  try {
+    while (Date.now() < until) {
+      if (runner.abort || runner.pause) break;
+      const remaining = until - Date.now();
+      await sleep(Math.min(350, Math.max(0, remaining)));
+    }
+  } finally {
+    runner.intervalWaitUntil = 0;
+    runner.intervalWaitMs = 0;
+    if (task) {
+      delete task.intervalWaitUntil;
+      delete task.intervalWaitMs;
+      task.updatedAt = Date.now();
+      await publishTask(task);
+    }
+  }
 }
 
 async function discardCancelledPreviewTask(previewRunId, previousTask = null) {
@@ -3772,7 +3803,7 @@ async function runTaskLoop(taskId) {
         if (Array.isArray(iv) && iv[0] < 1000) iv = [4000, 6000];
         const waitMs = randomBetween(iv);
         await log('info', `[队列] 等待投递间隔 ${Math.max(1, Math.round(waitMs / 1000))} 秒后继续下一岗…`);
-        await sleep(waitMs);
+        await waitDeliveryInterval(task, waitMs);
       }
     }
 

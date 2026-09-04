@@ -292,6 +292,7 @@ select:disabled { cursor: not-allowed; opacity: 0.46; }
 }
 .task-hint { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.45; }
 .status-line[data-status="running"] { color: var(--primary); }
+.status-line[data-status="waiting"] { color: var(--warn); }
 .status-line[data-status="paused"] { color: var(--warn); }
 .status-line[data-status="completed"] { color: var(--success); }
 .status-line[data-status="stopped"] { color: var(--muted); }

@@ -1210,6 +1210,11 @@ function describeTaskPhase(task, status) {
   const qCur = Number.isFinite(task?.queueCursor) ? Number(task.queueCursor) + 1 : 0;
 
   if (status === 'running') {
+    const waitUntil = Number(task?.intervalWaitUntil || 0);
+    if (waitUntil > Date.now()) {
+      const remain = Math.max(1, Math.ceil((waitUntil - Date.now()) / 1000));
+      return `投递间隔等待中 · 还剩 ${remain} 秒`;
+    }
     const prog = qLen ? `第 ${Math.min(qCur || 1, qLen)}/${qLen} 岗` : (pass ? `进度 ${done}/${pass}` : '运行中');
     return curTitle ? `${prog} · 当前：${curTitle}` : prog;
   }
@@ -1241,9 +1246,22 @@ function setControlArmed(id, { enabled, armed, title }) {
   el.title = title || '';
 }
 
+function intervalWaitRemainingSeconds(task, runner = {}) {
+  const until = Math.max(
+    Number(runner?.intervalWaitUntil || 0),
+    Number(task?.intervalWaitUntil || 0)
+  );
+  if (!until) return 0;
+  return Math.max(0, Math.ceil((until - Date.now()) / 1000));
+}
+
 function updateTaskUI(task, runner = {}) {
   const status = task?.status || 'idle';
-  const phase = describeTaskPhase(task, status);
+  const waitRemain = intervalWaitRemainingSeconds(task, runner);
+  const waitingInterval = status === 'running' && waitRemain > 0;
+  const phase = waitingInterval
+    ? `投递间隔等待中 · 还剩 ${waitRemain} 秒`
+    : describeTaskPhase(task, status);
   if ($('taskStatus')) {
     if (runner.previewing) {
       const previewPhaseText = {
@@ -1267,7 +1285,7 @@ function updateTaskUI(task, runner = {}) {
     } else {
       const pauseBit = status === 'paused' && task?.pauseReason ? '' : (task?.pauseReason && status !== 'paused' ? `（${task.pauseReason}）` : '');
       $('taskStatus').textContent = `状态：${statusLabel(status)}${phase ? ` · ${phase}` : ''}${pauseBit}`;
-      $('taskStatus').dataset.status = status;
+      $('taskStatus').dataset.status = waitingInterval ? 'waiting' : status;
     }
   }
   const c = task?.counters || { success: 0, skipped: 0, failed: 0, processed: 0 };
@@ -1286,6 +1304,7 @@ function updateTaskUI(task, runner = {}) {
     if (runner.previewing) {
       hint = '正在加载岗位…';
     }
+    else if (waitingInterval) hint = `上一岗已处理完，正在等待投递间隔（还剩 ${waitRemain} 秒），随后继续下一岗。可暂停或停止。`;
     else if (status === 'running') hint = '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
     else if (status === 'paused') hint = '已暂停：点「继续」恢复当前队列；或「停止」后重新批量投递。';
     else if (status === 'awaiting_confirm') hint = '预览已就绪：可「投递一份」试投，或「批量投递」勾选岗位。';
@@ -3061,8 +3080,8 @@ setInterval(() => {
   if (state.hostSuspended) return;
   refreshControlEnablement();
   const runnerState = state.config?.runner || {};
-  if (runnerState.previewing) {
-    // 计时每秒本地刷新；后台只取轻量 runner，不再搬运任务/历史/简历/日志。
+  if (runnerState.previewing || intervalWaitRemainingSeconds(state.config?.task, runnerState) > 0) {
+    // 扫描计时、投递间隔倒计时：每秒本地刷新；后台只取轻量 runner。
     updateTaskUI(state.config?.task, runnerState);
     refreshRunnerState().catch(() => {});
     return;
