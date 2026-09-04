@@ -41,7 +41,7 @@ import { TASK_STATUS } from '../shared/constants.js';
 import { isBossUrl, isBossTab, bossUrlGuardMessage, BOSS_MATCH_PATTERNS } from '../shared/boss-url.js';
 import { didContentDocumentChange, isBossJobListUrl, resolveBossJobListUrl } from '../shared/job-list-navigation.js';
 import { normalizeMatchText, normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
-import { computeSideBySideBounds } from '../shared/window-layout.js';
+import { computeSideBySideBounds, snapshotWindowBounds, windowBoundsMatch } from '../shared/window-layout.js';
 import { dedupeResumeImages } from '../shared/resume-images.js';
 import { pickNextTestDeliveryJob } from '../shared/test-delivery.js';
 import {
@@ -71,7 +71,12 @@ import {
   PREVIEW_SCAN_STOP,
   resolvePreviewScanStop
 } from '../shared/preview-scan-policy.js';
-import { isEnvironmentalFailure } from '../shared/environment-failures.js';
+import {
+  isEnvironmentalFailure,
+  isWorkerTriggerRetryable,
+  canFallbackWorkerMode,
+  WORKER_TRIGGER_RETRY
+} from '../shared/environment-failures.js';
 
 const SPLIT_ZOOM_FACTOR = 0.8;
 const BHT_RUNTIME_VERSION = String(chrome.runtime.getManifest?.().version || 'unknown');
@@ -688,6 +693,30 @@ async function setNormalWindowBounds(windowId, bounds) {
   });
 }
 
+async function applySplitWindowBounds(windowId, expected) {
+  await setNormalWindowBounds(windowId, expected);
+  const live = await chrome.windows.get(windowId).catch(() => null);
+  if (!live || !windowBoundsMatch(live, expected)) {
+    throw new Error('浏览器未应用分屏窗口尺寸');
+  }
+  return live;
+}
+
+async function restoreWindowSnapshot(windowId, snapshot) {
+  if (windowId == null || !snapshot) return false;
+  try {
+    const state = String(snapshot.state || 'normal');
+    if (state && state !== 'normal') {
+      await chrome.windows.update(windowId, { state }).catch(() => {});
+    } else {
+      await setNormalWindowBounds(windowId, snapshot).catch(() => {});
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function setSplitTabZoom(tabId) {
   if (tabId == null || !chrome.tabs?.setZoom) return false;
   try {
@@ -733,6 +762,11 @@ export async function prepareSplitWorkspace(task, settings = {}) {
   }
 
   task.execution.listTabId = listTab.id;
+  // 职位页留在用户原来的窗口，不要 windows.create({ tabId }) 把它拆出去。
+  const sourceWindowId = listTab.windowId;
+  task.execution.listWindowId = sourceWindowId;
+  const sourceWindow = await chrome.windows.get(sourceWindowId).catch(() => null);
+  const originalListBounds = snapshotWindowBounds(sourceWindow);
   const display = await getDisplayMetrics(listTab.id);
   const bounds = computeSideBySideBounds(display || {}, { minWidth: 520, minHeight: 600 });
   if (!bounds) {
@@ -740,7 +774,7 @@ export async function prepareSplitWorkspace(task, settings = {}) {
     return { ok: false, error: 'DISPLAY_TOO_SMALL', message: '当前屏幕空间不足，已回退为普通消息标签页' };
   }
 
-  // 1) 复用上一对分屏窗口：两个窗口和对应标签都在就只做尽力摆放，不再新建窗口
+  // 1) 复用上一对分屏窗口：职位窗仍是原窗口，聊天窗在右侧，只重新摆放
   if (task.execution.splitViewActive && task.execution.listWindowId && task.execution.messageWindowId) {
     const prevListWin = await chrome.windows.get(task.execution.listWindowId).catch(() => null);
     const prevMsgWin = await chrome.windows.get(task.execution.messageWindowId).catch(() => null);
@@ -748,58 +782,60 @@ export async function prepareSplitWorkspace(task, settings = {}) {
     const msgTabNow = await chrome.tabs.get(task.execution.messageTabId).catch(() => null);
     if (
       prevListWin && prevMsgWin && listTabNow && msgTabNow &&
+      prevListWin.id !== prevMsgWin.id &&
       listTabNow.windowId === prevListWin.id && msgTabNow.windowId === prevMsgWin.id
     ) {
-      // 部分平台 windows.update 会静默忽略坐标，失败不影响已有窗口位置
-      await setNormalWindowBounds(prevListWin.id, bounds.left).catch(() => {});
-      await setNormalWindowBounds(prevMsgWin.id, bounds.right).catch(() => {});
-      task.execution.splitBounds = bounds;
-      task.execution.phase = 'SPLIT_WORKSPACE_READY';
-      await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
-      await raiseSplitWindows(prevListWin.id, prevMsgWin.id);
-      await debugLog('background.split', 'pair_reused', {
-        listWindowId: prevListWin.id,
-        messageWindowId: prevMsgWin.id,
-        bounds
-      });
-      return {
-        ok: true,
-        reused: true,
-        listTabId: listTab.id,
-        messageTabId: msgTabNow.id,
-        bounds,
-        zoomFactor: SPLIT_ZOOM_FACTOR,
-        zoomApplied: false
-      };
+      try {
+        await applySplitWindowBounds(prevListWin.id, bounds.left);
+        await applySplitWindowBounds(prevMsgWin.id, bounds.right);
+        task.execution.splitBounds = bounds;
+        task.execution.phase = 'SPLIT_WORKSPACE_READY';
+        await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
+        await raiseSplitWindows(prevListWin.id, prevMsgWin.id);
+        await debugLog('background.split', 'pair_reused', {
+          listWindowId: prevListWin.id,
+          messageWindowId: prevMsgWin.id,
+          bounds
+        });
+        return {
+          ok: true,
+          reused: true,
+          listTabId: listTab.id,
+          messageTabId: msgTabNow.id,
+          bounds,
+          zoomFactor: SPLIT_ZOOM_FACTOR,
+          zoomApplied: false
+        };
+      } catch (_) {
+        await restoreWindowSnapshot(prevListWin.id, snapshotWindowBounds(prevListWin));
+        await restoreWindowSnapshot(prevMsgWin.id, snapshotWindowBounds(prevMsgWin));
+        // 原窗口坐标未生效时不要假装分屏成功，走下面完整摆放或失败回退
+      }
     }
   }
 
   try {
-    // 2) 左窗：把职位列表标签搬进按左半边创建的新窗口。
-    //    create({ tabId }) 在 windows.update 不生效的平台上也可靠，位置由创建参数保证。
-    const listWindow = await chrome.windows.create({
-      tabId: listTab.id,
-      type: 'normal',
-      focused: false,
-      ...bounds.left
-    });
-    const listWindowId = listWindow.id;
-    task.execution.listWindowId = listWindowId;
+    await applySplitWindowBounds(sourceWindowId, bounds.left);
 
-    // 3) 右窗：优先找现有聊天标签搬过去，没有就新建聊天窗口
     const savedMsgTab = task.execution.messageTabId
       ? await chrome.tabs.get(task.execution.messageTabId).catch(() => null)
       : null;
-    let messageTab = savedMsgTab && savedMsgTab.windowId !== listWindowId ? savedMsgTab : null;
+    let messageTab = savedMsgTab && savedMsgTab.id !== listTab.id ? savedMsgTab : null;
     if (!messageTab?.id) {
       const bossTabs = await chrome.tabs.query({ url: BOSS_MATCH_PATTERNS });
       messageTab = bossTabs.find(
-        (tab) => tab.id !== listTab.id && tab.windowId !== listWindowId && /\/chat/i.test(tab.url || tab.pendingUrl || '')
+        (tab) => tab.id !== listTab.id && /\/chat/i.test(tab.url || tab.pendingUrl || '')
       ) || null;
     }
 
     let messageWindow;
-    if (messageTab?.id) {
+    if (messageTab?.id && messageTab.windowId != null && messageTab.windowId !== sourceWindowId) {
+      await applySplitWindowBounds(messageTab.windowId, bounds.right);
+      messageWindow = await chrome.windows.get(messageTab.windowId).catch(() => null)
+        || { id: messageTab.windowId };
+      messageTab = await chrome.tabs.get(messageTab.id).catch(() => messageTab);
+    } else if (messageTab?.id) {
+      // 聊天标签和职位页还在同一窗口：只把聊天标签拆到右侧，职位页留下
       messageWindow = await chrome.windows.create({
         tabId: messageTab.id,
         type: 'normal',
@@ -840,8 +876,8 @@ export async function prepareSplitWorkspace(task, settings = {}) {
     task.execution.phase = 'SPLIT_WORKSPACE_READY';
 
     await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
-    await raiseSplitWindows(listWindowId, messageWindow.id);
-    const listWinState = await chrome.windows.get(listWindowId).catch(() => null);
+    await raiseSplitWindows(sourceWindowId, messageWindow.id);
+    const listWinState = await chrome.windows.get(sourceWindowId).catch(() => null);
     const msgWinState = await chrome.windows.get(messageWindow.id).catch(() => null);
     await debugLog('background.split', 'windows_state', {
       list: listWinState ? { id: listWinState.id, state: listWinState.state, left: listWinState.left, top: listWinState.top, width: listWinState.width, height: listWinState.height } : null,
@@ -858,6 +894,7 @@ export async function prepareSplitWorkspace(task, settings = {}) {
   } catch (error) {
     task.execution.splitViewActive = false;
     task.execution.splitViewError = String(error?.message || error);
+    await restoreWindowSnapshot(sourceWindowId, originalListBounds);
     await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
     await chrome.windows.update(task.execution.listWindowId || listTab.windowId, { focused: true }).catch(() => {});
     return {
@@ -1040,7 +1077,7 @@ async function closeConversationWorkerTab(task, tabId, { reason = '', publish = 
     task.updatedAt = Date.now();
     if (publish) await publishTask(task);
   }
-  if (reason) {
+  if (reason && typeof debugLog === 'function') {
     await debugLog('background.workerTab', 'closed', {
       taskId: task?.id || null,
       tabId: workerTabId,
@@ -1061,8 +1098,36 @@ function detailJobIdFromHref(href) {
   }
 }
 
-async function openConversationWorkerTab(task, attempt, messageTab, job) {
+async function restoreTabsAfterWorker(messageTab, listTabId, workerTab, task = null) {
+  const workerId = workerTab?.id || null;
+  if (messageTab?.id && messageTab.id !== workerId) {
+    try { await chrome.tabs.update(messageTab.id, { active: true }); } catch (_) {}
+  }
+  if (!listTabId) return;
+  try {
+    const listTab = await chrome.tabs.get(listTabId);
+    if (!listTab?.id || listTab.id === workerId) return;
+    const messageWindowId = messageTab?.windowId ?? task?.execution?.messageWindowId ?? null;
+    const listWindowId = listTab.windowId ?? task?.execution?.listWindowId ?? null;
+    if (task?.execution?.splitViewActive && listWindowId != null && messageWindowId != null && listWindowId !== messageWindowId) {
+      await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
+      await raiseSplitWindows(listWindowId, messageWindowId);
+      return;
+    }
+    // 同窗口时保持消息页，避免把用户从聊天切走。
+    if (messageWindowId != null && listTab.windowId === messageWindowId) return;
+    await chrome.tabs.update(listTab.id, { active: true });
+  } catch (_) {}
+}
+
+async function openConversationWorkerTab(task, attempt, messageTab, job, { forceNew = false } = {}) {
   if (!task.execution) task.execution = {};
+  if (forceNew && task.execution.workerTabId) {
+    await closeConversationWorkerTab(task, task.execution.workerTabId, {
+      reason: '重试立即沟通，关闭旧执行页后重新打开',
+      publish: true
+    });
+  }
   // 复用上一岗的执行页：直接导航新岗位，避免每岗新建冷加载标签页
   // （减少 BOSS 限流触发、后台标签页冻结/慢加载，也避免用户看到新标签页反复弹出）。
   let tab = null;
@@ -1073,7 +1138,8 @@ async function openConversationWorkerTab(task, attempt, messageTab, job) {
   let reused = Boolean(tab?.id);
   if (reused) {
     try {
-      await chrome.tabs.update(tab.id, { url: attempt.url, active: false });
+      // 必须 active:true：Chrome 会节流后台标签，job_detail 可能一直 loading，executeScript 卡到预算耗尽。
+      await chrome.tabs.update(tab.id, { url: attempt.url, active: true });
     } catch (_) {
       tab = null;
       reused = false;
@@ -1082,7 +1148,7 @@ async function openConversationWorkerTab(task, attempt, messageTab, job) {
   if (!reused) {
     const createOptions = {
       url: attempt.url,
-      active: false
+      active: true
     };
     const targetWindowId = messageTab?.windowId || task.execution.messageWindowId || null;
     if (targetWindowId != null) createOptions.windowId = targetWindowId;
@@ -1097,8 +1163,15 @@ async function openConversationWorkerTab(task, attempt, messageTab, job) {
   task.execution.workerUrl = attempt.url;
   task.updatedAt = Date.now();
   await publishTask(task);
+  if (typeof debugLog === 'function') {
+    await debugLog('background.workerTab', 'wait_complete', {
+      tabId: tab.id,
+      reused,
+      url: String(attempt.url || '').slice(0, 180)
+    });
+  }
   // 复用导航给更长预算：SPA 冷加载在后台标签页可能超过 30s
-  const ready = await waitTabComplete(tab.id, reused ? 45000 : 30000);
+  const ready = await waitTabComplete(tab.id, reused ? 45000 : 30000, { requireComplete: true });
   const readyUrl = ready?.url || ready?.pendingUrl || '';
   if (!ready?.id || !isBossUrl(readyUrl)) {
     throw new Error('临时沟通执行页未能加载 BOSS 岗位：' + String(readyUrl || attempt.url));
@@ -1112,11 +1185,26 @@ async function openConversationWorkerTab(task, attempt, messageTab, job) {
       throw new Error('临时沟通执行页导航未生效（仍停留在上一岗位详情），已跳过该岗位以防误点');
     }
   }
+  if (typeof debugLog === 'function') {
+    await debugLog('background.workerTab', 'inject', { tabId: tab.id, url: String(readyUrl).slice(0, 180) });
+  }
   const injected = await forceInjectContent(tab.id);
   if (!injected) {
     throw new Error('临时沟通执行页内容脚本注入超时（页面可能繁忙或被冻结），已跳过该岗位');
   }
   await sleep(250);
+  let pingOk = false;
+  const pingType = (typeof MSG !== 'undefined' && MSG.PING) || 'BHT_PING';
+  for (let pingTry = 0; pingTry < 3 && !pingOk; pingTry++) {
+    if (pingTry) await sleep(200);
+    try {
+      const pong = await chrome.tabs.sendMessage(tab.id, { type: pingType, payload: {} });
+      pingOk = Boolean(pong?.ok);
+    } catch (_) {}
+  }
+  if (!pingOk) {
+    throw new Error('临时沟通执行页内容脚本注入超时（页面可能繁忙或被冻结），已跳过该岗位');
+  }
   return ready;
 }
 
@@ -1138,55 +1226,75 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
 
   let result = null;
   const attemptResults = [];
-  for (let index = 0; index < attempts.length; index++) {
-    const attempt = attempts[index];
-    result = null;
-    let workerTab = null;
-    let triggerStarted = false;
-    let activityInspection = null;
-    let activityAccepted = null;
-    try {
-      if (selectedActiveBuckets.length) {
-        // 活跃度在左侧职位页点该岗位卡片核对（BOSS 原生渲染），不打开新标签页
-        activityInspection = await sendToBoss(
-          MSG.INSPECT_JOB_DETAIL || 'BHT_INSPECT_JOB_DETAIL',
-          { job },
-          { tabId: listTabId }
-        );
-        if (operationAborted(activityInspection)) {
-          result = activityInspection;
-        } else {
-          const activeText = String(activityInspection?.activeText || '').trim();
-          job.activeText = activeText;
-          activityAccepted = Boolean(
-            activityInspection?.ok &&
-            activeText &&
-            matchActive(activeText, selectedActiveBuckets)
-          );
-          await log('info', `[列表页] 已点卡片核对 HR 活跃度：${activeText || '未知'}（${activityAccepted ? '满足' : '不满足'}）`, {
-            jobId: job.jobId,
-            activeText,
-            activityAccepted,
-            inspectError: activityInspection?.error || ''
-          });
-          if (!activityAccepted) {
-            result = {
-              ok: false,
-              error: REASON.FILTER_ACTIVE,
-              filtered: true,
-              activeText,
-              activityInspection,
-              message: reasonText(REASON.FILTER_ACTIVE, activeText || '未知')
-            };
-          }
-        }
+  let activityInspection = null;
+  let activityAccepted = null;
+  if (selectedActiveBuckets.length) {
+    // 活跃度只在左侧点一次卡片核对；详情/列表回退共用结果，避免卡住时反复点同一张卡。
+    activityInspection = await sendToBoss(
+      MSG.INSPECT_JOB_DETAIL || 'BHT_INSPECT_JOB_DETAIL',
+      { job },
+      { tabId: listTabId }
+    );
+    if (operationAborted(activityInspection)) {
+      result = activityInspection;
+    } else {
+      const activeText = String(activityInspection?.activeText || '').trim();
+      job.activeText = activeText;
+      activityAccepted = Boolean(
+        activityInspection?.ok &&
+        activeText &&
+        matchActive(activeText, selectedActiveBuckets)
+      );
+      await log('info', `[列表页] 已点卡片核对 HR 活跃度：${activeText || '未知'}（${activityAccepted ? '满足' : '不满足'}）`, {
+        jobId: job.jobId,
+        activeText,
+        activityAccepted,
+        inspectError: activityInspection?.error || ''
+      });
+      if (!activityAccepted) {
+        result = {
+          ok: false,
+          error: REASON.FILTER_ACTIVE,
+          filtered: true,
+          activeText,
+          activityInspection,
+          message: reasonText(REASON.FILTER_ACTIVE, activeText || '未知')
+        };
       }
-      if (!result) {
-        workerTab = await openConversationWorkerTab(task, attempt, messageTab, job);
-        await log('info', '[执行页] 已在后台打开岗位，不会操作左侧职位列表', {
+    }
+  }
+
+  for (let index = 0; index < attempts.length; index++) {
+    if (result?.ok || result?.filtered || operationAborted(result)) break;
+    const attempt = attempts[index];
+    const maxTries = Math.max(1, Number(WORKER_TRIGGER_RETRY.maxTries || 3));
+    const retryDelayMs = Math.max(0, Number(WORKER_TRIGGER_RETRY.delayMs || 0));
+    for (let tryIndex = 0; tryIndex < maxTries; tryIndex++) {
+      if (runner.abort) {
+        result = { ok: false, error: 'OP_CANCELLED', message: '已取消' };
+        break;
+      }
+      result = null;
+      let workerTab = null;
+      let triggerStarted = false;
+      const forceNew = tryIndex > 0;
+      const modeLabel = attempt.mode === CONVERSATION_WORKER_MODE.DETAIL ? '详情页' : '列表页';
+      try {
+        await log('info', tryIndex === 0
+          ? `[执行页] 正在打开岗位详情并触发沟通（${modeLabel}）`
+          : `[执行页] 第 ${tryIndex + 1}/${maxTries} 次尝试：关闭旧标签后重新打开并点击立即沟通（${modeLabel}）`, {
+          jobId: job.jobId,
+          mode: attempt.mode,
+          tryIndex: tryIndex + 1,
+          maxTries,
+          url: String(attempt.url || '').slice(0, 180)
+        });
+        workerTab = await openConversationWorkerTab(task, attempt, messageTab, job, { forceNew });
+        await log('info', '[执行页] 已打开岗位详情，不会操作左侧职位列表', {
           jobId: job.jobId,
           workerTabId: workerTab.id,
           mode: attempt.mode,
+          tryIndex: tryIndex + 1,
           url: String(attempt.url || '').slice(0, 180)
         });
         triggerStarted = true;
@@ -1198,33 +1306,52 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
           },
           { tabId: workerTab.id, forceInject: true }
         );
+      } catch (error) {
+        result = {
+          ok: false,
+          error: triggerStarted ? 'WORKER_TRIGGER_EXCEPTION' : 'WORKER_TAB_FAILED',
+          message: '临时沟通执行页失败：' + String(error?.message || error)
+        };
+      } finally {
+        await restoreTabsAfterWorker(messageTab, listTabId, workerTab, task);
       }
+
       attemptResults.push({
         mode: attempt.mode,
         url: attempt.url,
+        tryIndex: tryIndex + 1,
         ok: Boolean(result?.ok),
         error: result?.error || '',
         activeText: activityInspection?.activeText || '',
         activityAccepted,
         navigated: Boolean(result?.navigated)
       });
-    } catch (error) {
-      result = {
-        ok: false,
-        error: triggerStarted ? 'WORKER_TRIGGER_EXCEPTION' : 'WORKER_TAB_FAILED',
-        message: '临时沟通执行页失败：' + String(error?.message || error)
-      };
-      attemptResults.push({ mode: attempt.mode, url: attempt.url, ok: false, error: result.error });
-    } finally {
-      // 执行页跨岗位复用：不随岗位关闭；任务结束/停止时统一清理（见 closeConversationWorkerTab 调用点）
+
+      if (result?.ok || result?.filtered || operationAborted(result)) break;
+
+      const canRetry = isWorkerTriggerRetryable(result) && tryIndex < maxTries - 1 && !runner.abort;
+      const failedTabId = workerTab?.id || task?.execution?.workerTabId;
+      if (failedTabId && isWorkerTriggerRetryable(result)) {
+        await closeConversationWorkerTab(task, failedTabId, {
+          reason: canRetry
+            ? '立即沟通未成功，关闭执行页后重试'
+            : '执行页加载或注入失败，丢弃冻结标签后再试',
+          publish: true
+        });
+      }
+      if (!canRetry) break;
+      await log('warn', `[执行页] 打开岗位或未找到立即沟通（${result?.message || result?.error || '未知'}），将重新打开标签重试（${tryIndex + 1}/${maxTries}）`, {
+        jobId: job.jobId,
+        error: result?.error || '',
+        tryIndex: tryIndex + 1,
+        maxTries
+      });
+      if (retryDelayMs) await sleep(retryDelayMs);
     }
 
     if (result?.ok || result?.filtered || operationAborted(result)) break;
-    // 详情页环境失败可落 list 模式兜底（左侧卡片仍是真实源）；页面已跳转（NAVIGATED）不兜底，避免对已失效岗位重复触发
-    const safeToFallback = /WORKER_CHAT_BUTTON_NOT_FOUND|WORKER_PAGE_NOT_READY|WORKER_CHAT_CLICK_NO_EFFECT|WORKER_TAB_FAILED|CONTENT_INJECT_FAIL|TARGET_TAB_CLOSED/.test(
-      String(result?.error || '')
-    );
-    if (!safeToFallback) break;
+    // 仅「还没点到按钮」才落到 list 模式。已点击/超时/已跳转不再点，避免重复建聊。
+    if (!canFallbackWorkerMode(result)) break;
   }
 
   const listAfter = await getListTabFingerprint(listTabId);
@@ -2755,7 +2882,7 @@ async function processOneJob(task, resultRow, config) {
         });
         return 'skipped';
       }
-      item.state = /LIST_JOB_NOT_FOUND|找不到/.test(String(trig?.error || '')) ? 'SKIPPED' : 'FAILED';
+      item.state = /LIST_JOB_NOT_FOUND|LIST_JOB_IDENTITY_MISMATCH|找不到/.test(String(trig?.error || '')) ? 'SKIPPED' : 'FAILED';
       item.reasons = [trig?.message || trig?.error || '列表页触发沟通失败'];
       if (item.state === 'SKIPPED') {
         task.counters.skipped += 1;

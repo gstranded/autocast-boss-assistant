@@ -281,6 +281,7 @@ test("successful conversation creation survives a forced list-to-chat navigation
   const manifest = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
   const isolated = manifest.content_scripts.find((entry) => !entry.world || entry.world === "ISOLATED");
   assert.ok(isolated?.js?.includes("shared/trigger-navigation-recovery.js"));
+  assert.ok(isolated?.js?.includes("shared/job-identity.js"));
   assert.ok(content.includes("trigger_navigation_recovered"));
   assert.ok(content.includes("window.__BHT_LAST_TRIGGER_CLICK__"));
   assert.ok(content.includes("for (let i = 0; i < 18 && !stay.ok; i++)"));
@@ -290,7 +291,7 @@ test("successful conversation creation survives a forced list-to-chat navigation
   assert.ok(background.includes("BOSS 在沟通成功后跳到聊天页"));
 });
 
-test("conversation trigger uses a temporary inactive worker and never navigates the left list", () => {
+test("conversation trigger uses a temporary worker tab and never navigates the left list", () => {
   const content = fs.readFileSync("extension/content/content-main.js", "utf8");
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const worker = fs.readFileSync("extension/shared/conversation-worker.js", "utf8");
@@ -298,7 +299,9 @@ test("conversation trigger uses a temporary inactive worker and never navigates 
   assert.ok(worker.includes("isListDocumentPreserved"));
   assert.ok(background.includes("triggerConversationInWorker"));
   assert.ok(background.includes("openConversationWorkerTab"));
-  assert.ok(background.includes("active: false"));
+  assert.ok(background.includes("await chrome.tabs.update(tab.id, { url: attempt.url, active: true })"), "worker tab is activated so Chrome does not freeze job_detail");
+  assert.ok(background.includes("url: attempt.url,\n      active: true"), "new worker tab is created active");
+  assert.ok(background.includes("restoreTabsAfterWorker"), "focus returns to chat/list after worker load");
   assert.ok(background.includes("workerDetail: attempt.mode === CONVERSATION_WORKER_MODE.DETAIL"));
   assert.ok(background.includes("closeConversationWorkerTab"));
   assert.ok(background.includes("左侧职位页保持原样"));
@@ -315,6 +318,11 @@ test("worker detail clicks the exact chat action and requires a creation receipt
   assert.ok(content.includes('error: "CONVERSATION_CREATE_NOT_CONFIRMED"'));
   assert.ok(content.includes("!clicked.already && !nativeGreeting.available"));
   assert.ok(content.includes("worker_detail_trigger_unconfirmed"));
+  assert.ok(content.includes('error: "WORKER_LEFT_DETAIL"'));
+  assert.ok(content.includes("LIST_JOB_IDENTITY_MISMATCH"));
+  assert.ok(content.includes("克隆列表页岗位对不上，已停止点击立即沟通"));
+  assert.ok(content.includes("function listCardIdentityMismatch"));
+  assert.ok(content.includes("BHTJobIdentity"));
 });
 
 test("HR activity is inspected on the temporary detail before any conversation click", () => {
@@ -330,9 +338,11 @@ test("HR activity is inspected on the temporary detail before any conversation c
   const triggerAt = worker.indexOf("MSG.TRIGGER_CONVERSATION");
   assert.ok(inspectAt >= 0 && triggerAt > inspectAt);
   assert.ok(worker.includes("matchActive(activeText, selectedActiveBuckets)"));
-  assert.ok(worker.includes("if (!result)"));
+  assert.ok(worker.includes("活跃度只在左侧点一次卡片核对"));
+  assert.ok(worker.includes("if (result?.ok || result?.filtered || operationAborted(result)) break;"));
   assert.ok(worker.includes("filtered: true"));
   assert.ok(worker.includes("result?.filtered"));
+  assert.ok(worker.includes("执行页加载或注入失败，丢弃冻结标签后再试"));
   assert.ok(background.includes("{ deferUnknownActive: true }"));
   assert.ok(background.includes("requiresActiveCheck: decision === 'pass' && requiresActiveCheck"));
   assert.ok(background.includes("finalizePreviewActivityDecisions"));
@@ -1167,7 +1177,7 @@ test("v1.7.19 worker tab reuse, inject budget and env auto-skip are wired", () =
 
   // 执行页跨岗位复用：命中既有 workerTabId 时导航复用，而不是每岗新建+关闭
   assert.ok(background.includes("autoDiscardable"), "worker tab must not be memory-recycled");
-  assert.ok(background.includes("await chrome.tabs.update(tab.id, { url: attempt.url, active: false })"), "reuse navigates existing worker tab");
+  assert.ok(background.includes("await chrome.tabs.update(tab.id, { url: attempt.url, active: true })"), "reuse navigates existing worker tab and wakes it");
   assert.ok(background.includes("let reused = Boolean(tab?.id)"), "reuse flag computed");
   assert.ok(!background.includes("本岗位沟通触发结束"), "worker tab is no longer closed per job");
 
@@ -1197,6 +1207,17 @@ test("v1.7.19 worker tab reuse, inject budget and env auto-skip are wired", () =
   assert.ok(background.includes("envAutoSkip"), "queue stamps env skip flag");
   assert.ok(background.includes("[自动跳过]"), "queue logs auto skip");
   assert.ok(background.includes("row?.envAutoSkip === true"), "queue skips confirm loop for env failures");
+  assert.ok(background.includes("执行页加载或注入失败，丢弃冻结标签后再试"), "frozen worker tab is discarded before fallback");
+  assert.ok(background.includes("活跃度只在左侧点一次卡片核对"), "activity inspect is not repeated on worker fallback");
+  assert.ok(background.includes("{ requireComplete: true }"), "worker load waits for complete instead of returning a loading tab");
+  assert.ok(background.includes("isWorkerTriggerRetryable"), "retryable trigger errors are classified");
+  assert.ok(background.includes("WORKER_TRIGGER_RETRY"), "retry budget is imported");
+  assert.ok(background.includes("forceNew"), "retry reopens a fresh worker tab");
+  assert.ok(background.includes("关闭旧标签后重新打开并点击立即沟通"), "retry logs reopen + click");
+  assert.ok(background.includes("canFallbackWorkerMode"), "list fallback only for unclicked open failures");
+  assert.ok(background.includes("for (let pingTry = 0; pingTry < 3"), "content ping is retried before discarding the tab");
+  assert.ok(background.includes("LIST_JOB_IDENTITY_MISMATCH"), "mismatched clone-list jobs are skipped not clicked");
+  assert.ok(envFail.includes("WORKER_LEFT_DETAIL"), "left-detail is environmental and not list-fallback");
 });
 
 
@@ -1207,8 +1228,12 @@ test("v1.7.19 openConversationWorkerTab reuses one worker tab across jobs", asyn
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const source = extractFunctionSource(
     background,
+    "async function closeConversationWorkerTab",
+    "function detailJobIdFromHref"
+  ) + "\n" + extractFunctionSource(
+    background,
     "function detailJobIdFromHref",
-    "async function openConversationWorkerTab"
+    "async function restoreTabsAfterWorker"
   ) + "\n" + extractFunctionSource(
     background,
     "async function openConversationWorkerTab",
@@ -1236,6 +1261,15 @@ test("v1.7.19 openConversationWorkerTab reuses one worker tab across jobs", asyn
         calls.update.push({ id, props });
         Object.assign(t, props);
         return t;
+      },
+      remove: async (id) => {
+        calls.remove = (calls.remove || 0) + 1;
+        const idx = tabs.findIndex((t) => t.id === id);
+        if (idx >= 0) tabs.splice(idx, 1);
+      },
+      sendMessage: async () => {
+        calls.ping = (calls.ping || 0) + 1;
+        return { ok: true, contentInstanceId: "content_test" };
       }
     }
   };
@@ -1269,6 +1303,7 @@ test("v1.7.19 openConversationWorkerTab reuses one worker tab across jobs", asyn
   const first = await open(task, attempt, messageTab, job);
   assert.equal(calls.create, 1, "first job creates one tab");
   assert.equal(first.id, task.execution.workerTabId, "execution tracks the created tab");
+  assert.equal(tabs[0].active, true, "worker tab is created active so Chrome loads job_detail");
   assert.equal(calls.update[0].props.autoDiscardable, false, "created tab protected from memory recycle");
   assert.deepEqual(budgetLog[0], { tabId: first.id, budgetMs: 30000 }, "first load uses default 30s budget");
 
@@ -1306,6 +1341,13 @@ test("v1.7.19 openConversationWorkerTab reuses one worker tab across jobs", asyn
   assert.equal(calls.create, 2, "closed worker tab is recreated");
   assert.notEqual(third.id, closedId, "new tab id after recreate");
   assert.deepEqual(budgetLog[2], { tabId: third.id, budgetMs: 30000 }, "recreated load uses default budget");
+
+  // 重试：forceNew 关闭旧执行页再新建，而不是导航复用
+  const retry = await open(task, attempt, messageTab, job, { forceNew: true });
+  assert.equal(calls.create, 3, "forceNew creates a fresh tab");
+  assert.equal(calls.remove, 1, "forceNew closes the previous worker tab");
+  assert.notEqual(retry.id, third.id, "retry tab is a new id");
+  assert.equal(task.execution.workerTabId, retry.id, "execution tracks the retry tab");
 });
 
 

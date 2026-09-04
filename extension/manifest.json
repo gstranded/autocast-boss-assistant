@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "__MSG_extName__",
   "description": "__MSG_extDesc__",
-  "version": "1.7.23",
+  "version": "1.7.24",
   "default_locale": "zh_CN",
   "icons": {
     "16": "assets/icons/icon16.png",
@@ -60,6 +60,7 @@
       "js": [
         "shared/trigger-navigation-recovery.js",
         "shared/conversation-match.js",
+        "shared/job-identity.js",
         "shared/operation-dispatch-gate.js",
         "content/content-main.js",
         "content/floating-host.js"

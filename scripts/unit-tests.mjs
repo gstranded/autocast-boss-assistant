@@ -32,7 +32,8 @@ import {
   isListDocumentPreserved
 } from "../extension/shared/conversation-worker.js";
 import { reasonText, REASON } from "../extension/shared/reason-codes.js";
-import { computeSideBySideBounds } from "../extension/shared/window-layout.js";
+import { computeSideBySideBounds, snapshotWindowBounds, windowBoundsMatch } from "../extension/shared/window-layout.js";
+import { isSyntheticJobId, listJobIdentityMismatch } from "../extension/shared/job-identity.js";
 import {
   dedupeResumeImages,
   mergeResumeImages,
@@ -52,7 +53,14 @@ import {
   shouldAcceptTaskSnapshot
 } from "../extension/shared/task-model.js";
 import { createOperationRegistry } from "../extension/background/operation-registry.js";
-import { isEnvironmentalFailure, ENV_AUTO_CONTINUE_ERRORS } from "../extension/shared/environment-failures.js";
+import {
+  isEnvironmentalFailure,
+  ENV_AUTO_CONTINUE_ERRORS,
+  isWorkerTriggerRetryable,
+  canFallbackWorkerMode,
+  WORKER_TRIGGER_RETRY,
+  WORKER_TRIGGER_RETRYABLE_ERRORS
+} from "../extension/shared/environment-failures.js";
 import { appendSessionDebugLog, getSessionDebugLogs } from "../extension/shared/debug-log.js";
 import {
   isScanResultWithinFinalizationWindow,
@@ -1054,7 +1062,8 @@ test("manifest version + hosts", () => {
   assert.ok(mainHook?.js?.includes("content/page-network-hook.js"));
   assert.equal(isolated?.js?.[0], "shared/trigger-navigation-recovery.js");
   assert.equal(isolated?.js?.[1], "shared/conversation-match.js");
-  assert.equal(isolated?.js?.[2], "shared/operation-dispatch-gate.js");
+  assert.equal(isolated?.js?.[2], "shared/job-identity.js");
+  assert.equal(isolated?.js?.[3], "shared/operation-dispatch-gate.js");
 });
 test("UI exposes themes, help tips and filter switches", () => {
   const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
@@ -1114,6 +1123,42 @@ test("side-by-side layout fills the available display", () => {
   assert.deepEqual(layout.left, { left: 0, top: 24, width: 960, height: 1056 });
   assert.deepEqual(layout.right, { left: 960, top: 24, width: 960, height: 1056 });
   assert.equal(computeSideBySideBounds({ left: 0, top: 0, width: 900, height: 800 }), null);
+  assert.equal(windowBoundsMatch({ left: 0, top: 24, width: 960, height: 1056 }, layout.left), true);
+  assert.equal(windowBoundsMatch({ left: 24, top: 24, width: 940, height: 1056 }, layout.left), true);
+  assert.equal(windowBoundsMatch({ left: 0, top: 24, width: 1280, height: 1056 }, layout.left), false);
+  assert.deepEqual(
+    snapshotWindowBounds({ left: 80, top: 60, width: 1280, height: 900, state: 'maximized' }),
+    { left: 80, top: 60, width: 1280, height: 900, state: 'maximized' }
+  );
+});
+test("list job identity requires a real jobId match and ignores similar titles", () => {
+  assert.equal(isSyntheticJobId(""), true);
+  assert.equal(isSyntheticJobId("name_abc"), true);
+  assert.equal(isSyntheticJobId("e8b92e03b03039140nJ93tu4FlFQ"), false);
+  assert.equal(listJobIdentityMismatch({
+    wantId: "job-a",
+    cardId: "job-a",
+    wantTitle: "前端",
+    gotTitle: "前端"
+  }), "");
+  assert.ok(listJobIdentityMismatch({
+    wantId: "job-a",
+    cardId: "job-b",
+    wantTitle: "前端",
+    gotTitle: "高级前端"
+  }).includes("列表岗位与目标不一致"));
+  assert.ok(listJobIdentityMismatch({
+    wantId: "job-a",
+    hrefId: "job-b",
+    wantTitle: "前端工程师",
+    gotTitle: "前端工程师"
+  }).includes("列表岗位与目标不一致"));
+  assert.equal(listJobIdentityMismatch({
+    wantId: "name_hash",
+    cardId: "job-b",
+    wantTitle: "前端",
+    gotTitle: "后端"
+  }), "");
 });
 test("task start prepares split workspace with fallback", () => {
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
@@ -1121,6 +1166,11 @@ test("task start prepares split workspace with fallback", () => {
   assert.ok(background.includes("computeSideBySideBounds"));
   assert.ok(background.includes("splitViewActive"));
   assert.ok(background.includes("普通消息标签页"));
+  assert.ok(background.includes("职位页留在用户原来的窗口"));
+  assert.ok(background.includes("applySplitWindowBounds"));
+  assert.ok(background.includes("restoreWindowSnapshot"));
+  assert.ok(background.includes("raiseSplitWindows(listWindowId, messageWindowId)"));
+  assert.ok(!/windows\.create\(\{\s*tabId: listTab\.id/.test(background), "must not detach the job list into a new window");
 });
 test("floating controls stay fully visible after a split-window resize", () => {
   const source = fs.readFileSync("extension/content/floating-host.js", "utf8");
@@ -1428,6 +1478,10 @@ try {
     status: "complete"
   };
   const windowCalls = [];
+  const windowState = {
+    1: { id: 1, left: 80, top: 60, width: 1280, height: 900, tabs: [] },
+    2: { id: 2, left: 80, top: 60, width: 1280, height: 900, tabs: [] }
+  };
   let displayWidth = 1920;
   globalThis.chrome = {
     runtime: {
@@ -1472,15 +1526,24 @@ try {
     },
     windows: {
       async get(windowId) {
-        return { id: windowId, left: 80, top: 60, width: 1280, height: 900, tabs: [] };
+        return { ...(windowState[windowId] || { id: windowId, left: 80, top: 60, width: 1280, height: 900, tabs: [] }) };
       },
       async update(windowId, patch) {
         windowCalls.push({ api: "windows.update", windowId, patch });
-        return { id: windowId, ...patch };
+        windowState[windowId] = { ...(windowState[windowId] || { id: windowId }), id: windowId, ...patch };
+        return windowState[windowId];
       },
       async create(options) {
         windowCalls.push({ api: "windows.create", options });
-        return { id: 2, tabs: [messageTab] };
+        windowState[2] = {
+          id: 2,
+          left: options.left ?? 960,
+          top: options.top ?? 24,
+          width: options.width ?? 960,
+          height: options.height ?? 1056,
+          tabs: [messageTab]
+        };
+        return { id: 2, tabs: [messageTab], ...windowState[2] };
       }
     }
   };
@@ -1503,8 +1566,9 @@ try {
   assert.ok(windowCalls
     .filter((call) => call.api === "tabs.setZoomSettings")
     .every((call) => call.settings.mode === "automatic" && call.settings.scope === "per-tab"));
-  assert.ok(windowCalls.some((call) => call.api === "windows.create" && call.options.left === 960));
-  assert.ok(windowCalls.some((call) => call.api === "windows.create" && call.options.tabId === listTab.id && call.options.left === 0));
+  assert.ok(windowCalls.some((call) => call.api === "windows.create" && call.options.left === 960), "chat window is created or placed on the right");
+  assert.ok(!windowCalls.some((call) => call.api === "windows.create" && call.options.tabId === listTab.id), "job list stays in the original window");
+  assert.ok(windowCalls.some((call) => call.api === "windows.update" && call.windowId === listTab.windowId && call.patch.left === 0), "original window is resized to the left half");
   assert.ok(windowCalls.some((call) => call.api === "windows.update" && call.windowId === 2 && call.patch.focused === true));
 
   const createsBeforeFallback = windowCalls.filter((call) => call.api === "windows.create").length;
@@ -1856,7 +1920,8 @@ test("env auto-continue classifies infrastructure errors only", () => {
     "OP_BRIDGE_TIMEOUT",
     "OP_DEADLINE_EXCEEDED",
     "NO_BOSS_TAB",
-    "NAVIGATED"
+    "NAVIGATED",
+    "WORKER_LEFT_DETAIL"
   ];
   for (const error of envErrors) {
     assert.ok(ENV_AUTO_CONTINUE_ERRORS.has(error), 'env set must contain ' + error);
@@ -1867,6 +1932,34 @@ test("env auto-continue classifies infrastructure errors only", () => {
   assert.equal(isEnvironmentalFailure({ ok: false, error: "CONVERSATION_CREATE_NOT_CONFIRMED" }), false, "unconfirmed receipt still pauses");
   assert.equal(isEnvironmentalFailure({ ok: false, error: "FILTER_ACTIVE" }), false, "filter skip is separate");
   assert.equal(isEnvironmentalFailure({ ok: false, error: "SEND_NOT_CONFIRMED" }), false, "mid-send failure still pauses");
+});
+
+test("worker trigger retries only reopenable environment failures", () => {
+  assert.equal(WORKER_TRIGGER_RETRY.maxTries, 3);
+  assert.ok(WORKER_TRIGGER_RETRYABLE_ERRORS.has("WORKER_TAB_FAILED"));
+  assert.ok(WORKER_TRIGGER_RETRYABLE_ERRORS.has("WORKER_CHAT_BUTTON_NOT_FOUND"));
+  assert.ok(WORKER_TRIGGER_RETRYABLE_ERRORS.has("WORKER_PAGE_NOT_READY"));
+  assert.ok(!WORKER_TRIGGER_RETRYABLE_ERRORS.has("CONVERSATION_CREATE_NOT_CONFIRMED"));
+  assert.ok(!WORKER_TRIGGER_RETRYABLE_ERRORS.has("WORKER_CHAT_CLICK_NO_EFFECT"));
+  assert.ok(!WORKER_TRIGGER_RETRYABLE_ERRORS.has("OP_BRIDGE_TIMEOUT"));
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "WORKER_TAB_FAILED" }), true);
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "CONTENT_INJECT_FAIL" }), true);
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "WORKER_CHAT_BUTTON_NOT_FOUND" }), true);
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "WORKER_CHAT_CLICK_NO_EFFECT" }), false, "already clicked, do not click again");
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "CONVERSATION_CREATE_NOT_CONFIRMED" }), false, "receipt missing is not re-clicked");
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "OP_BRIDGE_TIMEOUT" }), false, "bridge timeout may be after click");
+  assert.equal(isWorkerTriggerRetryable({ ok: true, error: "WORKER_TAB_FAILED" }), false, "success is not retried");
+  assert.equal(isWorkerTriggerRetryable({ ok: false, filtered: true, error: "FILTER_ACTIVE" }), false);
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "LOGIN_REQUIRED" }), false);
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "OP_CANCELLED" }), false);
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "NAVIGATED" }), false, "already navigated chat is not re-clicked");
+  assert.equal(isWorkerTriggerRetryable({ ok: false, error: "WORKER_LEFT_DETAIL" }), false, "already left detail is not re-clicked");
+  assert.equal(canFallbackWorkerMode({ ok: false, error: "WORKER_TAB_FAILED" }), true);
+  assert.equal(canFallbackWorkerMode({ ok: false, error: "WORKER_CHAT_BUTTON_NOT_FOUND" }), true);
+  assert.equal(canFallbackWorkerMode({ ok: false, error: "WORKER_LEFT_DETAIL" }), false, "left-detail does not list-fallback");
+  assert.equal(canFallbackWorkerMode({ ok: false, error: "CONVERSATION_CREATE_NOT_CONFIRMED" }), false);
+  assert.equal(canFallbackWorkerMode({ ok: false, error: "NAVIGATED" }), false);
+  assert.equal(isEnvironmentalFailure({ ok: false, error: "WORKER_LEFT_DETAIL" }), true);
   assert.equal(isEnvironmentalFailure({ ok: false, error: "DETAIL_IDENTITY_MISMATCH" }), false, "identity mismatch still pauses");
   assert.equal(isEnvironmentalFailure({ ok: false, error: "NAVIGATED" }), true, "temp page navigation interrupt is env");
   assert.equal(isEnvironmentalFailure({ ok: false, error: "IMAGE_SEND_NOT_CONFIRMED" }), false, "image confirm miss is stamped via envAutoSkip flag path");

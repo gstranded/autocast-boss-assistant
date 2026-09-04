@@ -27,7 +27,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.23";
+  const BHT_CONTENT_VERSION = "1.7.24";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -2303,6 +2303,19 @@ function firstEl(selectors, root = document) {
     return null;
   }
 
+  function listCardIdentityMismatch(job, card, detailTitle = "") {
+    const identity = globalThis.BHTJobIdentity;
+    if (!identity?.listJobIdentityMismatch) return "列表岗位身份校验模块缺失";
+    const parsed = card ? parseJobCard(card, Math.max(0, getJobCards().indexOf(card))) : {};
+    return identity.listJobIdentityMismatch({
+      wantId: job?.jobId || "",
+      cardId: parsed.jobId || "",
+      hrefId: extractJobIdFromHref(parsed.href || "") || extractJobIdFromHref(location.href),
+      wantTitle: job?.title || "",
+      gotTitle: detailTitle || parsed.title || ""
+    });
+  }
+
   function getChatRoot() {
     const input = (() => {
       try { return document.querySelector("#bht-mock-chat #chat-input, #chat-input, .chat-input [contenteditable='true']"); } catch (_) { return null; }
@@ -4181,18 +4194,18 @@ async function startChat(job, opts = {}) {
       await sleep(250);
     }
     if (!pageUsable) {
-      // 页面已跳转（点击前）：无按钮可点，交给导航恢复；直接返回未知态避免卡死
+      // 页面已跳转（点击前）：可能已经在建聊，不要当成「找不到按钮」去列表兜底再点。
       if (!clicked.ok) {
-        const unknown = {
+        const leftDetail = {
           ok: false,
-          error: "WORKER_CHAT_BUTTON_NOT_FOUND",
-          message: "临时执行页已离开岗位详情（可能已跳转），等待导航恢复",
+          error: "WORKER_LEFT_DETAIL",
+          message: "临时执行页已离开岗位详情（可能已跳转），不再重复点击立即沟通",
           detailTitle,
           href: location.href,
           contentVersion: BHT_CONTENT_VERSION
         };
-        debugTrace("worker_detail_chat_button_not_found", unknown, "warn");
-        return unknown;
+        debugTrace("worker_detail_left_page", leftDetail, "warn");
+        return leftDetail;
       }
     } else {
       const btn = gateBtn || findConversationActionButton(scopeRoot);
@@ -4232,17 +4245,16 @@ async function startChat(job, opts = {}) {
 
     const isDetailPageNow = () => /\/job_detail\//i.test(location.pathname);
     if (!clicked.ok && !isDetailPageNow()) {
-      // 点击后页面已跳转：无按钮可点，交给导航恢复
-      const unknown = {
+      const leftDetail = {
         ok: false,
-        error: "WORKER_CHAT_BUTTON_NOT_FOUND",
-        message: "临时执行页已离开岗位详情（可能已跳转），等待导航恢复",
+        error: "WORKER_LEFT_DETAIL",
+        message: "临时执行页已离开岗位详情（可能已跳转），不再重复点击立即沟通",
         detailTitle,
         href: location.href,
         contentVersion: BHT_CONTENT_VERSION
       };
-      debugTrace("worker_detail_chat_button_not_found", unknown, "warn");
-      return unknown;
+      debugTrace("worker_detail_left_page", leftDetail, "warn");
+      return leftDetail;
     }
 
     if (!clicked.ok) {
@@ -4444,17 +4456,31 @@ async function startChat(job, opts = {}) {
       const want = normalizeText(job.title || "");
       const got = normalizeText(detailTitle || "");
       const titleOk = !want || !got || got.includes(want.slice(0, 8)) || want.includes(got.slice(0, 8));
+      const identityMismatch = listCardIdentityMismatch(job, card, detailTitle);
       debugTrace("trigger_detail_identity", {
-        requested: { title: job.title || "", company: job.company || "", hrName: job.hrName || job.bossName || "" },
+        requested: { title: job.title || "", company: job.company || "", hrName: job.hrName || job.bossName || "", jobId: job.jobId || "" },
         extracted: {
           title: detailTitle || "",
           company: extractDetailCompany(),
-          hrName: extractDetailHrName()
+          hrName: extractDetailHrName(),
+          jobId: parseJobCard(card, Math.max(0, getJobCards().indexOf(card))).jobId || ""
         },
         normalized: { want, got },
         titleOk,
+        identityMismatch,
         detailRoot: describeDebugElement(firstEl(SELECTORS.detailRoot))
-      }, titleOk ? "debug" : "warn");
+      }, identityMismatch ? "error" : (titleOk ? "debug" : "warn"));
+      if (identityMismatch) {
+        return {
+          ok: false,
+          error: "LIST_JOB_IDENTITY_MISMATCH",
+          message: "克隆列表页岗位对不上，已停止点击立即沟通：" + identityMismatch,
+          requestedJobId: job.jobId || "",
+          detailTitle: detailTitle || "",
+          href: location.href,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+      }
       if (!titleOk) {
         log("list detail title weak match", { want: job.title, got: detailTitle });
       }
