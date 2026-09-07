@@ -87,7 +87,5 @@
         "*://bosszhipin.com/*"
       ]
     }
-  ],
-  "key": "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAr/SGmcAKhd/vtlOEliMvUZAFevA4AGRFhDrfGJxpP5VTu7jN/gDV7QzMFJQlzUcnY6HWAVIYn9vHdkxmR8zyTR+DzaOr+r37//YsToEDzj8MeoqN0AFkrV9ip23I7zsH+BkvrLV/0tp+IE405vm+GBluz7fj4vHXf4s3ArN6by0Zyj+zwWxeVzLhgFK+Ce/e6CEqMronBcslCiy4p5vK+edo7kAePM2GpCQn9qSf9b43juXsevjaVfCPkqzBjMskIdApNZkTWTXfOhXXNlhmYrrtAPeJFfbtl5rIOsNjO6YsDWeIImr5yufGcr10y9U8bC2YaAMOU3uVFtUimyffAvMqPKE0zrbpuc/uXRKzygwtmXCHcF3mmnExEsgR7SKJF4Vj81/2znA7aFq+fAbTzQidRpkhMOYqvpRBLsNT5lWC7/T4kCDWRbqSNpQVYxQNOC9kW95hF/XeAEp8940Qez7wr58lEBaLJEaTzF/zRD/yqppkFMoYFfjXKBGWJ/y3AgMBAAE=",
-  "update_url": "https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/updates.xml"
+  ]
 }

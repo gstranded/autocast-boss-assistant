@@ -45,8 +45,6 @@
 | `dist/RELEASE_vX.Y.Z.md` | 与 JSON 正文一致 |
 | Git tag / GitHub Release | `vX.Y.Z` |
 | ZIP 文件名 | `dist/autocast-boss-haitou-vX.Y.Z.zip` |
-| CRX 文件名 | `dist/autocast-boss-haitou-vX.Y.Z.crx`（签名私钥绝不入仓库，见 `docs/CRX_UPDATE.md`） |
-| `updates.xml` | 指向 `vX.Y.Z` 与对应 CRX 下载地址（`node scripts/build-crx.mjs` 自动刷新） |
 
 开发过程中 **不要提前改版本号**。版本号只在 `dev` 已合并进 `main`、准备发 Release 时一次性改齐。
 
@@ -58,6 +56,6 @@
 2. 若目录不存在：按 `docs/DEV_WORKFLOW.md` 建 worktree，不要改 Chrome 那份 `boss`。
 3. 改代码、写测试、在 **ego** 里加载 `boss-dev/extension` 验证。
 4. 不要对用户的 Chrome 扩展点「重新加载」，除非用户明确要求更新稳定版。
-5. 准备发版时：先把 `dev` 合进 `main`，再在 `main` 上按 `docs/RELEASE_PROCESS.md` 升版本、打包（ZIP 与 CRX）、打 tag。
+5. 准备发版时：先把 `dev` 合进 `main`，再在 `main` 上按 `docs/RELEASE_PROCESS.md` 升版本、打包、打 tag。
 6. 发版后让 `dev` 跟上 `main`，避免两条线再次分叉。
-7. CRX 签名密钥：`node scripts/generate-crx-key.mjs` 一次性生成（私钥默认 `~/.config/autocast-boss/crx-key.pem`），供发版与 CI 使用；丢失会改变扩展 ID，务必备份。
+7. Chrome Web Store 上架用商店专用包（不带 key/update_url，见 `docs/STORE_SUBMISSION.md`）。

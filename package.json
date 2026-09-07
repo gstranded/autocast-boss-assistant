@@ -10,8 +10,7 @@
     "test:panel:serve": "node scripts/panel-harness-server.mjs",
     "smoke": "node scripts/smoke-test.mjs",
     "release:check": "node scripts/sync-release-notes.mjs",
-    "release:sync": "node scripts/sync-release-notes.mjs --apply",
-    "build:crx": "node scripts/build-crx.mjs"
+    "release:sync": "node scripts/sync-release-notes.mjs --apply"
   },
   "devDependencies": {}
 }
