@@ -1204,9 +1204,13 @@ async function ensureMessageTab(task) {
     tab = win.tabs?.[0] || (await chrome.tabs.query({ windowId: win.id }))[0];
     if (!tab?.id) throw new Error('无法在右侧重建消息窗口');
   } else {
+    // 消息页建立在职位列表页所在窗口：openerTabId 必须与新建标签同窗口，
+    // 否则多窗口（或列表页被移到新建窗口）时会报「Tab opener must be in the same window」
+    const listTabForWindow = await chrome.tabs.get(task.execution.listTabId).catch(() => null);
     tab = await chrome.tabs.create({
       url: "https://www.zhipin.com/web/geek/chat",
       active: true,
+      windowId: listTabForWindow?.windowId,
       openerTabId: task.execution.listTabId || undefined
     });
   }
