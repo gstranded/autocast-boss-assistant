@@ -85,7 +85,8 @@ import {
   formatDeliveryScheduleStatus,
   nextDeliveryScheduleStart,
   normalizeDeliveryScheduleDays,
-  normalizeDeliveryScheduleWindows
+  normalizeDeliveryScheduleWindows,
+  diagnoseDeliveryScheduleWindows
 } from "../extension/shared/delivery-schedule.js";
 
 const {
@@ -1029,6 +1030,28 @@ test("delivery schedule caps the number of windows at 10", () => {
   const s = { scheduledDeliveryEnabled: true, scheduledDeliveryDays: [1, 2, 3, 4, 5], scheduledDeliveryWindows: many };
   assert.equal(evaluateDeliverySchedule(s, new Date(2026, 8, 7, 16, 30, 0, 0)).allowed, false);
   assert.equal(evaluateDeliverySchedule(s, new Date(2026, 8, 7, 15, 30, 0, 0)).activeWindow?.label, '15:00-15:59');
+});
+test("delivery schedule diagnoses duplicate invalid and overlapping windows", () => {
+  const rows = [
+    { start: '09:00', end: '12:00' },
+    { start: '09:00', end: '12:00' },
+    { start: '10:00', end: '13:00' },
+    { start: '25:00', end: '26:00' },
+    { start: '20:00', end: '19:00' },
+    { start: '20:00', end: '21:00' }
+  ];
+  const d = diagnoseDeliveryScheduleWindows(rows);
+  assert.deepEqual(d.map((x) => x.status), ['ok', 'duplicate', 'overlap', 'invalid', 'invalid', 'ok']);
+  assert.equal(d[1].ofIndex, 0);
+  assert.equal(d[2].ofIndex, 0);
+  assert.ok(d[1].reason.includes('完全相同'));
+  assert.ok(d[2].reason.includes('部分重叠'));
+  // 规范化结果与诊断一致：重复/非法被忽略，重叠保留取并集
+  const effective = normalizeDeliveryScheduleWindows(rows);
+  assert.deepEqual(effective.map((w) => w.label), ['09:00-12:00', '10:00-13:00', '20:00-21:00']);
+  // 全部合法时诊断全 ok
+  const clean = diagnoseDeliveryScheduleWindows([{ start: '08:00', end: '09:00' }, { start: '13:00', end: '14:00' }]);
+  assert.ok(clean.every((x) => x.status === 'ok'));
 });
 
 console.log("6) boss-url guard");

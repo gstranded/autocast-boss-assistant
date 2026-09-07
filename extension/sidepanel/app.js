@@ -22,6 +22,7 @@ import {
   evaluateDeliverySchedule,
   formatDeliveryScheduleStatus,
   normalizeDeliveryScheduleDays,
+  diagnoseDeliveryScheduleWindows,
   DEFAULT_DELIVERY_SCHEDULE_WINDOWS,
   MAX_DELIVERY_SCHEDULE_WINDOWS
 } from '../shared/delivery-schedule.js';
@@ -619,6 +620,27 @@ function readScheduledDeliveryWindows() {
   })).filter((row) => row.start && row.end);
 }
 
+function renderScheduleWindowDiagnosis(enabled) {
+  const container = $('deliveryScheduleWindows');
+  const warnEl = $('deliveryScheduleWarnings');
+  if (!container) return;
+  const rows = [...container.querySelectorAll('.schedule-window-row')].map((row) => ({
+    start: row.querySelector('[data-window-start]')?.value || '',
+    end: row.querySelector('[data-window-end]')?.value || ''
+  }));
+  const diagnosis = diagnoseDeliveryScheduleWindows(rows);
+  [...container.querySelectorAll('.schedule-window-row')].forEach((rowEl, index) => {
+    const item = diagnosis[index] || { status: 'ok', reason: '' };
+    rowEl.classList.toggle('schedule-window-warn', item.status !== 'ok');
+    const indexLabel = rowEl.querySelector('.schedule-window-index');
+    if (indexLabel) indexLabel.title = item.reason || '';
+  });
+  if (!warnEl) return;
+  const problems = diagnosis.filter((d) => d.status !== 'ok');
+  warnEl.hidden = !enabled || !problems.length;
+  warnEl.textContent = problems.map((d) => `时段 ${d.index + 1}：${d.reason}`).join('；');
+}
+
 function wireScheduleWindowButtons() {
   const container = $('deliveryScheduleWindows');
   if (!container || container.__bhtScheduleWired) return;
@@ -671,6 +693,7 @@ function updateDeliveryScheduleUi(settings = null) {
   document.querySelectorAll('[data-window-start], [data-window-end]').forEach((input) => { input.disabled = !enabled; });
   document.querySelectorAll('.schedule-window-remove, #btnAddScheduleWindow').forEach((button) => { button.disabled = !enabled; });
   $('deliveryScheduleConfig')?.classList.toggle('is-disabled', !enabled);
+  renderScheduleWindowDiagnosis(enabled);
   if ($('deliveryScheduleStatus')) {
     const schedule = evaluateDeliverySchedule(resolved, new Date());
     $('deliveryScheduleStatus').textContent = formatDeliveryScheduleStatus(resolved, new Date());
