@@ -95,13 +95,13 @@ export function diagnoseDeliveryScheduleWindows(rows = []) {
     }
     const same = valid.findIndex((w) => w.startMinute === startMinute && w.endMinute === endMinute);
     if (same >= 0) {
-      return { index, status: 'duplicate', ofIndex: same, reason: `与时段 ${same + 1} 完全相同，重复时段不生效` };
+      return { index, status: 'duplicate', ofIndex: valid[same].rowIndex, reason: `与时段 ${valid[same].rowIndex + 1} 完全相同，重复时段不生效` };
     }
     const overlapIndex = valid.findIndex((w) => startMinute < w.endMinute && endMinute > w.startMinute);
     if (overlapIndex >= 0) {
-      return { index, status: 'overlap', ofIndex: overlapIndex, reason: `与时段 ${overlapIndex + 1} 部分重叠，投递时段取并集` };
+      return { index, status: 'overlap', ofIndex: valid[overlapIndex].rowIndex, reason: `与时段 ${valid[overlapIndex].rowIndex + 1} 部分重叠，投递时段取并集` };
     }
-    valid.push({ startMinute, endMinute });
+    valid.push({ startMinute, endMinute, rowIndex: index });
     return { index, status: 'ok', ofIndex: null, reason: '' };
   });
 }

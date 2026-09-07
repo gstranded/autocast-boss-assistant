@@ -1052,6 +1052,15 @@ test("delivery schedule diagnoses duplicate invalid and overlapping windows", ()
   // 全部合法时诊断全 ok
   const clean = diagnoseDeliveryScheduleWindows([{ start: '08:00', end: '09:00' }, { start: '13:00', end: '14:00' }]);
   assert.ok(clean.every((x) => x.status === 'ok'));
+  // 前面行无效时，重叠标注引用原始行号而不是有效列表下标
+  const afterInvalid = diagnoseDeliveryScheduleWindows([
+    { start: '12:00', end: '09:00' },
+    { start: '10:00', end: '13:00' },
+    { start: '09:00', end: '12:00' }
+  ]);
+  assert.equal(afterInvalid[2].status, 'overlap');
+  assert.equal(afterInvalid[2].ofIndex, 1);
+  assert.ok(afterInvalid[2].reason.includes('时段 2'));
 });
 
 console.log("6) boss-url guard");
