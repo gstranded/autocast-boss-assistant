@@ -1261,6 +1261,9 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
   let activityAccepted = null;
   if (selectedActiveBuckets.length) {
     // 活跃度只在左侧点一次卡片核对；详情/列表回退共用结果，避免卡住时反复点同一张卡。
+    // 注意：ego 实测 detail API 连发 ~5 次即触发 BOSS 风控码 37 且会话内持续生效
+    // （12s 间隔的逐岗调用同样被拒），因此投递期不采用 API 核对，仍以点击核对为准
+    // （求职期望页的点击导航风险由「防级联+暂停」兜底）。
     activityInspection = await sendToBoss(
       MSG.INSPECT_JOB_DETAIL || 'BHT_INSPECT_JOB_DETAIL',
       { job },

@@ -2067,12 +2067,14 @@ function firstEl(selectors, root = document) {
   async function enrichJobActivities(payload = {}) {
     // 预览期核对 HR 活跃度：直连列表 detail API（BOSS 原生接口，带登录态），
     // 不点卡片、不导航、不离开列表页（与「左侧职位页保持原样」一致）。
-    // 限频保护：单次最多核对 12 岗、每岗间隔至少 900ms；遇到 429/403 或
-    // BOSS 风控码（如 code 37）立即熔断，避免破坏会话触发投递侧风控。
+    // 限频保护：单次最多核对 4 岗、每岗间隔至少 1200ms。
+    // ego 实测：detail API 连发约 5 次即触发 BOSS 风控码 37，且会话内持续生效
+    // （12s 间隔的逐岗调用同样被拒）——因此宁可少核对，只做最前排少量抽样，
+    // 其余岗位保留「投递时再核对」。
     const requested = Array.isArray(payload.jobs) ? payload.jobs : [];
     const deadlineAt = Number(payload.deadlineAt) || (Date.now() + 60000);
     const maxChecksRaw = Number(payload.maxChecks);
-    const maxChecks = Math.min(12, maxChecksRaw > 0 ? maxChecksRaw : 12);
+    const maxChecks = Math.min(4, maxChecksRaw > 0 ? maxChecksRaw : 4);
     const activities = [];
     let eligibleCount = 0;
     let checkedCount = 0;
@@ -2097,9 +2099,12 @@ function firstEl(selectors, root = document) {
         break;
       }
       if (res?.ok) {
+        // 与「点卡片核对」路径一致：activeText 先经 parseBossActiveLabel 归一化
+        // （BOSS 详情接口的原文文案可能与页面标签不同，如「当前在线」），
+        // 无法归一化时保留原文，交给 matchActive 判定（与点击路径的未知判定一致）。
         activities.push({
           jobId: String(job?.jobId || ""),
-          activeText: String(res.activeText || "").trim(),
+          activeText: parseBossActiveLabel(String(res.activeText || "")) || String(res.activeText || "").trim(),
           bossOnline: res.bossOnline === true,
           goldHunter: res.goldHunter === true,
           hrTitle: String(res.bossTitle || "").trim(),
@@ -2109,7 +2114,7 @@ function firstEl(selectors, root = document) {
         checkedCount += 1;
       }
       // 每岗之间限频，避免 detail API 突发触发 BOSS 风控（code 37）
-      await sleep(900);
+      await sleep(1200);
     }
     return {
       ok: true,

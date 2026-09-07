@@ -338,7 +338,7 @@ test("HR activity is inspected on the temporary detail before any conversation c
   const triggerAt = worker.indexOf("MSG.TRIGGER_CONVERSATION");
   assert.ok(inspectAt >= 0 && triggerAt > inspectAt);
   assert.ok(worker.includes("matchActive(activeText, selectedActiveBuckets)"));
-  assert.ok(worker.includes("活跃度只在左侧点一次卡片核对"));
+  assert.ok(worker.includes("活跃度只在左侧点一次卡片核对"), "activity checked once on the left card");
   assert.ok(worker.includes("if (result?.ok || result?.filtered || operationAborted(result)) break;"));
   assert.ok(worker.includes("filtered: true"));
   assert.ok(worker.includes("result?.filtered"));
@@ -1443,9 +1443,10 @@ test("left-list anomaly protection pauses instead of cascade-skipping", () => {
   assert.ok(background.includes("runner.consecutiveUnknownActive = 0"), "counter resets on success and batch start");
   // 锚点缺 city 时告警
   assert.ok(background.includes("锚点 URL 缺少 city 参数"), "anchor missing city warns");
-  // 预览 enrich 限频防风控
-  assert.ok(content.includes("maxChecks") && content.includes("await sleep(900)"), "enrich throttles per-job calls");
+  // 预览 enrich 限频防风控（ego 实测 detail API 约 5 次即 code 37 且会话内持续生效）
+  assert.ok(content.includes("maxChecks = Math.min(4") && content.includes("await sleep(1200)"), "enrich capped at 4 checks with 1.2s spacing");
   assert.ok(content.includes("ACTIVITY_BUDGET"), "enrich caps checks per scan");
+  assert.ok(content.includes("parseBossActiveLabel") && content.includes("无法归一化时保留原文"), "enrich normalizes active label like click path");
 });
 
 test("skip does not wait job interval and waits are logged", () => {
