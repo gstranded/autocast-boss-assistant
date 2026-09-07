@@ -1,9 +1,20 @@
 export const DEFAULT_DELIVERY_SCHEDULE_DAYS = Object.freeze([1, 2, 3, 4, 5]);
 
-export const DELIVERY_SCHEDULE_WINDOWS = Object.freeze([
-  Object.freeze({ startMinute: 9 * 60, endMinute: 12 * 60, label: '09:00-12:00' }),
-  Object.freeze({ startMinute: 14 * 60, endMinute: 17 * 60, label: '14:00-17:00' })
+// 设置里保存的默认时段（HH:MM 24 小时制），可在面板自定义
+export const DEFAULT_DELIVERY_SCHEDULE_WINDOWS = Object.freeze([
+  Object.freeze({ start: '09:00', end: '12:00' }),
+  Object.freeze({ start: '14:00', end: '17:00' })
 ]);
+
+// 兼容旧引用：默认时段的分钟表示
+function toDefaultWindow(stringWindow) {
+  const startMinute = parseClock(stringWindow.start);
+  const endMinute = parseClock(stringWindow.end);
+  return { startMinute, endMinute, label: `${stringWindow.start}-${stringWindow.end}` };
+}
+export const DELIVERY_SCHEDULE_WINDOWS = Object.freeze(
+  DEFAULT_DELIVERY_SCHEDULE_WINDOWS.map(toDefaultWindow).map(Object.freeze)
+);
 
 const WEEKDAY_LABELS = Object.freeze(['周日', '周一', '周二', '周三', '周四', '周五', '周六']);
 
@@ -11,6 +22,51 @@ export function normalizeDeliveryScheduleDays(days) {
   if (!Array.isArray(days)) return [...DEFAULT_DELIVERY_SCHEDULE_DAYS];
   return [...new Set(days.map(Number).filter((day) => Number.isInteger(day) && day >= 0 && day <= 6))]
     .sort((a, b) => a - b);
+}
+
+function parseClock(text) {
+  const match = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(String(text || '').trim());
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+export function formatClock(minute) {
+  const value = Math.max(0, Math.min(23 * 60 + 59, Math.round(minute)));
+  return `${String(Math.floor(value / 60)).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`;
+}
+
+// 输入：settings（用 settings.scheduledDeliveryWindows）或直接给数组；
+// 返回规范化数组 [{ startMinute, endMinute, label }]（按开始时间排序、去重、仅保留 start<end 的合法项）。
+// 缺失/未设置时返回默认两个时段；传显式空数组或全部非法时返回空数组（表示没有有效时段）。
+export function normalizeDeliveryScheduleWindows(input) {
+  let raw;
+  if (Array.isArray(input?.scheduledDeliveryWindows)) {
+    raw = input.scheduledDeliveryWindows;
+  } else if (Array.isArray(input)) {
+    raw = input;
+  } else {
+    raw = DEFAULT_DELIVERY_SCHEDULE_WINDOWS;
+  }
+  const parsed = raw
+    .map((w) => {
+      const startMinute = parseClock(w?.start);
+      const endMinute = parseClock(w?.end);
+      if (startMinute == null || endMinute == null || startMinute >= endMinute) return null;
+      return {
+        startMinute,
+        endMinute,
+        label: `${formatClock(startMinute)}-${formatClock(endMinute)}`
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.startMinute - b.startMinute);
+  const seen = new Set();
+  return parsed.filter((w) => {
+    const key = w.startMinute + ':' + w.endMinute;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function localTimeAt(day, minute) {
@@ -22,14 +78,15 @@ function localTimeAt(day, minute) {
 export function nextDeliveryScheduleStart(settings = {}, now = new Date()) {
   if (settings.scheduledDeliveryEnabled !== true) return null;
   const days = normalizeDeliveryScheduleDays(settings.scheduledDeliveryDays);
-  if (!days.length) return null;
+  const windows = normalizeDeliveryScheduleWindows(settings.scheduledDeliveryWindows);
+  if (!days.length || !windows.length) return null;
 
   for (let offset = 0; offset <= 7; offset++) {
     const day = new Date(now);
     day.setHours(0, 0, 0, 0);
     day.setDate(day.getDate() + offset);
     if (!days.includes(day.getDay())) continue;
-    for (const window of DELIVERY_SCHEDULE_WINDOWS) {
+    for (const window of windows) {
       const candidate = localTimeAt(day, window.startMinute);
       if (candidate.getTime() > now.getTime()) return candidate;
     }
@@ -40,18 +97,20 @@ export function nextDeliveryScheduleStart(settings = {}, now = new Date()) {
 export function evaluateDeliverySchedule(settings = {}, now = new Date()) {
   const enabled = settings.scheduledDeliveryEnabled === true;
   const days = normalizeDeliveryScheduleDays(settings.scheduledDeliveryDays);
+  const windows = normalizeDeliveryScheduleWindows(settings.scheduledDeliveryWindows);
   if (!enabled) {
-    return { enabled: false, allowed: true, days, activeWindow: null, nextStart: null };
+    return { enabled: false, allowed: true, days, windows, activeWindow: null, nextStart: null };
   }
 
   const minute = now.getHours() * 60 + now.getMinutes();
   const activeWindow = days.includes(now.getDay())
-    ? DELIVERY_SCHEDULE_WINDOWS.find((window) => minute >= window.startMinute && minute < window.endMinute) || null
+    ? windows.find((window) => minute >= window.startMinute && minute < window.endMinute) || null
     : null;
   return {
     enabled: true,
     allowed: Boolean(activeWindow),
     days,
+    windows,
     activeWindow,
     nextStart: activeWindow ? null : nextDeliveryScheduleStart(settings, now)
   };
@@ -61,6 +120,7 @@ export function formatDeliveryScheduleStatus(settings = {}, now = new Date()) {
   const state = evaluateDeliverySchedule(settings, now);
   if (!state.enabled) return '定时投递已关闭';
   if (!state.days.length) return '未选择运行日，定时任务不会启动';
+  if (!state.windows.length) return '未设置有效投递时段，任务不会自动运行';
   if (state.allowed) return `当前可投递 · ${state.activeWindow.label}`;
   if (!state.nextStart) return '当前不在投递时段';
   const next = state.nextStart;

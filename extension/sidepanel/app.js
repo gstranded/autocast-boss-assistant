@@ -21,7 +21,8 @@ import {
 import {
   evaluateDeliverySchedule,
   formatDeliveryScheduleStatus,
-  normalizeDeliveryScheduleDays
+  normalizeDeliveryScheduleDays,
+  DEFAULT_DELIVERY_SCHEDULE_WINDOWS
 } from '../shared/delivery-schedule.js';
 
 const $ = (id) => document.getElementById(id);
@@ -556,6 +557,16 @@ function fillSettings(settings) {
   document.querySelectorAll('[data-schedule-day]').forEach((input) => {
     input.checked = scheduledDays.has(Number(input.dataset.scheduleDay));
   });
+  const windows = Array.isArray(settings.scheduledDeliveryWindows)
+    ? settings.scheduledDeliveryWindows
+    : DEFAULT_DELIVERY_SCHEDULE_WINDOWS;
+  document.querySelectorAll('[data-window-start]').forEach((input) => {
+    const index = Number(input.dataset.windowStart);
+    const windowConfig = windows[index] || {};
+    input.value = windowConfig.start || '';
+    const endInput = document.querySelector(`[data-window-end="${index}"]`);
+    if (endInput) endInput.value = windowConfig.end || '';
+  });
   updateDeliveryScheduleUi(settings);
   updateDebugUi(settings);
 }
@@ -566,16 +577,31 @@ function readScheduledDeliveryDays() {
     .filter((day) => Number.isInteger(day));
 }
 
+function readScheduledDeliveryWindows() {
+  const rows = [];
+  document.querySelectorAll('[data-window-start]').forEach((input) => {
+    const index = Number(input.dataset.windowStart);
+    const endInput = document.querySelector(`[data-window-end="${index}"]`);
+    rows[index] = {
+      start: input.value || '',
+      end: endInput ? endInput.value || '' : ''
+    };
+  });
+  return rows.filter((row) => row && row.start && row.end);
+}
+
 function updateDeliveryScheduleUi(settings = null) {
   const enabled = settings
     ? settings.scheduledDeliveryEnabled === true
     : $('scheduledDeliveryEnabled')?.checked === true;
   const resolved = settings || {
     scheduledDeliveryEnabled: enabled,
-    scheduledDeliveryDays: readScheduledDeliveryDays()
+    scheduledDeliveryDays: readScheduledDeliveryDays(),
+    scheduledDeliveryWindows: readScheduledDeliveryWindows()
   };
   const dayInputs = document.querySelectorAll('[data-schedule-day]');
   dayInputs.forEach((input) => { input.disabled = !enabled; });
+  document.querySelectorAll('[data-window-start], [data-window-end]').forEach((input) => { input.disabled = !enabled; });
   $('deliveryScheduleConfig')?.classList.toggle('is-disabled', !enabled);
   if ($('deliveryScheduleStatus')) {
     const schedule = evaluateDeliverySchedule(resolved, new Date());
@@ -615,6 +641,7 @@ function readSettingsPatch(base) {
     debugLoggingEnabled: $('debugLoggingEnabled').checked,
     scheduledDeliveryEnabled: $('scheduledDeliveryEnabled').checked,
     scheduledDeliveryDays: readScheduledDeliveryDays(),
+    scheduledDeliveryWindows: readScheduledDeliveryWindows(),
     whitelistOnly: $('whitelistOnly').checked
   };
 }
@@ -2191,7 +2218,7 @@ function wireAutosave() {
     scheduleAutosave({ bumpRevision: false });
   }, true);
   root.addEventListener('change', (e) => {
-    if (e.target?.id === 'scheduledDeliveryEnabled' || e.target?.matches?.('[data-schedule-day]')) {
+    if (e.target?.id === 'scheduledDeliveryEnabled' || e.target?.matches?.('[data-schedule-day]') || e.target?.matches?.('[data-window-start], [data-window-end]')) {
       updateDeliveryScheduleUi();
     }
     if (shouldAutosaveTarget(e.target)) scheduleAutosave();

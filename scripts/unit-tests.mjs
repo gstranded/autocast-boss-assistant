@@ -80,10 +80,12 @@ import {
 } from "../extension/shared/log-order.js";
 import {
   DELIVERY_SCHEDULE_WINDOWS,
+  DEFAULT_DELIVERY_SCHEDULE_WINDOWS,
   evaluateDeliverySchedule,
   formatDeliveryScheduleStatus,
   nextDeliveryScheduleStart,
-  normalizeDeliveryScheduleDays
+  normalizeDeliveryScheduleDays,
+  normalizeDeliveryScheduleWindows
 } from "../extension/shared/delivery-schedule.js";
 
 const {
@@ -970,6 +972,51 @@ test("delivery schedule settings normalize imported day values", () => {
   assert.equal(nextDeliveryScheduleStart(noDays, new Date(2026, 8, 7, 10, 0, 0, 0)), null);
   assert.ok(formatDeliveryScheduleStatus(noDays).includes("未选择运行日"));
 });
+test("delivery schedule honors custom windows", () => {
+  const custom = { ...scheduledWeekdays, scheduledDeliveryWindows: [{ start: '10:00', end: '14:00' }] };
+  const monday = (hour, minute) => new Date(2026, 8, 7, hour, minute, 0, 0);
+  assert.equal(monday(9, 59).getDay(), 1);
+  assert.equal(evaluateDeliverySchedule(custom, monday(9, 59)).allowed, false);
+  assert.equal(evaluateDeliverySchedule(custom, monday(10, 0)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(custom, monday(13, 59)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(custom, monday(14, 0)).allowed, false);
+  assert.ok(formatDeliveryScheduleStatus(custom, monday(11, 0)).includes("当前可投递 · 10:00-14:00"));
+  assert.ok(formatDeliveryScheduleStatus(custom, monday(14, 0)).includes("当前暂停 · 下次 周二 10:00"));
+  // 默认两个时段可通过显式设置覆盖
+  const both = { ...scheduledWeekdays, scheduledDeliveryWindows: [{ start: '08:30', end: '09:30' }, { start: '20:00', end: '21:00' }] };
+  assert.equal(evaluateDeliverySchedule(both, new Date(2026, 8, 7, 8, 0, 0, 0)).allowed, false);
+  assert.equal(evaluateDeliverySchedule(both, new Date(2026, 8, 7, 9, 0, 0, 0)).allowed, true);
+  assert.equal(evaluateDeliverySchedule(both, new Date(2026, 8, 7, 20, 30, 0, 0)).allowed, true);
+  assert.ok(formatDeliveryScheduleStatus(both, new Date(2026, 8, 7, 9, 30, 0, 0)).includes("当前暂停 · 下次 周一 20:00"));
+});
+test("delivery schedule drops invalid windows and handles none", () => {
+  const mixed = {
+    ...scheduledWeekdays,
+    scheduledDeliveryWindows: [
+      { start: '09:00', end: '12:00' },
+      { start: '25:00', end: '26:00' },
+      { start: '14:00', end: '13:00' },
+      { start: '09:00', end: '12:00' }
+    ]
+  };
+  assert.deepEqual(normalizeDeliveryScheduleWindows(mixed.scheduledDeliveryWindows).map((w) => w.label), ["09:00-12:00"]);
+  const none = { ...scheduledWeekdays, scheduledDeliveryWindows: [] };
+  assert.equal(evaluateDeliverySchedule(none, new Date(2026, 8, 7, 10, 0, 0, 0)).allowed, false);
+  assert.equal(nextDeliveryScheduleStart(none, new Date(2026, 8, 7, 10, 0, 0, 0)), null);
+  assert.ok(formatDeliveryScheduleStatus(none).includes("未设置有效投递时段"));
+  // 缺失时回退默认两个时段
+  assert.deepEqual(normalizeDeliveryScheduleWindows(undefined).map((w) => w.label), ["09:00-12:00", "14:00-17:00"]);
+  assert.deepEqual(normalizeDeliveryScheduleWindows({ scheduledDeliveryWindows: undefined }).map((w) => w.label), ["09:00-12:00", "14:00-17:00"]);
+  assert.deepEqual(DEFAULT_DELIVERY_SCHEDULE_WINDOWS, [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '17:00' }]);
+});
+test("delivery schedule settings normalize windows", () => {
+  assert.deepEqual(normalizeSettings({}).scheduledDeliveryWindows, [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '17:00' }]);
+  const custom = normalizeSettings({ scheduledDeliveryWindows: [{ start: '08:00', end: '09:00' }, { start: '10:00', end: '11:00' }] });
+  assert.deepEqual(custom.scheduledDeliveryWindows, [{ start: '08:00', end: '09:00' }, { start: '10:00', end: '11:00' }]);
+  // 旧设置缺字段时补默认，不进默认值覆盖用户显式配置
+  const one = normalizeSettings({ scheduledDeliveryWindows: [{ start: '19:00', end: '23:00' }] });
+  assert.deepEqual(one.scheduledDeliveryWindows, [{ start: '19:00', end: '23:00' }]);
+});
 
 console.log("6) boss-url guard");
 test("boss urls accepted", () => {
@@ -1234,11 +1281,14 @@ test("task start prepares split workspace with fallback", () => {
   assert.ok(background.includes("computeSideBySideBounds"));
   assert.ok(background.includes("splitViewActive"));
   assert.ok(background.includes("普通消息标签页"));
-  assert.ok(background.includes("职位页留在用户原来的窗口"));
+  assert.ok(background.includes("职位页优先留在用户原来的窗口"));
   assert.ok(background.includes("applySplitWindowBounds"));
   assert.ok(background.includes("restoreWindowSnapshot"));
   assert.ok(background.includes("raiseSplitWindows(listWindowId, messageWindowId)"));
-  assert.ok(!/windows\.create\(\{\s*tabId: listTab\.id/.test(background), "must not detach the job list into a new window");
+  // 原窗口拒绝摆放时允许把列表页搬进新建窗口（仅回退路径），失败必须搬回原窗口
+  assert.ok(background.includes("tabId: listTab.id"), "fallback may detach the job list into a new window");
+  assert.ok(background.includes("chrome.tabs.move(listTab.id, { windowId: sourceWindowId"));
+  assert.ok(background.includes("relocated"), "relocation must be tracked");
 });
 test("floating controls stay fully visible after a split-window resize", () => {
   const source = fs.readFileSync("extension/content/floating-host.js", "utf8");

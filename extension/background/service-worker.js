@@ -1003,7 +1003,7 @@ export async function prepareSplitWorkspace(task, settings = {}) {
   }
 
   task.execution.listTabId = listTab.id;
-  // 职位页留在用户原来的窗口，不要 windows.create({ tabId }) 把它拆出去。
+  // 职位页优先留在用户原来的窗口（除非原窗口拒绝缩放，才搬进新建的可定位窗口，见下方 relocated 回退）
   const sourceWindowId = listTab.windowId;
   task.execution.listWindowId = sourceWindowId;
   const sourceWindow = await chrome.windows.get(sourceWindowId).catch(() => null);
@@ -1055,8 +1055,25 @@ export async function prepareSplitWorkspace(task, settings = {}) {
     }
   }
 
+  let listWindowId = sourceWindowId;
+  let relocated = false;
+  let originalListIndex = listTab.index;
   try {
-    await applySplitWindowBounds(sourceWindowId, bounds.left);
+    // 原窗口拒绝摆放（某些浏览器/ego 固定最大化或最小化）时，把列表页搬进新建的可定位窗口，分屏保持可用
+    try {
+      await applySplitWindowBounds(sourceWindowId, bounds.left);
+    } catch (_) {
+      const movedWindow = await chrome.windows.create({
+        tabId: listTab.id,
+        type: 'normal',
+        focused: false,
+        ...bounds.left
+      });
+      listWindowId = movedWindow.id;
+      relocated = true;
+      task.execution.listWindowId = listWindowId;
+      await applySplitWindowBounds(listWindowId, bounds.left);
+    }
 
     const savedMsgTab = task.execution.messageTabId
       ? await chrome.tabs.get(task.execution.messageTabId).catch(() => null)
@@ -1070,7 +1087,7 @@ export async function prepareSplitWorkspace(task, settings = {}) {
     }
 
     let messageWindow;
-    if (messageTab?.id && messageTab.windowId != null && messageTab.windowId !== sourceWindowId) {
+    if (!relocated && messageTab?.id && messageTab.windowId != null && messageTab.windowId !== listWindowId) {
       await applySplitWindowBounds(messageTab.windowId, bounds.right);
       messageWindow = await chrome.windows.get(messageTab.windowId).catch(() => null)
         || { id: messageTab.windowId };
@@ -1117,8 +1134,8 @@ export async function prepareSplitWorkspace(task, settings = {}) {
     task.execution.phase = 'SPLIT_WORKSPACE_READY';
 
     await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
-    await raiseSplitWindows(sourceWindowId, messageWindow.id);
-    const listWinState = await chrome.windows.get(sourceWindowId).catch(() => null);
+    await raiseSplitWindows(listWindowId, messageWindow.id);
+    const listWinState = await chrome.windows.get(listWindowId).catch(() => null);
     const msgWinState = await chrome.windows.get(messageWindow.id).catch(() => null);
     await debugLog('background.split', 'windows_state', {
       list: listWinState ? { id: listWinState.id, state: listWinState.state, left: listWinState.left, top: listWinState.top, width: listWinState.width, height: listWinState.height } : null,
@@ -1135,7 +1152,14 @@ export async function prepareSplitWorkspace(task, settings = {}) {
   } catch (error) {
     task.execution.splitViewActive = false;
     task.execution.splitViewError = String(error?.message || error);
-    await restoreWindowSnapshot(sourceWindowId, originalListBounds);
+    if (relocated) {
+      // 列表页已搬进新窗口：先搬回原窗口再关闭临时窗口，避免丢失标签
+      await chrome.tabs.move(listTab.id, { windowId: sourceWindowId, index: Math.min(originalListIndex, 1000) }).catch(() => {});
+      await chrome.windows.remove(listWindowId).catch(() => {});
+      task.execution.listWindowId = sourceWindowId;
+    } else {
+      await restoreWindowSnapshot(sourceWindowId, originalListBounds);
+    }
     await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
     await chrome.windows.update(task.execution.listWindowId || listTab.windowId, { focused: true }).catch(() => {});
     return {

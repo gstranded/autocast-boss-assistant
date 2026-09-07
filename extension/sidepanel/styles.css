@@ -407,9 +407,17 @@ select:disabled { cursor: not-allowed; opacity: 0.46; }
 .schedule-toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .schedule-config { margin-top: 11px; transition: opacity 0.16s ease; }
 .schedule-config.is-disabled { opacity: 0.5; }
-.schedule-windows { display: flex; align-items: center; gap: 14px; color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums; }
-.schedule-windows span + span { position: relative; }
-.schedule-windows span + span::before { content: ""; position: absolute; left: -8px; top: 50%; width: 3px; height: 3px; border-radius: 50%; background: var(--muted); }
+.schedule-windows { display: flex; flex-direction: column; gap: 8px; color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums; }
+.schedule-window-row { display: flex; align-items: center; gap: 8px; }
+.schedule-window-index { min-width: 34px; font-size: 11px; font-weight: 650; color: var(--muted); }
+.schedule-window-sep { color: var(--muted); font-size: 12px; }
+.schedule-window-row input[type="time"] {
+  flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--surface); color: var(--text); font: inherit; font-weight: 650; font-variant-numeric: tabular-nums;
+}
+.schedule-window-row input[type="time"]:focus-visible { box-shadow: var(--focus); }
+.schedule-window-row input[type="time"]:disabled { cursor: default; color: var(--muted); }
+.schedule-window-meta { font-size: 10.5px; font-weight: 500; color: var(--muted); }
 .schedule-days { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; margin-top: 9px; }
 .schedule-days label { min-width: 0; cursor: pointer; }
 .schedule-days input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }

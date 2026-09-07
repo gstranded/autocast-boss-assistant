@@ -9,7 +9,7 @@ import { deepClone, todayKey, uid } from './text-utils.js';
 import { countResumeImages, normalizeResumes } from './resume-images.js';
 import { normalizeMessageTemplateRoles } from './greeting-policy.js';
 import { mergeRuntimeLog, sortLogsNewestFirst } from './log-order.js';
-import { normalizeDeliveryScheduleDays } from './delivery-schedule.js';
+import { normalizeDeliveryScheduleDays, normalizeDeliveryScheduleWindows, formatClock } from './delivery-schedule.js';
 
 let logWriteChain = Promise.resolve();
 
@@ -20,6 +20,8 @@ export function normalizeSettings(settings = {}) {
   if (normalized.resumeSendTiming === 'on_request') normalized.resumeSendTiming = 'after_text';
   normalized.scheduledDeliveryEnabled = normalized.scheduledDeliveryEnabled === true;
   normalized.scheduledDeliveryDays = normalizeDeliveryScheduleDays(normalized.scheduledDeliveryDays);
+  normalized.scheduledDeliveryWindows = normalizeDeliveryScheduleWindows(normalized.scheduledDeliveryWindows)
+    .map((window) => ({ start: formatClock(window.startMinute), end: formatClock(window.endMinute) }));
   return normalized;
 }
 

@@ -69,6 +69,7 @@ export const DEFAULT_SETTINGS = {
   debugLoggingEnabled: false,
   scheduledDeliveryEnabled: false,
   scheduledDeliveryDays: [1, 2, 3, 4, 5],
+  scheduledDeliveryWindows: [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '17:00' }],
   whitelistOnly: false
 };
 
