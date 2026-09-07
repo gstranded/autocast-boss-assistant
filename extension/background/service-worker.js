@@ -492,7 +492,7 @@ async function configureDeliveryScheduleAlarm(settings = null) {
   const resolved = settings || (await getAllConfig()).settings || {};
   const schedule = evaluateDeliverySchedule(resolved, new Date());
   await chrome.alarms.clear(DELIVERY_SCHEDULE_ALARM);
-  if (!schedule.enabled || !schedule.days.length) return;
+  if (!schedule.enabled || !schedule.days.length || !schedule.windows.length) return;
   const when = schedule.allowed
     ? Date.now() + 1000
     : Math.max(Date.now() + 1000, schedule.nextStart?.getTime() || Date.now() + 60000);

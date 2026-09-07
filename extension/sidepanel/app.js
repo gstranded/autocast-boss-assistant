@@ -566,7 +566,7 @@ function fillSettings(settings) {
   updateDebugUi(settings);
 }
 
-function ensureScheduleWindowRows(count, values = []) {
+function ensureScheduleWindowRows(count, values = null) {
   const container = $('deliveryScheduleWindows');
   if (!container) return;
   const requested = Math.max(0, Math.min(MAX_DELIVERY_SCHEDULE_WINDOWS, Math.max(1, count)));
@@ -582,6 +582,7 @@ function ensureScheduleWindowRows(count, values = []) {
       <button type="button" class="schedule-window-remove" data-remove-window="" aria-label="" title="删除该时段">×</button>`;
     container.appendChild(row);
   }
+  const preset = Array.isArray(values) && values.length > 0 ? values : null;
   [...container.children].forEach((row, index) => {
     row.dataset.windowRow = String(index);
     row.querySelector('.schedule-window-index').textContent = `时段 ${index + 1}`;
@@ -594,9 +595,12 @@ function ensureScheduleWindowRows(count, values = []) {
     endInput.setAttribute('aria-label', `时段${index + 1}结束`);
     removeBtn.dataset.removeWindow = String(index);
     removeBtn.setAttribute('aria-label', `删除时段${index + 1}`);
-    const windowConfig = values[index] || {};
-    startInput.value = windowConfig.start || '';
-    endInput.value = windowConfig.end || '';
+    // 只在使用方显式提供值时回填；增删行重排时保留用户已填的时间
+    if (preset) {
+      const windowConfig = preset[index] || {};
+      startInput.value = windowConfig.start || '';
+      endInput.value = windowConfig.end || '';
+    }
   });
 }
 
