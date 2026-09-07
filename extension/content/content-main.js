@@ -49,6 +49,23 @@
   window.__BHT_ACTIVE_OP_TYPE__ = null;
   window.__BHT_CONTENT_LOADED__ = true;
   window.__BHT_LAST_TRIGGER_CLICK__ = null;
+  // 岗位身份模块是 ES module（供后台/单元测试复用），不能用经典脚本注入；
+  // 内容脚本隔离世界里通过动态 import 加载后挂到全局供本文件使用。
+  const bhtIdentityReady = (() => {
+    try {
+      return import(chrome.runtime.getURL('shared/job-identity.js'))
+        .then((mod) => {
+          globalThis.BHTJobIdentity = Object.freeze({
+            isSyntheticJobId: mod.isSyntheticJobId,
+            listJobIdentityMismatch: mod.listJobIdentityMismatch
+          });
+          return true;
+        })
+        .catch(() => false);
+    } catch (_) {
+      return Promise.resolve(false);
+    }
+  })();
   const nativeGreetingReceipts = [];
   const jobNetworkMetadata = new Map();
 
@@ -2306,7 +2323,8 @@ function firstEl(selectors, root = document) {
     return null;
   }
 
-  function listCardIdentityMismatch(job, card, detailTitle = "") {
+  async function listCardIdentityMismatch(job, card, detailTitle = "") {
+    await bhtIdentityReady;
     const identity = globalThis.BHTJobIdentity;
     if (!identity?.listJobIdentityMismatch) return "列表岗位身份校验模块缺失";
     const parsed = card ? parseJobCard(card, Math.max(0, getJobCards().indexOf(card))) : {};
@@ -4459,7 +4477,7 @@ async function startChat(job, opts = {}) {
       const want = normalizeText(job.title || "");
       const got = normalizeText(detailTitle || "");
       const titleOk = !want || !got || got.includes(want.slice(0, 8)) || want.includes(got.slice(0, 8));
-      const identityMismatch = listCardIdentityMismatch(job, card, detailTitle);
+      const identityMismatch = await listCardIdentityMismatch(job, card, detailTitle);
       debugTrace("trigger_detail_identity", {
         requested: { title: job.title || "", company: job.company || "", hrName: job.hrName || job.bossName || "", jobId: job.jobId || "" },
         extracted: {

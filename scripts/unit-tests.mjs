@@ -1164,8 +1164,9 @@ test("manifest version + hosts", () => {
   assert.ok(mainHook?.js?.includes("content/page-network-hook.js"));
   assert.equal(isolated?.js?.[0], "shared/trigger-navigation-recovery.js");
   assert.equal(isolated?.js?.[1], "shared/conversation-match.js");
-  assert.equal(isolated?.js?.[2], "shared/job-identity.js");
-  assert.equal(isolated?.js?.[3], "shared/operation-dispatch-gate.js");
+  assert.equal(isolated?.js?.[2], "shared/operation-dispatch-gate.js");
+  assert.ok(!isolated.js.includes("shared/job-identity.js"), "esm identity module must not be injected as a classic content script");
+  assert.equal(isolated?.js?.[3], "content/content-main.js");
 });
 test("UI exposes themes, help tips and filter switches", () => {
   const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");

@@ -61,7 +61,6 @@
       "js": [
         "shared/trigger-navigation-recovery.js",
         "shared/conversation-match.js",
-        "shared/job-identity.js",
         "shared/operation-dispatch-gate.js",
         "content/content-main.js",
         "content/floating-host.js"

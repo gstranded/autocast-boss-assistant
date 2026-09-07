@@ -281,7 +281,11 @@ test("successful conversation creation survives a forced list-to-chat navigation
   const manifest = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
   const isolated = manifest.content_scripts.find((entry) => !entry.world || entry.world === "ISOLATED");
   assert.ok(isolated?.js?.includes("shared/trigger-navigation-recovery.js"));
-  assert.ok(isolated?.js?.includes("shared/job-identity.js"));
+  assert.ok(!isolated?.js?.includes("shared/job-identity.js"), "esm identity module must not be a classic content script");
+  // 身份模块改为内容脚本内动态 import（ESM，classic 注入会 SyntaxError）
+  assert.ok(content.includes("import(chrome.runtime.getURL('shared/job-identity.js'))"));
+  assert.ok(content.includes("bhtIdentityReady"));
+  assert.ok(content.includes("await bhtIdentityReady"));
   assert.ok(content.includes("trigger_navigation_recovered"));
   assert.ok(content.includes("window.__BHT_LAST_TRIGGER_CLICK__"));
   assert.ok(content.includes("for (let i = 0; i < 18 && !stay.ok; i++)"));
