@@ -1,4 +1,5 @@
 import assert from "assert";
+import crypto from "node:crypto";
 import {
   evaluateJob,
   matchActive,
@@ -1212,6 +1213,22 @@ test("manifest version + hosts", () => {
   assert.equal(isolated?.js?.[2], "shared/operation-dispatch-gate.js");
   assert.ok(!isolated.js.includes("shared/job-identity.js"), "esm identity module must not be injected as a classic content script");
   assert.equal(isolated?.js?.[3], "content/content-main.js");
+});
+test("crx: manifest key and updates.xml share one stable extension id", () => {
+  const m = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
+  const xml = fs.readFileSync("updates.xml", "utf8");
+  const deriveId = (base64Spki) => {
+    const digest = crypto.createHash("sha256").update(Buffer.from(base64Spki, "base64")).digest("hex").slice(0, 32);
+    return digest.replace(/[0-9a-f]/g, (c) => String.fromCharCode(97 + parseInt(c, 16)));
+  };
+  const id = deriveId(m.key);
+  assert.equal(id.length, 32);
+  assert.match(id, /^[a-p]+$/, "extension id chars are a-p");
+  assert.ok(xml.includes(id), "updates.xml appid must match manifest key id");
+  assert.ok(m.update_url && m.update_url.endsWith("/main/updates.xml"), "update_url must point to the committed updates.xml");
+  const codebase = (xml.match(/codebase="([^"]+)"/) || [])[1] || "";
+  assert.ok(codebase.includes(`/releases/download/`), "codebase must be a releases download URL");
+  assert.ok(codebase.endsWith(m.version + ".crx") || codebase.includes("v" + m.version), "codebase version matches manifest");
 });
 test("UI exposes themes, help tips and filter switches", () => {
   const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");

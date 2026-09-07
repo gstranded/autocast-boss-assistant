@@ -54,9 +54,11 @@ node scripts/sync-release-notes.mjs --tag v1.5.4 --apply
 1. 按 AGENTS.md 把 Manifest、package.json、面板、content、浮窗宿主、测试桩的版本号改成同一个新版本。
 2. 在 `docs/releases/release-notes.json` 增加对应版本。
 3. 运行 `npm test` 和 `npm run smoke`。
-4. 打包扩展，ZIP 根目录必须直接包含 `manifest.json`。
-5. 提交并推送代码。
-6. 创建 Release 并上传 ZIP。
+4. 打包扩展：先 `npm install`（一次性，安装 crx3），再：
+   - ZIP：扩展目录打包为 `dist/autocast-boss-haitou-vX.Y.Z.zip`，根目录必须直接包含 `manifest.json`；
+   - CRX：`node scripts/build-crx.mjs`（自动用签名密钥生成 CRX 并按当前版本刷新根目录 `updates.xml`，私钥见 `docs/CRX_UPDATE.md`）。
+5. 提交并推送代码（`updates.xml` 随版本提交，Chrome 自动更新读取的是固定地址 `main/updates.xml`）。
+6. 创建 Release 并上传 ZIP 与 CRX（CRX 上传到 `release/download/vX.Y.Z/`，与 `updates.xml` 中 `codebase` 一致）。
 7. 运行同步脚本写入中文说明。
 8. 打开 GitHub Release 页面复核标题、正文、附件和中文显示。
 
