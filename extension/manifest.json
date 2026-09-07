@@ -35,7 +35,8 @@
     "*://*.zhipin.com/*",
     "*://zhipin.com/*",
     "*://*.bosszhipin.com/*",
-    "*://bosszhipin.com/*"
+    "*://bosszhipin.com/*",
+    "https://api.github.com/*"
   ],
   "content_scripts": [
     {

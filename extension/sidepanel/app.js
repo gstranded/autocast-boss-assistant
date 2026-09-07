@@ -641,6 +641,69 @@ function renderScheduleWindowDiagnosis(enabled) {
   warnEl.textContent = problems.map((d) => `时段 ${d.index + 1}：${d.reason}`).join('；');
 }
 
+const UPDATE_CHECK_API = 'https://api.github.com/repos/gstranded/autocast-boss-assistant';
+const UPDATE_CHECK_RELEASE_PAGE = 'https://github.com/gstranded/autocast-boss-assistant/releases';
+
+function isNewerVersion(latest, current) {
+  const parse = (v) => String(v || '').replace(/^v/, '').split('.').map((n) => Number(n) || 0);
+  const a = parse(latest);
+  const b = parse(current);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] || 0;
+    const y = b[i] || 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+
+function wireUpdateCheck() {
+  const btn = $('btnCheckUpdate');
+  const statusEl = $('updateStatus');
+  const currentEl = $('updateCurrentVersion');
+  if (!btn || btn.__bhtWired) return;
+  btn.__bhtWired = true;
+  if (currentEl) currentEl.textContent = 'v' + BHT_UI_VERSION;
+  btn.addEventListener('click', async () => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    if (statusEl) {
+      statusEl.hidden = false;
+      statusEl.textContent = '正在检查更新…';
+    }
+    try {
+      const res = await fetch(UPDATE_CHECK_API + '/releases/latest', {
+        headers: { Accept: 'application/vnd.github+json' }
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const release = await res.json();
+      const latest = String(release.tag_name || '').replace(/^v/, '');
+      const current = BHT_UI_VERSION;
+      if (!latest) throw new Error('响应缺少版本号');
+      if (isNewerVersion(latest, current)) {
+        statusEl.innerHTML = '';
+        const line = document.createElement('div');
+        line.textContent = `发现新版本 v${latest}（当前 v${current}）`;
+        const link = document.createElement('a');
+        link.href = release.html_url || UPDATE_CHECK_RELEASE_PAGE;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.textContent = '前往下载 ›';
+        link.addEventListener('click', () => {
+          try { chrome.tabs.create({ url: link.href, active: true }); } catch (_) {}
+        });
+        statusEl.appendChild(line);
+        statusEl.appendChild(link);
+      } else {
+        statusEl.textContent = `已是最新版本（v${current}）。`;
+      }
+    } catch (e) {
+      if (statusEl) statusEl.textContent = '检查失败：' + String(e?.message || e) + '（请检查网络后重试）';
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
 function wireScheduleWindowButtons() {
   const container = $('deliveryScheduleWindows');
   if (!container || container.__bhtScheduleWired) return;
@@ -3256,6 +3319,7 @@ wireControlButtons();
 try { wireAutosave();
 try { wireResumeFilePreview(); } catch (_) {} } catch (_) {}
 try { wireScheduleWindowButtons(); } catch (_) {}
+try { wireUpdateCheck(); } catch (_) {}
 refresh().catch(() => {});
 setInterval(() => {
   if (state.hostSuspended) return;

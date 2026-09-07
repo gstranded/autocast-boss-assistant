@@ -1213,6 +1213,10 @@ test("manifest version + hosts", () => {
   assert.equal(isolated?.js?.[2], "shared/operation-dispatch-gate.js");
   assert.ok(!isolated.js.includes("shared/job-identity.js"), "esm identity module must not be injected as a classic content script");
   assert.equal(isolated?.js?.[3], "content/content-main.js");
+  assert.ok(m.host_permissions.includes("https://api.github.com/*"), "update check needs api.github.com host permission");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(app.includes("btnCheckUpdate"), "update check UI wired");
+  assert.ok(app.includes("/releases/latest"), "update check fetches latest release");
 });
 test("crx: manifest key and updates.xml share one stable extension id", () => {
   const m = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));

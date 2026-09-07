@@ -366,6 +366,17 @@
 
         <!-- SETTINGS -->
         <section class="panel" id="tab-settings">
+          <div class="card">
+            <div class="card-title" data-help-title="版本与更新" data-help="检查 GitHub 上是否有新版本；更新包下载后可覆盖安装（同目录升级不丢设置）。">版本与更新</div>
+            <div class="update-row">
+              <div>
+                <div class="source-label">当前版本</div>
+                <div class="source-meta" id="updateCurrentVersion">v1.7.25</div>
+              </div>
+              <button id="btnCheckUpdate" class="btn tiny" type="button">检查更新</button>
+            </div>
+            <div id="updateStatus" class="update-status" hidden></div>
+          </div>
           <div class="card schedule-card">
             <div class="card-title" data-help-title="定时投递" data-help="开启后，投递任务只在选定日期的固定时段运行。时段结束会在当前岗位完成后暂停，下一时段自动继续。">定时投递</div>
             <div class="schedule-toggle-row">
