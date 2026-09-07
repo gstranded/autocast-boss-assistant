@@ -36,15 +36,25 @@ if (!fs.existsSync(keyPath)) {
   process.exit(1);
 }
 
+// 打包时确保 CRX 内的 manifest 带 update_url（否则该版本永远收不到后续自动更新）。
+// 从临时副本打包，不改动源目录。
+let packDir = srcDir;
 if (manifest.update_url !== updateUrl) {
-  console.warn('⚠️  当前 manifest.update_url 与更新清单地址不一致：' + String(manifest.update_url));
+  const tmpDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'crx-pack-'));
+  fs.cpSync(srcDir, tmpDir, { recursive: true });
+  const tmpManifest = path.join(tmpDir, 'manifest.json');
+  const patched = JSON.parse(fs.readFileSync(tmpManifest, 'utf8'));
+  patched.update_url = updateUrl;
+  fs.writeFileSync(tmpManifest, JSON.stringify(patched, null, 2));
+  packDir = tmpDir;
+  console.log('⚠️  manifest 缺少 update_url，已在构建时注入：' + updateUrl);
 }
-if (!manifest.key && !arg('--ignore-no-key', '')) {
-  console.warn('⚠️  manifest 未包含 "key"：打包出的 CRX 仍会以签名公钥派生 ID，但建议按 generate-crx-key 的输出补上 "key"（未打包安装也保持同一 ID）。');
+if (!manifest.key) {
+  console.log('ℹ️  manifest 未包含 "key"：CRX ID 由签名公钥派生（一致），如需未打包安装也保持同 ID，请按 generate-crx-key 输出补上。');
 }
 
 fs.mkdirSync(outDir, { recursive: true });
-await writeCRX3File([srcDir], {
+await writeCRX3File([packDir], {
   keyPath,
   crxPath,
   appVersion: version,
