@@ -643,6 +643,7 @@ function renderScheduleWindowDiagnosis(enabled) {
 
 const UPDATE_CHECK_API = 'https://api.github.com/repos/gstranded/autocast-boss-assistant';
 const UPDATE_CHECK_RELEASE_PAGE = 'https://github.com/gstranded/autocast-boss-assistant/releases';
+const UPDATE_CHECK_HOME_PAGE = 'https://github.com/gstranded/autocast-boss-assistant';
 
 function isNewerVersion(latest, current) {
   const parse = (v) => String(v || '').replace(/^v/, '').split('.').map((n) => Number(n) || 0);
@@ -656,6 +657,52 @@ function isNewerVersion(latest, current) {
   return false;
 }
 
+function openUpdateLink(url) {
+  return (e) => {
+    if (e) e.preventDefault();
+    try { chrome.tabs.create({ url, active: true }); } catch (_) {}
+  };
+}
+
+function formatUpdateDate(iso) {
+  try { return new Date(iso).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }); }
+  catch (_) { return ''; }
+}
+
+// 渲染检查结果：有新版 → 引导前往最新 Release；无新版 → 已是最新 + 项目主页入口
+function renderUpdateStatus(statusEl, { latest, current, release }) {
+  statusEl.innerHTML = '';
+  const line = document.createElement('div');
+  const dateText = release?.published_at ? ' · ' + formatUpdateDate(release.published_at) + ' 发布' : '';
+  if (latest && isNewerVersion(latest, current)) {
+    line.textContent = `发现新版本 v${latest}（当前 v${current}）${dateText}。`;
+    statusEl.appendChild(line);
+    const hint = document.createElement('div');
+    hint.textContent = `可前往最新版本下载页获取：${(release?.body || '').replace(/[#>*`\n-]/g, ' ').trim().slice(0, 80) || ''}`;
+    if (hint.textContent.trim().length > 5) statusEl.appendChild(hint);
+  } else {
+    line.textContent = `已是最新版本（v${current}）${dateText}。`;
+    statusEl.appendChild(line);
+  }
+  const links = document.createElement('div');
+  links.className = 'update-links';
+  const releaseLink = document.createElement('a');
+  releaseLink.href = (release && release.html_url) || UPDATE_CHECK_RELEASE_PAGE;
+  releaseLink.target = '_blank';
+  releaseLink.rel = 'noopener';
+  releaseLink.textContent = latest && isNewerVersion(latest, current) ? '前往下载 ›' : '更新日志 ›';
+  releaseLink.addEventListener('click', openUpdateLink(releaseLink.href));
+  const homeLink = document.createElement('a');
+  homeLink.href = UPDATE_CHECK_HOME_PAGE;
+  homeLink.target = '_blank';
+  homeLink.rel = 'noopener';
+  homeLink.textContent = '项目主页 ›';
+  homeLink.addEventListener('click', openUpdateLink(homeLink.href));
+  links.appendChild(releaseLink);
+  links.appendChild(homeLink);
+  statusEl.appendChild(links);
+}
+
 function wireUpdateCheck() {
   const btn = $('btnCheckUpdate');
   const statusEl = $('updateStatus');
@@ -663,6 +710,11 @@ function wireUpdateCheck() {
   if (!btn || btn.__bhtWired) return;
   btn.__bhtWired = true;
   if (currentEl) currentEl.textContent = 'v' + BHT_UI_VERSION;
+  const homeBtn = $('btnRepoHome');
+  if (homeBtn && !homeBtn.__bhtWired) {
+    homeBtn.__bhtWired = true;
+    homeBtn.addEventListener('click', openUpdateLink(UPDATE_CHECK_HOME_PAGE));
+  }
   btn.addEventListener('click', async () => {
     if (btn.disabled) return;
     btn.disabled = true;
@@ -679,23 +731,7 @@ function wireUpdateCheck() {
       const latest = String(release.tag_name || '').replace(/^v/, '');
       const current = BHT_UI_VERSION;
       if (!latest) throw new Error('响应缺少版本号');
-      if (isNewerVersion(latest, current)) {
-        statusEl.innerHTML = '';
-        const line = document.createElement('div');
-        line.textContent = `发现新版本 v${latest}（当前 v${current}）`;
-        const link = document.createElement('a');
-        link.href = release.html_url || UPDATE_CHECK_RELEASE_PAGE;
-        link.target = '_blank';
-        link.rel = 'noopener';
-        link.textContent = '前往下载 ›';
-        link.addEventListener('click', () => {
-          try { chrome.tabs.create({ url: link.href, active: true }); } catch (_) {}
-        });
-        statusEl.appendChild(line);
-        statusEl.appendChild(link);
-      } else {
-        statusEl.textContent = `已是最新版本（v${current}）。`;
-      }
+      renderUpdateStatus(statusEl, { latest, current, release });
     } catch (e) {
       if (statusEl) statusEl.textContent = '检查失败：' + String(e?.message || e) + '（请检查网络后重试）';
     } finally {
