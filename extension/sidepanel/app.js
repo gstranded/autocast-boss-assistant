@@ -662,6 +662,10 @@ function updateDeliveryScheduleUi(settings = null) {
     scheduledDeliveryDays: readScheduledDeliveryDays(),
     scheduledDeliveryWindows: readScheduledDeliveryWindows()
   };
+  // 本地变更立即反映到内存配置，避免 1s 定时器用 5s 前的旧配置短暂禁用控件
+  if (state.config?.settings && !settings) {
+    state.config.settings = { ...state.config.settings, ...resolved };
+  }
   const dayInputs = document.querySelectorAll('[data-schedule-day]');
   dayInputs.forEach((input) => { input.disabled = !enabled; });
   document.querySelectorAll('[data-window-start], [data-window-end]').forEach((input) => { input.disabled = !enabled; });
