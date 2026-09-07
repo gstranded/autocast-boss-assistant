@@ -13,7 +13,5 @@
     "release:sync": "node scripts/sync-release-notes.mjs --apply",
     "build:crx": "node scripts/build-crx.mjs"
   },
-  "devDependencies": {
-    "crx3": "^2.0.0"
-  }
+  "devDependencies": {}
 }
