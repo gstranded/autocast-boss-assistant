@@ -58,7 +58,7 @@ node scripts/sync-release-notes.mjs --tag v1.5.4 --apply
    - ZIP：扩展目录打包为 `dist/autocast-boss-haitou-vX.Y.Z.zip`，根目录必须直接包含 `manifest.json`；
    - CRX：`node scripts/build-crx.mjs`（自动用签名密钥生成 CRX 并按当前版本刷新根目录 `updates.xml`，私钥见 `docs/CRX_UPDATE.md`）。
 5. 提交并推送代码（`updates.xml` 随版本提交，Chrome 自动更新读取的是固定地址 `main/updates.xml`）。
-6. 创建 Release 并上传 ZIP 与 CRX（CRX 上传到 `release/download/vX.Y.Z/`，与 `updates.xml` 中 `codebase` 一致）。
+6. 创建 Release 并上传：CRX（`release/download/vX.Y.Z/`，与 `updates.xml` 中 `codebase` 一致，供自动更新协议下载）；`autocast-boss-haitou-vX.Y.Z-crx.zip`（内含该 CRX，供用户下载解压后拖入安装）。不再上传旧式源码 ZIP。
 7. 运行同步脚本写入中文说明。
 8. 打开 GitHub Release 页面复核标题、正文、附件和中文显示。
 
