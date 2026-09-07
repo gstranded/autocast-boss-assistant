@@ -2097,9 +2097,12 @@ function firstEl(selectors, root = document) {
         break;
       }
       if (res?.ok) {
+        // 与「点卡片核对」路径一致：activeText 先经 parseBossActiveLabel 归一化
+        // （BOSS 详情接口的原文文案可能与页面标签不同，如「当前在线」），
+        // 无法归一化时保留原文，交给 matchActive 判定（与点击路径的未知判定一致）。
         activities.push({
           jobId: String(job?.jobId || ""),
-          activeText: String(res.activeText || "").trim(),
+          activeText: parseBossActiveLabel(String(res.activeText || "")) || String(res.activeText || "").trim(),
           bossOnline: res.bossOnline === true,
           goldHunter: res.goldHunter === true,
           hrTitle: String(res.bossTitle || "").trim(),
