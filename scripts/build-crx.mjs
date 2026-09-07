@@ -37,7 +37,7 @@ if (!browser) {
 
 const manifest = JSON.parse(fs.readFileSync(path.join(srcDir, 'manifest.json'), 'utf8'));
 const version = manifest.version;
-const crxFile = `autocast-boss-haitou-v${version}.crx`;
+const crxFile = `update-channel-v${version}.crx`; // 自动更新协议专用文件名；用户安装包另装 zip
 const crxPath = path.join(outDir, crxFile);
 const crxUrl = `https://github.com/${repo}/releases/download/v${version}/${crxFile}`;
 const updateUrl = `https://raw.githubusercontent.com/${repo}/main/updates.xml`;
