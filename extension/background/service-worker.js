@@ -3529,6 +3529,25 @@ async function runTaskLoop(taskId) {
     // 连续「活跃度未知」计数从本次批次开始
     runner.consecutiveUnknownActive = 0;
 
+    // 列表页内容脚本版本一次性同步：扩展升级/重载后，未刷新的 BOSS 页仍运行旧版
+    // 内容脚本，投递首个关键操作会触发 sendToBoss 的「版本热更重注入」——
+    // contentInstanceId 变化会被指纹误判为「左侧页面外部变化」而偶发暂停
+    // （用户观察到的「无缘无故刷新」）。批次开始先对准版本，之后指纹全程稳定。
+    if (task.execution?.listTabId) {
+      try {
+        const pong = await chrome.tabs
+          .sendMessage(task.execution.listTabId, { type: MSG.PING, payload: {} })
+          .catch(() => null);
+        const contentVersion = String(pong?.contentVersion || '');
+        if (!pong?.ok || (BHT_RUNTIME_VERSION !== 'unknown' && contentVersion !== BHT_RUNTIME_VERSION)) {
+          await forceInjectContent(task.execution.listTabId);
+          await log('info', `[列表页] 内容脚本版本已同步（v${contentVersion || '未知'} → v${BHT_RUNTIME_VERSION}），本批次页面实例保持稳定`, {});
+        }
+      } catch (_) {
+        // 同步失败不阻塞：后续关键操作仍会按需注入，防级联保护兜底
+      }
+    }
+
     for (let qi = 0; qi < queue.length; qi++) {
       const row = queue[qi];
       await waitWhilePaused();

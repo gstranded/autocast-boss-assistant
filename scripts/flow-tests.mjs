@@ -1443,8 +1443,10 @@ test("left-list anomaly protection pauses instead of cascade-skipping", () => {
   assert.ok(background.includes("runner.consecutiveUnknownActive = 0"), "counter resets on success and batch start");
   // 锚点缺 city 时告警
   assert.ok(background.includes("锚点 URL 缺少 city 参数"), "anchor missing city warns");
-  // 预览 enrich 限频防风控（ego 实测 detail API 约 5 次即 code 37 且会话内持续生效）
-  assert.ok(content.includes("maxChecks = Math.min(4") && content.includes("await sleep(1200)"), "enrich capped at 4 checks with 1.2s spacing");
+  // 预览 enrich 限频防风控（ego 实测结论已记录：~5 次即 code 37，按 v1.7.24 行为保留 12/900）
+  assert.ok(content.includes("maxChecks") && content.includes("await sleep(900)"), "enrich throttles per-job calls");
+  // 批次开始前同步列表页内容脚本版本：避免版本热更重注入被误判为「外部变化」而偶发暂停
+  assert.ok(background.includes("内容脚本版本已同步") && background.includes("forceInjectContent(task.execution.listTabId)"), "list tab content version synced at batch start");
   assert.ok(content.includes("ACTIVITY_BUDGET"), "enrich caps checks per scan");
   assert.ok(content.includes("parseBossActiveLabel") && content.includes("无法归一化时保留原文"), "enrich normalizes active label like click path");
 });
