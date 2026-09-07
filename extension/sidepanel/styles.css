@@ -418,6 +418,20 @@ select:disabled { cursor: not-allowed; opacity: 0.46; }
 .schedule-window-row input[type="time"]:focus-visible { box-shadow: var(--focus); }
 .schedule-window-row input[type="time"]:disabled { cursor: default; color: var(--muted); }
 .schedule-window-meta { font-size: 10.5px; font-weight: 500; color: var(--muted); }
+.schedule-window-remove {
+  flex: none; width: 22px; height: 22px; border: 1px solid var(--line); border-radius: 50%;
+  background: var(--surface); color: var(--muted); font-size: 13px; line-height: 1; cursor: pointer;
+}
+.schedule-window-remove:hover:not(:disabled) { color: var(--danger, #e5534b); border-color: var(--danger, #e5534b); }
+.schedule-window-remove:disabled { cursor: default; opacity: 0.5; }
+.schedule-window-actions { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.schedule-window-add {
+  flex: none; padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--surface); color: var(--primary); font-size: 11.5px; font-weight: 650; cursor: pointer;
+}
+.schedule-window-add:hover:not(:disabled) { border-color: var(--primary); }
+.schedule-window-add:disabled { cursor: default; opacity: 0.5; }
+.schedule-window-hint { font-size: 10.5px; color: var(--muted); }
 .schedule-days { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; margin-top: 9px; }
 .schedule-days label { min-width: 0; cursor: pointer; }
 .schedule-days input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }

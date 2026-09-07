@@ -6,6 +6,9 @@ export const DEFAULT_DELIVERY_SCHEDULE_WINDOWS = Object.freeze([
   Object.freeze({ start: '14:00', end: '17:00' })
 ]);
 
+// 最多可配置的时段数量
+export const MAX_DELIVERY_SCHEDULE_WINDOWS = 10;
+
 // 兼容旧引用：默认时段的分钟表示
 function toDefaultWindow(stringWindow) {
   const startMinute = parseClock(stringWindow.start);
@@ -66,7 +69,7 @@ export function normalizeDeliveryScheduleWindows(input) {
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
-  });
+  }).slice(0, MAX_DELIVERY_SCHEDULE_WINDOWS);
 }
 
 function localTimeAt(day, minute) {

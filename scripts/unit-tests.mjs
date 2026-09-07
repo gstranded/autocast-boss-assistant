@@ -1017,6 +1017,19 @@ test("delivery schedule settings normalize windows", () => {
   const one = normalizeSettings({ scheduledDeliveryWindows: [{ start: '19:00', end: '23:00' }] });
   assert.deepEqual(one.scheduledDeliveryWindows, [{ start: '19:00', end: '23:00' }]);
 });
+test("delivery schedule caps the number of windows at 10", () => {
+  const many = Array.from({ length: 12 }, (_, i) => ({
+    start: `${String(6 + i).padStart(2, '0')}:00`,
+    end: `${String(6 + i).padStart(2, '0')}:59`
+  }));
+  const normalized = normalizeDeliveryScheduleWindows(many);
+  assert.equal(normalized.length, 10);
+  assert.equal(normalized[0].label, '06:00-06:59');
+  assert.equal(normalized[9].label, '15:00-15:59');
+  const s = { scheduledDeliveryEnabled: true, scheduledDeliveryDays: [1, 2, 3, 4, 5], scheduledDeliveryWindows: many };
+  assert.equal(evaluateDeliverySchedule(s, new Date(2026, 8, 7, 16, 30, 0, 0)).allowed, false);
+  assert.equal(evaluateDeliverySchedule(s, new Date(2026, 8, 7, 15, 30, 0, 0)).activeWindow?.label, '15:00-15:59');
+});
 
 console.log("6) boss-url guard");
 test("boss urls accepted", () => {

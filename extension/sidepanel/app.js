@@ -22,7 +22,8 @@ import {
   evaluateDeliverySchedule,
   formatDeliveryScheduleStatus,
   normalizeDeliveryScheduleDays,
-  DEFAULT_DELIVERY_SCHEDULE_WINDOWS
+  DEFAULT_DELIVERY_SCHEDULE_WINDOWS,
+  MAX_DELIVERY_SCHEDULE_WINDOWS
 } from '../shared/delivery-schedule.js';
 
 const $ = (id) => document.getElementById(id);
@@ -560,15 +561,43 @@ function fillSettings(settings) {
   const windows = Array.isArray(settings.scheduledDeliveryWindows)
     ? settings.scheduledDeliveryWindows
     : DEFAULT_DELIVERY_SCHEDULE_WINDOWS;
-  document.querySelectorAll('[data-window-start]').forEach((input) => {
-    const index = Number(input.dataset.windowStart);
-    const windowConfig = windows[index] || {};
-    input.value = windowConfig.start || '';
-    const endInput = document.querySelector(`[data-window-end="${index}"]`);
-    if (endInput) endInput.value = windowConfig.end || '';
-  });
+  ensureScheduleWindowRows(windows.length, windows);
   updateDeliveryScheduleUi(settings);
   updateDebugUi(settings);
+}
+
+function ensureScheduleWindowRows(count, values = []) {
+  const container = $('deliveryScheduleWindows');
+  if (!container) return;
+  const requested = Math.max(0, Math.min(MAX_DELIVERY_SCHEDULE_WINDOWS, Math.max(1, count)));
+  while (container.children.length > requested) container.lastElementChild.remove();
+  while (container.children.length < requested) {
+    const row = document.createElement('div');
+    row.className = 'schedule-window-row';
+    row.innerHTML = `
+      <span class="schedule-window-index"></span>
+      <input type="time" data-window-start="" value="" aria-label="" />
+      <span class="schedule-window-sep">至</span>
+      <input type="time" data-window-end="" value="" aria-label="" />
+      <button type="button" class="schedule-window-remove" data-remove-window="" aria-label="" title="删除该时段">×</button>`;
+    container.appendChild(row);
+  }
+  [...container.children].forEach((row, index) => {
+    row.dataset.windowRow = String(index);
+    row.querySelector('.schedule-window-index').textContent = `时段 ${index + 1}`;
+    const startInput = row.querySelector('[data-window-start]');
+    const endInput = row.querySelector('[data-window-end]');
+    const removeBtn = row.querySelector('[data-remove-window]');
+    startInput.dataset.windowStart = String(index);
+    endInput.dataset.windowEnd = String(index);
+    startInput.setAttribute('aria-label', `时段${index + 1}开始`);
+    endInput.setAttribute('aria-label', `时段${index + 1}结束`);
+    removeBtn.dataset.removeWindow = String(index);
+    removeBtn.setAttribute('aria-label', `删除时段${index + 1}`);
+    const windowConfig = values[index] || {};
+    startInput.value = windowConfig.start || '';
+    endInput.value = windowConfig.end || '';
+  });
 }
 
 function readScheduledDeliveryDays() {
@@ -578,16 +607,46 @@ function readScheduledDeliveryDays() {
 }
 
 function readScheduledDeliveryWindows() {
-  const rows = [];
-  document.querySelectorAll('[data-window-start]').forEach((input) => {
-    const index = Number(input.dataset.windowStart);
-    const endInput = document.querySelector(`[data-window-end="${index}"]`);
-    rows[index] = {
-      start: input.value || '',
-      end: endInput ? endInput.value || '' : ''
-    };
+  const container = $('deliveryScheduleWindows');
+  if (!container) return [];
+  return [...container.querySelectorAll('.schedule-window-row')].map((row) => ({
+    start: row.querySelector('[data-window-start]')?.value || '',
+    end: row.querySelector('[data-window-end]')?.value || ''
+  })).filter((row) => row.start && row.end);
+}
+
+function wireScheduleWindowButtons() {
+  const container = $('deliveryScheduleWindows');
+  if (!container || container.__bhtScheduleWired) return;
+  container.__bhtScheduleWired = true;
+  container.addEventListener('click', (e) => {
+    const removeBtn = e.target?.closest?.('[data-remove-window]');
+    if (removeBtn) {
+      // 至少保留一行：删除最后一行的行为改为清空该行，避免出现 0 行的空配置状态
+      if (container.children.length <= 1) {
+        const start = container.querySelector('[data-window-start]');
+        const end = container.querySelector('[data-window-end]');
+        if (start) { start.value = ''; start.dispatchEvent(new Event('input', { bubbles: true })); }
+        if (end) { end.value = ''; end.dispatchEvent(new Event('input', { bubbles: true })); }
+      } else {
+        removeBtn.closest('.schedule-window-row')?.remove();
+      }
+      ensureScheduleWindowRows(container.children.length);
+      updateDeliveryScheduleUi();
+      scheduleAutosave();
+      return;
+    }
   });
-  return rows.filter((row) => row && row.start && row.end);
+  const addBtn = $('btnAddScheduleWindow');
+  if (addBtn && !addBtn.__bhtWired) {
+    addBtn.__bhtWired = true;
+    addBtn.addEventListener('click', () => {
+      if (container.children.length >= MAX_DELIVERY_SCHEDULE_WINDOWS) return;
+      ensureScheduleWindowRows(container.children.length + 1);
+      updateDeliveryScheduleUi();
+      scheduleAutosave();
+    });
+  }
 }
 
 function updateDeliveryScheduleUi(settings = null) {
@@ -602,6 +661,7 @@ function updateDeliveryScheduleUi(settings = null) {
   const dayInputs = document.querySelectorAll('[data-schedule-day]');
   dayInputs.forEach((input) => { input.disabled = !enabled; });
   document.querySelectorAll('[data-window-start], [data-window-end]').forEach((input) => { input.disabled = !enabled; });
+  document.querySelectorAll('.schedule-window-remove, #btnAddScheduleWindow').forEach((button) => { button.disabled = !enabled; });
   $('deliveryScheduleConfig')?.classList.toggle('is-disabled', !enabled);
   if ($('deliveryScheduleStatus')) {
     const schedule = evaluateDeliverySchedule(resolved, new Date());
@@ -3164,6 +3224,7 @@ refreshControlEnablement();
 wireControlButtons();
 try { wireAutosave();
 try { wireResumeFilePreview(); } catch (_) {} } catch (_) {}
+try { wireScheduleWindowButtons(); } catch (_) {}
 refresh().catch(() => {});
 setInterval(() => {
   if (state.hostSuspended) return;

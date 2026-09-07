@@ -379,21 +379,27 @@
               </label>
             </div>
             <div id="deliveryScheduleConfig" class="schedule-config">
-              <div class="schedule-windows" aria-label="固定投递时段">
-                <div class="schedule-window-row">
+              <div class="schedule-windows" aria-label="固定投递时段" id="deliveryScheduleWindows">
+                <div class="schedule-window-row" data-window-row="0">
                   <span class="schedule-window-index">时段 1</span>
                   <input type="time" data-window-start="0" value="09:00" aria-label="时段1开始" />
                   <span class="schedule-window-sep">至</span>
                   <input type="time" data-window-end="0" value="12:00" aria-label="时段1结束" />
+                  <button type="button" class="schedule-window-remove" data-remove-window="0" aria-label="删除时段1" title="删除该时段">×</button>
                 </div>
-                <div class="schedule-window-row">
+                <div class="schedule-window-row" data-window-row="1">
                   <span class="schedule-window-index">时段 2</span>
                   <input type="time" data-window-start="1" value="14:00" aria-label="时段2开始" />
                   <span class="schedule-window-sep">至</span>
                   <input type="time" data-window-end="1" value="17:00" aria-label="时段2结束" />
+                  <button type="button" class="schedule-window-remove" data-remove-window="1" aria-label="删除时段2" title="删除该时段">×</button>
                 </div>
-                <div class="schedule-window-meta">开始需早于结束，非法时段会被忽略</div>
               </div>
+              <div class="schedule-window-actions">
+                <button type="button" id="btnAddScheduleWindow" class="schedule-window-add">＋ 添加时段</button>
+                <span class="schedule-window-hint">最多 10 个</span>
+              </div>
+              <div class="schedule-window-meta">开始需早于结束，非法时段会被忽略</div>
               <div class="schedule-days" aria-label="选择运行日">
                 <label title="周一"><input type="checkbox" data-schedule-day="1" aria-label="周一" /><span>一</span></label>
                 <label title="周二"><input type="checkbox" data-schedule-day="2" aria-label="周二" /><span>二</span></label>
