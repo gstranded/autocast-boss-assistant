@@ -641,7 +641,7 @@ function renderScheduleWindowDiagnosis(enabled) {
   warnEl.textContent = problems.map((d) => `时段 ${d.index + 1}：${d.reason}`).join('；');
 }
 
-const UPDATE_CHECK_API = 'https://api.github.com/repos/gstranded/autocast-boss-assistant';
+const UPDATE_CHECK_FEED = 'https://github.com/gstranded/autocast-boss-assistant/releases.atom';
 const UPDATE_CHECK_RELEASE_PAGE = 'https://github.com/gstranded/autocast-boss-assistant/releases';
 const UPDATE_CHECK_HOME_PAGE = 'https://github.com/gstranded/autocast-boss-assistant';
 
@@ -723,14 +723,22 @@ function wireUpdateCheck() {
       statusEl.textContent = '正在检查更新…';
     }
     try {
-      const res = await fetch(UPDATE_CHECK_API + '/releases/latest', {
-        headers: { Accept: 'application/vnd.github+json' }
-      });
+      const res = await fetch(UPDATE_CHECK_FEED);
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      const release = await res.json();
-      const latest = String(release.tag_name || '').replace(/^v/, '');
+      const xml = await res.text();
+      const parsed = new DOMParser().parseFromString(xml, 'application/xml');
+      const entry = parsed.querySelector('entry');
+      if (!entry) throw new Error('响应缺少版本信息');
+      const title = (entry.querySelector('title')?.textContent || '').trim();
+      const versionMatch = title.match(/v(\d+\.\d+\.\d+)/);
+      const latest = versionMatch ? versionMatch[1] : '';
       const current = BHT_UI_VERSION;
       if (!latest) throw new Error('响应缺少版本号');
+      const release = {
+        html_url: entry.querySelector('link[rel="alternate"]')?.getAttribute('href') || UPDATE_CHECK_RELEASE_PAGE,
+        published_at: entry.querySelector('updated')?.textContent || '',
+        body: (entry.querySelector('content')?.textContent || '').replace(/<[^>]+>/g, ' ')
+      };
       renderUpdateStatus(statusEl, { latest, current, release });
     } catch (e) {
       if (statusEl) statusEl.textContent = '检查失败：' + String(e?.message || e) + '（请检查网络后重试）';

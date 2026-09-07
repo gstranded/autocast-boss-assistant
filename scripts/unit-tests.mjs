@@ -1212,10 +1212,10 @@ test("manifest version + hosts", () => {
   assert.equal(isolated?.js?.[2], "shared/operation-dispatch-gate.js");
   assert.ok(!isolated.js.includes("shared/job-identity.js"), "esm identity module must not be injected as a classic content script");
   assert.equal(isolated?.js?.[3], "content/content-main.js");
-  assert.ok(m.host_permissions.includes("https://api.github.com/*"), "update check needs api.github.com host permission");
+  assert.ok(m.host_permissions.includes("https://github.com/*"), "update check needs github.com host permission");
   const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
   assert.ok(app.includes("btnCheckUpdate"), "update check UI wired");
-  assert.ok(app.includes("/releases/latest"), "update check fetches latest release");
+  assert.ok(app.includes("releases.atom"), "update check fetches releases.atom feed");
 });
 test("UI exposes themes, help tips and filter switches", () => {
   const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
