@@ -19,7 +19,7 @@
 <br/>
 ## 📺 视频教程（2 分钟上手）
 
-<video src="https://cdn.jsdelivr.net/gh/gstranded/autocast-boss-assistant@main/docs/assets/tutorial.mp4" controls style="width:100%;max-width:800px;border-radius:8px"></video>
+<video src="https://github.com/user-attachments/assets/2786b0d2-b9ee-43ac-a92d-a92918a796c6" controls style="width:100%;max-width:800px;border-radius:8px"></video>
 
 > 无法播放？[直接下载视频](https://github.com/gstranded/autocast-boss-assistant/raw/main/docs/assets/tutorial.mp4)（或浏览器里打开 [项目主页视频目录](https://github.com/gstranded/autocast-boss-assistant/tree/main/docs/assets)）
 
