@@ -84,6 +84,8 @@ import {
 
 const SPLIT_ZOOM_FACTOR = 0.8;
 const DELIVERY_SCHEDULE_ALARM = 'bht_delivery_schedule';
+// 防卡顿：连续投递多少岗后自动刷新一次消息页（BOSS 聊天页在长会话列表下会渲染卡顿）
+const MESSAGE_TAB_REFRESH_INTERVAL = 10;
 const BHT_RUNTIME_VERSION = String(chrome.runtime.getManifest?.().version || 'unknown');
 const VERSION_GUARDED_MESSAGES = new Set([
   MSG.RUN_PREVIEW,
@@ -1188,11 +1190,38 @@ async function ensureMessageTab(task) {
           try { await chrome.tabs.update(oldId, { active: true }); } catch (_) {}
         }
         if (task.execution.splitViewActive) await setSplitTabZoom(oldId);
-        await log("info", "[消息页] 复用 tab=" + oldId + " url=" + String(t.url || "").slice(0, 120));
+        // 防卡顿：连续投递 N 岗后自动刷新消息页，避免大会话列表累积导致渲染卡顿
+        //（BOSS 聊天页在几十岗复用后出现 73s 等待输入框 + 39s 发送无响应的卡顿）。
+        // 刷新只在「每 N 岗」的边界执行一次；分屏状态会在刷新后重新套用窗口尺寸。
+        const jobsSinceMsgRefresh = Number(task.execution?.jobsSinceMessageRefresh || 0) + 1;
+        task.execution.jobsSinceMessageRefresh = jobsSinceMsgRefresh;
+        let refreshed = false;
+        if (jobsSinceMsgRefresh >= MESSAGE_TAB_REFRESH_INTERVAL) {
+          task.execution.jobsSinceMessageRefresh = 0;
+          await log('info', `[消息页] 已连续处理 ${MESSAGE_TAB_REFRESH_INTERVAL} 岗，自动刷新消息页（防止会话列表累积卡顿）`, {
+            jobId: String(task?.currentJobId || ""),
+            tabId: oldId
+          });
+          try {
+            await chrome.tabs.reload(oldId);
+            await waitTabComplete(oldId, 25000);
+            await forceInjectContent(oldId);
+            if (task.execution.splitViewActive) await setSplitTabZoom(oldId);
+            refreshed = true;
+          } catch (_) {
+            await log('warn', '[消息页] 自动刷新失败，继续基于当前页面发送（等待输入框门禁兜底）', {
+              jobId: String(task?.currentJobId || ""),
+              tabId: oldId
+            });
+          }
+        }
+        await log("info", `[消息页] 复用 tab=${oldId} url=${String(t.url || "").slice(0, 120)}${refreshed ? ' · 已刷新' : ''}`);
         return t;
       }
     } catch (_) {}
   }
+  // 新建消息 tab 时重置刷新计数
+  task.execution.jobsSinceMessageRefresh = 0;
   let tab;
   if (task.execution.splitViewActive && task.execution.splitBounds?.right) {
     const win = await chrome.windows.create({
