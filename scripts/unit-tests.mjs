@@ -88,6 +88,10 @@ import {
   normalizeDeliveryScheduleWindows,
   diagnoseDeliveryScheduleWindows
 } from "../extension/shared/delivery-schedule.js";
+import {
+  isNonChatApplyLabel,
+  NON_CHAT_APPLY_LABELS
+} from "../extension/shared/non-chat-job.js";
 
 const {
   hasActiveState,
@@ -2182,6 +2186,25 @@ test("debug log never blocks a caller even while a flush is in flight", async ()
   ]);
   const elapsedMs = Date.now() - t0;
   assert.ok(elapsedMs < 300, "concurrent appends must not serialize on storage, took " + elapsedMs + "ms");
+});
+
+test("non-chat apply label recognition covers 央国企网申按钮", () => {
+  assert.equal(isNonChatApplyLabel("立即网申"), true);
+  assert.equal(isNonChatApplyLabel("立即投递"), true);
+  assert.equal(isNonChatApplyLabel("投递简历"), true);
+  assert.equal(isNonChatApplyLabel("立即申请"), true);
+  assert.equal(isNonChatApplyLabel("申请职位"), true);
+  assert.equal(isNonChatApplyLabel("网申"), true);
+  // 不允许误伤沟通类按钮与无关文本
+  assert.equal(isNonChatApplyLabel("立即沟通"), false);
+  assert.equal(isNonChatApplyLabel("继续沟通"), false);
+  assert.equal(isNonChatApplyLabel("打招呼"), false);
+  assert.equal(isNonChatApplyLabel("查看职位"), false);
+  assert.equal(isNonChatApplyLabel(""), false);
+  // 标签列表齐全
+  for (const label of NON_CHAT_APPLY_LABELS) {
+    assert.equal(isNonChatApplyLabel(label), true, label + " must be in its own list");
+  }
 });
 
 

@@ -3154,7 +3154,7 @@ async function processOneJob(task, resultRow, config) {
         });
         return 'skipped';
       }
-      item.state = /LIST_JOB_NOT_FOUND|LIST_JOB_IDENTITY_MISMATCH|找不到/.test(String(trig?.error || '')) ? 'SKIPPED' : 'FAILED';
+      item.state = /LIST_JOB_NOT_FOUND|LIST_JOB_IDENTITY_MISMATCH|NON_CHAT_JOB|找不到|不支持站内沟通/.test(String(trig?.error || '')) ? 'SKIPPED' : 'FAILED';
       item.reasons = [trig?.message || trig?.error || '列表页触发沟通失败'];
       if (item.state === 'SKIPPED') {
         task.counters.skipped += 1;

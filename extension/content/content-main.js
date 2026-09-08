@@ -2383,6 +2383,46 @@ function firstEl(selectors, root = document) {
 
   
 
+  // 央国企/特定企业岗位详情页没有「立即沟通」，而是「立即网申/立即投递/投递简历」等
+  // 站外或表单类按钮。检测到这些按钮说明该岗位不支持 BOSS 站内沟通，应跳过而非报错暂停。
+  function findNonChatApplyButton(scope = document) {
+    const roots = [scope, document].filter(Boolean);
+    const selector = [
+      ".job-detail-op a",
+      ".job-detail-op button",
+      ".job-detail-box a",
+      ".job-detail-box button",
+      ".job-detail-header a",
+      ".job-detail-header button",
+      "a",
+      "button",
+      "[role='button']"
+    ].join(",");
+    const seen = new Set();
+    for (const root of roots) {
+      let nodes = [];
+      try { nodes = Array.from(root.querySelectorAll(selector)); } catch (_) {}
+      for (const node of nodes) {
+        const interactive = node.matches?.("a,button,[role='button']")
+          ? node
+          : node.closest?.("a,button,[role='button']") || node;
+        if (!interactive || seen.has(interactive)) continue;
+        seen.add(interactive);
+        const label = textOf(interactive).replace(/\s+/g, " ").trim();
+        // 只认明确指向「网申/投递/申请」的动作按钮，避免误伤无关链接
+        if (!/^(立即网申|立即投递|投递简历|立即申请|申请职位|网申)$/.test(label)) continue;
+        try {
+          const style = getComputedStyle(interactive);
+          const rect = interactive.getBoundingClientRect();
+          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity || "1") === 0) continue;
+          if (rect.width < 18 || rect.height < 10) continue;
+        } catch (_) {}
+        return interactive;
+      }
+    }
+    return null;
+  }
+
   function findConversationActionButton(scope = document) {
     const roots = [scope, document].filter(Boolean);
     const selector = [
@@ -4554,6 +4594,26 @@ async function startChat(job, opts = {}) {
         if (typeof detectLoginModal === "function") {
           const loginHit = detectLoginModal();
           if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+        }
+        // 央国企等岗位走「立即网申」而无站内沟通：标记为可跳过，不暂停任务
+        const nonChatScope =
+          firstEl(SELECTORS.detailRoot) ||
+          document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+          document;
+        const nonChatBtn = findNonChatApplyButton(nonChatScope);
+        if (nonChatBtn) {
+          const nonChatLabel = textOf(nonChatBtn).replace(/\s+/g, " ").trim();
+          const nonChat = {
+            ok: false,
+            error: "NON_CHAT_JOB",
+            message: `该岗位为「${nonChatLabel}」流程，不支持站内沟通，已自动跳过`,
+            detailTitle,
+            buttonText: nonChatLabel,
+            href: location.href,
+            contentVersion: BHT_CONTENT_VERSION
+          };
+          debugTrace("trigger_non_chat_job", nonChat, "info");
+          return nonChat;
         }
         const missingButton = {
           ok: false,
