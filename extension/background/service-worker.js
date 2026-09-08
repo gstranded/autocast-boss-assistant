@@ -39,7 +39,7 @@ import { planResumeSend } from '../shared/resume-policy.js';
 import { REASON, reasonText } from '../shared/reason-codes.js';
 import { TASK_STATUS } from '../shared/constants.js';
 import { isBossUrl, isBossTab, bossUrlGuardMessage, BOSS_MATCH_PATTERNS } from '../shared/boss-url.js';
-import { didContentDocumentChange, isBossJobListUrl, resolveBossJobListUrl } from '../shared/job-list-navigation.js';
+import { didContentDocumentChange, isBossJobListUrl, resolveBossJobListUrl, sameJobListUrl } from '../shared/job-list-navigation.js';
 import { normalizeMatchText, normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
 import { computeSideBySideBounds, snapshotWindowBounds, windowBoundsMatch } from '../shared/window-layout.js';
 import { dedupeResumeImages } from '../shared/resume-images.js';
@@ -3771,6 +3771,38 @@ async function runTaskLoop(taskId) {
     }
     // 连续「活跃度未知」计数从本次批次开始
     runner.consecutiveUnknownActive = 0;
+
+    // 投递前锚点一致性预检：预览时保存的列表锚点（task.listHref）必须与当前列表页一致。
+    // 若不一致（用户切了搜索词/筛选、页面被替换或刷新成新列表），岗位集合已变化，
+    // 逐岗点卡片会读不到活跃度、连续 3 岗「未知」后被动暂停——不如在投递前就停下来，
+    // 明确提示用户「岗位列表已变化，请重新预览」。
+    if (task.listHref && task.execution?.listTabId) {
+      try {
+        const anchor = resolveBossJobListUrl({ candidate: task.listHref });
+        const fp = await getListTabFingerprint(task.execution.listTabId);
+        const same = sameJobListUrl(anchor, String(fp.url || ''));
+        if (same === false) {
+          try { await softReturnToList(task); } catch (_) {}
+          runner.pause = true;
+          task.status = TASK_STATUS.PAUSED;
+          task.awaitingUserRetry = true;
+          task.pauseReason = `岗位列表已变化（当前列表与预览时不一致，可能切换了搜索/筛选），请重新扫描预览后再投递`;
+          await log('warn', '[列表页] ' + task.pauseReason, {
+            anchor: String(anchor).slice(0, 160),
+            currentUrl: String(fp.url || '').slice(0, 160)
+          });
+          await publishTask(task);
+          return 'limited';
+        }
+        await log('info', '[列表页] 投递前锚点核对：当前列表与预览一致（岗位集合未变化）', {
+          anchor: String(anchor).slice(0, 120),
+          currentUrl: String(fp.url || '').slice(0, 120),
+          same: String(same)
+        });
+      } catch (_) {
+        // 预检失败不阻塞：逐岗核对与防级联保护仍兜底
+      }
+    }
 
     // 列表页内容脚本版本一次性同步：扩展升级/重载后，未刷新的 BOSS 页仍运行旧版
     // 内容脚本，投递首个关键操作会触发 sendToBoss 的「版本热更重注入」——

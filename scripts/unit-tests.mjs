@@ -24,7 +24,8 @@ import { isBossUrl, isBossHostname, isBossTab, bossUrlGuardMessage } from "../ex
 import {
   didContentDocumentChange,
   isBossJobListUrl,
-  resolveBossJobListUrl
+  resolveBossJobListUrl,
+  sameJobListUrl
 } from "../extension/shared/job-list-navigation.js";
 import {
   buildConversationWorkerAttempts,
@@ -1110,6 +1111,37 @@ test("job list navigation rejects non-list and non-BOSS targets", () => {
       currentUrl: "https://www.zhipin.com/web/user/"
     }),
     "https://www.zhipin.com/web/geek/jobs"
+  );
+});
+test("sameJobListUrl ignores volatile security params but catches keyword changes", () => {
+  // 相同筛选，仅 _security_check / ka 变化 → 视为同一列表
+  assert.equal(
+    sameJobListUrl(
+      "https://www.zhipin.com/web/geek/jobs?city=100010000&experience=108,102&query=go&_security_check=1_1788849875794",
+      "https://www.zhipin.com/web/geek/jobs?city=100010000&experience=108,102&query=go&ka=header-job"
+    ),
+    true
+  );
+  // 搜索词变了（go → AI）→ 岗位集合变化 → 不同列表
+  assert.equal(
+    sameJobListUrl(
+      "https://www.zhipin.com/web/geek/jobs?city=100010000&experience=108,102&query=go",
+      "https://www.zhipin.com/web/geek/jobs?city=100010000&experience=108,102&query=AI"
+    ),
+    false
+  );
+  // 城市变了 → 不同列表
+  assert.equal(
+    sameJobListUrl(
+      "https://www.zhipin.com/web/geek/jobs?city=100010000&query=go",
+      "https://www.zhipin.com/web/geek/jobs?city=101010100&query=go"
+    ),
+    false
+  );
+  // 非列表 URL → null（交给后续逐岗核对兜底）
+  assert.equal(
+    sameJobListUrl("https://www.zhipin.com/job_detail/abc.html", "https://www.zhipin.com/web/geek/jobs"),
+    null
   );
 });
 test("content document change detection distinguishes reload from SPA navigation", () => {
