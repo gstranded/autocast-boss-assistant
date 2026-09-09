@@ -2493,6 +2493,39 @@ function firstEl(selectors, root = document) {
   }
 
   
+  // BOSS 平台级每日沟通上限弹窗：「您已达到沟通上限 / 您今天已与N位BOSS沟通，休息一下，明天再来吧」
+  // 平台限制不随重试恢复，直接停止任务避免反复点击空转。
+  function detectBossDailyLimitModal() {
+    try {
+      const modalRoots = Array.from(
+        document.querySelectorAll(
+          ".dialog-wrap, .dialog-container, .boss-dialog, [class*='dialog'], [class*='modal'], [role='dialog']"
+        )
+      ).filter((el) => {
+        try {
+          const st = getComputedStyle(el);
+          if (st.display === "none" || st.visibility === "hidden") return false;
+          const r = el.getBoundingClientRect();
+          return r.width > 80 && r.height > 80;
+        } catch (_) {
+          return false;
+        }
+      }).slice(0, 8);
+      const text = modalRoots.map((el) => (el.innerText || el.textContent || "").replace(/\s+/g, " ").slice(0, 500)).join(" | ");
+      const markers = [
+        "您已达到沟通上限",
+        "已达沟通上限",
+        "已达到沟通上限",
+        "休息一下，明天再来吧"
+      ];
+      const hit = markers.find((m) => text.includes(m));
+      if (hit) {
+        return { ok: true, message: "BOSS 今日沟通上限已达，平台提示休息一下，请明天再试", marker: hit };
+      }
+    } catch (_) {}
+    return { ok: false };
+  }
+
   function detectLoginModal() {
     // 避免频繁读 body.innerText（BOSS 大页极慢，会导致发消息循环卡死）
     const modalRoots = Array.from(
@@ -2943,6 +2976,10 @@ async function startChatOnCurrentDetail(job = {}) {
     if (typeof detectLoginModal === "function") {
       const loginHit = detectLoginModal();
       if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+    }
+    if (typeof detectBossDailyLimitModal === "function") {
+      const limitHit = detectBossDailyLimitModal();
+      if (limitHit.ok) return { ok: false, error: "BOSS_DAILY_LIMIT", message: limitHit.message, contentVersion: BHT_CONTENT_VERSION };
     }
     // 已在聊天页/会话已打开：直接成功，避免二次点「立即沟通」失败
     if (hasUsableChatInput()) {
@@ -4441,6 +4478,13 @@ async function startChat(job, opts = {}) {
     if (typeof detectLoginModal === "function") {
       const loginHit = detectLoginModal();
       if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+    }
+    // BOSS 平台级每日沟通上限：直接报 BOSS_DAILY_LIMIT，后台停止任务，不重试空转
+    if (typeof detectBossDailyLimitModal === "function") {
+      const limitHit = detectBossDailyLimitModal();
+      if (limitHit.ok) {
+        return { ok: false, error: "BOSS_DAILY_LIMIT", message: limitHit.message, contentVersion: BHT_CONTENT_VERSION };
+      }
     }
 
     const ensureResult = await ensureJobList({ maxWaitMs: 8000, scroll: true, noHomeNav: true });
