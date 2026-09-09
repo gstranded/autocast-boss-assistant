@@ -1657,6 +1657,14 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
 
   const listAfter = await getListTabFingerprint(listTabId);
   const listPreserved = isListDocumentPreserved(listBefore, listAfter);
+  await debugLog('background.list', 'fingerprint_compare', {
+    jobId: job.jobId,
+    preserved: listPreserved,
+    before: { url: String(listBefore.url || '').slice(0, 160), contentInstanceId: String(listBefore.contentInstanceId || '').slice(0, 24) },
+    after: { url: String(listAfter.url || '').slice(0, 160), contentInstanceId: String(listAfter.contentInstanceId || '').slice(0, 24) },
+    urlChanged: String(listBefore.url || '') !== String(listAfter.url || ''),
+    instanceChanged: String(listBefore.contentInstanceId || '') !== String(listAfter.contentInstanceId || '')
+  }, listPreserved ? 'debug' : 'warn');
   await log(listPreserved ? 'success' : 'warn', listPreserved
     ? '[列表页] 左侧职位页保持原样：筛选、滚动位置和页面实例均未变化'
     : '[列表页] 检测到左侧页面发生外部变化；插件未在左侧触发沟通', {

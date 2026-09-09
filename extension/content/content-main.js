@@ -486,6 +486,14 @@
       nodes.sort((a, b) => textOf(a).length - textOf(b).length);
       const hit = nodes[0];
       if (!hit) return { ok: false, error: "EXPECT_TAB_NOT_FOUND", want };
+      debugTrace("expect_restore_click", {
+        want: String(want).slice(0, 60),
+        hitText: String(textOf(hit)).slice(0, 60),
+        hitClass: String(hit.className || "").slice(0, 80),
+        hitTag: String(hit.tagName || "").toUpperCase(),
+        hitRect: (() => { try { const r = hit.getBoundingClientRect(); return { top: Math.round(r.top), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) }; } catch (_) { return null; } })(),
+        matchReason: "manual-call"
+      }, "warn");
       clickLikeHuman(hit);
       await sleep(900);
       const after = detectSelectedJobExpect();
@@ -504,7 +512,9 @@
         if (getJobCards().length >= 3) break;
         await sleep(250);
       }
-      await restoreJobExpectIfNeeded(want);
+      // 不再自动点击恢复期望：页面结构因人而异，点击可能误触发筛选/刷新。
+      const current = (typeof detectSelectedJobExpect === "function" ? detectSelectedJobExpect() : "") || "";
+      debugTrace("list_after_load_expect_state", { savedExpect: String(want).slice(0, 60), currentExpect: String(current).slice(0, 60), action: "skip-restore" }, "debug");
       try { sessionStorage.removeItem("bht_restore_expect"); } catch (_) {}
     } catch (_) {}
   }
@@ -2239,10 +2249,16 @@ function firstEl(selectors, root = document) {
         page: pageInfo()
       };
     }
-    // Legacy callers may still provide an expectation. Apply it only before
-    // the first batch; continuation batches must not change the active list.
+    // 不再自动点击求职期望标签：页面结构因人而异（搜索词/城市/推荐 tab 都可能误匹配），
+    // 点击可能导致 BOSS 筛选/刷新，列表与预览不一致。期望状态交给用户自己确认。
+    // 仅在 debug 日志里记录当前期望与保存期望，便于排查。
     if (payload.resetSession !== false && payload.listExpectLabel && isListLikePage()) {
-      try { await restoreJobExpectIfNeeded(payload.listExpectLabel); } catch (_) {}
+      const expectNow = (typeof detectSelectedJobExpect === "function" ? detectSelectedJobExpect() : "") || "";
+      debugTrace("scan_jobs_expect_state", {
+        savedExpect: String(payload.listExpectLabel || "").slice(0, 60),
+        currentExpect: String(expectNow).slice(0, 60),
+        action: "skip-restore"
+      }, expectNow ? "debug" : "warn");
     }
     const adaptive = await scanAdaptiveJobBatch(payload);
     const cards = getJobCards();
@@ -2790,13 +2806,13 @@ function dismissCommonDialogs() {
     // 1) 已在列表且有卡片：绝不硬刷新，最多软恢复求职期望
     if (getJobCards().length >= 3 && isListLikePage()) {
       try { rememberListHref(); } catch (_) {}
-      const restored = await restoreJobExpectIfNeeded(expectLabel);
+      debugTrace("return_list_expect_state", { via: "still-on-list", expectLabel: String(expectLabel || "").slice(0, 60), current: (typeof detectSelectedJobExpect === "function" ? detectSelectedJobExpect() : "") || "", action: "skip-restore" }, "debug");
       return {
         ok: true,
         count: getJobCards().length,
         href: location.href,
         via: "still-on-list",
-        expectRestored: restored,
+        expectRestored: { ok: true, skipped: true },
         contentVersion: BHT_CONTENT_VERSION
       };
     }
@@ -2805,11 +2821,11 @@ function dismissCommonDialogs() {
     if (isListLikePage()) {
       let ensured = await ensureJobList({ maxWaitMs: 8000, scroll: true, noHomeNav: true });
       if (ensured?.ok && (ensured.count || 0) > 0) {
-        const restored = await restoreJobExpectIfNeeded(expectLabel);
+        debugTrace("return_list_expect_state", { via: "soft-wait-list", expectLabel: String(expectLabel || "").slice(0, 60), current: (typeof detectSelectedJobExpect === "function" ? detectSelectedJobExpect() : "") || "", action: "skip-restore" }, "debug");
         return {
           ...ensured,
           via: "soft-wait-list",
-          expectRestored: restored,
+          expectRestored: { ok: true, skipped: true },
           contentVersion: BHT_CONTENT_VERSION
         };
       }
@@ -2822,13 +2838,13 @@ function dismissCommonDialogs() {
       try { await closeChatPanel(); } catch (_) {}
       if (getJobCards().length >= 1 || isListLikePage()) {
         await ensureJobList({ maxWaitMs: 5000, scroll: true, noHomeNav: true });
-        const restored = await restoreJobExpectIfNeeded(expectLabel);
+        debugTrace("return_list_expect_state", { via: "history-back", expectLabel: String(expectLabel || "").slice(0, 60), current: (typeof detectSelectedJobExpect === "function" ? detectSelectedJobExpect() : "") || "", action: "skip-restore" }, "debug");
         return {
           ok: getJobCards().length > 0,
           count: getJobCards().length,
           href: location.href,
           via: "history-back",
-          expectRestored: restored,
+          expectRestored: { ok: true, skipped: true },
           contentVersion: BHT_CONTENT_VERSION
         };
       }
@@ -2837,11 +2853,11 @@ function dismissCommonDialogs() {
     // 4) 再软 ensure 一次（不点推荐、不硬跳裸 jobs）
     let ensured = await ensureJobList({ maxWaitMs: 8000, scroll: true, noHomeNav: true });
     if (ensured?.ok && (ensured.count || 0) > 0) {
-      const restored = await restoreJobExpectIfNeeded(expectLabel);
+      debugTrace("return_list_expect_state", { via: "ensure-soft", expectLabel: String(expectLabel || "").slice(0, 60), current: (typeof detectSelectedJobExpect === "function" ? detectSelectedJobExpect() : "") || "", action: "skip-restore" }, "debug");
       return {
         ...ensured,
         via: "ensure-soft",
-        expectRestored: restored,
+        expectRestored: { ok: true, skipped: true },
         contentVersion: BHT_CONTENT_VERSION
       };
     }
