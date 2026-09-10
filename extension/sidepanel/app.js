@@ -58,6 +58,7 @@ const state = {
   config: null,
   selected: new Set(),
   targetModeEnabled: false,
+  targetModeUserChanged: false,
   targetCountDraft: '',
   messageDirty: false,
   messageRevision: 0,
@@ -1649,7 +1650,12 @@ function updateTaskUI(task, runner = {}) {
   // 批量投递：不限 awaiting_confirm；单份投完(completed/stopped)后也应可点
   const sourceReady = task?.sourceContext?.sourceType === 'recommend' ||
     (task?.sourceContext?.sourceType === 'expectation' && String(task?.sourceContext?.expectationKey || '').trim());
-  if (task?.targetMode === true) state.targetModeEnabled = true;
+  // Restore an active target task on first load, but keep an explicit user
+  // toggle and completed historical tasks from being overwritten by refresh.
+  const targetTaskActive = status === 'running' || status === 'paused' || runner.targetLoop === true;
+  if (!state.targetModeUserChanged && task?.targetMode === true && targetTaskActive) {
+    state.targetModeEnabled = true;
+  }
   const targetEnabled = state.targetModeEnabled === true;
   const targetCanRefresh = targetEnabled && Boolean(sourceReady) &&
     (status === 'awaiting_confirm' || status === 'completed' || status === 'stopped') &&
@@ -2971,6 +2977,7 @@ function bindEvents() {
 
   $('btnTargetMode')?.addEventListener('click', () => {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
+    state.targetModeUserChanged = true;
     state.targetModeEnabled = !state.targetModeEnabled;
     if (state.targetModeEnabled && !$('targetDeliveryCount')?.value) {
       $('targetDeliveryCount').value = '10';

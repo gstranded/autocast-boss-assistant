@@ -286,6 +286,10 @@ test("target mode refreshes in the background and preserves stop/duplicate guard
   assert.ok(panel.includes("targetMode"));
   assert.ok(panel.includes("targetCount"));
   assert.ok(panel.includes("targetCountDraft"));
+  assert.ok(panel.includes("targetModeUserChanged"));
+  assert.ok(panel.includes("const targetTaskActive = status === 'running' || status === 'paused' || runner.targetLoop === true"));
+  assert.ok(panel.includes("!state.targetModeUserChanged && task?.targetMode === true && targetTaskActive"));
+  assert.ok(panel.includes("state.targetModeUserChanged = true"));
   assert.ok(panel.includes("state.targetCountDraft = String($('targetDeliveryCount').value || '')"));
   assert.ok(panel.includes("const targetCountValue = state.targetCountDraft ||"));
   assert.ok(background.includes("async function runTargetDeliveryLoop"));
