@@ -1,6 +1,7 @@
 import assert from "assert";
 import fs from "fs";
 import { isBossUrl } from "../extension/shared/boss-url.js";
+import { isBossJobListUrl } from "../extension/shared/job-list-navigation.js";
 import { planMessageSegments } from "../extension/shared/message-planner.js";
 import { MESSAGE_MODES } from "../extension/shared/constants.js";
 
@@ -1154,6 +1155,15 @@ test("plugin_only mode sends all enabled segments", () => {
 test("non boss url blocked by helper", () => {
   assert.equal(isBossUrl("https://www.zhipin.com/web/geek/chat"), true);
   assert.equal(isBossUrl("https://example.com/chat"), false);
+});
+
+test("popup only offers the floating panel on BOSS job list pages", () => {
+  const popup = fs.readFileSync("extension/popup/popup.js", "utf8");
+  assert.equal(isBossJobListUrl("https://www.zhipin.com/web/geek/jobs"), true);
+  assert.equal(isBossJobListUrl("https://www.zhipin.com/web/geek/chat"), false);
+  assert.equal(isBossJobListUrl("https://www.zhipin.com/job_detail/example.html"), false);
+  assert.ok(popup.includes("isBossJobListUrl(tab.url ||"));
+  assert.ok(popup.includes("请前往 BOSS 职位列表页使用插件"));
 });
 
 test("delivery hardening contracts", () => {

@@ -1,4 +1,5 @@
 import { isBossUrl } from "../shared/boss-url.js";
+import { isBossJobListUrl } from "../shared/job-list-navigation.js";
 import { STORAGE_KEYS } from "../shared/constants.js";
 
 const app = document.getElementById("app");
@@ -8,13 +9,13 @@ async function getActiveTab() {
   return tabs[0] || null;
 }
 
-function renderGuide(version) {
+function renderGuide(version, title = "请前往 BOSS 直聘页面使用插件") {
   app.innerHTML = `
     <div class="hero">
       <img class="logo" src="../assets/icons/icon128.png" alt="logo" />
       <div class="brand">AutoCast-Boss海投助手</div>
     </div>
-    <div class="title">请前往 BOSS 直聘页面使用插件</div>
+    <div class="title">${title}</div>
     <div class="guide">
       <div class="guide-title">使用说明</div>
       <ol>
@@ -95,5 +96,6 @@ try {
 const manifest = chrome.runtime.getManifest();
 const version = manifest.version || "1.1.1";
 const tab = await getActiveTab();
-if (tab && isBossUrl(tab.url || "")) renderBossReady(tab, version);
+if (tab && isBossJobListUrl(tab.url || "")) renderBossReady(tab, version);
+else if (tab && isBossUrl(tab.url || "")) renderGuide(version, "请前往 BOSS 职位列表页使用插件");
 else renderGuide(version);

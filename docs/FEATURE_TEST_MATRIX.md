@@ -65,7 +65,7 @@
 | ENT-01 | MV3 扩展加载 | manifest 可加载，版本与运行时一致 | `manifest version + version guard` | ego 扩展页重载后显示 `1.7.35`；当前 BOSS 面板显示 `v1.7.35` 且无版本锁定 | 通过 | ego 扩展页、当前 iframe URL `v=1.7.35`、连接徽标 |
 | ENT-02 | BOSS URL 守卫 | BOSS 列表/聊天页可连接，非 BOSS 页不执行 | `boss-url` tests | BOSS 列表显示“已连接 BOSS · v1.7.35”；打开 `example.com` 后弹出页锁定为“请前往 BOSS 直聘页面使用插件”，危险按钮未执行 | 通过 | 2026-09-11 ego；BOSS 与非 BOSS 两个独立场景 |
 | ENT-03 | 浮窗打开与复用 | BOSS 页右侧浮窗可打开/关闭，重复打开不重复注入 | popup/content smoke | 列表页浮窗根节点存在，打开后只有一个 `#bht-frame`，iframe 为 `mode=float&v=1.7.35` | 通过 | 当前 BOSS DOM/Target.getTargets |
-| ENT-04 | 弹出页入口 | popup 能识别当前 BOSS 页并打开浮窗，非 BOSS 页给出引导 | popup smoke | 独立打开 popup 页面，显示“请前往 BOSS 直聘页面”和版本 `v1.7.35`；BOSS 工具栏真实 popup 子场景待补 | 通过（非 BOSS） | popup 直接页 |
+| ENT-04 | 弹出页入口 | popup 能识别当前 BOSS 页并打开浮窗，非 BOSS 页给出引导 | popup smoke | 职位列表页真实 popup 显示“已在 BOSS 页面”并打开 `mode=float&v=1.7.35` 浮窗；聊天页明确引导到职位列表；非 BOSS 页显示通用引导 | 通过 | 2026-09-11 ego；真实 popup 列表/聊天/非 BOSS 三路径 |
 | ENT-05 | 面板六个 tab | 任务、筛选、消息、简历、记录、设置切换且表单不串页 | DOM/flow panel tests | 独立点击 6 个 tab；每个目标 tab 和 panel 均 active，最后恢复任务页 | 通过 | v1.7.35 iframe DOM |
 | ENT-06 | 明暗主题 | light/dark 切换立即生效并持久化 | panel theme tests | light 设置为 `data-theme=light`，dark 恢复为 `data-theme=dark` | 通过 | v1.7.35 iframe DOM |
 | ENT-07 | 帮助提示 | 标题旁帮助入口显示对应说明，不遮挡主要控件 | panel DOM checks | 打开任务控制说明，popover 可见且内容为对应说明 | 通过 | v1.7.35 iframe DOM |
@@ -87,7 +87,7 @@
 | TASK-09 | 通过率风险提示 | 极低或极高通过率提示检查筛选，不能阻止用户查看结果 | preview UI tests | 宽规则扫描 420/440 通过并显示高通过率提示；临时不命中关键词扫描 0/440，任务仍保留 440 条排除明细 | 通过 | 2026-09-11 ego；高/低两端均未阻止查看结果 |
 | TASK-10 | 扫描自动回顶部 | 扫描结束列表回到顶部，不丢原始可见岗位 | scan navigation tests | 扫描结束后 BOSS 列表 `scrollY=0`，首批岗位仍可见 | 通过 | 2026-09-11 ego |
 | TASK-11 | 扫描取消 | 取消只终止当前扫描，保留上一批预览，不发送消息 | cancellation flow tests | 启动预览后在 `locating_list` 阶段停止；旧任务仍为 `completed`、26 条结果，历史 40 条不变 | 通过 | 2026-09-11 ego；`previewCancelled=true` |
-| TASK-12 | 扫描非列表页恢复 | 从 BOSS 详情/聊天页点扫描时自动回到安全列表或给出明确失败 | navigation recovery tests | 构造“外部页→BOSS 聊天页”历史后调用真实 content 恢复，修复后保持在 BOSS 页，不再退回外部页；sender 端预览返回通道仍需独立补测 | 部分通过 | 2026-09-11 ego；已修复无列表锚点时的危险 `history.back()` |
+| TASK-12 | 扫描非列表页恢复 | 从 BOSS 详情/聊天页点扫描时自动回到安全列表或给出明确失败 | navigation recovery tests | BOSS 聊天页 popup 不再伪装成可打开面板，而是明确引导到职位列表；内部扫描恢复仍能自动导航到安全列表，且不会退回外部历史页 | 通过 | 2026-09-11 ego + flow；聊天页入口清晰失败，详情/非列表恢复路径受保护 |
 
 ### 5.3 插件筛选规则
 
@@ -150,14 +150,14 @@
 |---|---|---|---|---|---|---|
 | RES-01 | 图片导入 | 只接受图片；单张超过 8 MB 拒绝或提示 | resume storage tests | 真实导入 `assets/logo.png` 后缩略图为 1、保存成功；`8,388,609` bytes PNG 被提示“没有成功导入任何图片”，存储保持 0 | 通过 | 2026-09-11 ego；临时文件已清理 |
 | RES-02 | 图片压缩与本地存储 | 导入时压缩，保存在本地扩展存储，不上传作者服务器 | resume tests/privacy review | 保存后回读 `logo.png` data URL；重载面板缩略图仍为 1，数据只在 `bht_resumes` 本地存储 | 通过 | 2026-09-11 ego；未触发作者域请求 |
-| RES-03 | 多图顺序 | 缩略图按显示顺序串行发送，不能并发乱序 | resume send tests | 导入 `test-resume.png`、`test-resume.jpg`，保存/重载后存储顺序保持 `png → jpg`；未再做真实图片发送 | 部分通过 | 2026-09-11 ego；配置顺序通过，`IMAGE_SENT` 实际顺序待补 |
+| RES-03 | 多图顺序 | 缩略图按显示顺序串行发送，不能并发乱序 | resume send tests | 导入两张不同尺寸 PNG，保存/重载后保持 `2` 张；真实 1 份沟通在文本完成后按日志 `图片简历已发送 1/2`、`2/2` 顺序完成，随后清空方案 | 通过 | 2026-09-11 ego；真实串行发送证据 |
 | RES-04 | 图片预览灯箱 | 点击缩略图可全屏，左右切换，Esc 关闭 | lightbox tests | 保存测试图片后点击缩略图，打开 `image-preview.html` 弹窗；弹窗关闭后无残留 | 通过 | 2026-09-11 ego；单图场景 |
 | RES-05 | 清空图片 | 清空后 UI 和本地方案都无图片，保存后刷新仍为空 | resume flow tests | 清空测试图片、保存，后台和缩略图均为 0，再删除临时方案 | 通过 | 2026-09-11 ego |
 | RES-06 | 多个简历方案 | 可新建、重命名、切换；至少保留一个可用方案 | profile tests | 新建/重命名/保存临时方案，新增绑定规则，删除方案后回到唯一默认方案 | 通过 | 2026-09-11 ego |
 | RES-07 | 默认方案 | 设为默认后无绑定命中时选择该方案 | profile/binding tests | 临时方案设为默认后回读 profileId，切回默认方案并删除临时方案，最终恢复 `default` | 通过 | 2026-09-11 ego；未触发投递 |
 | RES-08 | 绑定规则 | 职位/JD 关键词命中规则，优先级数字越小越先；无命中回退默认 | binding tests | 保存临时“运维/技术支持”绑定规则，回读关键词和 profileId，删除方案后规则同步删除 | 通过 | 2026-09-11 ego；优先级冲突仍由 unit/flow 覆盖 |
 | RES-09 | 自动发送时机 | 关闭、仅手动、文本完成后自动三种策略边界明确 | resume-policy tests | UI 临时切换为关闭+手动，回读后恢复开启+`after_text`；实际发送策略由 unit/flow 覆盖 | 通过 | 2026-09-11 ego；未发送 |
-| RES-10 | 图片发送回执与重复保护 | 只有 IMAGE_SENT 回执算成功；重试不重复已发图片 | image receipt/idempotency tests | IMAGE_SENT 回执、失败重试和已发送图片幂等由 unit/flow 覆盖；本轮未为图片回执再新增真实沟通 | 部分通过 | unit/flow 通过；真实图片发送需额外账号副作用，未强行制造 |
+| RES-10 | 图片发送回执与重复保护 | 只有 IMAGE_SENT 回执算成功；重试不重复已发图片 | image receipt/idempotency tests | 真实 1 份沟通完成 `2/2` 图片发送并只增加 1 条成功历史；IMAGE_SENT 回执、失败重试幂等由 unit/flow 覆盖 | 通过 | 2026-09-11 ego + unit/flow；未额外制造失败重试副作用 |
 | RES-11 | BOSS 原生简历边界 | 不自动点击平台“发简历”，消息后仅按图片策略发送 | ADR-0011 + flow tests | 真实沟通日志只有图片策略安全跳过/发送路径，未出现自动点击 BOSS 原生“发简历” | 通过 | 既有 ego + ADR-0011；未点击平台原生简历按钮 |
 | RES-12 | 附件简历自动发送边界 | 当前 UI 不提供附件自动发送入口，必须明确显示不适用 | scope check | 简历页只有图片简历入口，发送策略只有图片/手动选项，后台已删除附件自动发送设置 | 通过 | 2026-09-11 ego + storage normalization |
 
@@ -179,7 +179,7 @@
 | RUN-12 | 失败重试 | 只重试当前失败步骤/可安全环境错误，不重复点击已创建会话 | retry tests | 可重试环境错误、会话重试边界和不重复触发由 flow contract 覆盖；未对真实账号故意制造失败 | 部分通过 | unit/flow 通过；未新增真实失败会话 |
 | RUN-13 | 连续失败暂停 | 达到阈值自动暂停并显示具体原因 | failure counter tests | 失败计数阈值和暂停状态由 task/failure contract 覆盖；未把真实账号阈值改为 1 后制造失败 | 部分通过 | unit/flow 通过；保留账号投递设置 |
 | RUN-14 | BOSS 每日沟通上限 | 识别平台上限弹窗后直接停止，不反复重试 | daily-limit tests | 平台上限识别和停止路径由 flow/代码检查覆盖；不主动触发 BOSS 风控或每日上限 | 部分通过 | 安全边界项；未观察到真实平台上限弹窗 |
-| RUN-15 | 定时投递 | 运行日、时段、跨边界暂停和闹钟恢复正确 | schedule tests | 保存周五 `23:00–23:01` 短窗口，窗口外显示“当前暂停·下次周五 23:00”；无效倒置时段被丢弃 | 部分通过 | 2026-09-11 ego；实际运行/闹钟跨边界仍由 flow/unit 覆盖 |
+| RUN-15 | 定时投递 | 运行日、时段、跨边界暂停和闹钟恢复正确 | schedule tests | 当前时间约 `05:02` 时保存周五 `06:00–06:01`，批量启动进入“当前暂停·下次周五 06:00”，runner 未启动；停止后恢复原设置 | 部分通过 | 2026-09-11 ego；窗口外真实门禁通过，跨边界自动恢复仍由 flow/unit 覆盖 |
 | RUN-16 | 随机投递间隔 | 基准值在允许范围，等待期间状态展示正确 | schedule/unit tests | 临时设置基准 1 秒，后台规范化为 `[1000,2000]`；恢复默认 `[4000,6000]` | 通过 | 2026-09-11 ego；运行中倒计时由已有 flow 覆盖 |
 | RUN-17 | 本次/每日上限 | 达到本次或每日上限停止/提示，0 每日上限表示未设上限 | limit tests | 临时设置本次上限 1、每日上限 0，回读准确；随后恢复 30/80，真实目标 1 已停止 | 通过 | 2026-09-11 ego + 既有真实受控任务 |
 | RUN-18 | 同公司上限 | 同公司达到日上限后后续岗位预览拒绝/跳过 | dedup/limit tests | 同一真实扫描批次注入本地 `byCompany=1`、上限 `1` 后复扫，目标岗位变为 `DEDUP_COMPANY_DAILY`，显示 `1/1` | 通过 | 2026-09-11 ego；使用浏览器本地日期键 |
@@ -254,8 +254,8 @@
 | 指标 | 数值 |
 |---|---:|
 | 已实现待验收功能编号 | 约 130 |
-| 当前通过 | 104（含 BOSS/非 BOSS、代码/flow 子场景） |
-| 当前部分通过 | 15 |
+| 当前通过 | 107（含 BOSS/非 BOSS、代码/flow 子场景） |
+| 当前部分通过 | 12 |
 | 当前待测 | 0 |
 | 当前问题 | 0 |
 | 当前阻塞 | 0（当前回归空间可稳定控制；旧 scratch 空间未作为本轮证据） |
