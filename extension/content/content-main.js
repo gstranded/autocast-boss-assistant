@@ -3134,15 +3134,15 @@ function dismissCommonDialogs() {
       return { ok: true, count: readyCount(), restored: false, href: location.href, via: "already-list" };
     }
 
-    // 聊天页先返回（软返回，不硬刷新）
-    if (isChatPage()) {
+    const savedTarget = getSavedJobListNavigationTarget();
+    // 只有存在已保存的 BOSS 列表锚点时才 history.back；否则可能退回外部历史页。
+    if (isChatPage() && savedTarget) {
       try { history.back(); } catch (_) {}
       await sleep(900);
     }
     await closeChatPanel();
     await sleep(300);
 
-    const savedTarget = getSavedJobListNavigationTarget();
     if (!noHomeNav && !isListLikePage() && savedTarget && !sameListUrl(location.href, savedTarget)) {
       return {
         ok: false,

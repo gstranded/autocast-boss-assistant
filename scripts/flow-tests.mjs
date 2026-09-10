@@ -229,6 +229,8 @@ test("preview auto-recovers non-list pages without silent zero results", () => {
   assert.ok(content.includes('error: "LIST_NAV_REQUIRED"'));
   assert.ok(content.includes("shouldNavigate: !noHomeNav"));
   assert.ok(content.includes("getJobListNavigationTarget"));
+  assert.ok(content.includes("if (isChatPage() && savedTarget)"));
+  assert.ok(content.includes("只有存在已保存的 BOSS 列表锚点时才 history.back"));
   assert.ok(content.includes("BHT_CONTENT_INSTANCE_ID"));
   assert.ok(content.includes("window.__BHT_CONTENT_INSTANCE_ID__"));
   assert.ok(content.includes("const updates = {}"));
