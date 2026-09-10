@@ -84,7 +84,6 @@ import {
 import {
   isEnvironmentalFailure,
   isWorkerTriggerRetryable,
-  canFallbackWorkerMode,
   WORKER_TRIGGER_RETRY
 } from '../shared/environment-failures.js';
 import {
@@ -1540,15 +1539,17 @@ async function openConversationWorkerTab(task, attempt, messageTab, job, { force
 async function triggerConversationInWorker(task, job, messageTab, listTabId, activeWithin = []) {
   const listBefore = await getListTabFingerprint(listTabId);
   const selectedActiveBuckets = normalizeActiveWithin(activeWithin);
+  // 正式投递只能在临时详情页执行。列表页 fallback 会点击左侧岗位卡片，
+  // BOSS 可能因此重建职位列表，导致预览队列与当前页面脱节。
   const attempts = buildConversationWorkerAttempts({
     job,
     listHref: task?.listHref || job?.listHref || ''
-  });
+  }).filter((attempt) => attempt.mode === CONVERSATION_WORKER_MODE.DETAIL);
   if (!attempts.length) {
     return {
       ok: false,
       error: 'WORKER_TARGET_MISSING',
-      message: '岗位缺少可用详情链接和列表锚点；为保护左侧筛选，已停止本次操作',
+      message: '岗位缺少可用详情链接；为保护左侧筛选，已跳过本次操作',
       listBefore
     };
   }
@@ -1557,44 +1558,6 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
   const attemptResults = [];
   let activityInspection = null;
   let activityAccepted = null;
-  if (selectedActiveBuckets.length) {
-    // 活跃度只在左侧点一次卡片核对；详情/列表回退共用结果，避免卡住时反复点同一张卡。
-    // 注意：ego 实测 detail API 连发 ~5 次即触发 BOSS 风控码 37 且会话内持续生效
-    // （12s 间隔的逐岗调用同样被拒），因此投递期不采用 API 核对，仍以点击核对为准
-    // （求职期望页的点击导航风险由「防级联+暂停」兜底）。
-    activityInspection = await sendToBoss(
-      MSG.INSPECT_JOB_DETAIL || 'BHT_INSPECT_JOB_DETAIL',
-      { job },
-      { tabId: listTabId }
-    );
-    if (operationAborted(activityInspection)) {
-      result = activityInspection;
-    } else {
-      const activeText = String(activityInspection?.activeText || '').trim();
-      job.activeText = activeText;
-      activityAccepted = Boolean(
-        activityInspection?.ok &&
-        activeText &&
-        matchActive(activeText, selectedActiveBuckets)
-      );
-      await log('info', `[列表页] 已点卡片核对 HR 活跃度：${activeText || '未知'}（${activityAccepted ? '满足' : '不满足'}）`, {
-        jobId: job.jobId,
-        activeText,
-        activityAccepted,
-        inspectError: activityInspection?.error || ''
-      });
-      if (!activityAccepted) {
-        result = {
-          ok: false,
-          error: REASON.FILTER_ACTIVE,
-          filtered: true,
-          activeText,
-          activityInspection,
-          message: reasonText(REASON.FILTER_ACTIVE, activeText || '未知')
-        };
-      }
-    }
-  }
 
   for (let index = 0; index < attempts.length; index++) {
     if (result?.ok || result?.filtered || operationAborted(result)) break;
@@ -1612,6 +1575,8 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
       const forceNew = tryIndex > 0;
       const modeLabel = attempt.mode === CONVERSATION_WORKER_MODE.DETAIL ? '详情页' : '列表页';
       try {
+        activityInspection = null;
+        activityAccepted = null;
         await log('info', tryIndex === 0
           ? `[执行页] 正在打开岗位详情并触发沟通（${modeLabel}）`
           : `[执行页] 第 ${tryIndex + 1}/${maxTries} 次尝试：关闭旧标签后重新打开并点击立即沟通（${modeLabel}）`, {
@@ -1629,15 +1594,59 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
           tryIndex: tryIndex + 1,
           url: String(attempt.url || '').slice(0, 180)
         });
-        triggerStarted = true;
-        result = await sendToBoss(
-          MSG.TRIGGER_CONVERSATION || 'BHT_TRIGGER_CONVERSATION',
-          {
-            job: { ...job, listHref: task?.listHref || job?.listHref || '' },
-            workerDetail: attempt.mode === CONVERSATION_WORKER_MODE.DETAIL
-          },
-          { tabId: workerTab.id, forceInject: true }
-        );
+
+        if (selectedActiveBuckets.length) {
+          // 活跃度核对也必须留在临时详情页；绝不能在左侧列表点卡片。
+          // 详情页读取失败与 HR 活跃度未知分开处理：前者允许按环境错误重试，
+          // 后者按用户筛选安全跳过，不使用预览阶段的旧值兜底。
+          activityInspection = await sendToBoss(
+            MSG.INSPECT_JOB_DETAIL || 'BHT_INSPECT_JOB_DETAIL',
+            { job },
+            { tabId: workerTab.id, forceInject: true }
+          );
+          if (operationAborted(activityInspection)) {
+            result = activityInspection;
+          } else if (isEnvironmentalFailure(activityInspection)) {
+            result = activityInspection;
+          } else {
+            const activeText = String(activityInspection?.activeText || '').trim();
+            job.activeText = activeText;
+            activityAccepted = Boolean(
+              activityInspection?.ok &&
+              activeText &&
+              matchActive(activeText, selectedActiveBuckets)
+            );
+            await log('info', `[执行页] 已在临时详情页核对 HR 活跃度：${activeText || '未知'}（${activityAccepted ? '满足' : '不满足'}）`, {
+              jobId: job.jobId,
+              workerTabId: workerTab.id,
+              activeText,
+              activityAccepted,
+              inspectError: activityInspection?.error || ''
+            });
+            if (!activityAccepted) {
+              result = {
+                ok: false,
+                error: REASON.FILTER_ACTIVE,
+                filtered: true,
+                activeText,
+                activityInspection,
+                message: reasonText(REASON.FILTER_ACTIVE, activeText || '未知')
+              };
+            }
+          }
+        }
+
+        if (!(result?.ok || result?.filtered || operationAborted(result))) {
+          triggerStarted = true;
+          result = await sendToBoss(
+            MSG.TRIGGER_CONVERSATION || 'BHT_TRIGGER_CONVERSATION',
+            {
+              job: { ...job, listHref: task?.listHref || job?.listHref || '' },
+              workerDetail: attempt.mode === CONVERSATION_WORKER_MODE.DETAIL
+            },
+            { tabId: workerTab.id, forceInject: true }
+          );
+        }
       } catch (error) {
         result = {
           ok: false,
@@ -1682,8 +1691,6 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
     }
 
     if (result?.ok || result?.filtered || operationAborted(result)) break;
-    // 仅「还没点到按钮」才落到 list 模式。已点击/超时/已跳转不再点，避免重复建聊。
-    if (!canFallbackWorkerMode(result)) break;
   }
 
   const listAfter = await getListTabFingerprint(listTabId);

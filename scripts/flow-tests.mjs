@@ -398,7 +398,9 @@ test("HR activity is inspected on the temporary detail before any conversation c
   const triggerAt = worker.indexOf("MSG.TRIGGER_CONVERSATION");
   assert.ok(inspectAt >= 0 && triggerAt > inspectAt);
   assert.ok(worker.includes("matchActive(activeText, selectedActiveBuckets)"));
-  assert.ok(worker.includes("活跃度只在左侧点一次卡片核对"), "activity checked once on the left card");
+  assert.ok(worker.includes("活跃度核对也必须留在临时详情页"), "activity checked on the temporary detail page");
+  assert.ok(worker.includes("tabId: workerTab.id"), "activity inspection targets the worker tab");
+  assert.ok(!worker.includes("tabId: listTabId"), "activity inspection never targets the left list tab");
   assert.ok(worker.includes("if (result?.ok || result?.filtered || operationAborted(result)) break;"));
   assert.ok(worker.includes("filtered: true"));
   assert.ok(worker.includes("result?.filtered"));
@@ -1310,13 +1312,14 @@ test("v1.7.19 worker tab reuse, inject budget and env auto-skip are wired", () =
   assert.ok(background.includes("[自动跳过]"), "queue logs auto skip");
   assert.ok(background.includes("row?.envAutoSkip === true"), "queue skips confirm loop for env failures");
   assert.ok(background.includes("执行页加载或注入失败，丢弃冻结标签后再试"), "frozen worker tab is discarded before fallback");
-  assert.ok(background.includes("活跃度只在左侧点一次卡片核对"), "activity inspect is not repeated on worker fallback");
+  assert.ok(!background.includes("活跃度只在左侧点一次卡片核对"), "old list-card activity path is removed");
+  assert.ok(background.includes("活跃度核对也必须留在临时详情页"), "activity inspect stays on the worker detail");
   assert.ok(background.includes("{ requireComplete: true }"), "worker load waits for complete instead of returning a loading tab");
   assert.ok(background.includes("isWorkerTriggerRetryable"), "retryable trigger errors are classified");
   assert.ok(background.includes("WORKER_TRIGGER_RETRY"), "retry budget is imported");
   assert.ok(background.includes("forceNew"), "retry reopens a fresh worker tab");
   assert.ok(background.includes("关闭旧标签后重新打开并点击立即沟通"), "retry logs reopen + click");
-  assert.ok(background.includes("canFallbackWorkerMode"), "list fallback only for unclicked open failures");
+  assert.ok(!background.includes("canFallbackWorkerMode"), "formal delivery has no list-card fallback");
   assert.ok(background.includes("for (let pingTry = 0; pingTry < 3"), "content ping is retried before discarding the tab");
   assert.ok(background.includes("LIST_JOB_IDENTITY_MISMATCH"), "mismatched clone-list jobs are skipped not clicked");
   assert.ok(envFail.includes("WORKER_LEFT_DETAIL"), "left-detail is environmental and not list-fallback");
@@ -1560,6 +1563,24 @@ test("left-list anomaly protection pauses instead of cascade-skipping", () => {
   assert.ok(background.includes("内容脚本版本已同步") && background.includes("forceInjectContent(task.execution.listTabId)"), "list tab content version synced at batch start");
   assert.ok(content.includes("ACTIVITY_BUDGET"), "enrich caps checks per scan");
   assert.ok(content.includes("parseBossActiveLabel") && content.includes("无法归一化时保留原文"), "enrich normalizes active label like click path");
+});
+
+test("worker delivery inspects activity on the temporary detail tab only", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const trigger = extractFunctionSource(
+    background,
+    "async function triggerConversationInWorker",
+    "async function sendToBoss"
+  );
+  const activityStart = trigger.indexOf("if (selectedActiveBuckets.length)");
+  const triggerStart = trigger.indexOf("MSG.TRIGGER_CONVERSATION");
+  assert.ok(activityStart >= 0 && triggerStart > activityStart, "worker activity inspection is inside the worker flow");
+  const activityBlock = trigger.slice(activityStart, triggerStart);
+  assert.ok(trigger.includes(".filter((attempt) => attempt.mode === CONVERSATION_WORKER_MODE.DETAIL)"), "delivery filters out list fallback attempts");
+  assert.ok(activityBlock.includes("tabId: workerTab.id"), "activity inspection targets the temporary detail tab");
+  assert.ok(!activityBlock.includes("tabId: listTabId"), "activity inspection never targets the left list tab");
+  assert.ok(!trigger.includes("canFallbackWorkerMode"), "delivery no longer falls back to clicking list cards");
+  assert.ok(!trigger.includes("[列表页] 已点卡片核对 HR 活跃度"), "old list-card activity path is removed");
 });
 
 test("skip does not wait job interval and waits are logged", () => {
