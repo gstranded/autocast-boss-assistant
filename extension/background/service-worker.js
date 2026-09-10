@@ -307,11 +307,22 @@ async function discardCancelledPreviewTask(previewRunId, previousTask = null) {
   return true;
 }
 
-async function publishPreviewTask(task, previewRunId, previousTask = null) {
+async function publishPreviewTask(task, previewRunId, previousTask = null, { deferPublish = false } = {}) {
   if (!isPreviewRunActive(previewRunId)) return false;
   // Mark the candidate so STOP_TASK can distinguish a late preview write from
   // a task that was created before this scan started.
   task.previewRunId = previewRunId;
+  // Target refreshes are one logical task. Publishing the fresh candidate here
+  // would make the panel accept a new task id, then reject the merged snapshot
+  // when refreshAndContinue restores the original task id.
+  if (deferPublish) {
+    await debugLog('background.preview', 'candidate_deferred_for_target_refresh', {
+      previewRunId,
+      taskId: task.id || null,
+      previousTaskId: previousTask?.id || null
+    });
+    return true;
+  }
   await publishTask(task);
   if (!isPreviewRunActive(previewRunId)) {
     await discardCancelledPreviewTask(previewRunId, previousTask);
@@ -2923,7 +2934,9 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
   task.queueCursor = 0;
   await log('info', '预览队列已建立：' + task.queue.length + ' 个待投');
     if (!isActive()) return cancelled();
-    const published = await publishPreviewTask(task, previewRunId, runner.previewPreviousTask);
+    const published = await publishPreviewTask(task, previewRunId, runner.previewPreviousTask, {
+      deferPublish: payload.targetMode === true && runner.targetLoop === true
+    });
     if (!published) return cancelled();
 
   // highlight

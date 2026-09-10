@@ -302,6 +302,8 @@ test("target mode refreshes in the background and preserves stop/duplicate guard
   assert.ok(content.includes("[ka^=\"${prefix}\"]"));
   assert.ok(content.includes("selected option in the hidden dropdown"));
   assert.ok(background.includes("jobMergeKey") && background.includes("mergeRefreshedTask"));
+  assert.ok(background.includes("candidate_deferred_for_target_refresh"));
+  assert.ok(background.includes("deferPublish: payload.targetMode === true && runner.targetLoop === true"));
 });
 
 test("boss context prefers the panel sender tab over the focused window tab", () => {
