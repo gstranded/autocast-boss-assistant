@@ -268,6 +268,9 @@ test("refresh and continue restores the saved source after BOSS resets the page"
   assert.ok(content.includes("restoreFilterRequest"));
   assert.ok(content.includes("readEffectiveFilterRequest"));
   assert.ok(content.includes("filterRequestMatches(expected.request, effectiveRequest)"));
+  assert.ok(content.includes('if (requestObserved && initialRequest[key]) return { key, value: "0" }'));
+  assert.ok(content.includes("observed: Boolean(request?.href || request?.encryptExpectId || request?.at)"));
+  assert.ok(content.includes("expectedRequestObserved"));
   assert.ok(content.includes("filtersRestored"));
   assert.ok(refresh.includes("sourceChangedBeforeRefresh"));
   assert.ok(refresh.includes("filtersChangedBeforeRefresh"));
@@ -310,6 +313,17 @@ test("target mode refreshes in the background and preserves stop/duplicate guard
   assert.ok(background.includes("jobMergeKey") && background.includes("mergeRefreshedTask"));
   assert.ok(background.includes("candidate_deferred_for_target_refresh"));
   assert.ok(background.includes("deferPublish: payload.targetMode === true && runner.targetLoop === true"));
+});
+
+test("single delivery counts the successful job before leaving the loop", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const marker = "if (task.testDelivery && outcome === 'success')";
+  const start = background.indexOf(marker);
+  assert.ok(start >= 0, "single-delivery success branch exists");
+  const branch = background.slice(start, start + 420);
+  assert.ok(branch.includes("task.counters.processed += 1"), "single delivery increments processed");
+  assert.ok(branch.includes("await publishTask(task)"), "single delivery persists the counter before break");
+  assert.ok(branch.includes("break"), "single delivery exits after one successful job");
 });
 
 test("boss context prefers the panel sender tab over the focused window tab", () => {

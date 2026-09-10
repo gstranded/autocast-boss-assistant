@@ -75,7 +75,7 @@ export function normalizeFilterSignature(signature = {}) {
       .map((hint) => String(hint || '').replace(/\s+/g, ' ').trim())
       .filter(Boolean)
   )).sort();
-  return { request, hints };
+  return { request, hints, observed: signature?.observed === true };
 }
 
 export function hasFilterRequestEvidence(signature = {}) {
@@ -88,6 +88,9 @@ export function sameFilterSignature(left = {}, right = {}) {
   const b = normalizeFilterSignature(right);
   const aHasRequest = hasFilterRequestEvidence(a);
   const bHasRequest = hasFilterRequestEvidence(b);
+  if (a.observed && b.observed) {
+    return JSON.stringify(a.request) === JSON.stringify(b.request);
+  }
   if (aHasRequest && bHasRequest) {
     return JSON.stringify(a.request) === JSON.stringify(b.request);
   }

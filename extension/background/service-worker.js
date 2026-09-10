@@ -4381,7 +4381,14 @@ async function runTaskLoop(taskId) {
           continue;
         }
       }
-      if (task.testDelivery && outcome === 'success') break;
+      if (task.testDelivery && outcome === 'success') {
+        // A single-delivery run exits before the normal batch accounting path;
+        // count the completed job before breaking so success and processed stay consistent.
+        task.counters.processed += 1;
+        task.updatedAt = Date.now();
+        await publishTask(task);
+        break;
+      }
 
       // 失败后等待用户：关闭=保持暂停不自动继续；重试=重置当前岗位后再跑一次
       while (outcome === 'failed') {

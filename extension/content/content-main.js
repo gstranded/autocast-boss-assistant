@@ -453,7 +453,7 @@
         .map((hint) => String(hint || "").replace(/\s+/g, " ").trim())
         .filter(Boolean)
     )).sort();
-    return { request, hints };
+    return { request, hints, observed: signature?.observed === true };
   }
 
   function buildLiveFilterSignature(request = readLastJobListRequest()) {
@@ -464,7 +464,8 @@
         key,
         String(domRequest[key] || requestFromPage[key] || '').trim()
       ])),
-      hints: detectActiveFilterHints()
+      hints: detectActiveFilterHints(),
+      observed: Boolean(request?.href || request?.encryptExpectId || request?.at)
     });
   }
 
@@ -633,9 +634,14 @@
 
   async function restoreFilterRequest(signature = {}, deadline = Date.now() + 12000) {
     const expected = normalizeFilterSignature(signature);
+    const initialRequest = readEffectiveFilterRequest();
+    const requestObserved = expected.observed === true;
     const targets = FILTER_REQUEST_KEYS
       .map((key) => {
         if (expected.request[key]) return { key, value: expected.request[key] };
+        // An observed empty field means "不限". Clear stale selections left
+        // behind by BOSS after a page reload before validating the request.
+        if (requestObserved && initialRequest[key]) return { key, value: "0" };
         const option = findFilterOptionByHints(key, expected.hints);
         const value = filterOptionValue(key, option);
         return value && value !== "0" ? { key, value, option } : null;
@@ -644,7 +650,8 @@
     const expectedHasRequest = FILTER_REQUEST_KEYS.some((key) => expected.request[key]);
     for (const target of targets) {
       const { key, value } = target;
-      if (expectedHasRequest && readEffectiveFilterRequest()[key] === value) continue;
+      const currentValue = readEffectiveFilterRequest()[key];
+      if (value === "0" ? !currentValue : currentValue === value) continue;
       const container = findFilterContainer(key);
       if (!container) {
         return { ok: false, error: "FILTER_CONTAINER_NOT_FOUND", key, value };
@@ -662,7 +669,8 @@
       clickLikeHuman(option);
       let applied = false;
       while (Date.now() < deadline) {
-        if (readEffectiveFilterRequest()[key] === value) {
+        const currentValue = readEffectiveFilterRequest()[key];
+        if (value === "0" ? !currentValue : currentValue === value) {
           applied = true;
           break;
         }
@@ -679,11 +687,14 @@
       actualHints.some((actual) => normalizeExpectText(actual) === normalizeExpectText(hint))
     );
     return {
-      ok: expectedHasRequest ? filterRequestMatches(expected.request, effectiveRequest) : hintsMatch,
+      ok: requestObserved
+        ? filterRequestMatches(expected.request, effectiveRequest)
+        : (expectedHasRequest ? filterRequestMatches(expected.request, effectiveRequest) : hintsMatch),
       request,
       effectiveRequest,
       actualHints,
-      expected: expected.request
+      expected: expected.request,
+      observed: requestObserved
     };
   }
 
@@ -770,7 +781,13 @@
           ? verifiedContext.selectionEvidence?.requestEncryptExpectId === ""
           : verifiedContext.selectionEvidence?.requestEncryptExpectId === String(expected.expectationKey || "");
         const expectedFilters = normalizeFilterSignature(expected.filterSignature || {});
-        const verifiedFilters = expectedFilters.request && FILTER_REQUEST_KEYS.some((key) => expectedFilters.request[key])
+        const expectedRequestObserved = expectedFilters.observed === true || Boolean(
+          expected.selectionEvidence?.requestHref || expected.selectionEvidence?.requestEncryptExpectId
+        );
+        const verifiedRequestObserved = verifiedContext.filterSignature?.observed === true || Boolean(
+          verifiedContext.selectionEvidence?.requestHref || verifiedContext.selectionEvidence?.requestEncryptExpectId
+        );
+        const verifiedFilters = expectedRequestObserved && verifiedRequestObserved
           ? filterRequestMatches(expectedFilters.request, verifiedContext.filterSignature?.request || {})
           : expectedFilters.hints.every((hint) =>
             (verifiedContext.filterSignature?.hints || []).some((actual) =>

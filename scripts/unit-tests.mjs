@@ -2035,6 +2035,10 @@ test("filter context comparison is conservative when request evidence exists", (
     { hints: ["1-3年"] },
     { request: { experience: "105" }, hints: ["3-5年"] }
   ), false);
+  assert.equal(sameFilterSignature(
+    { observed: true, request: {}, hints: ["刚刚活跃", "运维/技术支持(广州)"] },
+    { observed: true, request: {}, hints: [] }
+  ), true);
 });
 
 test("refresh merge keeps previous jobs and removes new-batch duplicates", () => {
