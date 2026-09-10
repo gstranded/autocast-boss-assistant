@@ -1,6 +1,6 @@
 {
   "name": "boss-haitou-assistant",
-  "version": "1.7.32",
+  "version": "1.7.33",
   "private": true,
   "type": "module",
   "description": "AutoCast 海投助手 Chrome / Edge 扩展",
