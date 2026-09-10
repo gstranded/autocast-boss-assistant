@@ -50,9 +50,22 @@ import {
   buildDeliveryQueue,
   countPassJobs,
   countPendingPassJobs,
+  jobMergeKey,
+  mergeTaskResults,
+  rebuildDeliveryQueue,
+  countSuccessfulDeliveries,
+  targetDeliveryRemaining,
+  isTargetDeliveryReached,
   taskCounterSnapshot,
   shouldAcceptTaskSnapshot
 } from "../extension/shared/task-model.js";
+import {
+  JOB_SOURCE_TYPES,
+  expectationDisplayLabel,
+  findExpectationMatches,
+  sameFilterSignature,
+  sameJobSourceContext
+} from "../extension/shared/job-expect-context.js";
 import { createOperationRegistry } from "../extension/background/operation-registry.js";
 import {
   isEnvironmentalFailure,
@@ -1964,6 +1977,72 @@ test("shared task model owns queue dedupe and pending counts", () => {
   assert.equal(countPassJobs(task), 3);
   assert.equal(countPendingPassJobs(task), 1);
   assert.deepEqual(taskCounterSnapshot(task), { success: 1, skipped: 2, failed: 3, processed: 6 });
+});
+
+test("job expectation context uses stable ids instead of display labels", () => {
+  const items = [
+    { id: "548669349", encryptId: "expect-a", positionName: "运维/技术支持", locationName: "广州" },
+    { id: "548669350", encryptId: "expect-b", positionName: "运维/技术支持", locationName: "深圳" }
+  ];
+  assert.equal(expectationDisplayLabel(items[0]), "运维/技术支持(广州)");
+  assert.equal(findExpectationMatches(items, { key: "expect-a" }).length, 1);
+  assert.equal(findExpectationMatches(items, { label: "运维/技术支持(广州)" })[0].encryptId, "expect-a");
+  assert.equal(sameJobSourceContext(
+    { sourceType: JOB_SOURCE_TYPES.EXPECTATION, expectationKey: "expect-a" },
+    { sourceType: JOB_SOURCE_TYPES.EXPECTATION, expectationKey: "expect-b" }
+  ), false);
+  assert.equal(sameJobSourceContext(
+    { sourceType: JOB_SOURCE_TYPES.RECOMMEND },
+    { sourceType: JOB_SOURCE_TYPES.RECOMMEND }
+  ), true);
+});
+
+test("filter context comparison is conservative when request evidence exists", () => {
+  const base = { request: { experience: "101", degree: "201", scale: "", jobType: "", salary: "", industry: "" }, hints: ["工作经验"] };
+  assert.equal(sameFilterSignature(base, structuredClone(base)), true);
+  assert.equal(sameFilterSignature(base, { ...base, request: { ...base.request, degree: "202" } }), false);
+  assert.equal(sameFilterSignature({ hints: ["学历", "公司规模"] }, { hints: ["公司规模", "学历"] }), true);
+  assert.equal(sameFilterSignature(
+    { hints: ["1-3年", "大专"] },
+    { request: { experience: "104", degree: "202" }, hints: ["1-3年", "大专"] }
+  ), true);
+  assert.equal(sameFilterSignature(
+    { hints: ["1-3年"] },
+    { request: { experience: "105" }, hints: ["3-5年"] }
+  ), false);
+});
+
+test("refresh merge keeps previous jobs and removes new-batch duplicates", () => {
+  const previous = [
+    { decision: "pass", selected: true, job: { jobId: "a", title: "Java", company: "A" } },
+    { decision: "reject", selected: false, job: { jobId: "b", title: "Go", company: "B" } }
+  ];
+  const incoming = [
+    { decision: "pass", selected: true, job: { jobId: "a", title: "Java", company: "A" } },
+    { decision: "pass", selected: true, job: { jobId: "c", title: "Python", company: "C" } }
+  ];
+  const merged = mergeTaskResults(previous, incoming);
+  assert.deepEqual(merged.results.map((row) => row.job.jobId), ["a", "b", "c"]);
+  assert.equal(merged.added, 1);
+  const queue = rebuildDeliveryQueue(merged.results, [{ jobId: "a", status: "done" }], ["a"]);
+  assert.deepEqual(queue.map((item) => [item.jobId, item.status]), [["a", "done"], ["c", "pending"]]);
+  assert.equal(jobMergeKey({ jobId: "a" }), "id:a");
+});
+
+test("target delivery counts only successful sends and stops at the target", () => {
+  const task = {
+    targetMode: true,
+    targetCount: 3,
+    counters: { success: 2, skipped: 4, failed: 1 }
+  };
+  assert.equal(countSuccessfulDeliveries(task), 2);
+  assert.equal(targetDeliveryRemaining(task), 1);
+  assert.equal(isTargetDeliveryReached(task), false);
+  task.counters.success = 3;
+  assert.equal(targetDeliveryRemaining(task), 0);
+  assert.equal(isTargetDeliveryReached(task), true);
+  task.counters.success = 9;
+  assert.equal(isTargetDeliveryReached(task), true);
 });
 
 test("operation registry returns and clears every active content operation", () => {

@@ -4,6 +4,7 @@
 
   const FRIEND_TARGET = /\/wapi\/zpgeek\/friend\/add\.json/i;
   const LIST_TARGET = /\/wapi\/zpgeek\/(?:search\/joblist|pc\/recommend\/job\/list|pc\/special\/zone\/joblist)\.json/i;
+  const JOB_LIST_CONTEXT_TARGET = LIST_TARGET;
   const DETAIL_TARGET = /\/wapi\/zpgeek\/job\/detail\.json/i;
   const TARGET = new RegExp(
     [FRIEND_TARGET.source, LIST_TARGET.source, DETAIL_TARGET.source].join('|'),
@@ -102,6 +103,33 @@
     return null;
   }
 
+  function requestContextFrom(url) {
+    if (!JOB_LIST_CONTEXT_TARGET.test(String(url || ''))) return null;
+    try {
+      const parsed = new URL(String(url || ''), location.origin);
+      const filterParams = {};
+      for (const key of ['jobType', 'salary', 'experience', 'degree', 'industry', 'scale']) {
+        filterParams[key] = String(parsed.searchParams.get(key) || '').trim();
+      }
+      return {
+        source: SOURCE,
+        type: 'job-list-context',
+        at: Date.now(),
+        href: parsed.href,
+        encryptExpectId: String(parsed.searchParams.get('encryptExpectId') || '').trim(),
+        filterParams
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function emitRequestContext(url) {
+    const context = requestContextFrom(url);
+    if (!context) return;
+    try { window.postMessage(context, location.origin); } catch (_) {}
+  }
+
   function emit(url, payload) {
     if (!TARGET.test(String(url || '')) || !payload || typeof payload !== 'object') return;
     try {
@@ -137,8 +165,10 @@
   const originalFetch = window.fetch;
   if (typeof originalFetch === 'function') {
     window.fetch = async function(...args) {
+      const requestUrl = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+      emitRequestContext(requestUrl);
       const response = await originalFetch.apply(this, args);
-      const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || response.url || '';
+      const url = requestUrl || response.url || '';
       if (TARGET.test(String(url || ''))) {
         response.clone().json().then((payload) => emit(url, payload)).catch(() => {});
       }
@@ -154,6 +184,7 @@
   };
   XMLHttpRequest.prototype.send = function(...args) {
     if (TARGET.test(this.__bhtNetworkUrl || '')) {
+      emitRequestContext(this.__bhtNetworkUrl);
       this.addEventListener('loadend', () => {
         try {
           const payload = typeof this.response === 'object' && this.response

@@ -32,6 +32,20 @@ export function countPendingPassJobs(task) {
   ).length;
 }
 
+export function countSuccessfulDeliveries(task) {
+  return Math.max(0, Number(task?.counters?.success || 0));
+}
+
+export function targetDeliveryRemaining(task) {
+  const target = Math.max(0, Number(task?.targetCount || 0));
+  if (!target) return 0;
+  return Math.max(0, target - countSuccessfulDeliveries(task));
+}
+
+export function isTargetDeliveryReached(task) {
+  return Boolean(task?.targetMode) && targetDeliveryRemaining(task) === 0;
+}
+
 export function taskCounterSnapshot(task) {
   const counters = task?.counters || {};
   return {
@@ -78,12 +92,10 @@ export function buildDeliveryQueue(results = [], { selectedOnly = true } = {}) {
 
   for (const row of rows) {
     const job = row.job || {};
+    const key = jobMergeKey(job);
     const id = String(job.jobId || '');
     const title = normalizeMatchText(job.title || '');
     const company = normalizeMatchText(job.company || '');
-    const key = id && !id.startsWith('name_') && !id.startsWith('dom_')
-      ? `id:${id}`
-      : `tc:${company}|${title}`;
     if (seen.has(key) || (!title && !id)) continue;
     seen.add(key);
     queue.push({
@@ -97,4 +109,46 @@ export function buildDeliveryQueue(results = [], { selectedOnly = true } = {}) {
     });
   }
   return queue;
+}
+
+export function jobMergeKey(job = {}) {
+  const id = String(job?.jobId || '').trim();
+  if (id && !id.startsWith('name_') && !id.startsWith('dom_')) return `id:${id}`;
+  const company = normalizeMatchText(job?.company || '');
+  const title = normalizeMatchText(job?.title || '');
+  return `tc:${company}|${title}`;
+}
+
+export function mergeTaskResults(previous = [], incoming = []) {
+  const seen = new Set();
+  const results = [];
+  let duplicates = 0;
+  for (const row of [...(previous || []), ...(incoming || [])]) {
+    const key = jobMergeKey(row?.job || row || {});
+    if (seen.has(key)) {
+      duplicates += 1;
+      continue;
+    }
+    seen.add(key);
+    results.push(row);
+  }
+  return { results, added: Math.max(0, results.length - (previous || []).length), duplicates };
+}
+
+export function rebuildDeliveryQueue(results = [], previousQueue = [], doneIds = []) {
+  const done = new Set((doneIds || []).map(String));
+  const previous = new Map((previousQueue || []).map((item) => [jobMergeKey(item), item]));
+  return buildDeliveryQueue(results, { selectedOnly: true }).map((item, index) => {
+    const old = previous.get(jobMergeKey(item));
+    const status = old?.status && ['done', 'skipped', 'failed'].includes(old.status)
+      ? old.status
+      : done.has(String(item.jobId || '')) ? 'done' : 'pending';
+    return {
+      ...item,
+      index,
+      status,
+      ...(old?.outcome ? { outcome: old.outcome } : {}),
+      ...(status === 'pending' ? {} : { finishedAt: old?.finishedAt || Date.now() })
+    };
+  });
 }

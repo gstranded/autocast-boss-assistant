@@ -254,6 +254,56 @@ test("background force-injects content on critical ops", () => {
   assert.ok(s.includes("critical.includes"));
 });
 
+test("refresh and continue restores the saved source after BOSS resets the page", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const refresh = extractFunctionSource(
+    background,
+    "async function refreshAndContinue",
+    "function itemErrorHint"
+  );
+  assert.ok(content.includes("FILTER_OPTION_PREFIXES"));
+  assert.ok(content.includes("restoreFilterRequest"));
+  assert.ok(content.includes("readEffectiveFilterRequest"));
+  assert.ok(content.includes("filterRequestMatches(expected.request, effectiveRequest)"));
+  assert.ok(content.includes("filtersRestored"));
+  assert.ok(refresh.includes("sourceChangedBeforeRefresh"));
+  assert.ok(refresh.includes("filtersChangedBeforeRefresh"));
+  assert.ok(refresh.includes("RESTORE_JOB_SOURCE_CONTEXT"));
+  assert.ok(refresh.includes("requestMatches"));
+  assert.ok(refresh.includes("FILTER_RESTORE_VERIFY_FAILED"));
+  assert.ok(!refresh.includes("error: 'JOB_SOURCE_CHANGED'"), "refresh preflight must not reject BOSS's temporary recommendation state");
+});
+
+test("target mode refreshes in the background and preserves stop/duplicate guards", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  assert.ok(html.includes('id="btnTargetMode"'));
+  assert.ok(html.includes('id="targetDeliveryCount"'));
+  assert.ok(!html.includes('id="btnRefreshContinue"'));
+  assert.ok(panel.includes("targetMode"));
+  assert.ok(panel.includes("targetCount"));
+  assert.ok(panel.includes("targetCountDraft"));
+  assert.ok(panel.includes("state.targetCountDraft = String($('targetDeliveryCount').value || '')"));
+  assert.ok(panel.includes("const targetCountValue = state.targetCountDraft ||"));
+  assert.ok(background.includes("async function runTargetDeliveryLoop"));
+  assert.ok(background.includes("targetDeliveryRemaining(task)"));
+  assert.ok(background.includes("withRunnerAdmission('previewing'"));
+  assert.ok(background.includes("refreshAndContinue({"));
+  assert.ok(background.includes("TARGET_REFRESH_LIMIT"));
+  assert.ok(background.includes("TARGET_NO_NEW_JOBS"));
+  assert.ok(background.includes("if (task.targetMode === true) runTargetDeliveryLoop"));
+  assert.ok(background.includes("alreadyCompleted: true"));
+  assert.ok(background.includes("[目标模式] 目标已达到，忽略重复启动"));
+  assert.ok(background.includes("task.status = TASK_STATUS.COMPLETED;"));
+  assert.ok(content.includes("detectActiveFilterRequest"));
+  assert.ok(content.includes("[ka^=\"${prefix}\"]"));
+  assert.ok(content.includes("selected option in the hidden dropdown"));
+  assert.ok(background.includes("jobMergeKey") && background.includes("mergeRefreshedTask"));
+});
+
 test("boss context prefers the panel sender tab over the focused window tab", () => {
   const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
   assert.ok(s.includes("async function tabFromSender"));

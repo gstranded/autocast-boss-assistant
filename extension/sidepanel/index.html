@@ -45,6 +45,14 @@
                 <button id="btnPreview" class="btn primary command-btn">扫描预览</button>
                 <button id="btnStart" class="btn success command-btn" disabled>批量投递</button>
               </div>
+              <div class="target-mode-controls">
+                <button id="btnTargetMode" class="btn command-btn" type="button" aria-pressed="false">目标模式：关闭</button>
+                <label class="target-count-field" for="targetDeliveryCount">
+                  <span>成功目标</span>
+                  <input id="targetDeliveryCount" type="number" min="1" max="500" value="10" inputmode="numeric" />
+                  <span>份</span>
+                </label>
+              </div>
               <div class="task-secondary-actions">
                 <button id="btnTestOne" class="btn command-btn" title="每次只投 1 个尚未投过的通过岗位；可反复点击，一份一份往下投">投递一份</button>
                 <button id="btnDiagnose" class="btn command-btn">页面诊断</button>
