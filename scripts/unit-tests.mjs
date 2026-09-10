@@ -12,6 +12,7 @@ import { planMessageSegments } from "../extension/shared/message-planner.js";
 import { MESSAGE_MODES, MESSAGE_SEGMENT_KINDS, STORAGE_KEYS } from "../extension/shared/constants.js";
 import {
   NATIVE_GREETING_STATES,
+  normalizeMessageSegmentKind,
   normalizeMessageTemplateRoles,
   resolveNativeGreetingEvidence
 } from "../extension/shared/greeting-policy.js";
@@ -139,6 +140,11 @@ async function runRegisteredTests() {
 console.log("1) text-utils");
 test("normalize greeting", () => {
   assert.ok(normalizeText("您好，世界").length > 0);
+});
+test("message segment role prefers current editor value", () => {
+  assert.equal(normalizeMessageSegmentKind("greeting", MESSAGE_SEGMENT_KINDS.SUPPLEMENT), MESSAGE_SEGMENT_KINDS.GREETING);
+  assert.equal(normalizeMessageSegmentKind("supplement", MESSAGE_SEGMENT_KINDS.GREETING), MESSAGE_SEGMENT_KINDS.SUPPLEMENT);
+  assert.equal(normalizeMessageSegmentKind("unknown", MESSAGE_SEGMENT_KINDS.SUPPLEMENT), MESSAGE_SEGMENT_KINDS.SUPPLEMENT);
 });
 test("similar greetings", () => {
   assert.ok(isSimilar("您好，我对这个岗位很感兴趣", "你好，我对该职位很感兴趣！", 0.85));
@@ -1553,6 +1559,16 @@ test("template version only bumps when message content changes", () => {
   assert.ok(app.includes("shouldBump = opts.bumpVersion !== false && changed"));
   assert.ok(app.includes("readTemplate(prevTemplate, { bumpVersion: false })"));
   assert.ok(app.includes("ensureConfigSavedBeforeDelivery"));
+});
+
+test("deleting a message segment preserves unsaved DOM edits", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const start = app.indexOf("box.querySelectorAll('[data-del]')");
+  const end = app.indexOf("box.querySelectorAll('[data-kind], [data-en], [data-text]')", start);
+  assert.ok(start > 0 && end > start);
+  const block = app.slice(start, end);
+  assert.ok(block.includes("const draft = readTemplate(state.config.messageTemplate"));
+  assert.ok(block.includes("draft.segments.filter((s) => s.id !== id)"));
 });
 
 test("start/test delivery refuses ALREADY_RUNNING and requires pre-save", () => {

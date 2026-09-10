@@ -4,6 +4,7 @@ import { reasonText } from '../shared/reason-codes.js';
 import { previewReasonLines, normalizeActiveWithin } from '../shared/filter-engine.js';
 import { MESSAGE_SEGMENT_KINDS, STORAGE_KEYS } from '../shared/constants.js';
 import { mergeResumeImages } from '../shared/resume-images.js';
+import { normalizeMessageSegmentKind } from '../shared/greeting-policy.js';
 import {
   collectDoneJobIds,
   countPassJobs,
@@ -880,7 +881,12 @@ function renderSegments(template) {
   box.querySelectorAll('[data-del]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const id = btn.getAttribute('data-del');
-      state.config.messageTemplate.segments = state.config.messageTemplate.segments.filter((s) => s.id !== id);
+      // 删除会重绘整个列表，先把当前 DOM 草稿同步回 state，避免覆盖刚改的角色或文本。
+      const draft = readTemplate(state.config.messageTemplate || { version: 1, segments: [] }, { bumpVersion: false });
+      state.config.messageTemplate = {
+        ...draft,
+        segments: draft.segments.filter((s) => s.id !== id)
+      };
       renderSegments(state.config.messageTemplate);
       markMessageDirty();
       state.formDirty = true;
@@ -927,9 +933,7 @@ function readTemplate(base = {}, opts = {}) {
     map.set(seg.id, {
       ...seg,
       enabled: en ? en.checked : seg.enabled !== false,
-      kind: kind?.value === MESSAGE_SEGMENT_KINDS.SUPPLEMENT
-        ? MESSAGE_SEGMENT_KINDS.SUPPLEMENT
-        : (seg.kind || MESSAGE_SEGMENT_KINDS.GREETING),
+      kind: normalizeMessageSegmentKind(kind?.value, seg.kind),
       text: tx ? tx.value : (seg.text || '')
     });
   }
@@ -942,9 +946,7 @@ function readTemplate(base = {}, opts = {}) {
     map.set(id, {
       id,
       enabled: en ? en.checked : true,
-      kind: kind?.value === MESSAGE_SEGMENT_KINDS.SUPPLEMENT
-        ? MESSAGE_SEGMENT_KINDS.SUPPLEMENT
-        : MESSAGE_SEGMENT_KINDS.GREETING,
+      kind: normalizeMessageSegmentKind(kind?.value),
       text: tx.value || ''
     });
   });

@@ -6,14 +6,20 @@ export const NATIVE_GREETING_STATES = Object.freeze({
   UNKNOWN: 'unknown'
 });
 
+export function normalizeMessageSegmentKind(value, fallback = MESSAGE_SEGMENT_KINDS.GREETING) {
+  if (Object.values(MESSAGE_SEGMENT_KINDS).includes(value)) return value;
+  return Object.values(MESSAGE_SEGMENT_KINDS).includes(fallback)
+    ? fallback
+    : MESSAGE_SEGMENT_KINDS.GREETING;
+}
+
 export function normalizeMessageTemplateRoles(template = {}) {
   const segments = (template.segments || []).map((segment, index) => ({
     ...segment,
-    kind: Object.values(MESSAGE_SEGMENT_KINDS).includes(segment?.kind)
-      ? segment.kind
-      : index === 0
-        ? MESSAGE_SEGMENT_KINDS.GREETING
-        : MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+    kind: normalizeMessageSegmentKind(
+      segment?.kind,
+      index === 0 ? MESSAGE_SEGMENT_KINDS.GREETING : MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+    )
   }));
   return { ...template, segments };
 }
