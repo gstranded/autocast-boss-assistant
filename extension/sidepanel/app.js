@@ -56,6 +56,8 @@ const state = {
   modalClosedForKey: '',
   config: null,
   selected: new Set(),
+  messageDirty: false,
+  messageRevision: 0,
   activeProfileId: null,
   draftBindings: [],
   lastCompletionSignalId: '',
@@ -876,6 +878,7 @@ function renderSegments(template) {
       const id = btn.getAttribute('data-del');
       state.config.messageTemplate.segments = state.config.messageTemplate.segments.filter((s) => s.id !== id);
       renderSegments(state.config.messageTemplate);
+      markMessageDirty();
       state.formDirty = true;
       scheduleAutosave();
     });
@@ -893,6 +896,11 @@ function renderSegments(template) {
     control.addEventListener('change', update);
   });
   renderMessageFlowPreview();
+}
+
+function markMessageDirty() {
+  state.messageDirty = true;
+  state.messageRevision += 1;
 }
 
 function templateSegmentsSignature(segments = []) {
@@ -1977,9 +1985,10 @@ async function refresh(options = {}) {
   const prevLists = state.config?.lists;
   const wasDirty = state.formDirty;
   const editingNow = typeof isEditingForm === 'function' ? isEditingForm() : false;
+  const keepMessage = soft || state.messageDirty || editingNow;
 
   state.config = res;
-  if ((wasDirty || editingNow || soft) && prevTemplate) {
+  if ((wasDirty || editingNow || soft || state.messageDirty) && prevTemplate) {
     try {
       // soft/dirty 路径只同步 DOM 草稿，不抬升版本（真正保存时再按内容决定）
       state.config.messageTemplate = readTemplate(prevTemplate, { bumpVersion: false });
@@ -2008,7 +2017,7 @@ async function refresh(options = {}) {
     }));
     fillFilters(res.filters, res.lists, res.settings);
     fillSettings(res.settings);
-    renderSegments(res.messageTemplate);
+    if (!keepMessage) renderSegments(res.messageTemplate);
     renderProfileList();
     renderResumeEditor();
     renderBindings();
@@ -2089,15 +2098,25 @@ async function saveFilters(opts = {}) {
 async function saveMessage(opts = {}) {
   if (!state.config) state.config = {};
   // 永远以 DOM 为准，不依赖可能被 refresh 冲掉的 base
+  const revisionAtStart = state.messageRevision;
   const template = readTemplate(state.config.messageTemplate || { version: 1, segments: [] });
   const settings = readSettingsPatch(state.config.settings || {});
   await api(MSG.SAVE_TEMPLATE, template);
   await api(MSG.SAVE_SETTINGS, settings);
-  state.config.messageTemplate = template;
+  // 保存期间若用户继续编辑，保留最新 DOM 草稿，让下一轮 autosave 接着落盘。
+  let latestTemplate = template;
+  try {
+    latestTemplate = readTemplate(state.config.messageTemplate || template, { bumpVersion: false });
+  } catch (_) {}
+  state.config.messageTemplate = latestTemplate;
   state.config.settings = { ...(state.config.settings || {}), ...settings };
+  if (state.messageRevision === revisionAtStart &&
+      templateSegmentsSignature(latestTemplate.segments) === templateSegmentsSignature(template.segments)) {
+    state.messageDirty = false;
+  }
   if (opts.refresh !== false) {
-    state.formDirty = false;
-    renderSegments(template);
+    if (!state.messageDirty) state.formDirty = false;
+    renderSegments(latestTemplate);
     await refresh({ soft: true });
   }
   return true;
@@ -2305,7 +2324,9 @@ async function flushAutosave(options = {}) {
   let saveFailed = false;
   try {
     // 关键：先读齐草稿再写，中间禁止 refresh，避免新消息段被旧 storage 覆盖
-    try { await saveMessage({ refresh: false }); } catch (e) { saveFailed = true; console.warn('autosave message', e); }
+    if (state.messageDirty) {
+      try { await saveMessage({ refresh: false }); } catch (e) { saveFailed = true; console.warn('autosave message', e); }
+    }
     try { await saveFilters({ refresh: false }); } catch (e) { saveFailed = true; console.warn('autosave filters', e); }
     try { await saveSettings({ refresh: false }); } catch (e) { saveFailed = true; console.warn('autosave settings', e); }
     try {
@@ -2405,6 +2426,7 @@ function wireAutosave() {
   root.__bhtAutosave = true;
   root.addEventListener('input', (e) => {
     if (!shouldAutosaveTarget(e.target)) return;
+    if (e.target.closest?.('#segments')) markMessageDirty();
     state.formDirty = true;
     autosaveRevision += 1;
     if (e.isComposing || autosaveComposingTarget === e.target) {
@@ -2419,7 +2441,10 @@ function wireAutosave() {
     if (e.target?.id === 'scheduledDeliveryEnabled' || e.target?.matches?.('[data-schedule-day]') || e.target?.matches?.('[data-window-start], [data-window-end]')) {
       updateDeliveryScheduleUi();
     }
-    if (shouldAutosaveTarget(e.target)) scheduleAutosave();
+    if (shouldAutosaveTarget(e.target)) {
+      if (e.target.closest?.('#segments')) markMessageDirty();
+      scheduleAutosave();
+    }
   }, true);
   root.addEventListener('compositionstart', (e) => {
     if (!shouldAutosaveTarget(e.target)) return;
@@ -2597,6 +2622,7 @@ function bindEvents() {
       text: ''
     });
     state.config.messageTemplate = template;
+    markMessageDirty();
     state.formDirty = true;
     renderSegments(template);
     toast('已新增消息段（填写后自动保存）', 'success', 2200);
@@ -3188,6 +3214,7 @@ function bindEvents() {
       const data = JSON.parse(text);
       const res = await api(MSG.IMPORT_CONFIG, { data });
       if (!res?.ok) throw new Error(res?.error || '导入失败');
+      state.messageDirty = false;
       state.formDirty = false;
       await refresh({ soft: false });
       toast('导入成功', 'success');

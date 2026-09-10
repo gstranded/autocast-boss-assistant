@@ -401,6 +401,10 @@ test("message conversation matching performs a second real reload after propagat
 test("autosave protects IME composition and never rebuilds message inputs", () => {
   const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
   assert.ok(app.includes("AUTOSAVE_DELAY_MS = 1800"));
+  assert.ok(app.includes("messageDirty"));
+  assert.ok(app.includes("messageRevision"));
+  assert.ok(app.includes("if (!keepMessage) renderSegments(res.messageTemplate)"));
+  assert.ok(app.includes("const revisionAtStart = state.messageRevision"));
   assert.ok(app.includes("compositionstart"));
   assert.ok(app.includes("compositionend"));
   assert.ok(app.includes("e.isComposing"));
@@ -408,6 +412,7 @@ test("autosave protects IME composition and never rebuilds message inputs", () =
   const flushStart = app.indexOf("async function flushAutosave");
   const flushEnd = app.indexOf("function scheduleAutosave", flushStart);
   const flush = app.slice(flushStart, flushEnd);
+  assert.ok(flush.includes("if (state.messageDirty)"));
   assert.ok(!flush.includes("renderSegments("));
   assert.ok(!flush.includes("refresh({ soft: true })"));
   assert.ok(!flush.includes("toast("));
