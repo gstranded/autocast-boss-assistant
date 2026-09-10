@@ -52,8 +52,18 @@ import {
 import {
   buildDeliveryQueue,
   collectDoneJobIds,
+  jobMergeKey,
+  isTargetDeliveryReached,
+  mergeTaskResults,
+  rebuildDeliveryQueue,
+  targetDeliveryRemaining,
   taskCounterSnapshot
 } from '../shared/task-model.js';
+import {
+  JOB_SOURCE_TYPES,
+  sameFilterSignature,
+  sameJobSourceContext
+} from '../shared/job-expect-context.js';
 import { createOperationRegistry } from './operation-registry.js';
 import {
   appendSessionDebugLog,
@@ -92,7 +102,8 @@ const VERSION_GUARDED_MESSAGES = new Set([
   MSG.CONFIRM_AND_START,
   MSG.RUN_TEST_DELIVERY,
   'BHT_RUN_TEST_DELIVERY',
-  MSG.RESUME_TASK
+  MSG.RESUME_TASK,
+  MSG.REFRESH_AND_CONTINUE
 ]);
 const JOB_PHASE = Object.freeze({
   CHAT_TRIGGERED: 'CHAT_TRIGGERED',
@@ -125,7 +136,8 @@ let runner = {
   schedulePauseRequested: false,
   skipCurrent: false,
   pauseLogged: false,
-  consecutiveUnknownActive: 0
+  consecutiveUnknownActive: 0,
+  targetLoop: false
 };
 const operations = createOperationRegistry();
 let debugLoggingEnabled = false;
@@ -190,7 +202,7 @@ function summarizeBossOperationResult(result) {
 }
 
 function runnerIsBusy() {
-  return runner.running || runner.starting || runner.previewing;
+  return runner.running || runner.starting || runner.previewing || runner.targetLoop;
 }
 
 function isPreviewRunActive(runId = '') {
@@ -228,7 +240,8 @@ function runnerSnapshot() {
     stopping: runner.running && runner.abort,
     intervalWaitUntil: Number(runner.intervalWaitUntil || 0),
     intervalWaitMs: Number(runner.intervalWaitMs || 0),
-    activeOperations: operations.size
+    activeOperations: operations.size,
+    targetLoop: runner.targetLoop === true
   };
 }
 
@@ -308,7 +321,9 @@ async function publishPreviewTask(task, previewRunId, previousTask = null) {
 }
 
 async function withRunnerAdmission(kind, action) {
-  if (runnerIsBusy()) {
+  const isTargetRefreshAdmission = kind === 'previewing' && runner.targetLoop === true &&
+    !runner.running && !runner.starting && !runner.previewing;
+  if (runnerIsBusy() && !isTargetRefreshAdmission) {
     await debugLog('background.runner', 'admission_rejected', {
       requested: kind,
       running: runner.running,
@@ -328,7 +343,9 @@ async function withRunnerAdmission(kind, action) {
   if (kind === 'previewing') {
     // runner 已通过空闲门禁；此时的 pause/abort/skip 只能来自上一轮残留。
     runner.pause = false;
-    runner.abort = false;
+    // 目标模式在两个投递批次之间会短暂释放 running，再进入扫描恢复。
+    // 此时用户点「停止」写入的 abort 不能被新的 preview admission 清掉。
+    if (!runner.targetLoop) runner.abort = false;
     runner.skipCurrent = false;
     runner.previewRunId = admissionId;
     runner.previewStartedAt = Date.now();
@@ -642,7 +659,10 @@ async function enforceDeliverySchedule(source = 'alarm', now = new Date()) {
   await publishTask(task);
   runner.pause = false;
   await log('info', '已进入定时投递时段，自动恢复任务', { taskId: task.id, source });
-  if (!runner.running) runTaskLoop(task.id);
+  if (!runner.running) {
+    if (task.targetMode === true) runTargetDeliveryLoop(task.id);
+    else runTaskLoop(task.id);
+  }
   return { ok: true, action: 'resumed', schedule, splitView: split };
 }
 
@@ -2599,6 +2619,25 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
     return { ok: false, error: 'LIST_TAB_NOT_FOUND', message: '请先打开当前要扫描的 BOSS 职位列表页' };
   }
   previewTab = sourcePreviewTab;
+  let initialSourceContext = null;
+  if (payload.captureSourceContext !== false) {
+    const sourceCapture = await sendToBoss(
+      MSG.GET_JOB_SOURCE_CONTEXT,
+      { refreshExpectations: true },
+      { tabId: sourcePreviewTab.id, forceInject: true, previewRunId }
+    ).catch(() => null);
+    if (sourceCapture?.ok && sourceCapture.context) {
+      initialSourceContext = sourceCapture.context;
+      await debugLog('background.preview', 'source_context_captured', {
+        sourceType: initialSourceContext.sourceType,
+        expectationKey: initialSourceContext.expectationKey || '',
+        expectationLabel: initialSourceContext.expectationLabel || '',
+        filterSignature: initialSourceContext.filterSignature || null
+      });
+    } else {
+      await log('warn', '[扫描] 未能完整记录 BOSS 求职期望来源；本轮仍可预览，但刷新并继续不可用');
+    }
+  }
   {
     // BOSS 的求职期望和部分筛选只存在当前 SPA 状态中。
     // 直接滚动当前职位页，才能保证扫描的就是用户看到的这批岗位。
@@ -2715,6 +2754,24 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
     }
 
     if (!isActive()) return cancelled();
+    let finalSourceContext = initialSourceContext;
+    if (payload.captureSourceContext !== false) {
+      const sourceAfterScan = await sendToBoss(
+        MSG.GET_JOB_SOURCE_CONTEXT,
+        { refreshExpectations: false },
+        { tabId: sourcePreviewTab?.id || previewTab?.id || null, forceInject: true, previewRunId }
+      ).catch(() => null);
+      if (sourceAfterScan?.ok && sourceAfterScan.context) {
+        finalSourceContext = sourceAfterScan.context;
+        if (isRefreshableJobSourceContext(initialSourceContext) && !sameJobSourceContext(initialSourceContext, finalSourceContext)) {
+          await log('warn', '[扫描] 扫描期间求职期望发生变化，已取消本轮结果，避免混入不同来源岗位', {
+            before: initialSourceContext,
+            after: finalSourceContext
+          });
+          return { ok: false, error: 'JOB_SOURCE_CHANGED_DURING_SCAN', message: '扫描期间求职期望发生变化，请恢复后重新扫描' };
+        }
+      }
+    }
     const collectionResultReceivedAt = Date.now();
     const collectionFinishedAt = Number(scan.scanMeta?.collectionFinishedAt || 0) ||
       Math.min(collectionResultReceivedAt, deadlineAt);
@@ -2801,6 +2858,7 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
       reachedEnd,
       timedOut,
       sourceContextPreserved: true,
+      sourceContext: finalSourceContext,
       scanTabId: sourcePreviewTab.id,
       stopReason: stop.reason,
       stopMessage: stop.message,
@@ -2850,6 +2908,7 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
   if (previewListExpect) {
     task.listExpectLabel = previewListExpect;
   }
+  task.sourceContext = finalSourceContext;
   task.queue = (task.results || [])
     .filter((r) => r.selected !== false && r.decision === 'pass')
     .map((r, idx) => ({
@@ -2881,6 +2940,299 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
     scanMeta
   });
   return { ok: true, task, summary, warnings, scanMeta, navigation: previewNavigation };
+  }
+}
+
+function isRefreshableJobSourceContext(context = {}) {
+  return context?.sourceType === JOB_SOURCE_TYPES.RECOMMEND ||
+    (context?.sourceType === JOB_SOURCE_TYPES.EXPECTATION && Boolean(String(context?.expectationKey || '').trim()));
+}
+
+function mergeRefreshedTask(previousTask, freshTask, refreshMeta = {}) {
+  const previousResults = Array.isArray(previousTask?.results) ? previousTask.results : [];
+  const freshResults = Array.isArray(freshTask?.results) ? freshTask.results : [];
+  const previousKeys = new Set(previousResults.map((row) => jobMergeKey(row?.job || row || {})));
+  const freshNewResults = freshResults.filter((row) => !previousKeys.has(jobMergeKey(row?.job || row || {})));
+  const mergedResults = mergeTaskResults(previousResults, freshResults);
+  const previousItems = Array.isArray(previousTask?.items) ? previousTask.items : [];
+  const itemKeys = new Set(previousItems.map((item) => jobMergeKey(item)));
+  const freshItems = (Array.isArray(freshTask?.items) ? freshTask.items : [])
+    .filter((item) => !itemKeys.has(jobMergeKey(item)));
+  const doneIds = collectDoneJobIds(
+    previousItems,
+    previousTask?.queue || [],
+    previousTask?.testedJobIds || []
+  );
+  const queue = rebuildDeliveryQueue(
+    mergedResults.results,
+    previousTask?.queue || [],
+    Array.from(doneIds)
+  );
+  const queueCursor = Math.max(0, queue.findIndex((item) => item.status === 'pending'));
+  const previousRefreshes = Array.isArray(previousTask?.refreshHistory)
+    ? previousTask.refreshHistory
+    : [];
+  const refreshRecord = {
+    at: Date.now(),
+    sourceType: refreshMeta.sourceType || freshTask?.sourceContext?.sourceType || '',
+    expectationLabel: refreshMeta.expectationLabel || freshTask?.sourceContext?.expectationLabel || '',
+    scanned: Number(freshTask?.summary?.scanned || 0),
+    added: freshNewResults.length,
+    duplicates: Math.max(0, freshResults.length - freshNewResults.length),
+    total: mergedResults.results.length
+  };
+  const task = {
+    ...freshTask,
+    ...previousTask,
+    status: TASK_STATUS.AWAITING_CONFIRM,
+    updatedAt: Date.now(),
+    summary: summarizePreview(mergedResults.results),
+    warnings: Array.from(new Set([
+      ...(previousTask?.warnings || []),
+      ...(freshTask?.warnings || [])
+    ].filter(Boolean))),
+    results: mergedResults.results,
+    items: [...previousItems, ...freshItems],
+    queue,
+    queueCursor,
+    sourceContext: freshTask?.sourceContext || previousTask?.sourceContext || null,
+    listHref: freshTask?.listHref || previousTask?.listHref || '',
+    listExpectLabel: freshTask?.listExpectLabel || previousTask?.listExpectLabel || '',
+    execution: freshTask?.execution || previousTask?.execution || {},
+    previewNavigation: freshTask?.previewNavigation || null,
+    scanMeta: {
+      ...(freshTask?.scanMeta || {}),
+      refreshCount: previousRefreshes.length + 1,
+      previousUniqueCount: previousResults.length,
+      newUniqueCount: freshNewResults.length,
+      totalUniqueCount: mergedResults.results.length,
+      duplicateCount: Math.max(0, freshResults.length - freshNewResults.length),
+      sourceContextPreserved: true
+    },
+    refreshHistory: [...previousRefreshes, refreshRecord].slice(-30),
+    testedJobIds: Array.from(new Set([
+      ...(previousTask?.testedJobIds || []).map(String),
+      ...(freshTask?.testedJobIds || []).map(String)
+    ])),
+    counters: { ...(previousTask?.counters || freshTask?.counters || {}) },
+    currentJobId: null,
+    nextJobId: null,
+    completionSignal: null,
+    pauseReason: '',
+    pauseSource: '',
+    awaitingUserRetry: false,
+    uiErrorDismissed: true,
+    retryCurrent: false,
+    errorKey: '',
+    lastErrorDetail: '',
+    consecutiveFails: 0,
+    testDelivery: false,
+    testJobId: null,
+    refreshCount: previousRefreshes.length + 1
+  };
+  return { task, added: freshNewResults.length, duplicates: refreshRecord.duplicates };
+}
+
+async function refreshAndContinue(payload = {}, sourceTab, previewRunId = '') {
+  if (!sourceTab?.id) return { ok: false, error: 'LIST_TAB_NOT_FOUND', message: '未找到当前 BOSS 职位列表页' };
+  const all = await getAllConfig();
+  const previousTask = cloneTaskSnapshot(all.task);
+  if (!previousTask) return { ok: false, error: 'NO_TASK', message: '请先完成一次扫描预览' };
+  if (![TASK_STATUS.COMPLETED, TASK_STATUS.STOPPED].includes(previousTask.status)) {
+    return { ok: false, error: 'TASK_NOT_FINISHED', message: '请先完成或停止当前投递任务，再刷新并继续' };
+  }
+  if (!isRefreshableJobSourceContext(previousTask.sourceContext)) {
+    return { ok: false, error: 'JOB_SOURCE_NOT_RESTORABLE', message: '这批预览没有记录可恢复的求职期望来源，请重新扫描后再使用' };
+  }
+  const tabOpt = { tabId: sourceTab.id, forceInject: true, previewRunId };
+  // “刷新并继续”恢复的是已完成任务的快照。BOSS 刷新时可能先把当前页
+  // 临时切回“推荐”，因此刷新前的页面状态只能用于诊断，不能作为拦截条件。
+  const before = await sendToBoss(MSG.GET_JOB_SOURCE_CONTEXT, { refreshExpectations: true }, tabOpt).catch(() => null);
+  const sourceChangedBeforeRefresh = Boolean(
+    before?.context && !sameJobSourceContext(previousTask.sourceContext, before.context)
+  );
+  const filtersChangedBeforeRefresh = Boolean(
+    before?.context && !sameFilterSignature(previousTask.sourceContext.filterSignature, before.context.filterSignature)
+  );
+  await log('info', '[刷新并继续] 将以已保存任务快照恢复求职期望和普通筛选', {
+    before: before?.context || null,
+    sourceChangedBeforeRefresh,
+    filtersChangedBeforeRefresh
+  });
+
+  setPreviewPhase('restoring_source', previewRunId);
+  await log('info', '[刷新并继续] 正在刷新职位列表并恢复原求职期望', {
+    tabId: sourceTab.id,
+    sourceType: previousTask.sourceContext.sourceType,
+    expectationLabel: previousTask.sourceContext.expectationLabel || '推荐'
+  });
+  try {
+    await chrome.tabs.reload(sourceTab.id);
+    const readyTab = await waitTabComplete(sourceTab.id, 45000, { requireComplete: true });
+    if (!readyTab || !isBossJobListUrl(readyTab.url || readyTab.pendingUrl || '')) {
+      return { ok: false, error: 'LIST_RELOAD_FAILED', message: '职位列表刷新失败，旧任务已保留' };
+    }
+    await forceInjectContent(sourceTab.id);
+    await sleep(650);
+    const restored = await sendToBoss(
+      MSG.RESTORE_JOB_SOURCE_CONTEXT,
+      { sourceContext: previousTask.sourceContext, timeoutMs: 15000 },
+      { tabId: sourceTab.id, forceInject: true, previewRunId }
+    );
+    if (!restored?.ok || !restored.context) {
+      await log('warn', '[刷新并继续] 求职期望恢复失败，未开始扫描', {
+        error: restored?.error || '',
+        message: restored?.message || '',
+        filters: restored?.filters || null,
+        expectedFilterSignature: previousTask.sourceContext.filterSignature || null
+      });
+      return {
+        ok: false,
+        error: restored?.error || 'JOB_SOURCE_RESTORE_FAILED',
+        message: restored?.message || '求职期望恢复失败，旧任务已保留',
+        filters: restored?.filters || null
+      };
+    }
+    if (!sameJobSourceContext(previousTask.sourceContext, restored.context)) {
+      return { ok: false, error: 'JOB_SOURCE_RESTORE_VERIFY_FAILED', message: '恢复后的求职期望与原任务不一致，已停止扫描' };
+    }
+    if (!sameFilterSignature(previousTask.sourceContext.filterSignature, restored.context.filterSignature)) {
+      await log('warn', '[刷新并继续] 刷新后普通筛选未恢复，未开始扫描', {
+        expected: previousTask.sourceContext.filterSignature,
+        current: restored.context.filterSignature
+      });
+      return { ok: false, error: 'FILTER_RESTORE_VERIFY_FAILED', message: '刷新后普通筛选未恢复，已停止扫描；旧任务已保留' };
+    }
+    await log('success', '[刷新并继续] 求职期望和普通筛选恢复验证通过', {
+      sourceType: restored.context.sourceType,
+      expectationKey: restored.context.expectationKey || '',
+      expectationLabel: restored.context.expectationLabel || '推荐',
+      domActiveCount: restored.context.selectionEvidence?.domActiveCount || 0,
+      requestEncryptExpectId: restored.context.selectionEvidence?.requestEncryptExpectId || '',
+      requestMatches: restored.context.selectionEvidence?.requestMatches === true,
+      filterSignature: restored.context.filterSignature || null
+    });
+    setPreviewPhase('collecting', previewRunId);
+    const fresh = await runPreview({
+      ...payload,
+      captureSourceContext: true
+    }, readyTab, previewRunId);
+    if (!fresh?.ok || !fresh.task) return fresh;
+    const merged = mergeRefreshedTask(previousTask, fresh.task, previousTask.sourceContext);
+    await publishTask(merged.task);
+    await log('success', `[刷新并继续] 扫描完成：新增 ${merged.added} 个岗位，重复 ${merged.duplicates} 个，累计 ${merged.task.results.length} 个`, {
+      taskId: merged.task.id,
+      sourceType: merged.task.sourceContext?.sourceType || '',
+      expectationLabel: merged.task.sourceContext?.expectationLabel || ''
+    });
+    return {
+      ...fresh,
+      task: merged.task,
+      summary: merged.task.summary,
+      refresh: { added: merged.added, duplicates: merged.duplicates, total: merged.task.results.length }
+    };
+  } catch (error) {
+    await log('error', '[刷新并继续] 页面刷新或恢复异常，旧任务已保留：' + String(error?.message || error));
+    return { ok: false, error: 'REFRESH_CONTINUE_FAILED', message: '刷新并继续失败，旧任务已保留：' + String(error?.message || error) };
+  }
+}
+
+async function recordTargetModeHalt(task, message, level = 'warn') {
+  if (!task) return;
+  task.targetLastError = String(message || '目标模式已停止');
+  task.updatedAt = Date.now();
+  await publishTask(task);
+  await log(level, `[目标模式] ${task.targetLastError}`, {
+    taskId: task.id,
+    targetCount: Number(task.targetCount || 0),
+    success: Number(task.counters?.success || 0),
+    refreshCount: Number(task.targetRefreshCount || 0)
+  });
+}
+
+async function runTargetDeliveryLoop(taskId) {
+  if (runner.targetLoop) return { ok: false, error: 'TARGET_LOOP_RUNNING' };
+  runner.targetLoop = true;
+  runner.abort = false;
+  try {
+    while (!runner.abort) {
+      let all = await getAllConfig();
+      let task = all.task;
+      if (!task || task.id !== taskId || task.targetMode !== true) {
+        return { ok: false, error: 'TARGET_TASK_NOT_FOUND' };
+      }
+      if (isTargetDeliveryReached(task)) {
+        task.status = TASK_STATUS.COMPLETED;
+        task.targetLastError = '';
+        task.pauseReason = '';
+        task.awaitingUserRetry = false;
+        task.updatedAt = Date.now();
+        setTaskTerminalSignal(task, TASK_STATUS.COMPLETED);
+        await publishTask(task);
+        await log('success', `[目标模式] 已达到目标：成功 ${task.counters?.success || 0}/${task.targetCount}`, { taskId });
+        return { ok: true, task };
+      }
+      if (task.status === TASK_STATUS.PAUSED || task.status === TASK_STATUS.STOPPED || task.status === TASK_STATUS.FAILED) {
+        return { ok: false, error: 'TARGET_TASK_PAUSED', task };
+      }
+
+      await runTaskLoop(taskId);
+      if (runner.abort) return { ok: false, error: 'ABORTED' };
+
+      all = await getAllConfig();
+      task = all.task;
+      if (!task || task.id !== taskId) return { ok: false, error: 'TARGET_TASK_NOT_FOUND' };
+      if (isTargetDeliveryReached(task)) {
+        await log('success', `[目标模式] 已达到目标：成功 ${task.counters?.success || 0}/${task.targetCount}`, { taskId });
+        return { ok: true, task };
+      }
+      if (task.status !== TASK_STATUS.COMPLETED) return { ok: false, error: 'TARGET_TASK_NOT_COMPLETED', task };
+
+      const refreshCount = Number(task.targetRefreshCount || 0) + 1;
+      task.targetRefreshCount = refreshCount;
+      if (refreshCount > 50) {
+        await recordTargetModeHalt(task, `已刷新 ${refreshCount - 1} 轮仍未达到目标，为避免无限重复已停止；成功 ${task.counters?.success || 0}/${task.targetCount}`);
+        return { ok: false, error: 'TARGET_REFRESH_LIMIT', task };
+      }
+      const listTabId = task.execution?.listTabId;
+      let sourceTab = null;
+      try { sourceTab = listTabId != null ? await chrome.tabs.get(listTabId) : null; } catch (_) {}
+      if (!sourceTab?.id || !isBossJobListUrl(sourceTab.url || sourceTab.pendingUrl || '')) {
+        await recordTargetModeHalt(task, '目标未达成，无法找到原 BOSS 职位列表页，已暂停自动刷新');
+        return { ok: false, error: 'TARGET_LIST_TAB_NOT_FOUND', task };
+      }
+
+      await publishTask(task);
+      await log('info', `[目标模式] 当前批次已结束，成功 ${task.counters?.success || 0}/${task.targetCount}；开始第 ${refreshCount} 轮刷新、恢复筛选并扫描`, {
+        taskId,
+        listTabId,
+        targetRemaining: targetDeliveryRemaining(task)
+      });
+      const refreshed = await withRunnerAdmission('previewing', (previewRunId) => refreshAndContinue({
+        scroll: true,
+        maxScanMs: 60000,
+        forceRestore: true,
+        captureSourceContext: true,
+        targetMode: true
+      }, sourceTab, previewRunId));
+      if (runner.abort) return { ok: false, error: 'ABORTED' };
+      if (!refreshed?.ok || !refreshed.task) {
+        all = await getAllConfig();
+        task = all.task || task;
+        await recordTargetModeHalt(task, refreshed?.message || '目标未达成，刷新恢复失败；旧任务已保留');
+        return { ok: false, error: refreshed?.error || 'TARGET_REFRESH_FAILED', task };
+      }
+      const pending = (refreshed.task.queue || []).some((item) => item.status === 'pending');
+      if (!pending) {
+        await recordTargetModeHalt(refreshed.task, `第 ${refreshCount} 轮扫描没有新增可投递岗位，目标未达成；成功 ${refreshed.task.counters?.success || 0}/${refreshed.task.targetCount}`);
+        return { ok: false, error: 'TARGET_NO_NEW_JOBS', task: refreshed.task };
+      }
+      // refreshAndContinue leaves the merged task in awaiting_confirm. The next
+      // loop consumes its pending queue without requiring another button click.
+    }
+    return { ok: false, error: 'ABORTED' };
+  } finally {
+    runner.targetLoop = false;
   }
 }
 
@@ -4116,6 +4468,16 @@ async function runTaskLoop(taskId) {
         break;
       }
 
+      if (task.targetMode === true && isTargetDeliveryReached(task)) {
+        task.counters.processed += 1;
+        task.updatedAt = Date.now();
+        await publishTask(task);
+        await log('success', `[目标模式] 本岗位完成后已达到目标：成功 ${task.counters?.success || 0}/${task.targetCount}`, {
+          taskId: task.id,
+          jobId: row.job?.jobId || ''
+        });
+        break;
+      }
       if (outcome === 'limited') break;
       if (outcome === 'aborted') break;
 
@@ -4354,6 +4716,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return await runPreview(payload || {}, guard.tab, previewRunId);
         });
       }
+      case MSG.REFRESH_AND_CONTINUE: {
+        return await withRunnerAdmission('previewing', async (previewRunId) => {
+          const guard = await assertBossContext(sender);
+          if (!guard.ok) {
+            await log('warn', guard.message);
+            return guard;
+          }
+          return await refreshAndContinue(payload || {}, guard.tab, previewRunId);
+        });
+      }
       case MSG.CONFIRM_AND_START: {
         return await withRunnerAdmission('starting', async () => {
         // CONFIRM_AND_START guard
@@ -4371,6 +4743,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return { ok: false, error: 'NO_PREVIEW', message: '请先扫描预览，再批量投递' };
         }
 
+        const targetMode = payload?.targetMode === true;
+        const requestedTargetCount = Number(payload?.targetCount);
+        const targetCount = Number.isFinite(requestedTargetCount)
+          ? Math.max(1, Math.min(500, Math.floor(requestedTargetCount)))
+          : 0;
+        if (targetMode && !targetCount) {
+          return { ok: false, error: 'TARGET_COUNT_INVALID', message: '目标模式需要设置 1-500 份成功投递目标' };
+        }
+        if (targetMode && !isRefreshableJobSourceContext(task.sourceContext)) {
+          return { ok: false, error: 'JOB_SOURCE_NOT_RESTORABLE', message: '目标模式需要先扫描一批带有效求职期望来源的岗位' };
+        }
+        task.targetMode = targetMode;
+        task.targetCount = targetMode ? targetCount : 0;
+        task.targetLastError = '';
+        if (targetMode && isTargetDeliveryReached(task)) {
+          task.status = TASK_STATUS.COMPLETED;
+          task.pauseReason = '';
+          task.awaitingUserRetry = false;
+          task.updatedAt = Date.now();
+          setTaskTerminalSignal(task, TASK_STATUS.COMPLETED);
+          await publishTask(task);
+          await log('info', `[目标模式] 目标已达到，忽略重复启动：成功 ${task.counters?.success || 0}/${targetCount}`, {
+            taskId: task.id,
+            targetCount
+          });
+          return {
+            ok: true,
+            alreadyCompleted: true,
+            taskId: task.id,
+            task,
+            targetMode: true,
+            targetCount
+          };
+        }
+        if (targetMode && !task.targetStartedAt) task.targetStartedAt = Date.now();
+        if (!targetMode) {
+          delete task.targetStartedAt;
+          delete task.targetRefreshCount;
+        }
+
         // 单份投完后 status 可能是 completed/stopped：允许直接进入批量
         const doneIds = collectDoneJobIds(task.items, task.queue, task.testedJobIds);
 
@@ -4385,7 +4797,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             .filter((r) => r?.decision === 'pass' && r?.job?.jobId && !doneIds.has(String(r.job.jobId)))
             .map((r) => String(r.job.jobId));
         }
-        if (!selectedIds.length) {
+        if (!selectedIds.length && !targetMode) {
           return {
             ok: false,
             error: 'NO_PENDING',
@@ -4479,7 +4891,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } else {
           await log('info', '批量投递启动：待投 ' + selectedIds.length + ' 岗（已跳过已完成 ' + doneIds.size + '）');
           // async loop
-          runTaskLoop(task.id);
+          if (targetMode) runTargetDeliveryLoop(task.id);
+          else runTaskLoop(task.id);
         }
         return {
           ok: true,
@@ -4487,7 +4900,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           splitView: split,
           pending: selectedIds.length,
           scheduled: scheduledStart.waiting,
-          nextStartAt: task.scheduleNextStartAt || null
+          nextStartAt: task.scheduleNextStartAt || null,
+          targetMode,
+          targetCount: targetMode ? targetCount : 0
         };
         });
       }
@@ -4752,7 +5167,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await publishTask(all.task);
         runner.pause = false;
         runner.abort = false;
-        if (!runner.running) runTaskLoop(all.task.id);
+        if (!runner.running) {
+          if (all.task.targetMode === true) runTargetDeliveryLoop(all.task.id);
+          else runTaskLoop(all.task.id);
+        }
         await log('info', payload?.retry ? '重试当前岗位' : '继续任务');
         return { ok: true };
       }

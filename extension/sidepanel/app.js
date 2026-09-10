@@ -35,7 +35,8 @@ const VERSION_GUARDED_API_MESSAGES = new Set([
   MSG.RUN_PREVIEW,
   MSG.CONFIRM_AND_START,
   MSG.RUN_TEST_DELIVERY,
-  MSG.RESUME_TASK
+  MSG.RESUME_TASK,
+  MSG.REFRESH_AND_CONTINUE
 ]);
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
@@ -56,6 +57,8 @@ const state = {
   modalClosedForKey: '',
   config: null,
   selected: new Set(),
+  targetModeEnabled: false,
+  targetCountDraft: '',
   messageDirty: false,
   messageRevision: 0,
   activeProfileId: null,
@@ -402,7 +405,7 @@ function setBossMode(isBoss, reason = '') {
   state.isBoss = effectiveBoss;
   state.bossBlockReason = effectiveBoss ? '' : (reason || '');
   if (!effectiveBoss) {
-    ['btnPreview', 'btnDiagnose', 'btnStart', 'btnTestOne', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
+    ['btnPreview', 'btnDiagnose', 'btnStart', 'btnTestOne', 'btnTargetMode', 'targetDeliveryCount', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
       const el = $(id);
       if (!el) return;
       el.disabled = true;
@@ -1489,8 +1492,11 @@ function describeTaskPhase(task, status) {
       const remain = Math.max(1, Math.ceil((waitUntil - Date.now()) / 1000));
       return `投递间隔等待中 · 还剩 ${remain} 秒`;
     }
+    const target = task?.targetMode && task?.targetCount
+      ? `目标 ${task.counters?.success || 0}/${task.targetCount}`
+      : '';
     const prog = qLen ? `第 ${Math.min(qCur || 1, qLen)}/${qLen} 岗` : (pass ? `进度 ${done}/${pass}` : '运行中');
-    return curTitle ? `${prog} · 当前：${curTitle}` : prog;
+    return [target, prog, curTitle ? `当前：${curTitle}` : ''].filter(Boolean).join(' · ');
   }
   if (status === 'paused') {
     return (task?.pauseReason || '已暂停') + (curTitle ? ` · 当前：${curTitle}` : '');
@@ -1542,6 +1548,7 @@ function updateTaskUI(task, runner = {}) {
         opening_worker: '正在准备岗位',
         locating_list: '正在准备岗位',
         navigating: '正在准备岗位',
+        restoring_source: '正在恢复筛选',
         waiting_navigation: '正在加载岗位',
         scanning_cards: '正在加载岗位',
         scanning_more: '正在加载岗位',
@@ -1584,14 +1591,20 @@ function updateTaskUI(task, runner = {}) {
         : '当前投递时段已结束：完成当前岗位后自动暂停。';
     }
     else if (waitingInterval) hint = `上一岗已处理完，正在等待投递间隔（还剩 ${waitRemain} 秒），随后继续下一岗。可暂停或停止。`;
-    else if (status === 'running') hint = '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
+    else if (status === 'running') hint = task?.targetMode
+      ? `目标模式运行中：成功 ${task.counters?.success || 0}/${task.targetCount}，当前批次不足时会自动刷新并恢复筛选。`
+      : '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
     else if (status === 'paused' && task?.pauseSource === 'schedule') hint = `${task.pauseReason || '等待下一个投递时段'}；进入时段后自动继续。`;
     else if (status === 'paused') hint = '已暂停：点「继续」恢复当前队列；或「停止」后重新批量投递。';
-    else if (status === 'awaiting_confirm') hint = '预览已就绪：可「投递一份」试投，或「批量投递」勾选岗位。';
+    else if (status === 'awaiting_confirm') hint = state.targetModeEnabled
+      ? `目标模式已${task?.targetMode ? '保存' : '开启'}：设置成功目标后点「批量投递」，不足时会自动刷新列表。`
+      : '预览已就绪：可「投递一份」试投，或「批量投递」勾选岗位。';
     else if (status === 'completed' || status === 'stopped') {
       hint = pending > 0
         ? '上一轮已结束，但仍有未投岗位：「投递一份」逐个投，或「批量投递」一次投剩余。'
-        : '本轮已结束。重新「扫描预览」后再投。';
+        : (task?.targetMode && task?.targetLastError
+          ? `目标模式暂未达成：${task.targetLastError}`
+          : '本轮已结束。重新「扫描预览」后再投。');
     } else if (status === 'failed') hint = '任务失败。可停止后重新扫描，或对剩余岗位批量投递。';
     else hint = '先扫描预览，再投递一份或批量投递。';
     $('taskHint').textContent = hint;
@@ -1601,7 +1614,7 @@ function updateTaskUI(task, runner = {}) {
   const isRunning = status === 'running';
   const isPaused = status === 'paused';
   const isPreviewing = Boolean(runner.previewing);
-  const executionBusy = Boolean(runner.running || runner.starting || runner.previewing || runner.stopping);
+  const executionBusy = Boolean(runner.running || runner.starting || runner.previewing || runner.stopping || runner.targetLoop);
   const activeRun = isRunning || isPaused;
   // 控制条：按状态点亮当前可操作按钮，其它变暗
   setControlArmed('btnPause', {
@@ -1634,9 +1647,16 @@ function updateTaskUI(task, runner = {}) {
   const hasPass = countPassJobs(task) > 0 || Array.from(state.selected || []).length > 0;
   const hasPending = countPendingPassJobs(task) > 0 || Array.from(state.selected || []).length > 0;
   // 批量投递：不限 awaiting_confirm；单份投完(completed/stopped)后也应可点
+  const sourceReady = task?.sourceContext?.sourceType === 'recommend' ||
+    (task?.sourceContext?.sourceType === 'expectation' && String(task?.sourceContext?.expectationKey || '').trim());
+  if (task?.targetMode === true) state.targetModeEnabled = true;
+  const targetEnabled = state.targetModeEnabled === true;
+  const targetCanRefresh = targetEnabled && Boolean(sourceReady) &&
+    (status === 'awaiting_confirm' || status === 'completed' || status === 'stopped') &&
+    Array.isArray(task?.results) && task.results.length > 0;
   const canBatch =
     onBoss &&
-    hasPass &&
+    (hasPass || targetCanRefresh) &&
     !executionBusy &&
     status !== 'previewing' &&
     // 暂停中应走「继续」，避免和队列冲突
@@ -1645,7 +1665,7 @@ function updateTaskUI(task, runner = {}) {
     $('btnStart').disabled = !canBatch;
     $('btnStart').classList.toggle('is-armed', canBatch && (status === 'awaiting_confirm' || status === 'completed' || status === 'stopped'));
     $('btnStart').title = canBatch
-      ? (hasPending ? '批量投递当前勾选/剩余通过岗位' : '批量投递勾选岗位')
+      ? (targetEnabled ? `目标模式：投递至 ${$('targetDeliveryCount')?.value || task?.targetCount || 10} 份成功` : (hasPending ? '批量投递当前勾选/剩余通过岗位' : '批量投递勾选岗位'))
       : (isRunning ? '任务运行中，请先停止' : isPaused ? '任务已暂停，请点继续或先停止' : '请先扫描预览');
   }
   if ($('btnTestOne')) {
@@ -1654,6 +1674,23 @@ function updateTaskUI(task, runner = {}) {
     $('btnTestOne').disabled = !canOne;
     $('btnTestOne').classList.toggle('is-armed', canOne && (status === 'completed' || status === 'stopped' || status === 'awaiting_confirm'));
     $('btnTestOne').title = canOne ? '每次只投 1 个尚未投过的通过岗位' : (isPaused ? '请先停止或继续当前任务' : '请先扫描预览');
+  }
+  if ($('btnTargetMode')) {
+    const active = state.targetModeEnabled === true;
+    $('btnTargetMode').disabled = !onBoss || executionBusy;
+    $('btnTargetMode').classList.toggle('is-armed', active);
+    $('btnTargetMode').setAttribute('aria-pressed', active ? 'true' : 'false');
+    $('btnTargetMode').textContent = active ? '目标模式：开启' : '目标模式：关闭';
+    $('btnTargetMode').title = active ? '批量投递将持续刷新列表，直到成功达到目标份数' : '开启后批量投递会自动刷新列表，直到成功达到目标份数';
+  }
+  if ($('targetDeliveryCount')) {
+    const targetInput = $('targetDeliveryCount');
+    const targetCountValue = state.targetCountDraft ||
+      (task?.targetMode && Number(task.targetCount) > 0 ? String(task.targetCount) : '');
+    if (targetCountValue && document.activeElement !== targetInput) {
+      targetInput.value = targetCountValue;
+    }
+    targetInput.disabled = !onBoss || executionBusy || !targetEnabled;
   }
   if ($('btnPreview')) $('btnPreview').disabled = !(onBoss && !executionBusy && status !== 'running');
   if ($('btnDiagnose')) $('btnDiagnose').disabled = !onBoss;
@@ -2788,6 +2825,8 @@ function bindEvents() {
         buttons: {
           preview: { disabled: !!$('btnPreview')?.disabled },
           testOne: { disabled: !!$('btnTestOne')?.disabled, title: $('btnTestOne')?.title || '' },
+          targetMode: { enabled: state.targetModeEnabled === true, disabled: !!$('btnTargetMode')?.disabled, title: $('btnTargetMode')?.title || '' },
+          targetCount: $('targetDeliveryCount')?.value || '',
           start: { disabled: !!$('btnStart')?.disabled }
         },
         runner: state.config?.runner || null,
@@ -2859,6 +2898,10 @@ function bindEvents() {
             }, {}),
           currentJobId: state.config?.task?.currentJobId || '',
           pauseReason: state.config?.task?.pauseReason || '',
+          targetMode: state.config?.task?.targetMode === true,
+          targetCount: state.config?.task?.targetCount || 0,
+          targetRefreshCount: state.config?.task?.targetRefreshCount || 0,
+          targetLastError: state.config?.task?.targetLastError || '',
           testedJobIds: state.config?.task?.testedJobIds || [],
           items: (state.config?.task?.items || []).slice(-3).map((it) => ({
             jobId: it.jobId,
@@ -2895,7 +2938,7 @@ function bindEvents() {
         previewPass: 0
       };
       updateTaskUI(state.config.task, state.config.runner);
-      const res = await api(MSG.RUN_PREVIEW, { scroll: true, maxScanMs: 60000 });
+      const res = await api(MSG.RUN_PREVIEW, { scroll: true, maxScanMs: 60000, captureSourceContext: true });
       if (!res?.ok) {
         if (res?.error === 'OP_CANCELLED') {
           toast('已取消本次扫描，上一次预览结果已保留', 'warn', 3500);
@@ -2926,6 +2969,30 @@ function bindEvents() {
     }
   });
 
+  $('btnTargetMode')?.addEventListener('click', () => {
+    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
+    state.targetModeEnabled = !state.targetModeEnabled;
+    if (state.targetModeEnabled && !$('targetDeliveryCount')?.value) {
+      $('targetDeliveryCount').value = '10';
+    }
+    if (state.targetModeEnabled && !state.targetCountDraft) {
+      state.targetCountDraft = String($('targetDeliveryCount')?.value || '10');
+    }
+    updateTaskUI(state.config?.task, state.config?.runner || {});
+    toast(state.targetModeEnabled ? '目标模式已开启：批量投递会自动刷新补充岗位' : '目标模式已关闭：按当前批次投递', 'success', 2200);
+  });
+
+  $('targetDeliveryCount')?.addEventListener('input', () => {
+    state.targetCountDraft = String($('targetDeliveryCount').value || '');
+  });
+
+  $('targetDeliveryCount')?.addEventListener('change', () => {
+    const input = $('targetDeliveryCount');
+    const value = Math.max(1, Math.min(500, Math.floor(Number(input.value) || 1)));
+    input.value = String(value);
+    state.targetCountDraft = String(value);
+  });
+
   $('btnDiagnose')?.addEventListener('click', async () => {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
     toast('正在诊断页面…', 'warn', 1200);
@@ -2951,6 +3018,8 @@ function bindEvents() {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
     let selectedJobIds = Array.from(state.selected || []);
     const task = state.config?.task;
+    const targetMode = state.targetModeEnabled === true;
+    const targetCount = Math.max(1, Math.min(500, Math.floor(Number($('targetDeliveryCount')?.value || 0))));
     const doneIds = collectDoneJobIds(task?.items, task?.queue, task?.testedJobIds);
     // 若没勾选，或勾选的都已投完：自动改选剩余未投通过岗
     const pendingPassIds = (task?.results || [])
@@ -2962,7 +3031,7 @@ function bindEvents() {
     } else {
       selectedJobIds = selectedPending;
     }
-    if (!selectedJobIds.length) {
+    if (!selectedJobIds.length && !(targetMode && task?.results?.length)) {
       toast('没有可批量投递的岗位：请重新扫描，或勾选尚未投过的通过岗位', 'error', 4000);
       return;
     }
@@ -2977,12 +3046,20 @@ function bindEvents() {
       showErrorModal('保存失败', String(e?.message || e || '无法保存当前配置'), { showRetry: false });
       return;
     }
-    const res = await api(MSG.CONFIRM_AND_START, { selectedJobIds, mode: 'batch' });
+    const res = await api(MSG.CONFIRM_AND_START, {
+      selectedJobIds,
+      mode: 'batch',
+      targetMode,
+      targetCount
+    });
     if (!res?.ok) {
       toast(res?.message || res?.error || '启动失败', 'error', 3500);
       showErrorModal('启动失败', res?.message || res?.error || '无法开始任务', { showRetry: false });
     } else {
-      const message = res.scheduled
+      state.targetCountDraft = '';
+      const message = res.targetMode
+        ? `目标模式已开始：成功目标 ${res.targetCount} 份，不足时会自动刷新列表`
+        : res.scheduled
         ? '已加入定时队列，将在下一个投递时段自动开始'
         : res.splitView?.ok
           ? '已开始投递 · 已打开左右分屏'

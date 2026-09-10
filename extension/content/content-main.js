@@ -22,6 +22,8 @@
     SCROLL_LIST_TOP: "BHT_SCROLL_LIST_TOP",
     CLOSE_CHAT: "BHT_CLOSE_CHAT",
     DIAGNOSE: "BHT_DIAGNOSE",
+    GET_JOB_SOURCE_CONTEXT: "BHT_GET_JOB_SOURCE_CONTEXT",
+    RESTORE_JOB_SOURCE_CONTEXT: "BHT_RESTORE_JOB_SOURCE_CONTEXT",
     RUN_OP: "BHT_RUN_OP",
     CANCEL_OP: "BHT_CANCEL_OP",
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
@@ -68,6 +70,7 @@
   })();
   const nativeGreetingReceipts = [];
   const jobNetworkMetadata = new Map();
+  let latestJobListRequest = null;
 
   function rememberJobNetworkMetadata(raw = {}) {
     const jobId = String(raw.jobId || '').trim();
@@ -102,6 +105,17 @@
     if (event.source !== window || event.origin !== location.origin) return;
     const data = event.data;
     if (!data || data.source !== "bht-page-network-hook") return;
+    if (data.type === "job-list-context") {
+      latestJobListRequest = {
+        href: String(data.href || ""),
+        encryptExpectId: String(data.encryptExpectId || "").trim(),
+        filterParams: data.filterParams && typeof data.filterParams === "object"
+          ? { ...data.filterParams }
+          : {},
+        at: Number(data.at || Date.now())
+      };
+      return;
+    }
     if (data.type === "job-metadata") {
       for (const job of Array.isArray(data.jobs) ? data.jobs : []) rememberJobNetworkMetadata(job);
       return;
@@ -344,8 +358,447 @@
     }
   }
 
+  function normalizeExpectText(value) {
+    return String(value || "")
+      .replace(/[\s\u00a0]+/g, "")
+      .replace(/[（]/g, "(")
+      .replace(/[）]/g, ")")
+      .trim();
+  }
+
+  function expectationDisplayLabel(item = {}) {
+    const position = String(item.positionName || item.position || "").trim();
+    const location = String(item.locationName || item.location || "").trim();
+    if (!position) return location;
+    if (!location || normalizeExpectText(position).includes(normalizeExpectText(location))) return position;
+    return `${position}(${location})`;
+  }
+
+  function expectationKey(item = {}) {
+    return String(item.encryptId || item.encryptExpectId || item.id || "").trim();
+  }
+
+  function getJobExpectTabs() {
+    try {
+      const nodes = Array.from(document.querySelectorAll(
+        ".c-expect-select a, .expect-and-search a, a.expect-item, a.synthesis"
+      ));
+      const seen = new Set();
+      return nodes.filter((el) => {
+        if (seen.has(el)) return false;
+        seen.add(el);
+        const cls = String(el.className || "");
+        const ka = String(el.getAttribute?.("ka") || "");
+        const text = textOf(el).replace(/\s+/g, " ").trim();
+        return text && (
+          /(^|\s)expect-item(\s|$)/.test(cls) ||
+          /(^|\s)synthesis(\s|$)/.test(cls) ||
+          /jobs_recommend_tab_click|expect/.test(ka)
+        );
+      });
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function isActiveJobExpectTab(el) {
+    const cls = String(el?.className || "");
+    return /(^|\s)(active|selected|current|on)(\s|$)/i.test(cls) ||
+      el?.getAttribute?.("aria-selected") === "true";
+  }
+
+  function readLastJobListRequest() {
+    const live = latestJobListRequest && typeof latestJobListRequest === "object"
+      ? latestJobListRequest
+      : null;
+    let latest = live;
+    try {
+      const entries = performance.getEntriesByType("resource")
+        .map((entry) => String(entry.name || ""))
+        .filter((href) => /\/wapi\/zpgeek\/(?:search\/joblist|pc\/recommend\/job\/list|pc\/special\/zone\/joblist)\.json/i.test(href));
+      for (const href of entries) {
+        try {
+          const parsed = new URL(href, location.origin);
+          const filterParams = {};
+          for (const key of ["jobType", "salary", "experience", "degree", "industry", "scale"]) {
+            filterParams[key] = String(parsed.searchParams.get(key) || "").trim();
+          }
+          latest = {
+            href: parsed.href,
+            encryptExpectId: String(parsed.searchParams.get("encryptExpectId") || "").trim(),
+            filterParams,
+            at: Number(latest?.at || 0) || Date.now()
+          };
+        } catch (_) {}
+      }
+    } catch (_) {}
+    return latest || {
+      href: "",
+      encryptExpectId: "",
+      filterParams: {},
+      at: 0
+    };
+  }
+
+  function normalizeFilterSignature(signature = {}) {
+    const request = {};
+    const sourceRequest = signature?.request && typeof signature.request === "object"
+      ? signature.request
+      : {};
+    for (const key of ["jobType", "salary", "experience", "degree", "industry", "scale"]) {
+      request[key] = String(sourceRequest[key] || "").trim();
+    }
+    const hints = Array.from(new Set(
+      (Array.isArray(signature?.hints) ? signature.hints : [])
+        .map((hint) => String(hint || "").replace(/\s+/g, " ").trim())
+        .filter(Boolean)
+    )).sort();
+    return { request, hints };
+  }
+
+  function buildLiveFilterSignature(request = readLastJobListRequest()) {
+    const domRequest = detectActiveFilterRequest();
+    const requestFromPage = request?.filterParams || {};
+    return normalizeFilterSignature({
+      request: Object.fromEntries(FILTER_REQUEST_KEYS.map((key) => [
+        key,
+        String(domRequest[key] || requestFromPage[key] || '').trim()
+      ])),
+      hints: detectActiveFilterHints()
+    });
+  }
+
+  function readEffectiveFilterRequest(request = readLastJobListRequest()) {
+    return buildLiveFilterSignature(request).request;
+  }
+
+  let jobExpectationsCache = { at: 0, items: [] };
+  async function readJobExpectations({ force = false } = {}) {
+    if (!force && Date.now() - jobExpectationsCache.at < 15000) return jobExpectationsCache.items;
+    try {
+      const url = new URL("/wapi/zpgeek/pc/recommend/expect/list.json", location.origin);
+      url.searchParams.set("_", String(Date.now()));
+      const response = await fetch(url.href, { credentials: "include" });
+      const payload = await response.json();
+      const data = payload?.zpData || {};
+      const items = [
+        ...(Array.isArray(data.expectList) ? data.expectList : []),
+        ...(Array.isArray(data.partTimeExpectList) ? data.partTimeExpectList : [])
+      ].map((item) => ({
+        id: String(item?.id || "").trim(),
+        encryptId: String(item?.encryptId || item?.encryptExpectId || "").trim(),
+        positionName: String(item?.positionName || item?.position || "").trim(),
+        locationName: String(item?.locationName || item?.location || "").trim(),
+        label: expectationDisplayLabel(item)
+      })).filter((item) => item.id || item.encryptId || item.label);
+      jobExpectationsCache = { at: Date.now(), items };
+      return items;
+    } catch (_) {
+      return jobExpectationsCache.items || [];
+    }
+  }
+
+  async function getJobSourceContext({ refreshExpectations = false } = {}) {
+    const tabs = getJobExpectTabs();
+    const activeTabs = tabs.filter(isActiveJobExpectTab);
+    const request = readLastJobListRequest();
+    const base = {
+      sourceType: "unknown",
+      expectationKey: "",
+      expectationLabel: "",
+      selectedLabel: activeTabs.length === 1 ? textOf(activeTabs[0]).replace(/\s+/g, " ").trim() : "",
+      filterSignature: buildLiveFilterSignature(request),
+      selectionEvidence: {
+        domActiveCount: activeTabs.length,
+        requestEncryptExpectId: request.encryptExpectId || "",
+        requestMatches: request.encryptExpectId === "",
+        requestHref: request.href || "",
+        requestAt: request.at || 0
+      },
+      capturedAt: Date.now()
+    };
+    if (activeTabs.length !== 1) {
+      return { ok: true, context: { ...base, error: activeTabs.length ? "EXPECTATION_SELECTION_AMBIGUOUS" : "EXPECTATION_SELECTION_NOT_FOUND" } };
+    }
+    const active = activeTabs[0];
+    const activeLabel = base.selectedLabel;
+    const cls = String(active.className || "");
+    const isRecommend = /(^|\s)synthesis(\s|$)/.test(cls) ||
+      String(active.getAttribute?.("ka") || "").includes("jobs_recommend_tab_click") ||
+      activeLabel === "推荐";
+    if (isRecommend) {
+      return { ok: true, context: { ...base, sourceType: "recommend", expectationLabel: "推荐" } };
+    }
+    const items = await readJobExpectations({ force: refreshExpectations });
+    const wanted = normalizeExpectText(activeLabel);
+    const matches = items.filter((item) => {
+      const label = normalizeExpectText(item.label);
+      return label === wanted || normalizeExpectText(item.positionName) === wanted ||
+        (wanted.includes(normalizeExpectText(item.positionName)) &&
+          (!item.locationName || wanted.includes(normalizeExpectText(item.locationName))));
+    });
+    if (matches.length !== 1) {
+      return {
+        ok: true,
+        context: {
+          ...base,
+          sourceType: "expectation",
+          expectationLabel: activeLabel,
+          error: matches.length ? "EXPECTATION_AMBIGUOUS" : "EXPECTATION_ID_NOT_FOUND"
+        }
+      };
+    }
+    const item = matches[0];
+    return {
+      ok: true,
+      context: {
+        ...base,
+        sourceType: "expectation",
+        expectationKey: expectationKey(item),
+        expectationId: item.id,
+        expectationLabel: item.label || activeLabel,
+        selectedLabel: activeLabel,
+        selectionEvidence: {
+          ...base.selectionEvidence,
+          expectedEncryptExpectId: expectationKey(item),
+          requestMatches: request.encryptExpectId === expectationKey(item)
+        }
+      }
+    };
+  }
+
+  const FILTER_REQUEST_KEYS = ["jobType", "salary", "experience", "degree", "industry", "scale"];
+  const FILTER_OPTION_PREFIXES = {
+    jobType: "sel-job-rec-jobType-",
+    salary: "sel-job-rec-salary-",
+    experience: "sel-job-rec-exp-",
+    degree: "sel-job-rec-degree-",
+    industry: "sel-industry-",
+    scale: "sel-job-rec-scale-"
+  };
+
+  function filterRequestMatches(expected = {}, actual = {}) {
+    return FILTER_REQUEST_KEYS.every((key) =>
+      String(expected?.[key] || "").trim() === String(actual?.[key] || "").trim()
+    );
+  }
+
+  function findFilterContainer(key) {
+    const prefix = FILTER_OPTION_PREFIXES[key];
+    if (!prefix) return null;
+    return Array.from(document.querySelectorAll(".condition-filter-select, .condition-industry-select"))
+      .find((container) => Array.from(container.querySelectorAll("[ka]"))
+        .some((el) => String(el.getAttribute("ka") || "").startsWith(prefix))) || null;
+  }
+
+  function findFilterOption(key, value) {
+    const prefix = FILTER_OPTION_PREFIXES[key];
+    if (!prefix) return null;
+    const wanted = `${prefix}${String(value || "").trim()}`;
+    return Array.from(document.querySelectorAll("[ka]"))
+      .find((el) => String(el.getAttribute("ka") || "") === wanted) || null;
+  }
+
+  function filterOptionText(el) {
+    return Array.from(el?.childNodes || [])
+      .filter((node) => node.nodeType === 3)
+      .map((node) => String(node.textContent || ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function filterHintMatches(optionText, hints = []) {
+    const option = normalizeExpectText(optionText);
+    if (!option || option === "不限") return false;
+    return (hints || []).some((hint) => {
+      const normalized = normalizeExpectText(hint);
+      return normalized === option || normalized.includes(option) || option.includes(normalized);
+    });
+  }
+
+  function findFilterOptionByHints(key, hints = []) {
+    const prefix = FILTER_OPTION_PREFIXES[key];
+    if (!prefix) return null;
+    return Array.from(document.querySelectorAll("[ka]"))
+      .filter((el) => String(el.getAttribute("ka") || "").startsWith(prefix))
+      .find((el) => filterHintMatches(filterOptionText(el), hints)) || null;
+  }
+
+  function filterOptionValue(key, option) {
+    const prefix = FILTER_OPTION_PREFIXES[key];
+    const ka = String(option?.getAttribute?.("ka") || "");
+    return prefix && ka.startsWith(prefix) ? ka.slice(prefix.length) : "";
+  }
+
+  async function restoreFilterRequest(signature = {}, deadline = Date.now() + 12000) {
+    const expected = normalizeFilterSignature(signature);
+    const targets = FILTER_REQUEST_KEYS
+      .map((key) => {
+        if (expected.request[key]) return { key, value: expected.request[key] };
+        const option = findFilterOptionByHints(key, expected.hints);
+        const value = filterOptionValue(key, option);
+        return value && value !== "0" ? { key, value, option } : null;
+      })
+      .filter(Boolean);
+    const expectedHasRequest = FILTER_REQUEST_KEYS.some((key) => expected.request[key]);
+    for (const target of targets) {
+      const { key, value } = target;
+      if (expectedHasRequest && readEffectiveFilterRequest()[key] === value) continue;
+      const container = findFilterContainer(key);
+      if (!container) {
+        return { ok: false, error: "FILTER_CONTAINER_NOT_FOUND", key, value };
+      }
+      clickLikeHuman(container.querySelector(".current-select") || container);
+      let option = null;
+      while (Date.now() < deadline) {
+        option = findFilterOption(key, value);
+        if (option) break;
+        await sleep(120);
+      }
+      if (!option) {
+        return { ok: false, error: "FILTER_OPTION_NOT_FOUND", key, value };
+      }
+      clickLikeHuman(option);
+      let applied = false;
+      while (Date.now() < deadline) {
+        if (readEffectiveFilterRequest()[key] === value) {
+          applied = true;
+          break;
+        }
+        await sleep(180);
+      }
+      if (!applied) {
+        return { ok: false, error: "FILTER_REQUEST_NOT_UPDATED", key, value };
+      }
+    }
+    const request = readLastJobListRequest();
+    const effectiveRequest = readEffectiveFilterRequest(request);
+    const actualHints = detectActiveFilterHints();
+    const hintsMatch = !expected.hints.length || expected.hints.every((hint) =>
+      actualHints.some((actual) => normalizeExpectText(actual) === normalizeExpectText(hint))
+    );
+    return {
+      ok: expectedHasRequest ? filterRequestMatches(expected.request, effectiveRequest) : hintsMatch,
+      request,
+      effectiveRequest,
+      actualHints,
+      expected: expected.request
+    };
+  }
+
+  async function restoreJobSourceContext(payload = {}) {
+    const expected = payload?.sourceContext || payload || {};
+    const sourceType = String(expected.sourceType || "unknown");
+    if (sourceType !== "recommend" && sourceType !== "expectation") {
+      return { ok: false, error: "JOB_SOURCE_UNKNOWN", message: "扫描时没有记录可恢复的求职期望来源" };
+    }
+    const deadline = Date.now() + Math.max(3000, Number(payload?.timeoutMs || 12000));
+    const waitForTabs = async () => {
+      while (Date.now() < deadline) {
+        if (getJobExpectTabs().length) return true;
+        await sleep(250);
+      }
+      return false;
+    };
+    if (!await waitForTabs()) {
+      return { ok: false, error: "EXPECTATION_UI_NOT_READY", message: "BOSS 求职期望区域未加载完成" };
+    }
+    const clickTab = (tab) => {
+      clickLikeHuman(tab);
+      return true;
+    };
+    if (sourceType === "recommend") {
+      const recommend = getJobExpectTabs().find((el) => {
+        const cls = String(el.className || "");
+        return /(^|\s)synthesis(\s|$)/.test(cls) || textOf(el).replace(/\s+/g, " ").trim() === "推荐";
+      });
+      if (!recommend) return { ok: false, error: "RECOMMEND_TAB_NOT_FOUND", message: "未找到 BOSS 的推荐入口" };
+      if (!isActiveJobExpectTab(recommend)) clickTab(recommend);
+    } else {
+      const items = await readJobExpectations({ force: true });
+      const matches = items.filter((item) => expectationKey(item) === String(expected.expectationKey || ""));
+      if (matches.length !== 1) {
+        return { ok: false, error: matches.length ? "EXPECTATION_AMBIGUOUS" : "EXPECTATION_NOT_FOUND", message: "BOSS 当前账号中找不到原求职期望，已停止恢复" };
+      }
+      const wantedLabel = normalizeExpectText(matches[0].label || expected.expectationLabel);
+      let nodes = [];
+      while (Date.now() < deadline) {
+        nodes = getJobExpectTabs().filter((el) => {
+          const cls = String(el.className || "");
+          if (!/(^|\s)expect-item(\s|$)/.test(cls)) return false;
+          const text = normalizeExpectText(textOf(el));
+          return text === wantedLabel || text === normalizeExpectText(expected.expectationLabel) ||
+            text === normalizeExpectText(matches[0].positionName);
+        });
+        if (nodes.length) break;
+        await sleep(250);
+      }
+      if (nodes.length !== 1) {
+        return { ok: false, error: nodes.length ? "EXPECTATION_TAB_AMBIGUOUS" : "EXPECTATION_TAB_NOT_FOUND", message: "未找到唯一的目标求职期望入口，已停止恢复" };
+      }
+      const target = nodes[0];
+      if (!isActiveJobExpectTab(target)) clickTab(target);
+    }
+
+    while (Date.now() < deadline) {
+      const context = await getJobSourceContext({ refreshExpectations: false });
+      const current = context.context || {};
+      const sourceMatches = sourceType === "recommend"
+        ? current.sourceType === "recommend"
+        : current.sourceType === "expectation" && current.expectationKey === String(expected.expectationKey || "");
+      const requestMatches = sourceType === "recommend"
+        ? current.selectionEvidence?.requestEncryptExpectId === ""
+        : current.selectionEvidence?.requestEncryptExpectId === String(expected.expectationKey || "");
+      if (sourceMatches && requestMatches) {
+        const filters = await restoreFilterRequest(expected.filterSignature || {}, deadline);
+        if (!filters.ok) {
+          return {
+            ok: false,
+            error: "FILTER_RESTORE_FAILED",
+            message: `普通筛选恢复失败（${filters.key || filters.error || "请求未匹配"}），已停止扫描`,
+            context: current,
+            filters
+          };
+        }
+        const verified = await getJobSourceContext({ refreshExpectations: false });
+        const verifiedContext = verified.context || {};
+        const verifiedSource = sourceType === "recommend"
+          ? verifiedContext.sourceType === "recommend"
+          : verifiedContext.sourceType === "expectation" && verifiedContext.expectationKey === String(expected.expectationKey || "");
+        const verifiedRequest = sourceType === "recommend"
+          ? verifiedContext.selectionEvidence?.requestEncryptExpectId === ""
+          : verifiedContext.selectionEvidence?.requestEncryptExpectId === String(expected.expectationKey || "");
+        const expectedFilters = normalizeFilterSignature(expected.filterSignature || {});
+        const verifiedFilters = expectedFilters.request && FILTER_REQUEST_KEYS.some((key) => expectedFilters.request[key])
+          ? filterRequestMatches(expectedFilters.request, verifiedContext.filterSignature?.request || {})
+          : expectedFilters.hints.every((hint) =>
+            (verifiedContext.filterSignature?.hints || []).some((actual) =>
+              normalizeExpectText(actual) === normalizeExpectText(hint)
+            )
+          );
+        if (verifiedSource && verifiedRequest && verifiedFilters) {
+          return {
+            ok: true,
+            context: verifiedContext,
+            restored: true,
+            filtersRestored: true,
+            filterEvidence: filters
+          };
+        }
+      }
+      await sleep(300);
+    }
+    return { ok: false, error: "JOB_SOURCE_RESTORE_VERIFY_FAILED", message: "已尝试恢复求职期望，但页面状态或岗位请求未验证通过" };
+  }
+
   function detectSelectedJobExpect() {
     try {
+      const exactActive = getJobExpectTabs().filter(isActiveJobExpectTab);
+      if (exactActive.length === 1) {
+        const exactText = textOf(exactActive[0]).replace(/\s+/g, " ").trim();
+        if (exactText) return exactText;
+      }
       const selectors = [
         ".expect-list .active",
         ".expect-list .selected",
@@ -397,10 +850,38 @@
         const t = textOf(el).replace(/\s+/g, " ").trim();
         if (t && t.length <= 30 && !hints.includes(t)) hints.push(t);
       }
+      // BOSS keeps the selected option in the hidden dropdown. Its text is
+      // still reliable, while the visible filter label only says "(1)".
+      for (const key of FILTER_REQUEST_KEYS) {
+        const prefix = FILTER_OPTION_PREFIXES[key];
+        if (!prefix) continue;
+        const selected = Array.from(document.querySelectorAll(`[ka^="${prefix}"]`))
+          .filter((el) => /(^|\s)active(\s|$)/i.test(String(el.className || '')) || el.getAttribute('aria-selected') === 'true');
+        for (const el of selected) {
+          const t = textOf(el).replace(/\s+/g, " ").trim();
+          if (t && t.length <= 30 && t !== '不限' && !hints.includes(t)) hints.push(t);
+        }
+      }
       return hints.slice(0, 12);
     } catch (_) {
       return [];
     }
+  }
+
+  function detectActiveFilterRequest() {
+    const result = Object.fromEntries(FILTER_REQUEST_KEYS.map((key) => [key, '']));
+    try {
+      for (const key of FILTER_REQUEST_KEYS) {
+        const prefix = FILTER_OPTION_PREFIXES[key];
+        if (!prefix) continue;
+        const values = Array.from(document.querySelectorAll(`[ka^="${prefix}"]`))
+          .filter((el) => /(^|\s)active(\s|$)/i.test(String(el.className || '')) || el.getAttribute('aria-selected') === 'true')
+          .map((el) => String(el.getAttribute('ka') || '').slice(prefix.length).trim())
+          .filter((value) => value && value !== '0');
+        result[key] = Array.from(new Set(values)).join(',');
+      }
+    } catch (_) {}
+    return result;
   }
 
   function getSavedListCtx() {
@@ -5330,7 +5811,7 @@ async function startChat(job, opts = {}) {
 
 async function runOpByType(type, payload = {}) {
     const lockKey = String(type || '');
-    const needLock = /START_CHAT|INSPECT_JOB_DETAIL|ENRICH_JOB_ACTIVITY|TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SCAN_JOBS/.test(lockKey);
+    const needLock = /START_CHAT|INSPECT_JOB_DETAIL|ENRICH_JOB_ACTIVITY|TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SCAN_JOBS|RESTORE_JOB_SOURCE_CONTEXT/.test(lockKey);
     if (needLock) {
       if (window.__BHT_OP_LOCK__) {
         return { ok: false, error: 'OP_BUSY', message: '已有操作进行中', contentVersion: BHT_CONTENT_VERSION };
@@ -5348,6 +5829,10 @@ async function runOpByType(type, payload = {}) {
         };
       case MSG.DIAGNOSE:
         return { ok: true, ...diagnose(), contentVersion: BHT_CONTENT_VERSION };
+      case MSG.GET_JOB_SOURCE_CONTEXT:
+        return { ...(await getJobSourceContext({ refreshExpectations: payload?.refreshExpectations === true })), contentVersion: BHT_CONTENT_VERSION };
+      case MSG.RESTORE_JOB_SOURCE_CONTEXT:
+        return { ...(await restoreJobSourceContext(payload || {})), contentVersion: BHT_CONTENT_VERSION };
       case MSG.SCAN_JOBS:
         return await scanJobs(payload || {});
       case MSG.INSPECT_JOB_DETAIL:
