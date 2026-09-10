@@ -63,6 +63,8 @@ const state = {
   targetCountDraft: '',
   messageDirty: false,
   messageRevision: 0,
+  lastPersistedConfigSections: null,
+  lastRemoteConfigSections: null,
   activeProfileId: null,
   draftBindings: [],
   lastCompletionSignalId: '',
@@ -90,6 +92,77 @@ const state = {
     textSaving: false
   }
 };
+
+function stableConfigValue(value) {
+  if (Array.isArray(value)) return value.map(stableConfigValue);
+  if (value && typeof value === 'object') {
+    return Object.keys(value).sort().reduce((out, key) => {
+      out[key] = stableConfigValue(value[key]);
+      return out;
+    }, {});
+  }
+  return value;
+}
+
+function configSectionSignature(value) {
+  return JSON.stringify(stableConfigValue(value));
+}
+
+function configSections(config = {}) {
+  return {
+    settings: config.settings || {},
+    filters: config.filters || {},
+    lists: config.lists || {},
+    messageTemplate: config.messageTemplate || {},
+    resumes: config.resumes || {},
+    bindings: config.bindings || {}
+  };
+}
+
+function rememberPersistedConfig(config = state.config) {
+  state.lastPersistedConfigSections = structuredClone(configSections(config));
+}
+
+function localConfigSections(remote = {}) {
+  const base = state.config || remote || {};
+  let messageTemplate = base.messageTemplate || remote.messageTemplate || {};
+  let filters = remote.filters || base.filters || {};
+  let lists = remote.lists || base.lists || {};
+  let bindings = remote.bindings || base.bindings || {};
+  try { messageTemplate = readTemplate(messageTemplate, { bumpVersion: false }); } catch (_) {}
+  try { filters = readFilters(); } catch (_) {}
+  try {
+    lists = {
+      companyBlacklist: parseKeywords(($('blacklist')?.value || '').replace(/\n/g, ',')),
+      companyWhitelist: parseKeywords(($('whitelist')?.value || '').replace(/\n/g, ','))
+    };
+  } catch (_) {}
+  try {
+    bindings = {
+      rules: readBindingsFromDom()
+        .filter((r) => (r.keywords || []).length && r.profileId)
+        .sort((a, b) => (a.priority || 0) - (b.priority || 0))
+    };
+  } catch (_) {}
+  const sections = {
+    settings: (() => {
+      try { return readSettingsPatch(base.settings || remote.settings || {}); } catch (_) { return base.settings || remote.settings || {}; }
+    })(),
+    filters,
+    lists,
+    messageTemplate,
+    resumes: structuredClone(base.resumes || remote.resumes || {}),
+    bindings
+  };
+  const files = $('imageFiles')?.files;
+  if (files?.length) {
+    sections.resumes = {
+      ...sections.resumes,
+      __pendingFiles: Array.from(files).map((file) => ({ name: file.name, size: file.size, type: file.type }))
+    };
+  }
+  return sections;
+}
 
 function applyTheme(theme) {
   const next = theme === 'light' ? 'light' : 'dark';
@@ -2018,6 +2091,11 @@ async function refresh(options = {}) {
   lastFullRefreshAt = Date.now();
   const res = await api(MSG.GET_STATE);
   if (!res?.ok) return;
+  const remoteConfigSections = configSections(res);
+  state.lastRemoteConfigSections = structuredClone(remoteConfigSections);
+  if (!state.lastPersistedConfigSections || (!state.formDirty && !state.messageDirty)) {
+    state.lastPersistedConfigSections = structuredClone(remoteConfigSections);
+  }
   state.runtimeVersion = String(res.runtimeVersion || '');
   state.runtimeVersionChecked = true;
   state.runtimeVersionMismatch = state.runtimeVersion !== BHT_UI_VERSION;
@@ -2138,6 +2216,7 @@ async function saveFilters(opts = {}) {
     state.formDirty = false;
     await refresh({ soft: true });
   }
+  rememberPersistedConfig();
 }
 
 async function saveMessage(opts = {}) {
@@ -2164,6 +2243,7 @@ async function saveMessage(opts = {}) {
     renderSegments(latestTemplate);
     await refresh({ soft: true });
   }
+  rememberPersistedConfig();
   return true;
 }
 
@@ -2175,6 +2255,7 @@ async function saveSettings(opts = {}) {
     state.formDirty = false;
     await refresh({ soft: true });
   }
+  rememberPersistedConfig();
 }
 
 
@@ -2329,6 +2410,7 @@ async function saveResumeNow(opts = {}) {
     try { renderProfileList(); } catch (_) {}
   }
   if (shouldRefresh) await refresh({ soft: true });
+  rememberPersistedConfig();
   return { resumes, added, skipped, duplicates };
 }
 
@@ -2342,6 +2424,7 @@ async function saveBindings(opts = {}) {
     state.formDirty = false;
     await refresh({ soft: true });
   }
+  rememberPersistedConfig();
 }
 
 
@@ -2368,16 +2451,8 @@ async function flushAutosave(options = {}) {
   autosaving = true;
   let saveFailed = false;
   try {
-    // 关键：先读齐草稿再写，中间禁止 refresh，避免新消息段被旧 storage 覆盖
-    if (state.messageDirty) {
-      try { await saveMessage({ refresh: false }); } catch (e) { saveFailed = true; console.warn('autosave message', e); }
-    }
-    try { await saveFilters({ refresh: false }); } catch (e) { saveFailed = true; console.warn('autosave filters', e); }
-    try { await saveSettings({ refresh: false }); } catch (e) { saveFailed = true; console.warn('autosave settings', e); }
-    try {
-      await saveResume({ refresh: false, render: false, clearInputs: false, includePendingFiles: false });
-    } catch (e) { saveFailed = true; console.warn('autosave resume', e); }
-    try { await saveBindings({ refresh: false }); } catch (e) { saveFailed = true; console.warn('autosave bind', e); }
+    // 关键：按基线比较后只保存真实变更的 section，并拒绝跨面板冲突。
+    try { await persistDirtyConfigSections(); } catch (e) { saveFailed = true; console.warn('autosave config', e); }
     // 输入期间不重建表单、不触发 refresh、不弹 toast；周期状态刷新会单独更新任务与日志。
     if (!saveFailed && autosaveRevision === revisionAtStart && !autosaveComposingTarget) {
       state.formDirty = false;
@@ -2406,6 +2481,69 @@ function scheduleAutosave(options = {}) {
   autosaveTimer = setTimeout(() => { flushAutosave(); }, delayMs);
 }
 
+async function persistDirtyConfigSections() {
+  if (!state.formDirty && !state.messageDirty) return;
+  // 多个 BOSS 标签页都可能挂着浮窗。启动前重新读取后台配置，并把当前面板
+  // 与上次落盘基线逐 section 比较，避免旧浮窗把另一面板的新配置整包覆盖。
+  const latest = await api(MSG.GET_STATE);
+  const remoteSections = configSections(latest || {});
+  const baseSections = state.lastPersistedConfigSections || remoteSections;
+  const localSections = localConfigSections(latest || {});
+  const localChanged = new Set();
+  const conflicts = [];
+  for (const name of Object.keys(remoteSections)) {
+    const base = configSectionSignature(baseSections[name]);
+    const local = configSectionSignature(localSections[name]);
+    const remote = configSectionSignature(remoteSections[name]);
+    const changedLocally = local !== base;
+    const changedRemotely = remote !== base;
+    if (changedLocally) localChanged.add(name);
+    if (changedLocally && changedRemotely && local !== remote) conflicts.push(name);
+  }
+  if (!localChanged.size) {
+    state.formDirty = false;
+    state.messageDirty = false;
+    state.config = { ...(state.config || {}), ...latest };
+    state.lastPersistedConfigSections = structuredClone(remoteSections);
+    return;
+  }
+  if (conflicts.length) {
+    throw new Error('配置已在其他面板更新（' + conflicts.join('、') + '），请刷新当前面板后再投递');
+  }
+  // saveMessage/saveFilters/saveResume 都会顺带保存 settings。若设置不是本面板
+  // 的改动但远端已更新，先把最新 settings 回填，避免 section 级保存再次覆盖它。
+  if (!localChanged.has('settings') &&
+      configSectionSignature(remoteSections.settings) !== configSectionSignature(baseSections.settings)) {
+    state.config = { ...(state.config || {}), settings: remoteSections.settings };
+    fillSettings(remoteSections.settings);
+  }
+  const errors = [];
+  if (localChanged.has('messageTemplate')) {
+    try { await saveMessage({ refresh: false }); } catch (e) { errors.push('消息：' + (e?.message || e)); }
+  }
+  if (localChanged.has('settings')) {
+    try { await saveSettings({ refresh: false }); } catch (e) { errors.push('设置：' + (e?.message || e)); }
+  }
+  if (localChanged.has('resumes')) {
+    // 文件必须通过简历页的显式保存导入；投递前只保存已落盘的方案元数据。
+    try { await saveResume({ refresh: false, render: false, clearInputs: false, includePendingFiles: false }); } catch (e) { errors.push('简历：' + (e?.message || e)); }
+  }
+  if (localChanged.has('filters') || localChanged.has('lists')) {
+    try { await saveFilters({ refresh: false }); } catch (e) { errors.push('筛选：' + (e?.message || e)); }
+  }
+  if (localChanged.has('bindings')) {
+    try { await saveBindings({ refresh: false }); } catch (e) { errors.push('绑定：' + (e?.message || e)); }
+  }
+  if (errors.length) {
+    throw new Error(errors.join('；'));
+  }
+  state.formDirty = false;
+  state.messageDirty = false;
+  const saved = await api(MSG.GET_STATE);
+  state.config = saved || state.config;
+  rememberPersistedConfig(saved || state.config);
+}
+
 async function ensureConfigSavedBeforeDelivery() {
   clearTimeout(autosaveTimer);
   autosaveTimer = null;
@@ -2413,20 +2551,7 @@ async function ensureConfigSavedBeforeDelivery() {
   for (let i = 0; i < 40 && autosaving; i++) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  const errors = [];
-  try { await saveMessage({ refresh: false }); } catch (e) { errors.push('消息：' + (e?.message || e)); }
-  try { await saveSettings({ refresh: false }); } catch (e) { errors.push('设置：' + (e?.message || e)); }
-  try {
-    await saveResume({ refresh: false, clearInputs: false, includePendingFiles: false });
-  } catch (e) {
-    errors.push('简历：' + (e?.message || e));
-  }
-  try { await saveFilters({ refresh: false }); } catch (e) { errors.push('筛选：' + (e?.message || e)); }
-  try { await saveBindings({ refresh: false }); } catch (e) { errors.push('绑定：' + (e?.message || e)); }
-  if (errors.length) {
-    throw new Error(errors.join('；'));
-  }
-  state.formDirty = false;
+  await persistDirtyConfigSections();
 }
 
 function wireResumeFilePreview() {
@@ -3051,6 +3176,7 @@ function bindEvents() {
     try {
       await ensureConfigSavedBeforeDelivery();
     } catch (e) {
+      $('btnStart').disabled = false;
       toast('保存配置失败，已取消投递：' + (e?.message || e), 'error', 4000);
       showErrorModal('保存失败', String(e?.message || e || '无法保存当前配置'), { showRetry: false });
       return;
@@ -3084,6 +3210,7 @@ function bindEvents() {
     try {
       await ensureConfigSavedBeforeDelivery();
     } catch (e) {
+      $('btnTestOne').disabled = false;
       toast('保存配置失败，已取消投递一份：' + (e?.message || e), 'error', 4000);
       showErrorModal('保存失败', String(e?.message || e || '无法保存当前配置'), { showRetry: false });
       return;

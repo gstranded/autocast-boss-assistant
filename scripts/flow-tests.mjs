@@ -472,11 +472,11 @@ test("autosave protects IME composition and never rebuilds message inputs", () =
   const flushStart = app.indexOf("async function flushAutosave");
   const flushEnd = app.indexOf("function scheduleAutosave", flushStart);
   const flush = app.slice(flushStart, flushEnd);
-  assert.ok(flush.includes("if (state.messageDirty)"));
+  assert.ok(flush.includes("persistDirtyConfigSections"));
   assert.ok(!flush.includes("renderSegments("));
   assert.ok(!flush.includes("refresh({ soft: true })"));
   assert.ok(!flush.includes("toast("));
-  assert.ok(flush.includes("render: false"));
+  assert.ok(app.includes("render: false"));
 });
 
 test("preview accumulates virtualized jobs until bottom or the 60 second deadline", () => {

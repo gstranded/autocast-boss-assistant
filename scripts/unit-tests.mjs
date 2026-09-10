@@ -1578,6 +1578,15 @@ test("start/test delivery refuses ALREADY_RUNNING and requires pre-save", () => 
   assert.ok(background.includes("withRunnerAdmission('starting'"));
   assert.ok(background.includes("runner.previewing"));
   assert.ok(app.includes("await ensureConfigSavedBeforeDelivery()"));
+  assert.ok(app.includes("persistDirtyConfigSections"));
+  assert.ok(app.includes("配置已在其他面板更新"),
+    "cross-panel config conflicts must block delivery instead of overwriting remote state");
+  assert.ok(app.includes("$('btnStart').disabled = false"),
+    "batch delivery must be retryable after a pre-save conflict");
+  assert.ok(app.includes("$('btnTestOne').disabled = false"),
+    "single delivery must be retryable after a pre-save conflict");
+  assert.ok(app.includes("const localChanged = new Set()"),
+    "delivery pre-save must be section-scoped");
   assert.ok(!app.includes("try { await saveSettings(); await saveResume(); await saveMessage(); } catch (_) {}"));
 });
 
