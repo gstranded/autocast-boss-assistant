@@ -2942,7 +2942,8 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
   await log('info', '预览队列已建立：' + task.queue.length + ' 个待投');
     if (!isActive()) return cancelled();
     const published = await publishPreviewTask(task, previewRunId, runner.previewPreviousTask, {
-      deferPublish: payload.targetMode === true && runner.targetLoop === true
+      deferPublish: payload.deferPublish === true ||
+        (payload.targetMode === true && runner.targetLoop === true)
     });
     if (!published) return cancelled();
 
@@ -3135,7 +3136,10 @@ async function refreshAndContinue(payload = {}, sourceTab, previewRunId = '') {
     setPreviewPhase('collecting', previewRunId);
     const fresh = await runPreview({
       ...payload,
-      captureSourceContext: true
+      captureSourceContext: true,
+      // A refresh is one logical task. Keep the temporary scan out of
+      // storage/events until it has been merged back into the original task.
+      deferPublish: true
     }, readyTab, previewRunId);
     if (!fresh?.ok || !fresh.task) return fresh;
     const merged = mergeRefreshedTask(previousTask, fresh.task, previousTask.sourceContext);

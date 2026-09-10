@@ -276,6 +276,7 @@ test("refresh and continue restores the saved source after BOSS resets the page"
   assert.ok(refresh.includes("sourceChangedBeforeRefresh"));
   assert.ok(refresh.includes("filtersChangedBeforeRefresh"));
   assert.ok(refresh.includes("RESTORE_JOB_SOURCE_CONTEXT"));
+  assert.ok(refresh.includes("deferPublish: true"), "refresh scans must defer the temporary task publish");
   assert.ok(refresh.includes("requestMatches"));
   assert.ok(refresh.includes("FILTER_RESTORE_VERIFY_FAILED"));
   assert.ok(!refresh.includes("error: 'JOB_SOURCE_CHANGED'"), "refresh preflight must not reject BOSS's temporary recommendation state");
@@ -313,7 +314,8 @@ test("target mode refreshes in the background and preserves stop/duplicate guard
   assert.ok(content.includes("selected option in the hidden dropdown"));
   assert.ok(background.includes("jobMergeKey") && background.includes("mergeRefreshedTask"));
   assert.ok(background.includes("candidate_deferred_for_target_refresh"));
-  assert.ok(background.includes("deferPublish: payload.targetMode === true && runner.targetLoop === true"));
+  assert.ok(background.includes("payload.deferPublish === true"));
+  assert.ok(background.includes("payload.targetMode === true && runner.targetLoop === true"));
 });
 
 test("single delivery counts the successful job before leaving the loop", () => {
