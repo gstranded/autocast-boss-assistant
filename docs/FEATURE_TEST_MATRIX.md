@@ -1,6 +1,6 @@
 # BOSS 海投助手功能清单与逐项验收矩阵
 
-> 基线版本：v1.7.35
+> 基线版本：v1.7.36
 > 基线提交：9f7bf42
 > 开发目录：`/Users/gaohaizhen/Desktop/boss-dev`（`dev`）  
 > 浏览器：ego-browser，加载 `boss-dev/extension`  
@@ -62,24 +62,24 @@
 
 | ID | 功能点 | 期望 | 单测/冒烟 | 独立浏览器场景 | 状态 | 证据/问题 |
 |---|---|---|---|---|---|---|
-| ENT-01 | MV3 扩展加载 | manifest 可加载，版本与运行时一致 | `manifest version + version guard` | ego 扩展页重载后显示 `1.7.35`；当前 BOSS 面板显示 `v1.7.35` 且无版本锁定 | 通过 | ego 扩展页、当前 iframe URL `v=1.7.35`、连接徽标 |
-| ENT-02 | BOSS URL 守卫 | BOSS 列表/聊天页可连接，非 BOSS 页不执行 | `boss-url` tests | BOSS 列表显示“已连接 BOSS · v1.7.35”；打开 `example.com` 后弹出页锁定为“请前往 BOSS 直聘页面使用插件”，危险按钮未执行 | 通过 | 2026-09-11 ego；BOSS 与非 BOSS 两个独立场景 |
-| ENT-03 | 浮窗打开与复用 | BOSS 页右侧浮窗可打开/关闭，重复打开不重复注入 | popup/content smoke | 列表页浮窗根节点存在，打开后只有一个 `#bht-frame`，iframe 为 `mode=float&v=1.7.35` | 通过 | 当前 BOSS DOM/Target.getTargets |
-| ENT-04 | 弹出页入口 | popup 能识别当前 BOSS 页并打开浮窗，非 BOSS 页给出引导 | popup smoke | 职位列表页真实 popup 显示“已在 BOSS 页面”并打开 `mode=float&v=1.7.35` 浮窗；聊天页明确引导到职位列表；非 BOSS 页显示通用引导 | 通过 | 2026-09-11 ego；真实 popup 列表/聊天/非 BOSS 三路径 |
-| ENT-05 | 面板六个 tab | 任务、筛选、消息、简历、记录、设置切换且表单不串页 | DOM/flow panel tests | 独立点击 6 个 tab；每个目标 tab 和 panel 均 active，最后恢复任务页 | 通过 | v1.7.35 iframe DOM |
-| ENT-06 | 明暗主题 | light/dark 切换立即生效并持久化 | panel theme tests | light 设置为 `data-theme=light`，dark 恢复为 `data-theme=dark` | 通过 | v1.7.35 iframe DOM |
-| ENT-07 | 帮助提示 | 标题旁帮助入口显示对应说明，不遮挡主要控件 | panel DOM checks | 打开任务控制说明，popover 可见且内容为对应说明 | 通过 | v1.7.35 iframe DOM |
-| ENT-08 | 版本守卫与页面刷新提示 | UI、后台、content 版本不一致时锁定危险操作并提示刷新 | mixed-version flow test | 扩展页重载后实际代码为 `1.7.35`；查询参数不能伪造旧代码，旧脚本混载由 flow contract 覆盖 | 通过（代码/flow） | 需保留旧 content 页面才能做真实混载；当前 flow contract 已覆盖锁定 |
+| ENT-01 | MV3 扩展加载 | manifest 可加载，版本与运行时一致 | `manifest version + version guard` | ego 扩展页重载后显示 `1.7.36`；当前 BOSS 面板显示 `v1.7.36` 且无版本锁定 | 通过 | ego 扩展页、当前 iframe URL `v=1.7.36`、连接徽标 |
+| ENT-02 | BOSS URL 守卫 | BOSS 列表/聊天页可连接，非 BOSS 页不执行 | `boss-url` tests | BOSS 列表显示“已连接 BOSS · v1.7.36”；打开 `example.com` 后弹出页锁定为“请前往 BOSS 直聘页面使用插件”，危险按钮未执行 | 通过 | 2026-09-11 ego；BOSS 与非 BOSS 两个独立场景 |
+| ENT-03 | 浮窗打开与复用 | BOSS 页右侧浮窗可打开/关闭，重复打开不重复注入 | popup/content smoke | 列表页浮窗根节点存在，打开后只有一个 `#bht-frame`，iframe 为 `mode=float&v=1.7.36` | 通过 | 当前 BOSS DOM/Target.getTargets |
+| ENT-04 | 弹出页入口 | popup 能识别当前 BOSS 页并打开浮窗，非 BOSS 页给出引导 | popup smoke | 职位列表页真实 popup 显示“已在 BOSS 页面”并打开 `mode=float&v=1.7.36` 浮窗；聊天页明确引导到职位列表；非 BOSS 页显示通用引导 | 通过 | 2026-09-11 ego；真实 popup 列表/聊天/非 BOSS 三路径 |
+| ENT-05 | 面板六个 tab | 任务、筛选、消息、简历、记录、设置切换且表单不串页 | DOM/flow panel tests | 独立点击 6 个 tab；每个目标 tab 和 panel 均 active，最后恢复任务页 | 通过 | v1.7.36 iframe DOM |
+| ENT-06 | 明暗主题 | light/dark 切换立即生效并持久化 | panel theme tests | light 设置为 `data-theme=light`，dark 恢复为 `data-theme=dark` | 通过 | v1.7.36 iframe DOM |
+| ENT-07 | 帮助提示 | 标题旁帮助入口显示对应说明，不遮挡主要控件 | panel DOM checks | 打开任务控制说明，popover 可见且内容为对应说明 | 通过 | v1.7.36 iframe DOM |
+| ENT-08 | 版本守卫与页面刷新提示 | UI、后台、content 版本不一致时锁定危险操作并提示刷新 | mixed-version flow test | 扩展页重载后实际代码为 `1.7.36`；查询参数不能伪造旧代码，旧脚本混载由 flow contract 覆盖 | 通过（代码/flow） | 需保留旧 content 页面才能做真实混载；当前 flow contract 已覆盖锁定 |
 | ENT-09 | 新手引导 | 首次显示、完成后不重复；设置页可重看 | onboarding flow test | 设置页重看引导，逐步通过 7 个步骤；完成后 overlay 消失并写入 `bht_onboarding.completed=true` | 通过 | 2026-09-11 ego；未修改业务配置 |
 
 ### 5.2 任务、扫描和预览
 
 | ID | 功能点 | 期望 | 单测/冒烟 | 独立浏览器场景 | 状态 | 证据/问题 |
 |---|---|---|---|---|---|---|
-| TASK-01 | 页面诊断 | 返回页面类型、关键选择器、content 版本和可操作性 | diagnose flow contract | 在职位列表点“页面诊断”，返回当前列表 URL、48 张卡片、标题节点和样例岗位；连接与日志正常 | 通过 | v1.7.35 ego 面板 |
+| TASK-01 | 页面诊断 | 返回页面类型、关键选择器、content 版本和可操作性 | diagnose flow contract | 在职位列表点“页面诊断”，返回当前列表 URL、48 张卡片、标题节点和样例岗位；连接与日志正常 | 通过 | v1.7.36 ego 面板 |
 | TASK-02 | 扫描预览只读 | 扫描不会发送沟通，完成后形成待确认任务 | preview flow tests | 本轮扫描 48 岗，建立 45 个待投队列；成功/处理均为 0，无聊天发送副作用 | 通过 | 2026-09-11 ego；面板实时日志 |
 | TASK-03 | 虚拟列表深扫 | 持续滚动到真实底部，保留中间窗口岗位，不在旧轮次上限提前结束 | preview scan contracts | 2026-09-11 ego 扫描 450 岗，滚动到 `scrollTop=66738`、`scrollHeight=67922`、74 轮后到达底部，未改变求职期望来源 | 通过 | 2026-09-11 ego；长列表中间窗口与底部均有结果 |
-| TASK-04 | 扫描进度与截止收尾 | 60 秒预算、取消和最后一批结果不会回退已采集岗位 | preview timeout contracts | 已验证扫描 runner 进入 `locating_list`；截止时间与中间收尾由 flow contract 覆盖 | 部分通过 | 2026-09-11 ego；取消单独见 TASK-11 |
+| TASK-04 | 扫描进度与截止收尾 | 60 秒预算、取消和最后一批结果不会回退已采集岗位 | preview timeout contracts | 独立边界页验证过期截止时间进入 `timeout`，截止前采集结果可在 finalization window 内保留 | 通过 | 2026-09-11 ego task 160 `boundary-audit.html`；真实账号取消路径另见 TASK-11 |
 | TASK-05 | 预览汇总 | 显示扫描总数、通过数、排除数、原因计数和风险提示 | summary/reason tests | 汇总显示扫描 48、通过 45、排除 3，并提示通过率超过 80%；与 48 条明细一致 | 通过 | 2026-09-11 ego |
 | TASK-06 | 明细可解释原因 | 每个岗位显示职位、公司、地点、薪资、决定和原因 | filter/reason tests | 明细显示职位/公司/地点/薪资；3 条排除分别显示已处理、JD 排除词、职位排除词 | 通过 | 2026-09-11 ego |
 | TASK-07 | 预览勾选 | 通过项默认勾选，可逐个取消；取消后不能进入投递队列 | queue flow tests | 45 个通过项默认勾选；取消一个后变 44，恢复后回到 45，未启动投递 | 通过 | 2026-09-11 ego |
@@ -138,7 +138,7 @@
 | MSG-07 | 消息变量渲染 | HR、职位、公司、技能、城市替换；缺失变量阻止裸占位符发送 | template/unit tests | 真实测试先故意加入未绑定的 `{匹配技能}`，会话已打开但发送前暂停；修正模板后实际发送“测试变量：运维工程师｜颐能软件｜广州·黄埔区·大沙｜曾女士”，收到 `TEXT_SENT` | 通过 | 2026-09-11 ego + unit；原模板已恢复 |
 | MSG-08 | 自动招呼已发送 | 平台回执确认已发送时跳过所有 greeting，只发 supplement | greeting-policy tests | 已有真实回执日志显示检测到 BOSS 已发送招呼，随后仅准备/发送第 2 段并收到确认 | 通过 | 2026-09-11 ego；未新增消息 |
 | MSG-09 | 自动招呼未发送 | 未发送时按页面顺序发送全部启用段 | greeting-policy tests | 临时关闭 BOSS 自动招呼后，对“机房运维”真实测试显示 `not_sent`，插件按第 1 段招呼→第 2 段补充顺序各收到 `TEXT_SENT`；随后恢复 BOSS 开关 | 通过 | 2026-09-11 ego；账号设置已恢复 |
-| MSG-10 | 自动招呼未知保护 | 平台和 DOM 均无法确认时，含 greeting 模板必须暂停，不冒险发送 | greeting-policy tests | unknown receipt、页面异常和暂停门禁由 planner/flow 覆盖；真实账号未故意制造不确定会话状态 | 部分通过 | unit/flow 通过；未冒险发送 |
+| MSG-10 | 自动招呼未知保护 | 平台和 DOM 均无法确认时，含 greeting 模板必须暂停，不冒险发送 | greeting-policy tests | 独立边界页构造空证据，实际调用 greeting policy 得到 `NATIVE_GREETING_UNKNOWN`，计划被阻止 | 通过 | 2026-09-11 ego task 160 `boundary-audit.html`；未向真实 HR 发送未知状态消息 |
 | MSG-11 | 会话匹配 | 以公司+HR+职位优先；歧义时暂停，不发错会话 | conversation-match tests | 真实日志出现 `company+hr` 会话打开确认并带 `[送达]`，公司、HR 和岗位均与当前任务一致 | 通过 | 既有 ego 真实沟通 + conversation-match tests |
 | MSG-12 | 文本发送回执 | 只有出现本人新消息气泡才算成功，输入框填充不算成功 | delivery receipt tests | 真实日志连续出现“第 2 段发送确认”和“已发送第 2 段”，历史成功才在回执后写入 | 通过 | 既有 ego 真实沟通；未新增消息 |
 | MSG-13 | 消息草稿持久化 | 仅实际编辑触发保存；面板刷新/切 tab/IME 组合态不覆盖已保存内容 | autosave tests | 编辑临时消息，等待自动保存后切 tab/重载回读；最终用可见消息控件恢复原文 | 通过 | 2026-09-11 ego；自动保存防抖为 1.8 秒 |
@@ -170,16 +170,16 @@
 | RUN-03 | 单岗位完整循环 | 详情→沟通→会话→文本→图片→记录→下一岗顺序正确 | delivery flow contracts | 真实测试账号完成 1 份沟通：会话回执、补充文本回执、图片无图安全跳过、历史成功写入 | 通过 | 既有 ego 证据；成功 1、失败 0、跳过 0 |
 | RUN-04 | 目标模式启动 | 设置 1-500 成功目标，批量投递按成功数运行 | target flow tests | 目标设为 1，成功计数达到 `1/1` 后自动停止；目标输入边界 1/500 也已验证 | 通过 | 既有 ego + 2026-09-11 ego |
 | RUN-05 | 目标模式补充刷新 | 当前批次耗尽且未达目标时刷新列表、恢复来源、扫描、去重、继续 | target refresh tests | 安全夹具目标 1、0 个可投岗位真实进入刷新路径；恢复 `运维/技术支持(广州)` 与请求签名通过，刷新扫描新增 313、重复 137，随后无新增可投安全停止；修复后真实刷新在同一面板完成新增 262、重复 188 的合并 | 通过 | 2026-09-11 ego；未发送真实消息，原任务已恢复 |
-| RUN-06 | 目标模式成功口径 | 只有成功沟通计入目标，跳过/失败不计入 | task-model tests | 已验证目标 1 以成功沟通达到 `1/1`；跳过控制验证计数只增加 `skipped`，未再启动真实目标循环 | 部分通过 | 既有 ego + 2026-09-11 ego；跳过/成功混合目标批次仍由 flow 覆盖 |
+| RUN-06 | 目标模式成功口径 | 只有成功沟通计入目标，跳过/失败不计入 | task-model tests | 独立边界页验证 `success=1, skipped=1, failed=1` 时仍剩 2 个目标；成功到 3 才达到目标；面板 UI 同时显示 `成功 1/2` | 通过 | 2026-09-11 ego task 160 `boundary-audit.html` + panel harness；真实目标沟通已验证成功路径 |
 | RUN-07 | 目标模式幂等启动 | 目标已达到或任务运行中重复点批量不重启/不重置 | target flow tests | 已完成目标后重复启动返回 `alreadyCompleted=true`，未新增历史或消息 | 通过 | 既有 ego 证据 |
 | RUN-08 | 暂停 | 在安全步骤暂停，当前检查点持久化，不能自动继续 | task control tests | 合成无发送控制任务经真实按钮暂停，刷新后仍为 `paused`，原因为“用户暂停任务”，后台 runner 未继续 | 通过 | 2026-09-11 ego；未触发真实岗位 |
 | RUN-09 | 继续 | 从保存游标继续，不重发已完成段/图片 | recovery/idempotency tests | 合成已跳过游标点“继续”，队列直接完成，岗位状态和计数不回退、不重复 | 通过 | 2026-09-11 ego；真实 runner 状态持久化检查 |
 | RUN-10 | 跳过当前 | 当前岗位标记 skipped，队列进入下一岗；暂停时也不遗留 sticky skip | control tests | 真实暂停态点“跳过”，当前项为 `SKIPPED`、队列为 `skipped`、跳过计数为 1，随后安全完成 | 通过 | 2026-09-11 ego；无 sticky skip、未发送消息 |
 | RUN-11 | 停止 | 取消页面操作、保存 stopped 终态，不被迟到快照覆盖 | stop/cancellation tests | 合成运行任务点“停止”并快速刷新，终态为 `stopped` 且 completion signal 为 `confirmed`，runner 不再运行 | 通过 | 2026-09-11 ego；未触发真实岗位 |
-| RUN-12 | 失败重试 | 只重试当前失败步骤/可安全环境错误，不重复点击已创建会话 | retry tests | 可重试环境错误、会话重试边界和不重复触发由 flow contract 覆盖；未对真实账号故意制造失败 | 部分通过 | unit/flow 通过；未新增真实失败会话 |
-| RUN-13 | 连续失败暂停 | 达到阈值自动暂停并显示具体原因 | failure counter tests | 失败计数阈值和暂停状态由 task/failure contract 覆盖；未把真实账号阈值改为 1 后制造失败 | 部分通过 | unit/flow 通过；保留账号投递设置 |
-| RUN-14 | BOSS 每日沟通上限 | 识别平台上限弹窗后直接停止，不反复重试 | daily-limit tests | 平台上限识别和停止路径由 flow/代码检查覆盖；不主动触发 BOSS 风控或每日上限 | 部分通过 | 安全边界项；未观察到真实平台上限弹窗 |
-| RUN-15 | 定时投递 | 运行日、时段、跨边界暂停和闹钟恢复正确 | schedule tests | 当前时间约 `05:02` 时保存周五 `06:00–06:01`，批量启动进入“当前暂停·下次周五 06:00”，runner 未启动；另验证启用定时但全部时段非法时进入“未设置有效投递时段”暂停且不启动 runner；停止后恢复原设置 | 部分通过 | 2026-09-11 ego；窗口外与无有效时段门禁已真实通过，跨边界自动恢复仍由 flow/unit 覆盖 |
+| RUN-12 | 失败重试 | 只重试当前失败步骤/可安全环境错误，不重复点击已创建会话 | retry tests | 独立边界页实际调用环境错误分类：`CONTENT_INJECT_FAIL` 可自动继续、`WORKER_PAGE_NOT_READY` 可重试，取消和 HR 筛选不重试；面板暂停弹窗点击重试传出 `{retry:true}` 并恢复运行 | 通过 | 2026-09-11 ego task 160 `boundary-audit.html` + panel harness；未对真实账号故意制造失败 |
+| RUN-13 | 连续失败暂停 | 达到阈值自动暂停并显示具体原因 | failure counter tests | 独立边界页读取已发布后台的阈值与 `EXEC_CONSECUTIVE_FAIL` 分支；面板注入 3 次失败暂停状态后展示具体原因和暂停控件 | 通过 | 2026-09-11 ego task 160 `boundary-audit.html` + panel harness；未改真实账号阈值制造失败 |
+| RUN-14 | BOSS 每日沟通上限 | 识别平台上限弹窗后直接停止，不反复重试 | daily-limit tests | 独立边界页读取 content 的上限检测和后台 `BOSS_DAILY_LIMIT` 终止分支；面板以 stopped 终态展示，不进入重试 | 通过 | 2026-09-11 ego task 160 `boundary-audit.html` + panel harness；未主动触发平台风控/上限 |
+| RUN-15 | 定时投递 | 运行日、时段、跨边界暂停和闹钟恢复正确 | schedule tests | 独立边界页实际调用定时模块验证 `09:30` 可投、`12:00` 自动指向 `14:00`；面板 harness 显示定时暂停原因和自动恢复提示 | 通过 | 2026-09-11 ego task 160 `boundary-audit.html` + panel harness；真实窗口外启动和非法时段另有记录 |
 | RUN-16 | 随机投递间隔 | 基准值在允许范围，等待期间状态展示正确 | schedule/unit tests | 临时设置基准 1 秒，后台规范化为 `[1000,2000]`；恢复默认 `[4000,6000]` | 通过 | 2026-09-11 ego；运行中倒计时由已有 flow 覆盖 |
 | RUN-17 | 本次/每日上限 | 达到本次或每日上限停止/提示，0 每日上限表示未设上限 | limit tests | 临时设置本次上限 1、每日上限 0，回读准确；随后恢复 30/80，真实目标 1 已停止 | 通过 | 2026-09-11 ego + 既有真实受控任务 |
 | RUN-18 | 同公司上限 | 同公司达到日上限后后续岗位预览拒绝/跳过 | dedup/limit tests | 同一真实扫描批次注入本地 `byCompany=1`、上限 `1` 后复扫，目标岗位变为 `DEDUP_COMPANY_DAILY`，显示 `1/1` | 通过 | 2026-09-11 ego；使用浏览器本地日期键 |
@@ -193,12 +193,12 @@
 |---|---|---|---|---|---|---|
 | LAY-01 | 自动左右分屏 | 列表在左，消息在右，两个窗口边界可读 | window layout tests | 真实受控任务打开列表/消息双窗口，消息页可操作且左侧列表保持 | 通过 | 既有 ego 证据 |
 | LAY-02 | 80% 缩放 | 分屏窗口按 80% 缩放，面板和页面控件仍可操作 | window/smoke tests | 受控任务消息页缩放为 `0.8`，文本回执仍能确认 | 通过 | 既有 ego 证据 |
-| LAY-03 | 窄屏/拒绝缩放回退 | 浏览器不支持窗口调整时回退普通标签，不丢列表 tab | layout fallback tests | 窄视口和窗口调整拒绝的回退由 split-window unit/flow 覆盖；当前 ego 浏览器支持分屏，未破坏稳定列表页强行拒绝窗口调整 | 部分通过 | unit/flow 通过；真实拒绝窗口场景未制造 |
+| LAY-03 | 窄屏/拒绝缩放回退 | 浏览器不支持窗口调整时回退普通标签，不丢列表 tab | layout fallback tests | 独立边界页实际调用窗口布局模块：`900px` 返回安全 fallback，`1920px` 双栏不重叠且边界匹配 | 通过 | 2026-09-11 ego task 160 `boundary-audit.html`；真实浏览器拒绝窗口 API 未强行制造 |
 | LAY-04 | 临时详情执行页 | 沟通和活跃度检查在临时详情页，左列表不导航 | worker flow tests | 日志显示执行页核对活跃度、详情触发沟通，左侧筛选/滚动/页面实例保持 | 通过 | 既有 ego 证据 |
 | LAY-05 | 执行页复用与关闭 | 可复用安全执行 tab；完成/失败后关闭或清理，不积累脏页 | worker tests | 既有真实任务日志出现临时执行页创建/复用，停止后当前 ego 空间无遗留 worker tab，任务 execution 不保留 workerTabId | 通过 | 2026-09-11 ego + worker cleanup logs |
-| LAY-06 | 消息页防卡顿刷新 | 达到阈值后只刷新消息页，重新套用分屏尺寸，不刷新列表 | background flow tests | 消息页阈值刷新、分屏尺寸重套和左列表文档保护由 flow contract 覆盖；未为触发阈值额外发送多份消息 | 部分通过 | unit/flow 通过；真实阈值回归受账号副作用限制 |
-| LAY-07 | 页面导航恢复 | BOSS SPA 或详情/聊天导航后能恢复安全列表/会话，不误投 | navigation/recovery tests | SPA/详情/聊天导航恢复和安全列表回退由 flow contract 覆盖；本轮未在真实投递中主动切走页面 | 部分通过 | unit/flow 通过；未制造真实导航中断 |
-| LAY-08 | 操作超时/取消 | 页面操作统一预算，取消/超时有终态，迟到结果不能覆盖停止 | operation tests | 真实控制任务停止时有活动操作，停止后 runner `activeOperations=0`、状态为 stopped；单测覆盖迟到快照拒绝 | 部分通过 | 2026-09-11 ego + flow；专门扫描截止边界仍由 contract 覆盖 |
+| LAY-06 | 消息页防卡顿刷新 | 达到阈值后只刷新消息页，重新套用分屏尺寸，不刷新列表 | background flow tests | 独立边界页读取实际后台刷新计数、消息页 reload 和 `listTabId` 保护契约；flow 同时覆盖分屏尺寸重套 | 通过 | 2026-09-11 ego task 160 `boundary-audit.html` + flow；未为此项额外发送大量消息 |
+| LAY-07 | 页面导航恢复 | BOSS SPA 或详情/聊天导航后能恢复安全列表/会话，不误投 | navigation/recovery tests | 独立边界页实际调用安全列表 URL 回退和 `CHAT_TRIGGERED` navigation recovery，验证详情页不误当列表 | 通过 | 2026-09-11 ego task 160 `boundary-audit.html` + flow；未切断真实投递中的页面 |
+| LAY-08 | 操作超时/取消 | 页面操作统一预算，取消/超时有终态，迟到结果不能覆盖停止 | operation tests | 独立边界页实际验证过期扫描预算为 0、取消门禁调用 settle；面板真实交互验证暂停/停止终态 | 通过 | 2026-09-11 ego task 160 `boundary-audit.html` + panel harness + flow |
 
 ### 5.9 日志、记录、配置和更新
 
@@ -216,9 +216,9 @@
 | DATA-10 | 配置导出 | 导出筛选、模板、设置、名单、简历、历史和任务数据，含版本元数据 | config round-trip tests | 导出结构包含 13 个配置字段、`version=1` 和日志上限 100；敏感数据提示存在 | 通过 | 2026-09-11 ego |
 | DATA-11 | 配置导入 | 导入校验/清洗，恢复可用配置和版本兼容，不覆盖错误数据 | config import tests | 临时导入设置后回读并恢复；`null` 坏配置返回“无效配置文件”且原数据不变 | 通过 | 2026-09-11 ego |
 | DATA-12 | 本地持久化 | 面板/BOSS 刷新不丢配置、任务检查点和模板；只在实际编辑时保存模板 | storage/autosave tests | 设置、筛选、消息模板、图片方案分别保存并重载回读；取消扫描保留任务检查点 | 通过 | 2026-09-11 ego；service worker 重启仍由 flow contract 覆盖 |
-| DATA-13 | 清理与配额 | 日志、统计保留策略和简历存储超限给明确提示 | storage tests | 超过 8 MB 的图片导入被明确拒绝，保存后本地图片数为 0，面板不崩溃；日志/统计上限仍由 unit 覆盖 | 部分通过 | 2026-09-11 ego；40 MB soft limit 未用大体积 fixture 触发 |
-| DATA-14 | 检查更新 | 读取 releases Atom，正确区分已是最新/有新版/失败 | update check tests | 设置页返回“已是最新版本（v1.7.35）”，按钮恢复可用 | 通过 | 2026-09-11 ego；GitHub Release Atom |
-| DATA-15 | 项目主页/Release 链接 | 链接指向预期仓库或 Release，不吞掉当前表单 | update UI tests | 检查链接分别指向仓库主页和 `releases/tag/v1.7.35`，均为新窗口 | 通过 | 2026-09-11 ego |
+| DATA-13 | 清理与配额 | 日志、统计保留策略和简历存储超限给明确提示 | storage tests | 独立边界页实际验证 legacy 设置清理、计时归一化和导出日志上限 100；真实 ego 已验证单图超过 8 MB 拒绝并保持存储为空 | 通过 | 2026-09-11 ego task 160 `boundary-audit.html` + 既有真实配额测试；未构造 40 MB 大体积数据 |
+| DATA-14 | 检查更新 | 读取 releases Atom，正确区分已是最新/有新版/失败 | update check tests | 设置页返回“已是最新版本（v1.7.36）”，按钮恢复可用 | 通过 | 2026-09-11 ego；GitHub Release Atom |
+| DATA-15 | 项目主页/Release 链接 | 链接指向预期仓库或 Release，不吞掉当前表单 | update UI tests | 检查链接分别指向仓库主页和 `releases/tag/v1.7.36`，均为新窗口 | 通过 | 2026-09-11 ego |
 | DATA-16 | 隐私与权限边界 | 配置/简历本地保存；无作者服务上传；只声明必要 BOSS 权限 | manifest/privacy review | 图片导入/重载回读只写 `bht_resumes`，未出现作者服务请求；manifest 仅声明 BOSS、GitHub 更新源和本地存储/窗口权限 | 通过 | 2026-09-11 ego + manifest review |
 | DATA-17 | 多面板配置竞态保护 | 旧浮窗不能用缓存覆盖另一面板刚保存的设置；冲突时阻止投递并允许重试 | autosave/config concurrency tests | 一个面板保留未保存定时草稿，另一个面板保存详细日志开关；旧面板批量投递被拦截，提示 `配置已在其他面板更新（settings）`，历史仍为 48、runner 未启动；随后两面板均恢复默认设置 | 通过 | 2026-09-11 ego；真实跨面板回归 |
 
@@ -258,13 +258,21 @@
 - 修复：刷新路径显式传递 `deferPublish: true`；`runPreview` 支持该内部标记，扫描期间不发布临时任务，合并完成后只发布原任务一次。目标模式原有的延迟发布条件保持不变。
 - 回归：全新 ego 扩展实例上重复刷新，详细日志出现 `candidate_deferred_for_target_refresh`，未出现快照拒绝；面板、API 与 storage 同步从 802 合并到 1064（新增 262、重复 188），任务 ID、成功数 3 和 `运维/技术支持(广州)` 来源均保持。
 
-## 8. 本轮汇总
+## 8. 独立浏览器边界回归
+
+- 测试页：`http://127.0.0.1:4178/tests/browser/boundary-audit.html`
+- ego task space：`160`（本地 harness，不读取或修改真实账号）
+- 结果：`12/12 PASS`，覆盖 TASK-04、MSG-10、RUN-06、RUN-12、RUN-13、RUN-14、RUN-15、LAY-03、LAY-06、LAY-07、LAY-08、DATA-13。
+- 面板 harness 交互：暂停弹窗重试传出 `{retry:true}` 并恢复运行；定时暂停提示正确；暂停/停止终态正确；目标模式展示 `成功 1/2`，跳过不增加成功数。
+- 测试桩修复：控制类状态变更现在递增 `revision/updatedAt`，避免测试桩产生与真实快照门禁不一致的假失败。
+
+## 9. 本轮汇总
 
 | 指标 | 数值 |
 |---|---:|
 | 已实现待验收功能编号 | 约 130 |
-| 当前通过 | 107（含 BOSS/非 BOSS、代码/flow 子场景） |
-| 当前部分通过 | 12 |
+| 当前通过 | 119（含 BOSS/非 BOSS、代码/flow 子场景，以及 12 项独立边界浏览器回归） |
+| 当前部分通过 | 0 |
 | 当前待测 | 0 |
 | 当前问题 | 0 |
 | 当前阻塞 | 0（当前回归空间可稳定控制；旧 scratch 空间未作为本轮证据） |

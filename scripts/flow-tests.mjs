@@ -1623,6 +1623,20 @@ test("skip does not wait job interval and waits are logged", () => {
   assert.ok(background.includes("qi >= queue.length - 1"), "last queue item does not wait");
 });
 
+test("browser boundary audit covers every previously partial feature", () => {
+  const page = fs.readFileSync("tests/browser/boundary-audit.html", "utf8");
+  const harness = fs.readFileSync("scripts/panel-harness-server.mjs", "utf8");
+  const stub = fs.readFileSync("tests/browser/chrome-stub.js", "utf8");
+  for (const id of [
+    "TASK-04", "MSG-10", "RUN-06", "RUN-12", "RUN-13", "RUN-14", "RUN-15",
+    "LAY-03", "LAY-06", "LAY-07", "LAY-08", "DATA-13"
+  ]) {
+    assert.ok(page.includes(id), `${id} must have an independent browser check`);
+  }
+  assert.ok(harness.includes("/background/") && harness.includes("/content/"), "browser audit serves shipped background/content source");
+  assert.ok(stub.includes("function updateTaskStatus") && stub.includes("revision: Number(state.task.revision || 0) + 1"), "panel harness control responses advance task snapshots");
+});
+
 
 await runRegisteredTests();
 

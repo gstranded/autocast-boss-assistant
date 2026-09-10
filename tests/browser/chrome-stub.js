@@ -109,6 +109,17 @@
     return { ok: true, runtimeVersion: "1.7.36", ...clone(state) };
   }
 
+  function updateTaskStatus(status, patch = {}) {
+    if (!state.task) return;
+    state.task = {
+      ...state.task,
+      ...patch,
+      status,
+      revision: Number(state.task.revision || 0) + 1,
+      updatedAt: Date.now()
+    };
+  }
+
   function persistStorage() {
     try {
       localStorage.setItem(persistenceKey, JSON.stringify(storage));
@@ -276,9 +287,13 @@
     }
     if (type === "BHT_EXPORT_CONFIG") return { ok: true, data: clone(state) };
     if (type === "BHT_IMPORT_CONFIG") return { ok: true };
-    if (type === "BHT_PAUSE_TASK") state.task = { ...(state.task || {}), status: "paused" };
-    if (type === "BHT_RESUME_TASK") state.task = { ...(state.task || {}), status: "running" };
-    if (type === "BHT_STOP_TASK") state.task = { ...(state.task || {}), status: "stopped" };
+    if (type === "BHT_PAUSE_TASK") updateTaskStatus("paused");
+    if (type === "BHT_RESUME_TASK") updateTaskStatus("running", {
+      pauseReason: "",
+      awaitingUserRetry: false,
+      retryCurrent: payload?.retry === true
+    });
+    if (type === "BHT_STOP_TASK") updateTaskStatus("stopped");
     return { ok: true };
   }
 
