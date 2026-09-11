@@ -300,6 +300,18 @@ test("target mode refreshes in the background and preserves stop/duplicate guard
   assert.ok(panel.includes("state.targetCountDraft = String($('targetDeliveryCount').value || '')"));
   assert.ok(panel.includes("const targetCountValue = state.targetCountDraft ||"));
   assert.ok(background.includes("async function runTargetDeliveryLoop"));
+  assert.ok(background.includes("async function runTargetDeliveryLoop(taskId, taskRunId = uid('run'))"),
+    "target loop must accept the caller generation");
+  assert.ok(background.includes("runTargetDeliveryLoop(task.id, runner.taskRunId)"),
+    "confirm start must pass the current generation into target loop");
+  assert.ok(background.includes("runTargetDeliveryLoop(all.task.id, resumeTaskRunId)"),
+    "resume must pass the current generation into target loop");
+  assert.ok(background.includes("if (runner.stopping || runner.abort) return { ok: false, error: 'OP_CANCELLED' }"),
+    "late delivery loops must not clear a stop gate");
+  assert.ok(background.includes("if (runner.taskRunTaskId && !isTaskRunCurrent(taskId, taskRunId))"),
+    "late delivery loops must reject stale generations");
+  assert.ok(background.includes("任务正在停止，恢复操作已取消"),
+    "resume must recheck a stop request before changing the run generation");
   assert.ok(background.includes("targetDeliveryRemaining(task)"));
   assert.ok(background.includes("withRunnerAdmission('previewing'"));
   assert.ok(background.includes("refreshAndContinue({"));
@@ -313,9 +325,42 @@ test("target mode refreshes in the background and preserves stop/duplicate guard
   assert.ok(content.includes("[ka^=\"${prefix}\"]"));
   assert.ok(content.includes("selected option in the hidden dropdown"));
   assert.ok(background.includes("jobMergeKey") && background.includes("mergeRefreshedTask"));
+  assert.ok(content.includes("locationText") && content.includes("securityId") && content.includes("lid"),
+    "synthetic job identities must include stable location/identity evidence");
+  assert.ok(background.includes("lid: r.job?.lid || ''") && background.includes("lid: q.lid || ''"),
+    "queue snapshots must retain synthetic identity evidence");
   assert.ok(background.includes("candidate_deferred_for_target_refresh"));
   assert.ok(background.includes("payload.deferPublish === true"));
+  const refreshMergeStart = background.indexOf("function mergeRefreshedTask");
+  const refreshMergeEnd = background.indexOf("async function refreshAndContinue", refreshMergeStart);
+  const refreshMerge = background.slice(refreshMergeStart, refreshMergeEnd);
+  assert.ok(refreshMerge.includes("...previousExecution") && refreshMerge.includes("...freshExecution"),
+    "refresh merge must retain the existing execution context while updating list context");
+  assert.ok(refreshMerge.includes("messageTabId: previousExecution.messageTabId"),
+    "refresh merge must retain the reusable message tab");
+  assert.ok(background.includes("qMeta.status === 'failed'"),
+    "resume must skip failed queue entries unless an explicit retry reset them to pending");
+  assert.ok(background.includes("jobsShareMergeIdentity(x, row.job || {})"),
+    "queue resume lookup must tolerate synthetic job ids being upgraded after refresh");
   assert.ok(background.includes("payload.targetMode === true && runner.targetLoop === true"));
+  assert.ok(background.includes("async function recordTargetModeHalt"));
+  assert.ok(background.includes("task.status = TASK_STATUS.STOPPED;"));
+  assert.ok(background.includes("setTaskTerminalSignal(task, TASK_STATUS.STOPPED)"));
+  const targetStopStart = background.indexOf("case MSG.STOP_TASK");
+  const targetStopEnd = background.indexOf("case MSG.SKIP_CURRENT", targetStopStart);
+  const targetStop = background.slice(targetStopStart, targetStopEnd);
+  assert.ok(targetStop.includes("runner.previewing && !runner.running && runner.targetLoop"));
+  assert.ok(targetStop.indexOf("runner.previewRunId = ''") < targetStop.indexOf("await cancelActiveOperations('用户停止目标模式刷新')"));
+  assert.ok(targetStop.includes("all.task.status = TASK_STATUS.STOPPED"));
+  assert.ok(targetStop.includes("setTaskTerminalSignal(all.task, TASK_STATUS.STOPPED)"));
+  assert.ok(background.includes("admission_rejected_after_stop"));
+  assert.ok(background.includes("if (runner.abort && task?.status !== TASK_STATUS.STOPPED)"));
+  assert.ok(background.includes("未开始投递"), "start path must not revive a task stopped during setup");
+  assert.ok(background.includes("runner.taskRunTaskId = task.id"), "start path must bind generation before split setup");
+  const refreshStart = background.indexOf("async function refreshAndContinue");
+  const refreshEnd = background.indexOf("async function recordTargetModeHalt", refreshStart);
+  const refresh = background.slice(refreshStart, refreshEnd);
+  assert.ok(refresh.includes("if (!isPreviewRunActive(previewRunId)) return previewCancelledResult()"));
 });
 
 test("single delivery counts the successful job before leaving the loop", () => {
@@ -494,6 +539,24 @@ test("autosave protects IME composition and never rebuilds message inputs", () =
   assert.ok(!flush.includes("refresh({ soft: true })"));
   assert.ok(!flush.includes("toast("));
   assert.ok(app.includes("render: false"));
+  assert.ok(app.includes("function rememberPersistedConfigSection"));
+  assert.ok(app.includes("resumeRevision: 0"));
+  assert.ok(app.includes("const resumesStable = state.resumeRevision === resumeRevisionAtStart"));
+  assert.ok(app.includes("state.config.resumes = resumes"));
+  assert.ok(!app.includes("currentResumes = structuredClone(state.config?.resumes || {})"));
+  assert.ok(app.includes("try { flushActiveProfileForm(); } catch (_) {}"));
+  assert.ok(app.includes("const messageStable = state.messageRevision === revisionAtStart"));
+  assert.ok(app.includes("if (messageStable)"));
+  assert.ok(app.includes("if (state.messageDirty)"));
+  assert.ok(app.includes("localChanged.add('messageTemplate')"));
+  assert.ok(app.includes("const requestedSections = opts.sections ? new Set(opts.sections) : null"));
+  assert.ok(app.includes("saveFilters({ refresh: false, sections: localChanged })"));
+  assert.ok(app.includes("if (autosaveRevision === autosaveRevisionAtStart && !pendingResumeFiles) state.formDirty = false"));
+  assert.ok(app.includes("await saveSettings({ refresh: false });"), "theme saves must use the config queue");
+  assert.ok(app.includes("enqueueConfigSave(() => api(MSG.IMPORT_CONFIG"), "imports must wait for pending saves");
+  const profileActions = app.slice(app.indexOf("$('btnAddProfile')"), app.indexOf("$('btnAddBinding')"));
+  assert.ok(profileActions.includes("enqueueConfigSave"), "resume management writes must use the config queue");
+  assert.ok(!app.includes("rememberPersistedConfig();\n  return true;"));
 });
 
 test("preview accumulates virtualized jobs until bottom or the 60 second deadline", () => {
@@ -955,6 +1018,11 @@ test("cancelled preview generations cannot filter or publish late results", () =
   assert.ok(panel.includes("Object.prototype.hasOwnProperty.call(res, 'task')"));
   assert.ok(stop.indexOf("runner.previewRunId = ''") < stop.indexOf("await cancelActiveOperations"));
   assert.ok(stop.indexOf("runner.previewing = false") > stop.indexOf("await discardCancelledPreviewTask"));
+  const publishTaskStart = background.indexOf("async function publishTask");
+  const publishTaskEnd = background.indexOf("function setTaskTerminalSignal", publishTaskStart);
+  const publishTask = background.slice(publishTaskStart, publishTaskEnd);
+  assert.ok(publishTask.includes("await saveTask(task)") && publishTask.lastIndexOf("await saveTask(task)") > publishTask.indexOf("if (runner.abort && task?.status !== TASK_STATUS.STOPPED)"),
+    "stop must converge after a slow task write");
   const sendStart = background.indexOf("async function sendToBoss");
   const sendEnd = background.indexOf("async function assertBossContext", sendStart);
   const sendToBoss = background.slice(sendStart, sendEnd);

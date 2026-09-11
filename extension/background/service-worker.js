@@ -53,6 +53,7 @@ import {
   buildDeliveryQueue,
   collectDoneJobIds,
   jobMergeKey,
+  jobsShareMergeIdentity,
   isTargetDeliveryReached,
   mergeTaskResults,
   rebuildDeliveryQueue,
@@ -136,11 +137,27 @@ let runner = {
   skipCurrent: false,
   pauseLogged: false,
   consecutiveUnknownActive: 0,
-  targetLoop: false
+  targetLoop: false,
+  stopping: false,
+  taskRunId: '',
+  taskRunTaskId: ''
 };
 const operations = createOperationRegistry();
 let debugLoggingEnabled = false;
 let activePreviewRun = null;
+let taskWriteChain = Promise.resolve();
+
+function enqueueTaskWrite(work) {
+  const run = taskWriteChain.then(work, work);
+  taskWriteChain = run.catch(() => {});
+  return run;
+}
+
+function taskPublishMatchesRunner(taskId, taskRunId) {
+  if (!taskRunId || !runner.taskRunId || !runner.taskRunTaskId) return true;
+  return String(taskRunId) === String(runner.taskRunId) &&
+    String(taskId || '') === String(runner.taskRunTaskId || '');
+}
 
 function cloneTaskSnapshot(task) {
   if (!task || typeof task !== 'object') return null;
@@ -201,7 +218,7 @@ function summarizeBossOperationResult(result) {
 }
 
 function runnerIsBusy() {
-  return runner.running || runner.starting || runner.previewing || runner.targetLoop;
+  return runner.running || runner.starting || runner.previewing || runner.targetLoop || runner.stopping;
 }
 
 function isPreviewRunActive(runId = '') {
@@ -236,7 +253,7 @@ function runnerSnapshot() {
     previewPass: runner.previewPass || 0,
     pause: runner.pause && !runner.abort,
     schedulePauseRequested: runner.schedulePauseRequested === true,
-    stopping: runner.running && runner.abort,
+    stopping: runner.stopping === true || (runner.running && runner.abort),
     intervalWaitUntil: Number(runner.intervalWaitUntil || 0),
     intervalWaitMs: Number(runner.intervalWaitMs || 0),
     activeOperations: operations.size,
@@ -275,35 +292,37 @@ async function waitDeliveryInterval(task, waitMs) {
 
 async function discardCancelledPreviewTask(previewRunId, previousTask = null) {
   if (!previewRunId) return false;
-  let current = null;
-  try {
-    current = (await getAllConfig()).task;
-  } catch (_) {
-    return false;
-  }
-  if (String(current?.previewRunId || '') !== String(previewRunId)) return false;
+  return enqueueTaskWrite(async () => {
+    let current = null;
+    try {
+      current = (await getAllConfig()).task;
+    } catch (_) {
+      return false;
+    }
+    if (String(current?.previewRunId || '') !== String(previewRunId)) return false;
 
-  const restored = cloneTaskSnapshot(previousTask);
-  if (restored) {
-    restored.updatedAt = Date.now();
-    delete restored.previewRunId;
-    await saveTask(restored);
-  } else {
-    await saveTask(null);
-  }
-  try {
-    chrome.runtime.sendMessage({
-      type: MSG.TASK_EVENT,
-      payload: restored,
-      authoritative: true,
-      reason: 'preview_cancel_rollback'
-    }).catch(() => {});
-  } catch (_) {}
-  await debugLog('background.preview', 'discard_cancelled_publish', {
-    previewRunId,
-    restoredTaskId: restored?.id || null
-  }, 'warn');
-  return true;
+    const restored = cloneTaskSnapshot(previousTask);
+    if (restored) {
+      restored.updatedAt = Date.now();
+      delete restored.previewRunId;
+      await saveTask(restored);
+    } else {
+      await saveTask(null);
+    }
+    try {
+      chrome.runtime.sendMessage({
+        type: MSG.TASK_EVENT,
+        payload: restored,
+        authoritative: true,
+        reason: 'preview_cancel_rollback'
+      }).catch(() => {});
+    } catch (_) {}
+    await debugLog('background.preview', 'discard_cancelled_publish', {
+      previewRunId,
+      restoredTaskId: restored?.id || null
+    }, 'warn');
+    return true;
+  });
 }
 
 async function publishPreviewTask(task, previewRunId, previousTask = null, { deferPublish = false } = {}) {
@@ -333,6 +352,14 @@ async function publishPreviewTask(task, previewRunId, previousTask = null, { def
 async function withRunnerAdmission(kind, action) {
   const isTargetRefreshAdmission = kind === 'previewing' && runner.targetLoop === true &&
     !runner.running && !runner.starting && !runner.previewing;
+  if (runner.stopping) {
+    await debugLog('background.runner', 'admission_rejected_while_stopping', { requested: kind }, 'warn');
+    return { ok: false, error: 'OP_CANCELLED', message: '任务正在停止，请稍后重试' };
+  }
+  if (isTargetRefreshAdmission && runner.abort) {
+    await debugLog('background.runner', 'admission_rejected_after_stop', { requested: kind }, 'warn');
+    return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，刷新操作已取消' };
+  }
   if (runnerIsBusy() && !isTargetRefreshAdmission) {
     await debugLog('background.runner', 'admission_rejected', {
       requested: kind,
@@ -350,6 +377,14 @@ async function withRunnerAdmission(kind, action) {
   }
   const admissionId = kind === 'previewing' ? uid('preview') : '';
   runner[kind] = true;
+  if (kind === 'starting') {
+    // A previous stopped task leaves abort=true until the next run starts.
+    // Clear it at the new admission so staging a scheduled/new task is not
+    // mistaken for a late write from the previous run.
+    runner.abort = false;
+    runner.taskRunId = uid('run');
+    runner.taskRunTaskId = '';
+  }
   if (kind === 'previewing') {
     // runner 已通过空闲门禁；此时的 pause/abort/skip 只能来自上一轮残留。
     runner.pause = false;
@@ -588,6 +623,10 @@ async function waitForRunnableQueueBoundary(taskId) {
 }
 
 async function enforceDeliverySchedule(source = 'alarm', now = new Date()) {
+  if (runner.stopping || runner.abort) {
+    await debugLog('background.schedule', 'resume_rejected_after_stop', { source }, 'warn');
+    return { ok: false, error: 'OP_CANCELLED', message: '任务正在停止或已停止，定时恢复已取消' };
+  }
   const all = await getAllConfig();
   const settings = all.settings || {};
   const schedule = evaluateDeliverySchedule(settings, now);
@@ -663,15 +702,25 @@ async function enforceDeliverySchedule(source = 'alarm', now = new Date()) {
   task.status = TASK_STATUS.RUNNING;
   task.pauseReason = '';
   task.updatedAt = Date.now();
-  runner.abort = false;
   let split = null;
-  if (!runner.running) split = await prepareSplitWorkspace(task, settings);
-  await publishTask(task);
+  let resumedTaskRunId = '';
+  if (!runner.running) {
+    resumedTaskRunId = uid('run');
+    runner.taskRunId = resumedTaskRunId;
+    runner.taskRunTaskId = task.id;
+    task.execution = { ...(task.execution || {}), taskRunId: resumedTaskRunId };
+    split = await prepareSplitWorkspace(task, settings);
+  }
+  const published = await publishTask(task);
+  if (!published || runner.stopping || runner.abort || task.status === TASK_STATUS.STOPPED ||
+      (!runner.running && !isTaskRunCurrent(task.id, resumedTaskRunId))) {
+    return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，刷新操作已取消' };
+  }
   runner.pause = false;
   await log('info', '已进入定时投递时段，自动恢复任务', { taskId: task.id, source });
   if (!runner.running) {
-    if (task.targetMode === true) runTargetDeliveryLoop(task.id);
-    else runTaskLoop(task.id);
+    if (task.targetMode === true) runTargetDeliveryLoop(task.id, resumedTaskRunId);
+    else runTaskLoop(task.id, resumedTaskRunId);
   }
   return { ok: true, action: 'resumed', schedule, splitView: split };
 }
@@ -2205,17 +2254,60 @@ async function log(level, message, extra = {}) {
 }
 
 async function publishTask(task) {
-  // STOP 是不可逆终态：旧异步分支即使稍后返回，也不能把 storage 写回 running/paused。
-  if (runner.running && runner.abort && task?.status !== TASK_STATUS.STOPPED) {
-    task.status = TASK_STATUS.STOPPED;
-    task.updatedAt = Date.now();
-    setTaskTerminalSignal(task, TASK_STATUS.STOPPED);
+  const taskRunId = String(task?.execution?.taskRunId || '');
+  const taskId = String(task?.id || '');
+  if (!taskPublishMatchesRunner(taskId, taskRunId)) {
+    await debugLog('background.task', 'stale_task_publish_rejected', {
+      taskId: taskId || null,
+      taskRunId,
+      activeTaskRunId: runner.taskRunId,
+      activeTaskId: runner.taskRunTaskId || null
+    }, 'warn');
+    return false;
   }
-  task.revision = Number(task.revision || 0) + 1;
-  await saveTask(task);
-  try {
-    chrome.runtime.sendMessage({ type: MSG.TASK_EVENT, payload: task }).catch(() => {});
-  } catch (_) {}
+  return enqueueTaskWrite(async () => {
+    // STOP 或新任务启动可能发生在排队期间；旧代次到这里必须完全失效。
+    if (!taskPublishMatchesRunner(taskId, taskRunId)) {
+      await debugLog('background.task', 'stale_task_publish_rejected_after_queue', {
+        taskId: taskId || null,
+        taskRunId,
+        activeTaskRunId: runner.taskRunId,
+        activeTaskId: runner.taskRunTaskId || null
+      }, 'warn');
+      return false;
+    }
+    // STOP 是不可逆终态：旧异步分支即使稍后返回，也不能把 storage 写回 running/paused。
+    if (runner.abort && task?.status !== TASK_STATUS.STOPPED) {
+      task.status = TASK_STATUS.STOPPED;
+      task.updatedAt = Date.now();
+      setTaskTerminalSignal(task, TASK_STATUS.STOPPED);
+    }
+    task.revision = Number(task.revision || 0) + 1;
+    await saveTask(task);
+    // saveTask 可能跨过 STOP_TASK 的异步边界；若停止在写入期间到达，
+    // 再写一次终态，避免较慢的旧快照覆盖停止结果。
+    if (runner.abort && task?.status !== TASK_STATUS.STOPPED) {
+      task.status = TASK_STATUS.STOPPED;
+      task.updatedAt = Date.now();
+      setTaskTerminalSignal(task, TASK_STATUS.STOPPED);
+      task.revision = Number(task.revision || 0) + 1;
+      await saveTask(task);
+    }
+    // 新代次可能已被接纳；不再向面板广播旧快照，但后续写入仍按同一队列落盘。
+    if (!taskPublishMatchesRunner(taskId, taskRunId)) {
+      await debugLog('background.task', 'stale_task_publish_rejected_after_write', {
+        taskId: taskId || null,
+        taskRunId,
+        activeTaskRunId: runner.taskRunId,
+        activeTaskId: runner.taskRunTaskId || null
+      }, 'warn');
+      return false;
+    }
+    try {
+      chrome.runtime.sendMessage({ type: MSG.TASK_EVENT, payload: task }).catch(() => {});
+    } catch (_) {}
+    return true;
+  });
 }
 
 function operationAborted(result) {
@@ -2243,13 +2335,31 @@ function setTaskTerminalSignal(task, status) {
 }
 
 function ensureItem(task, job) {
-  let item = task.items.find((x) => x.jobId === job.jobId);
+  let item = task.items.find((x) => x.jobId === job.jobId) ||
+    task.items.find((x) => jobsShareMergeIdentity(x, job));
+  if (item) {
+    const itemId = String(item.jobId || '');
+    const jobId = String(job.jobId || '');
+    if ((!itemId || itemId.startsWith('name_') || itemId.startsWith('dom_')) &&
+        jobId && !jobId.startsWith('name_') && !jobId.startsWith('dom_')) {
+      item.jobId = job.jobId;
+    }
+    item.bossId = item.bossId || job.bossId;
+    item.company = item.company || job.company;
+    item.title = item.title || job.title;
+    item.location = item.location || job.location || '';
+    item.lid = item.lid || job.lid || '';
+    item.securityId = item.securityId || job.securityId || '';
+  }
   if (!item) {
     item = {
       jobId: job.jobId,
       bossId: job.bossId,
       company: job.company,
       title: job.title,
+      location: job.location || '',
+      lid: job.lid || '',
+      securityId: job.securityId || '',
       state: 'NOT_STARTED',
       reasons: [],
       selected: true
@@ -2322,6 +2432,19 @@ async function navigatePreviewToJobList(previewTab, scan = {}, previewRunId = ''
       targetHref
     };
   }
+}
+
+function isTaskRunCurrent(taskId, taskRunId) {
+  return String(runner.taskRunId || '') === String(taskRunId || '') &&
+    String(runner.taskRunTaskId || '') === String(taskId || '');
+}
+
+function taskMatchesStopRequest(task, taskId, taskRunId) {
+  if (!task) return false;
+  if (!taskId) return true;
+  if (String(task.id || '') !== String(taskId)) return false;
+  const storedRunId = String(task.execution?.taskRunId || '');
+  return !taskRunId || !storedRunId || storedRunId === String(taskRunId);
 }
 
 async function restoreListTabAfterTriggerNavigation(task, tabId) {
@@ -2904,6 +3027,9 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
       bossId: r.job.bossId,
       company: r.job.company,
       title: r.job.title,
+      location: r.job.location || '',
+      lid: r.job.lid || '',
+      securityId: r.job.securityId || '',
       state: r.decision === 'pass' ? 'NOT_STARTED' : 'SKIPPED',
       reasons: r.reasonTexts,
       selected: r.selected,
@@ -2934,6 +3060,8 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
       jobId: r.job?.jobId,
       title: r.job?.title,
       company: r.job?.company,
+      location: r.job?.location || '',
+      lid: r.job?.lid || '',
       href: r.job?.href || '',
       securityId: r.job?.securityId || '',
       status: 'pending'
@@ -2972,13 +3100,28 @@ function isRefreshableJobSourceContext(context = {}) {
 function mergeRefreshedTask(previousTask, freshTask, refreshMeta = {}) {
   const previousResults = Array.isArray(previousTask?.results) ? previousTask.results : [];
   const freshResults = Array.isArray(freshTask?.results) ? freshTask.results : [];
-  const previousKeys = new Set(previousResults.map((row) => jobMergeKey(row?.job || row || {})));
-  const freshNewResults = freshResults.filter((row) => !previousKeys.has(jobMergeKey(row?.job || row || {})));
+  const freshNewResults = freshResults.filter((row) => !previousResults.some((previous) =>
+    jobsShareMergeIdentity(previous?.job || previous || {}, row?.job || row || {})
+  ));
   const mergedResults = mergeTaskResults(previousResults, freshResults);
   const previousItems = Array.isArray(previousTask?.items) ? previousTask.items : [];
-  const itemKeys = new Set(previousItems.map((item) => jobMergeKey(item)));
-  const freshItems = (Array.isArray(freshTask?.items) ? freshTask.items : [])
-    .filter((item) => !itemKeys.has(jobMergeKey(item)));
+  const allFreshItems = Array.isArray(freshTask?.items) ? freshTask.items : [];
+  const freshItems = allFreshItems
+    .filter((item) => !previousItems.some((previous) => jobsShareMergeIdentity(previous, item)));
+  const items = previousItems.map((previous) => {
+    const fresh = allFreshItems.find((item) => jobsShareMergeIdentity(previous, item));
+    if (!fresh) return previous;
+    return {
+      ...previous,
+      ...fresh,
+      jobId: !previous.jobId || String(previous.jobId || '').startsWith('name_') || String(previous.jobId || '').startsWith('dom_')
+        ? (fresh.jobId || previous.jobId)
+        : previous.jobId,
+      state: previous.state || fresh.state,
+      reasons: previous.reasons || fresh.reasons,
+      receipts: previous.receipts || fresh.receipts
+    };
+  });
   const doneIds = collectDoneJobIds(
     previousItems,
     previousTask?.queue || [],
@@ -3002,6 +3145,8 @@ function mergeRefreshedTask(previousTask, freshTask, refreshMeta = {}) {
     duplicates: Math.max(0, freshResults.length - freshNewResults.length),
     total: mergedResults.results.length
   };
+  const previousExecution = previousTask?.execution || {};
+  const freshExecution = freshTask?.execution || {};
   const task = {
     ...freshTask,
     ...previousTask,
@@ -3013,13 +3158,30 @@ function mergeRefreshedTask(previousTask, freshTask, refreshMeta = {}) {
       ...(freshTask?.warnings || [])
     ].filter(Boolean))),
     results: mergedResults.results,
-    items: [...previousItems, ...freshItems],
+    items: [...items, ...freshItems.filter((item) =>
+      !previousItems.some((previous) => jobsShareMergeIdentity(previous, item))
+    )],
     queue,
     queueCursor,
     sourceContext: freshTask?.sourceContext || previousTask?.sourceContext || null,
     listHref: freshTask?.listHref || previousTask?.listHref || '',
     listExpectLabel: freshTask?.listExpectLabel || previousTask?.listExpectLabel || '',
-    execution: freshTask?.execution || previousTask?.execution || {},
+    execution: {
+      // A refresh candidate only knows about the list tab. Keep the existing
+      // message/split workspace so a checkpoint retry reuses the same chat
+      // tab instead of silently creating a second one.
+      ...previousExecution,
+      ...freshExecution,
+      ...(previousExecution.messageTabId
+        ? { messageTabId: previousExecution.messageTabId }
+        : {}),
+      ...(previousExecution.messageWindowId
+        ? { messageWindowId: previousExecution.messageWindowId }
+        : {}),
+      ...(previousTask?.execution?.taskRunId
+        ? { taskRunId: previousTask.execution.taskRunId }
+        : {})
+    },
     previewNavigation: freshTask?.previewNavigation || null,
     scanMeta: {
       ...(freshTask?.scanMeta || {}),
@@ -3142,7 +3304,11 @@ async function refreshAndContinue(payload = {}, sourceTab, previewRunId = '') {
       deferPublish: true
     }, readyTab, previewRunId);
     if (!fresh?.ok || !fresh.task) return fresh;
+    // STOP_TASK can invalidate the preview after runPreview's final check but
+    // before this refresh merges and publishes the candidate task.
+    if (!isPreviewRunActive(previewRunId)) return previewCancelledResult();
     const merged = mergeRefreshedTask(previousTask, fresh.task, previousTask.sourceContext);
+    if (!isPreviewRunActive(previewRunId)) return previewCancelledResult();
     await publishTask(merged.task);
     await log('success', `[刷新并继续] 扫描完成：新增 ${merged.added} 个岗位，重复 ${merged.duplicates} 个，累计 ${merged.task.results.length} 个`, {
       taskId: merged.task.id,
@@ -3164,6 +3330,11 @@ async function refreshAndContinue(payload = {}, sourceTab, previewRunId = '') {
 async function recordTargetModeHalt(task, message, level = 'warn') {
   if (!task) return;
   task.targetLastError = String(message || '目标模式已停止');
+  task.status = TASK_STATUS.STOPPED;
+  task.pauseReason = task.targetLastError;
+  task.awaitingUserRetry = false;
+  task.uiErrorDismissed = false;
+  setTaskTerminalSignal(task, TASK_STATUS.STOPPED);
   task.updatedAt = Date.now();
   await publishTask(task);
   await log(level, `[目标模式] ${task.targetLastError}`, {
@@ -3174,9 +3345,15 @@ async function recordTargetModeHalt(task, message, level = 'warn') {
   });
 }
 
-async function runTargetDeliveryLoop(taskId) {
+async function runTargetDeliveryLoop(taskId, taskRunId = uid('run')) {
   if (runner.targetLoop) return { ok: false, error: 'TARGET_LOOP_RUNNING' };
+  if (runner.stopping || runner.abort) return { ok: false, error: 'OP_CANCELLED' };
+  if (runner.taskRunTaskId && !isTaskRunCurrent(taskId, taskRunId)) {
+    return { ok: false, error: 'STALE_TASK_RUN' };
+  }
   runner.targetLoop = true;
+  runner.taskRunId = taskRunId;
+  runner.taskRunTaskId = taskId;
   runner.abort = false;
   try {
     while (!runner.abort) {
@@ -3200,8 +3377,9 @@ async function runTargetDeliveryLoop(taskId) {
         return { ok: false, error: 'TARGET_TASK_PAUSED', task };
       }
 
-      await runTaskLoop(taskId);
+      const deliveryResult = await runTaskLoop(taskId, taskRunId);
       if (runner.abort) return { ok: false, error: 'ABORTED' };
+      if (deliveryResult?.ok === false) return deliveryResult;
 
       all = await getAllConfig();
       task = all.task;
@@ -4132,9 +4310,15 @@ async function processOneJob(task, resultRow, config) {
   return 'success';
 }
 
-async function runTaskLoop(taskId) {
+async function runTaskLoop(taskId, taskRunId = uid('run')) {
   if (runner.running) return { ok: false, error: 'ALREADY_RUNNING' };
+  if (runner.stopping || runner.abort) return { ok: false, error: 'OP_CANCELLED' };
+  if (runner.taskRunTaskId && !isTaskRunCurrent(taskId, taskRunId)) {
+    return { ok: false, error: 'STALE_TASK_RUN' };
+  }
   runner.running = true;
+  runner.taskRunId = taskRunId;
+  runner.taskRunTaskId = taskId;
   runner.abort = false;
   runner.pause = false;
   runner.schedulePauseRequested = false;
@@ -4149,6 +4333,8 @@ async function runTaskLoop(taskId) {
       return { ok: false, error: 'TASK_NOT_FOUND' };
     }
 
+    if (!isTaskRunCurrent(taskId, taskRunId)) return { ok: false, error: 'STALE_TASK_RUN' };
+    task.execution = { ...(task.execution || {}), taskRunId };
     if (await pauseAtDeliveryScheduleBoundary(task, config.settings || {}, new Date())) {
       return { ok: true, task, scheduled: true };
     }
@@ -4162,10 +4348,8 @@ async function runTaskLoop(taskId) {
     {
       const rebuilt = buildDeliveryQueue(task.results || [], { selectedOnly: true });
       // 保留已完成状态
-      const prev = new Map((task.queue || []).map((q) => [String(q.jobId || '') + '|' + normalizeText(q.title || ''), q]));
       task.queue = rebuilt.map((q) => {
-        const old = prev.get(String(q.jobId || '') + '|' + normalizeText(q.title || '')) ||
-          (task.queue || []).find((x) => x.jobId && x.jobId === q.jobId);
+        const old = (task.queue || []).find((candidate) => jobsShareMergeIdentity(candidate, q));
         if (old && (old.status === 'done' || old.status === 'skipped' || old.status === 'failed')) {
           return { ...q, status: old.status, outcome: old.outcome, finishedAt: old.finishedAt };
         }
@@ -4185,6 +4369,8 @@ async function runTaskLoop(taskId) {
           company: q.company,
           href: q.href,
           securityId: q.securityId,
+          location: q.location || '',
+          lid: q.lid || '',
           listHref: task.listHref
         }
       };
@@ -4249,19 +4435,28 @@ async function runTaskLoop(taskId) {
       }
     }
 
-    for (let qi = 0; qi < queue.length; qi++) {
+    for (let qi = 0; qi < queue.length && isTaskRunCurrent(taskId, taskRunId); qi++) {
       const row = queue[qi];
       const boundary = await waitForRunnableQueueBoundary(taskId);
       if (!boundary.ok) break;
+      if (!isTaskRunCurrent(taskId, taskRunId)) return { ok: false, error: 'STALE_TASK_RUN' };
       config = boundary.config;
       task = boundary.task;
 
       // 持久化游标：queue 状态优先（SW 重启后仍能续跑）
-      const qMeta = (task.queue || [])[qi] || (task.queue || []).find((x) => x.jobId === row.job?.jobId);
-      if (qMeta && (qMeta.status === 'done' || qMeta.status === 'skipped' || qMeta.status === 'failed' && qMeta.skipOnResume)) {
+      const qMeta = (task.queue || [])[qi] || (task.queue || []).find((x) =>
+        jobsShareMergeIdentity(x, row.job || {})
+      );
+      // "继续" means move past a failed job. The explicit retry action resets
+      // its queue entry to pending, so only that action may run it again.
+      if (qMeta && (
+        qMeta.status === 'done' ||
+        qMeta.status === 'skipped' ||
+        qMeta.status === 'failed'
+      )) {
         continue;
       }
-      const item = task.items.find((x) => x.jobId === row.job.jobId);
+      const item = task.items.find((x) => jobsShareMergeIdentity(x, row.job || {}));
       if (item && (item.state === 'COMPLETED' || item.state === 'SKIPPED')) {
         if (qMeta && qMeta.status === 'pending') {
           qMeta.status = item.state === 'COMPLETED' ? 'done' : 'skipped';
@@ -4363,6 +4558,8 @@ async function runTaskLoop(taskId) {
               jobId: nextId,
               title: nextPick.pick.job.title || '',
               company: nextPick.pick.job.company || '',
+              location: nextPick.pick.job.location || '',
+              lid: nextPick.pick.job.lid || '',
               href: nextPick.pick.job.href || '',
               securityId: nextPick.pick.job.securityId || '',
               status: 'pending'
@@ -4375,6 +4572,8 @@ async function runTaskLoop(taskId) {
               jobId: nextId,
               title: nextPick.pick.job.title || '',
               company: nextPick.pick.job.company || '',
+              location: nextPick.pick.job.location || '',
+              lid: nextPick.pick.job.lid || '',
               href: nextPick.pick.job.href || '',
               securityId: nextPick.pick.job.securityId || '',
               listHref: task.listHref
@@ -4549,10 +4748,11 @@ async function runTaskLoop(taskId) {
       }
     }
 
+    if (!isTaskRunCurrent(taskId, taskRunId)) return { ok: false, error: 'STALE_TASK_RUN' };
     config = await getAllConfig();
     task = config.task;
     if (task) {
-      if (runner.abort) {
+      if (runner.abort || task.status === TASK_STATUS.STOPPED) {
         task.status = TASK_STATUS.STOPPED;
         setTaskTerminalSignal(task, TASK_STATUS.STOPPED);
         await log('warn', taskSummaryText(task, TASK_STATUS.STOPPED));
@@ -4593,7 +4793,7 @@ async function runTaskLoop(taskId) {
     await debugLog('background.task', 'runner_exception', { taskId, error: serializeError(err) }, 'error');
     await log('error', `任务异常：${err?.message || err}`, { error: serializeError(err) });
     const config = await getAllConfig();
-    if (config.task) {
+    if (config.task?.id === taskId && config.task?.execution?.taskRunId === taskRunId && isTaskRunCurrent(taskId, taskRunId)) {
       config.task.status = TASK_STATUS.FAILED;
       config.task.updatedAt = Date.now();
       await publishTask(config.task);
@@ -4602,14 +4802,16 @@ async function runTaskLoop(taskId) {
   } finally {
     try {
       const all = await getAllConfig();
-      if (all.task?.execution?.workerTabId) {
+      if (all.task?.id === taskId && all.task?.execution?.taskRunId === taskRunId && all.task?.execution?.workerTabId) {
         await closeConversationWorkerTab(all.task, all.task.execution.workerTabId, {
           reason: '任务循环结束，清理遗留沟通执行页'
         });
       }
     } catch (_) {}
-    runner.running = false;
-    runner.schedulePauseRequested = false;
+    if (isTaskRunCurrent(taskId, taskRunId)) {
+      runner.running = false;
+      runner.schedulePauseRequested = false;
+    }
   }
 }
 
@@ -4711,17 +4913,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           now: Date.now(),
           runner: runnerSnapshot()
         };
-      case MSG.SAVE_SETTINGS:
+      case MSG.SAVE_SETTINGS: {
         await saveSettings(payload);
-        await syncDebugLoggingSetting(payload);
-        await configureDeliveryScheduleAlarm(payload);
+        // SAVE_SETTINGS accepts a partial patch. Resolve the persisted full
+        // settings before updating in-memory diagnostics and the schedule
+        // alarm, otherwise saving an unrelated field clears the alarm.
+        const savedSettings = (await getAllConfig()).settings || {};
+        await syncDebugLoggingSetting(savedSettings);
+        await configureDeliveryScheduleAlarm(savedSettings);
         await enforceDeliverySchedule('settings_changed');
         await debugLog('background.settings', 'saved', {
           debugLoggingEnabled,
-          splitViewEnabled: payload?.splitViewEnabled !== false,
-          scheduledDeliveryEnabled: payload?.scheduledDeliveryEnabled === true
+          splitViewEnabled: savedSettings.splitViewEnabled !== false,
+          scheduledDeliveryEnabled: savedSettings.scheduledDeliveryEnabled === true
         });
         return { ok: true };
+      }
       case MSG.SAVE_FILTERS:
         await saveFilters(payload);
         return { ok: true };
@@ -4866,6 +5073,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               jobId: id,
               company: row?.job?.company || '',
               title: row?.job?.title || '',
+              location: row?.job?.location || '',
+              lid: row?.job?.lid || '',
+              securityId: row?.job?.securityId || '',
               state: 'NOT_STARTED',
               reasons: [],
               selected: true
@@ -4901,11 +5111,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         task.uiErrorDismissed = false;
         task.retryCurrent = false;
         task.consecutiveFails = 0;
+        runner.taskRunTaskId = task.id;
+        task.execution = { ...(task.execution || {}), taskRunId: runner.taskRunId };
         const scheduledStart = stageTaskForDeliverySchedule(task, all.settings || {}, new Date());
         const split = scheduledStart.waiting
           ? { ok: false, skipped: true, reason: 'waiting_for_schedule' }
           : await prepareSplitWorkspace(task, all.settings || {});
         await publishTask(task);
+        if (runner.abort || task.status === TASK_STATUS.STOPPED) {
+          return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，未开始投递' };
+        }
         if (split.ok) {
           await log('success', '[分屏] 职位列表在左侧，消息中心在右侧', {
             listTabId: split.listTabId,
@@ -4922,8 +5137,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } else {
           await log('info', '批量投递启动：待投 ' + selectedIds.length + ' 岗（已跳过已完成 ' + doneIds.size + '）');
           // async loop
-          if (targetMode) runTargetDeliveryLoop(task.id);
-          else runTaskLoop(task.id);
+          if (runner.abort || task.status === TASK_STATUS.STOPPED) {
+            return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，未开始投递' };
+          }
+          if (targetMode) runTargetDeliveryLoop(task.id, runner.taskRunId);
+          else runTaskLoop(task.id, runner.taskRunId);
         }
         return {
           ok: true,
@@ -5009,6 +5227,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 jobId: onlyId,
                 company: pick.job?.company || '',
                 title: pick.job?.title || '',
+                location: pick.job?.location || '',
+                lid: pick.job?.lid || '',
+                securityId: pick.job?.securityId || '',
                 state: 'NOT_STARTED',
                 reasons: [],
                 selected: true
@@ -5022,6 +5243,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               jobId: pick.job.jobId,
               title: pick.job.title,
               company: pick.job.company,
+              location: pick.job.location || '',
+              lid: pick.job.lid || '',
               href: pick.job.href || '',
               securityId: pick.job.securityId || '',
               status: 'pending'
@@ -5046,11 +5269,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         task.testedJobIds = Array.from(new Set([...(task.testedJobIds || []).map(String), ...extraForPick]));
         task.pauseReason = '';
         task.awaitingUserRetry = false;
+        runner.taskRunTaskId = task.id;
+        task.execution = { ...(task.execution || {}), taskRunId: runner.taskRunId };
         const scheduledStart = stageTaskForDeliverySchedule(task, all.settings || {}, new Date());
         const split = scheduledStart.waiting
           ? { ok: false, skipped: true, reason: 'waiting_for_schedule' }
           : await prepareSplitWorkspace(task, all.settings || {});
         await publishTask(task);
+        if (runner.abort || task.status === TASK_STATUS.STOPPED) {
+          return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，未开始投递' };
+        }
         if (split.ok) {
           await log('success', '[分屏] 投递一份已打开左右工作区', {
             listTabId: split.listTabId,
@@ -5069,7 +5297,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               remain +
               ' 岗（活跃度不满足将自动顺延，投成功 1 岗后停止）',
         { jobId: onlyId, remain, nextStartAt: task.scheduleNextStartAt || null });
-        if (!scheduledStart.waiting) runTaskLoop(task.id);
+        if (!scheduledStart.waiting) {
+          if (runner.abort || task.status === TASK_STATUS.STOPPED) {
+            return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，未开始投递' };
+          }
+          runTaskLoop(task.id, runner.taskRunId);
+        }
         return {
           ok: true,
           testJobId: onlyId,
@@ -5098,9 +5331,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await log('warn', '用户暂停任务');
         return { ok: true };
       case MSG.RESUME_TASK: {
+        if (runner.stopping || runner.abort) {
+          return { ok: false, error: 'OP_CANCELLED', message: '任务正在停止，请稍后重试' };
+        }
         {
           const all0 = await getAllConfig();
-          if (all0.task) {
+          if (all0.task && all0.task.status !== TASK_STATUS.STOPPED) {
             all0.task.awaitingUserRetry = false;
             // payload.retry === true 表示弹窗「重试」：只重置当前失败岗位
             const wantRetry = Boolean(payload?.retry);
@@ -5176,12 +5412,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         const all = await getAllConfig();
         if (!all.task) return { ok: false, error: 'NO_TASK' };
+        if (all.task.status === TASK_STATUS.STOPPED) {
+          return { ok: false, error: 'TASK_STOPPED', message: '任务已停止，请重新扫描或重新启动投递' };
+        }
+        const resumeOwnsLoop = !runner.running;
+        const resumeTaskRunId = resumeOwnsLoop
+          ? uid('run')
+          : String(all.task.execution?.taskRunId || runner.taskRunId || '');
         // 先把状态写回 RUNNING 再释放暂停：循环唤醒后读到的才是新状态，
         // 避免循环用旧 paused 快照发布导致面板一直显示「已暂停」。
         const scheduledResume = stageTaskForDeliverySchedule(all.task, all.settings || {}, new Date());
         if (scheduledResume.waiting) {
           runner.pause = true;
-          await publishTask(all.task);
+          const published = await publishTask(all.task);
+          if (!published || runner.stopping || runner.abort || all.task.status === TASK_STATUS.STOPPED) {
+            return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，恢复操作已取消' };
+          }
           await log('info', all.task.pauseReason, {
             taskId: all.task.id,
             nextStartAt: all.task.scheduleNextStartAt
@@ -5193,20 +5439,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             message: all.task.pauseReason
           };
         }
+        if (runner.stopping || runner.abort) {
+          return { ok: false, error: 'OP_CANCELLED', message: '任务正在停止，恢复操作已取消' };
+        }
+        if (resumeOwnsLoop) {
+          runner.taskRunId = resumeTaskRunId;
+          runner.taskRunTaskId = all.task.id;
+          all.task.execution = { ...(all.task.execution || {}), taskRunId: resumeTaskRunId };
+        }
         all.task.status = TASK_STATUS.RUNNING;
         all.task.pauseReason = '';
-        await publishTask(all.task);
-        runner.pause = false;
+        // Clear the old pause generation before the write. A STOP_TASK arriving
+        // during publish must be able to set abort=true and keep it set; doing
+        // this after the await would let a late RESUME undo the stop request.
         runner.abort = false;
-        if (!runner.running) {
-          if (all.task.targetMode === true) runTargetDeliveryLoop(all.task.id);
-          else runTaskLoop(all.task.id);
+        const published = await publishTask(all.task);
+        if (!published || runner.stopping || runner.abort || all.task.status === TASK_STATUS.STOPPED) {
+          return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，恢复操作已取消' };
+        }
+        runner.pause = false;
+        if (resumeOwnsLoop) {
+          if (all.task.targetMode === true) runTargetDeliveryLoop(all.task.id, resumeTaskRunId);
+          else runTaskLoop(all.task.id, resumeTaskRunId);
         }
         await log('info', payload?.retry ? '重试当前岗位' : '继续任务');
         return { ok: true };
       }
-      case MSG.STOP_TASK:
-        if (runner.previewing && !runner.running) {
+      case MSG.STOP_TASK: {
+        runner.stopping = true;
+        const stopTaskId = String(runner.taskRunTaskId || '');
+        const stopTaskRunId = String(runner.taskRunId || '');
+        try {
+        if (runner.previewing && !runner.running && !runner.targetLoop) {
           const cancelledPreviewRunId = runner.previewRunId;
           const previousPreviewTask = runner.previewPreviousTask;
           const previewRunPromise = activePreviewRun?.id === cancelledPreviewRunId
@@ -5235,6 +5499,51 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           await log('warn', '用户已取消扫描预览');
           return { ok: true, previewCancelled: true, task: all.task || null };
         }
+        if (runner.previewing && !runner.running && runner.targetLoop) {
+          const cancelledPreviewRunId = runner.previewRunId;
+          const previousPreviewTask = runner.previewPreviousTask;
+          const previewRunPromise = activePreviewRun?.id === cancelledPreviewRunId
+            ? activePreviewRun.promise
+            : null;
+          runner.abort = true;
+          runner.pause = false;
+          runner.previewRunId = '';
+          runner.previewPhase = 'cancelling';
+          await cancelActiveOperations('用户停止目标模式刷新');
+          if (previewRunPromise) {
+            try { await previewRunPromise; } catch (_) {}
+          }
+          await discardCancelledPreviewTask(cancelledPreviewRunId, previousPreviewTask);
+          runner.previewing = false;
+          runner.previewStartedAt = 0;
+          runner.previewScanStartedAt = 0;
+          runner.previewScanFinishedAt = 0;
+          runner.previewPhase = '';
+          runner.previewScanned = 0;
+          runner.previewPass = 0;
+          runner.previewPreviousTask = null;
+          const all = await getAllConfig();
+          if (all.task && !taskMatchesStopRequest(all.task, stopTaskId, stopTaskRunId)) {
+            await debugLog('background.task', 'stale_stop_ignored', {
+              taskId: all.task.id || null,
+              taskRunId: all.task.execution?.taskRunId || '',
+              requestedTaskId: stopTaskId || null,
+              requestedTaskRunId: stopTaskRunId || null
+            }, 'warn');
+            return { ok: true, task: all.task, ignored: true };
+          }
+          if (all.task) {
+            all.task.status = TASK_STATUS.STOPPED;
+            all.task.pauseReason = all.task.targetLastError || '用户停止目标模式';
+            all.task.awaitingUserRetry = false;
+            all.task.updatedAt = Date.now();
+            setTaskTerminalSignal(all.task, TASK_STATUS.STOPPED);
+            await publishTask(all.task);
+            await log('warn', taskSummaryText(all.task, TASK_STATUS.STOPPED));
+            return { ok: true, task: all.task };
+          }
+          return { ok: true, task: null };
+        }
         runner.abort = true;
         runner.pause = false;
         runner.schedulePauseRequested = false;
@@ -5242,6 +5551,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         {
           const all = await getAllConfig();
           if (all.task) {
+            if (!taskMatchesStopRequest(all.task, stopTaskId, stopTaskRunId)) {
+              await debugLog('background.task', 'stale_stop_ignored', {
+                taskId: all.task.id || null,
+                taskRunId: all.task.execution?.taskRunId || '',
+                requestedTaskId: stopTaskId || null,
+                requestedTaskRunId: stopTaskRunId || null
+              }, 'warn');
+              return { ok: true, task: all.task, ignored: true };
+            }
             if (all.task.execution?.workerTabId) {
               await closeConversationWorkerTab(all.task, all.task.execution.workerTabId, {
                 reason: '用户停止任务，关闭临时沟通执行页',
@@ -5258,6 +5576,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         await log('warn', '用户停止任务：当前没有可汇报的任务');
         return { ok: true, task: null };
+        } finally {
+          runner.stopping = false;
+        }
+      }
       case MSG.SKIP_CURRENT: {
         // 若在等待用户重试的暂停中：直接标记当前岗位跳过，并清掉 skip 标志，避免下一岗被连带跳过
         if (runner.pause) {

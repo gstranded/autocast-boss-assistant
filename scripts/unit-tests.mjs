@@ -20,7 +20,7 @@ import { checkDedup, checkLimits, segmentIdempotencyKey, jobIdempotencyKey } fro
 import { renderTemplate, pickResumeProfile } from "../extension/shared/template.js";
 import { filterHistoryRows, filterHistoryByDate, summarizeHistory, startOfLocalDay, endOfLocalDay, normalizeHistoryDateRange } from "../extension/shared/history-view.js";
 import { planResumeSend } from "../extension/shared/resume-policy.js";
-import { buildExportPayload, importConfigPatch, IMPORT_CONFIG_KEYS, sanitizeImportedTask, normalizeSettings } from "../extension/shared/storage.js";
+import { buildExportPayload, importConfigPatch, IMPORT_CONFIG_KEYS, sanitizeImportedTask, normalizeSettings, saveSettings } from "../extension/shared/storage.js";
 import { isBossUrl, isBossHostname, isBossTab, bossUrlGuardMessage } from "../extension/shared/boss-url.js";
 import {
   didContentDocumentChange,
@@ -52,6 +52,7 @@ import {
   countPassJobs,
   countPendingPassJobs,
   jobMergeKey,
+  jobsShareMergeIdentity,
   mergeTaskResults,
   rebuildDeliveryQueue,
   countSuccessfulDeliveries,
@@ -799,6 +800,31 @@ test("export payload round-trips settings filters template and bindings", () => 
   assert.deepEqual(patch[STORAGE_KEYS.MESSAGE_TEMPLATE], exported.messageTemplate);
   assert.deepEqual(patch[STORAGE_KEYS.BINDINGS], exported.bindings);
   assert.equal(Object.keys(IMPORT_CONFIG_KEYS).includes("settings"), true);
+});
+
+test("settings patches serialize and preserve concurrent keys", async () => {
+  const previousChrome = globalThis.chrome;
+  const stored = { [STORAGE_KEYS.SETTINGS]: { theme: "dark", taskMaxCommunicate: 30 } };
+  globalThis.chrome = {
+    storage: {
+      local: {
+        get: async (key) => ({ [key]: structuredClone(stored[key]) }),
+        set: async (patch) => {
+          for (const [key, value] of Object.entries(patch)) stored[key] = structuredClone(value);
+        }
+      }
+    }
+  };
+  try {
+    await Promise.all([
+      saveSettings({ theme: "light" }),
+      saveSettings({ taskMaxCommunicate: 42 })
+    ]);
+    assert.equal(stored[STORAGE_KEYS.SETTINGS].theme, "light");
+    assert.equal(stored[STORAGE_KEYS.SETTINGS].taskMaxCommunicate, 42);
+  } finally {
+    globalThis.chrome = previousChrome;
+  }
 });
 
 test("export carries daily stats, idempotency and task; import sanitizes task", () => {
@@ -2055,7 +2081,57 @@ test("refresh merge keeps previous jobs and removes new-batch duplicates", () =>
   assert.equal(merged.added, 1);
   const queue = rebuildDeliveryQueue(merged.results, [{ jobId: "a", status: "done" }], ["a"]);
   assert.deepEqual(queue.map((item) => [item.jobId, item.status]), [["a", "done"], ["c", "pending"]]);
+  const refreshed = rebuildDeliveryQueue(
+    [
+      { decision: "pass", selected: true, job: { jobId: "failed", title: "失败岗", company: "A" } },
+      { decision: "pass", selected: true, job: { jobId: "new", title: "新岗位", company: "B" } }
+    ],
+    [{ jobId: "failed", status: "failed", outcome: "failed" }],
+    ["failed"]
+  );
+  assert.deepEqual(refreshed.map((item) => [item.jobId, item.status]), [["failed", "failed"], ["new", "pending"]],
+    "refresh must keep failed jobs out of the pending queue; explicit retry resets them separately");
   assert.equal(jobMergeKey({ jobId: "a" }), "id:a");
+  assert.notEqual(
+    jobMergeKey({ jobId: "name_old", company: "同一公司", title: "同一职位", location: "广州", securityId: "sid-1", lid: "lid-1" }),
+    jobMergeKey({ jobId: "name_new", company: "同一公司", title: "同一职位", location: "广州", securityId: "sid-2", lid: "lid-2" })
+  );
+  const incomplete = { jobId: "name_old", company: "同一公司", title: "同一职位", location: "广州" };
+  const enriched = { jobId: "dom_new", company: "同一公司", title: "同一职位", location: "广州", securityId: "sid-1", lid: "lid-1" };
+  assert.equal(jobsShareMergeIdentity(incomplete, enriched), true);
+  assert.equal(jobsShareMergeIdentity(
+    { ...incomplete, securityId: "sid-1" },
+    { ...enriched, jobId: "real-1" }
+  ), true);
+  assert.equal(jobsShareMergeIdentity(
+    { ...incomplete, lid: "lid-1" },
+    { ...enriched, jobId: "real-1", securityId: "" }
+  ), true);
+  assert.equal(jobsShareMergeIdentity(
+    { ...incomplete, href: "https://www.zhipin.com/job_detail/1.html" },
+    { ...enriched, jobId: "real-1", href: "https://www.zhipin.com/job_detail/1.html" }
+  ), true);
+  assert.equal(jobsShareMergeIdentity(
+    incomplete,
+    { ...enriched, location: "深圳", securityId: "", lid: "" }
+  ), false);
+  assert.equal(jobsShareMergeIdentity(
+    enriched,
+    { ...enriched, jobId: "name_other", securityId: "sid-2" }
+  ), false);
+  assert.equal(jobsShareMergeIdentity(
+    enriched,
+    { ...enriched, jobId: "name_other", lid: "lid-2" }
+  ), false);
+  assert.equal(jobsShareMergeIdentity(
+    enriched,
+    { ...enriched, jobId: "name_other", location: "深圳", securityId: "sid-2", lid: "lid-2" }
+  ), false);
+  const upgraded = mergeTaskResults(
+    [{ decision: "pass", job: { ...incomplete, securityId: "sid-1" } }],
+    [{ decision: "pass", job: { ...enriched, jobId: "real-1" } }]
+  );
+  assert.deepEqual(upgraded.results.map((row) => row.job.jobId), ["real-1"]);
 });
 
 test("target delivery counts only successful sends and stops at the target", () => {

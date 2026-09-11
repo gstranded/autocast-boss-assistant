@@ -1,7 +1,7 @@
 # BOSS 海投助手功能清单与逐项验收矩阵
 
 > 基线版本：v1.7.36
-> 基线提交：9f7bf42
+> 基线提交：2be3e52
 > 开发目录：`/Users/gaohaizhen/Desktop/boss-dev`（`dev`）  
 > 浏览器：ego-browser，加载 `boss-dev/extension`  
 > 建立日期：2026-09-10

@@ -2031,7 +2031,13 @@ function firstEl(selectors, root = document) {
     const jd = [textOf(card), tags.join(" ")].join(" ");
 
     if (!jobId) {
-      const stable = hashStr(normalizeText(title) + "|" + normalizeText(company));
+      const stable = hashStr([
+        title,
+        company,
+        locationText,
+        securityId,
+        lid
+      ].map(normalizeText).join("|"));
       jobId = (title || company) ? ("name_" + stable) : ("dom_" + index + "_" + stable);
     }
 

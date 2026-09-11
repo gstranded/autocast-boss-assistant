@@ -63,6 +63,7 @@ const state = {
   targetCountDraft: '',
   messageDirty: false,
   messageRevision: 0,
+  resumeRevision: 0,
   lastPersistedConfigSections: null,
   lastRemoteConfigSections: null,
   activeProfileId: null,
@@ -108,6 +109,53 @@ function configSectionSignature(value) {
   return JSON.stringify(stableConfigValue(value));
 }
 
+let configSaveChain = Promise.resolve();
+
+function enqueueConfigSave(work) {
+  const run = configSaveChain.then(work);
+  configSaveChain = run.catch(() => {});
+  return run;
+}
+
+function draftRevisionSnapshot() {
+  return {
+    autosave: autosaveRevision,
+    message: state.messageRevision,
+    resume: state.resumeRevision
+  };
+}
+
+function draftRevisionsStable(snapshot) {
+  return autosaveRevision === snapshot.autosave &&
+    state.messageRevision === snapshot.message &&
+    state.resumeRevision === snapshot.resume;
+}
+
+function settleManagementDirty(snapshot, dirtyBefore) {
+  if (!dirtyBefore && draftRevisionsStable(snapshot) && !state.messageDirty) {
+    state.formDirty = false;
+  } else {
+    // A management request only saves the resume section. Keep any unrelated
+    // draft, or edits made while the request was in flight, eligible for autosave.
+    state.formDirty = true;
+  }
+}
+
+function hasPendingResumeFiles() {
+  return Boolean($('imageFiles')?.files?.length);
+}
+
+function settingsSavePatch(settings) {
+  const baseline = state.lastPersistedConfigSections?.settings;
+  if (!baseline) return settings;
+  return Object.keys(settings || {}).reduce((patch, key) => {
+    if (configSectionSignature(settings[key]) !== configSectionSignature(baseline[key])) {
+      patch[key] = settings[key];
+    }
+    return patch;
+  }, {});
+}
+
 function configSections(config = {}) {
   return {
     settings: config.settings || {},
@@ -123,7 +171,16 @@ function rememberPersistedConfig(config = state.config) {
   state.lastPersistedConfigSections = structuredClone(configSections(config));
 }
 
+function rememberPersistedConfigSection(name, value) {
+  const sections = state.lastPersistedConfigSections
+    ? structuredClone(state.lastPersistedConfigSections)
+    : configSections(state.config || {});
+  sections[name] = structuredClone(value);
+  state.lastPersistedConfigSections = sections;
+}
+
 function localConfigSections(remote = {}) {
+  try { flushActiveProfileForm(); } catch (_) {}
   const base = state.config || remote || {};
   let messageTemplate = base.messageTemplate || remote.messageTemplate || {};
   let filters = remote.filters || base.filters || {};
@@ -154,13 +211,6 @@ function localConfigSections(remote = {}) {
     resumes: structuredClone(base.resumes || remote.resumes || {}),
     bindings
   };
-  const files = $('imageFiles')?.files;
-  if (files?.length) {
-    sections.resumes = {
-      ...sections.resumes,
-      __pendingFiles: Array.from(files).map((file) => ({ name: file.name, size: file.size, type: file.type }))
-    };
-  }
   return sections;
 }
 
@@ -191,14 +241,7 @@ function wireThemeSwitch() {
       const theme = button.dataset.themeValue === 'light' ? 'light' : 'dark';
       applyTheme(theme);
       try {
-        let base = state.config?.settings;
-        if (!base) {
-          const bag = await globalThis.chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
-          base = bag?.[STORAGE_KEYS.SETTINGS] || {};
-        }
-        const settings = { ...base, theme };
-        await api(MSG.SAVE_SETTINGS, settings);
-        if (state.config) state.config.settings = settings;
+        await saveSettings({ refresh: false });
       } catch (e) {
         toast('主题保存失败：' + String(e?.message || e), 'error');
       }
@@ -1376,6 +1419,7 @@ function renderProfileList() {
     btn.addEventListener('click', () => {
       // flush current form into memory first
       flushActiveProfileForm();
+      state.resumeRevision += 1;
       state.activeProfileId = btn.getAttribute('data-switch');
       renderResumeEditor();
       renderProfileList();
@@ -1383,12 +1427,17 @@ function renderProfileList() {
   });
   box.querySelectorAll('[data-default]').forEach((btn) => {
     btn.addEventListener('click', async () => {
-      flushActiveProfileForm();
-      state.config.resumes.defaultProfileId = btn.getAttribute('data-default');
-      await api(MSG.SAVE_RESUMES, state.config.resumes);
-      state.formDirty = false;
-  await refresh({ soft: false });
-      toast('已更新默认方案', 'success');
+      await enqueueConfigSave(async () => {
+        const dirtyBefore = state.formDirty || state.messageDirty;
+        flushActiveProfileForm();
+        state.config.resumes.defaultProfileId = btn.getAttribute('data-default');
+        state.resumeRevision += 1;
+        const revisionAtStart = draftRevisionSnapshot();
+        await api(MSG.SAVE_RESUMES, state.config.resumes);
+        settleManagementDirty(revisionAtStart, dirtyBefore);
+        await refresh({ soft: false });
+        toast('已更新默认方案', 'success');
+      });
     });
   });
 }
@@ -2197,65 +2246,113 @@ async function refreshRunnerState() {
   return runnerPollPromise;
 }
 
-async function saveFilters(opts = {}) {
+async function saveFiltersNow(opts = {}) {
+  const revisionAtStart = autosaveRevision;
+  const requestedSections = opts.sections ? new Set(opts.sections) : null;
+  const saveFilterSection = !requestedSections || requestedSections.has('filters');
+  const saveListSection = !requestedSections || requestedSections.has('lists');
+  const saveSettingsSection = !requestedSections || requestedSections.has('settings');
   const filters = readFilters();
   const lists = {
     companyBlacklist: parseKeywords($('blacklist').value.replace(/\n/g, ',')),
     companyWhitelist: parseKeywords($('whitelist').value.replace(/\n/g, ','))
   };
   const settings = readSettingsPatch(state.config?.settings || {});
-  await api(MSG.SAVE_FILTERS, filters);
-  await api(MSG.SAVE_LISTS, lists);
-  await api(MSG.SAVE_SETTINGS, settings);
+  const settingsPatch = settingsSavePatch(settings);
+  if (saveFilterSection) await api(MSG.SAVE_FILTERS, filters);
+  if (saveListSection) await api(MSG.SAVE_LISTS, lists);
+  if (saveSettingsSection && Object.keys(settingsPatch).length) await api(MSG.SAVE_SETTINGS, settingsPatch);
+  const currentFilters = readFilters();
+  const currentLists = {
+    companyBlacklist: parseKeywords($('blacklist').value.replace(/\n/g, ',')),
+    companyWhitelist: parseKeywords($('whitelist').value.replace(/\n/g, ','))
+  };
+  const currentSettings = readSettingsPatch(state.config?.settings || {});
+  const filtersStable = !saveFilterSection || configSectionSignature(currentFilters) === configSectionSignature(filters);
+  const listsStable = !saveListSection || configSectionSignature(currentLists) === configSectionSignature(lists);
+  const settingsStable = !saveSettingsSection || configSectionSignature(currentSettings) === configSectionSignature(settings);
   if (state.config) {
-    state.config.filters = filters;
-    state.config.lists = lists;
-    state.config.settings = { ...(state.config.settings || {}), ...settings };
+    if (saveFilterSection && filtersStable) state.config.filters = filters;
+    if (saveListSection && listsStable) state.config.lists = lists;
+    if (saveSettingsSection && settingsStable) state.config.settings = { ...(state.config.settings || {}), ...settings };
   }
   if (opts.refresh !== false) {
-    state.formDirty = false;
+    if (autosaveRevision === revisionAtStart && filtersStable && listsStable && settingsStable) {
+      state.formDirty = false;
+    }
     await refresh({ soft: true });
   }
-  rememberPersistedConfig();
+  if (saveFilterSection && filtersStable) rememberPersistedConfigSection('filters', filters);
+  if (saveListSection && listsStable) rememberPersistedConfigSection('lists', lists);
+  if (saveSettingsSection && settingsStable) rememberPersistedConfigSection('settings', settings);
 }
 
-async function saveMessage(opts = {}) {
+function saveFilters(opts = {}) {
+  return enqueueConfigSave(() => saveFiltersNow(opts));
+}
+
+async function saveMessageNow(opts = {}) {
   if (!state.config) state.config = {};
   // 永远以 DOM 为准，不依赖可能被 refresh 冲掉的 base
   const revisionAtStart = state.messageRevision;
+  const autosaveRevisionAtStart = autosaveRevision;
   const template = readTemplate(state.config.messageTemplate || { version: 1, segments: [] });
   const settings = readSettingsPatch(state.config.settings || {});
+  const settingsPatch = settingsSavePatch(settings);
   await api(MSG.SAVE_TEMPLATE, template);
-  await api(MSG.SAVE_SETTINGS, settings);
-  // 保存期间若用户继续编辑，保留最新 DOM 草稿，让下一轮 autosave 接着落盘。
+  if (Object.keys(settingsPatch).length) await api(MSG.SAVE_SETTINGS, settingsPatch);
+  // 保存期间若用户继续编辑，只更新实际写入的 section 基线，让下一轮
+  // autosave 接着落盘最新 DOM 草稿。
   let latestTemplate = template;
+  let latestSettings = settings;
   try {
     latestTemplate = readTemplate(state.config.messageTemplate || template, { bumpVersion: false });
   } catch (_) {}
-  state.config.messageTemplate = latestTemplate;
-  state.config.settings = { ...(state.config.settings || {}), ...settings };
-  if (state.messageRevision === revisionAtStart &&
-      templateSegmentsSignature(latestTemplate.segments) === templateSegmentsSignature(template.segments)) {
+  try { latestSettings = readSettingsPatch(state.config.settings || settings); } catch (_) {}
+  const messageStable = state.messageRevision === revisionAtStart &&
+    templateSegmentsSignature(latestTemplate.segments) === templateSegmentsSignature(template.segments);
+  const settingsStable = configSectionSignature(latestSettings) === configSectionSignature(settings);
+  if (messageStable) {
+    state.config.messageTemplate = template;
     state.messageDirty = false;
+    rememberPersistedConfigSection('messageTemplate', template);
+  } else {
+    state.messageDirty = true;
+  }
+  if (settingsStable) {
+    state.config.settings = { ...(state.config.settings || {}), ...settings };
+    rememberPersistedConfigSection('settings', settings);
   }
   if (opts.refresh !== false) {
     if (!state.messageDirty) state.formDirty = false;
     renderSegments(latestTemplate);
     await refresh({ soft: true });
   }
-  rememberPersistedConfig();
+  if (autosaveRevision !== autosaveRevisionAtStart || !settingsStable) state.formDirty = true;
   return true;
 }
 
-async function saveSettings(opts = {}) {
+function saveMessage(opts = {}) {
+  return enqueueConfigSave(() => saveMessageNow(opts));
+}
+
+async function saveSettingsNow(opts = {}) {
+  const revisionAtStart = autosaveRevision;
   const settings = readSettingsPatch(state.config?.settings || {});
-  await api(MSG.SAVE_SETTINGS, settings);
-  if (state.config) state.config.settings = { ...(state.config.settings || {}), ...settings };
+  const settingsPatch = settingsSavePatch(settings);
+  if (Object.keys(settingsPatch).length) await api(MSG.SAVE_SETTINGS, settingsPatch);
+  const currentSettings = readSettingsPatch(state.config?.settings || {});
+  const settingsStable = configSectionSignature(currentSettings) === configSectionSignature(settings);
+  if (state.config && settingsStable) state.config.settings = { ...(state.config.settings || {}), ...settings };
   if (opts.refresh !== false) {
-    state.formDirty = false;
+    if (autosaveRevision === revisionAtStart && settingsStable) state.formDirty = false;
     await refresh({ soft: true });
   }
-  rememberPersistedConfig();
+  if (settingsStable) rememberPersistedConfigSection('settings', settings);
+}
+
+function saveSettings(opts = {}) {
+  return enqueueConfigSave(() => saveSettingsNow(opts));
 }
 
 
@@ -2327,12 +2424,14 @@ async function fileToCompressedDataUrl(file, maxEdge = 1280, quality = 0.72) {
 let resumeSaveChain = Promise.resolve();
 
 function saveResume(opts = {}) {
-  const run = resumeSaveChain.then(() => saveResumeNow(opts));
+  const run = resumeSaveChain.then(() => enqueueConfigSave(() => saveResumeNow(opts)));
   resumeSaveChain = run.catch(() => {});
   return run;
 }
 
 async function saveResumeNow(opts = {}) {
+  const resumeRevisionAtStart = state.resumeRevision;
+  const autosaveRevisionAtStart = autosaveRevision;
   const shouldRefresh = opts.refresh !== false;
   const shouldRender = opts.render !== false;
   const clearInputs = opts.clearInputs !== false;
@@ -2392,39 +2491,61 @@ async function saveResumeNow(opts = {}) {
   await assertResumeStorageCapacity(resumes);
 
   const settings = readSettingsPatch(state.config?.settings || {});
+  const settingsPatch = settingsSavePatch(settings);
   // 仅当后台 ok 时继续（api 会抛错）
   await api(MSG.SAVE_RESUMES, resumes);
-  await api(MSG.SAVE_SETTINGS, settings);
+  if (Object.keys(settingsPatch).length) await api(MSG.SAVE_SETTINGS, settingsPatch);
+
+  let currentSettings = settings;
+  try { currentSettings = readSettingsPatch(state.config?.settings || settings); } catch (_) {}
+  const resumesStable = state.resumeRevision === resumeRevisionAtStart;
+  const settingsStable = configSectionSignature(currentSettings) === configSectionSignature(settings);
 
   // 成功后才改本地状态/清输入
   if (state.config) {
+    // 即使保存期间用户改了简历表单，也要把已成功写入的图片快照放回内存；
+    // 否则下一次自动保存可能用旧 state 覆盖刚写入的图片。unstable 时再把
+    // 当前名称草稿写回这个新快照，供下一轮按基线继续保存。
     state.config.resumes = resumes;
-    state.config.settings = { ...(state.config.settings || {}), ...settings };
+    if (!resumesStable) {
+      try { flushActiveProfileForm(); } catch (_) {}
+    }
+    if (settingsStable) state.config.settings = { ...(state.config.settings || {}), ...settings };
   }
-  state.formDirty = false;
-  if (clearInputs) {
+  if (resumesStable && settingsStable && autosaveRevision === autosaveRevisionAtStart) state.formDirty = false;
+  if (clearInputs && resumesStable) {
     if ($('imageFiles')) $('imageFiles').value = '';
   }
-  if (shouldRender) {
+  if (shouldRender && resumesStable) {
     try { renderResumeEditor(); } catch (_) {}
     try { renderProfileList(); } catch (_) {}
   }
   if (shouldRefresh) await refresh({ soft: true });
-  rememberPersistedConfig();
+  if (resumesStable) rememberPersistedConfigSection('resumes', resumes);
+  if (settingsStable) rememberPersistedConfigSection('settings', settings);
   return { resumes, added, skipped, duplicates };
 }
 
-async function saveBindings(opts = {}) {
+async function saveBindingsNow(opts = {}) {
+  const revisionAtStart = autosaveRevision;
   const rules = readBindingsFromDom()
     .filter((r) => (r.keywords || []).length && r.profileId)
     .sort((a, b) => (a.priority || 0) - (b.priority || 0));
   await api(MSG.SAVE_BINDINGS, { rules });
-  if (state.config) state.config.bindings = { rules };
+  const currentRules = readBindingsFromDom()
+    .filter((r) => (r.keywords || []).length && r.profileId)
+    .sort((a, b) => (a.priority || 0) - (b.priority || 0));
+  const bindingsStable = configSectionSignature({ rules: currentRules }) === configSectionSignature({ rules });
+  if (state.config && bindingsStable) state.config.bindings = { rules };
   if (opts.refresh !== false) {
-    state.formDirty = false;
+    if (autosaveRevision === revisionAtStart && bindingsStable) state.formDirty = false;
     await refresh({ soft: true });
   }
-  rememberPersistedConfig();
+  if (bindingsStable) rememberPersistedConfigSection('bindings', { rules });
+}
+
+function saveBindings(opts = {}) {
+  return enqueueConfigSave(() => saveBindingsNow(opts));
 }
 
 
@@ -2454,7 +2575,7 @@ async function flushAutosave(options = {}) {
     // 关键：按基线比较后只保存真实变更的 section，并拒绝跨面板冲突。
     try { await persistDirtyConfigSections(); } catch (e) { saveFailed = true; console.warn('autosave config', e); }
     // 输入期间不重建表单、不触发 refresh、不弹 toast；周期状态刷新会单独更新任务与日志。
-    if (!saveFailed && autosaveRevision === revisionAtStart && !autosaveComposingTarget) {
+    if (!saveFailed && autosaveRevision === revisionAtStart && !autosaveComposingTarget && !hasPendingResumeFiles()) {
       state.formDirty = false;
     } else {
       state.formDirty = true;
@@ -2483,6 +2604,9 @@ function scheduleAutosave(options = {}) {
 
 async function persistDirtyConfigSections() {
   if (!state.formDirty && !state.messageDirty) return;
+  const pendingResumeFiles = hasPendingResumeFiles();
+  const autosaveRevisionAtStart = autosaveRevision;
+  const messageRevisionAtStart = state.messageRevision;
   // 多个 BOSS 标签页都可能挂着浮窗。启动前重新读取后台配置，并把当前面板
   // 与上次落盘基线逐 section 比较，避免旧浮窗把另一面板的新配置整包覆盖。
   const latest = await api(MSG.GET_STATE);
@@ -2500,8 +2624,21 @@ async function persistDirtyConfigSections() {
     if (changedLocally) localChanged.add(name);
     if (changedLocally && changedRemotely && local !== remote) conflicts.push(name);
   }
+  // soft refresh 会把消息 DOM 草稿同步进 state.config；这时仅靠
+  // state.config 与 DOM 的签名比较会把真实编辑误判成“没有变化”。
+  // dirty 标记来自用户输入，因此消息 section 必须进入保存候选；
+  // 若远端同时改过且内容不同，仍按冲突处理，避免覆盖其他面板的更新。
+  if (state.messageDirty) {
+    const base = configSectionSignature(baseSections.messageTemplate);
+    const local = configSectionSignature(localSections.messageTemplate);
+    const remote = configSectionSignature(remoteSections.messageTemplate);
+    if (remote !== base && local !== remote && !conflicts.includes('messageTemplate')) {
+      conflicts.push('messageTemplate');
+    }
+    localChanged.add('messageTemplate');
+  }
   if (!localChanged.size) {
-    state.formDirty = false;
+    state.formDirty = pendingResumeFiles;
     state.messageDirty = false;
     state.config = { ...(state.config || {}), ...latest };
     state.lastPersistedConfigSections = structuredClone(remoteSections);
@@ -2529,7 +2666,7 @@ async function persistDirtyConfigSections() {
     try { await saveResume({ refresh: false, render: false, clearInputs: false, includePendingFiles: false }); } catch (e) { errors.push('简历：' + (e?.message || e)); }
   }
   if (localChanged.has('filters') || localChanged.has('lists')) {
-    try { await saveFilters({ refresh: false }); } catch (e) { errors.push('筛选：' + (e?.message || e)); }
+    try { await saveFilters({ refresh: false, sections: localChanged }); } catch (e) { errors.push('筛选：' + (e?.message || e)); }
   }
   if (localChanged.has('bindings')) {
     try { await saveBindings({ refresh: false }); } catch (e) { errors.push('绑定：' + (e?.message || e)); }
@@ -2537,11 +2674,13 @@ async function persistDirtyConfigSections() {
   if (errors.length) {
     throw new Error(errors.join('；'));
   }
-  state.formDirty = false;
-  state.messageDirty = false;
   const saved = await api(MSG.GET_STATE);
   state.config = saved || state.config;
-  rememberPersistedConfig(saved || state.config);
+  // 保存函数已按 section 更新成功写入的基线。这里仅在整个保存期间没有
+  // 新输入时清除 dirty；否则保留最新草稿，下一轮继续保存。
+  if (autosaveRevision === autosaveRevisionAtStart && !pendingResumeFiles) state.formDirty = false;
+  if (pendingResumeFiles) state.formDirty = true;
+  if (state.messageRevision === messageRevisionAtStart) state.messageDirty = false;
 }
 
 async function ensureConfigSavedBeforeDelivery() {
@@ -2551,6 +2690,9 @@ async function ensureConfigSavedBeforeDelivery() {
   for (let i = 0; i < 40 && autosaving; i++) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+  if (hasPendingResumeFiles()) {
+    throw new Error('检测到待保存的图片简历，请先点击“保存简历”完成导入，或清除本次选择后再投递');
+  }
   await persistDirtyConfigSections();
 }
 
@@ -2559,6 +2701,8 @@ function wireResumeFilePreview() {
   if (!input || input.__bhtPreview) return;
   input.__bhtPreview = true;
   input.addEventListener('change', () => {
+    state.resumeRevision += 1;
+    state.formDirty = true;
     const box = $('imagePreview');
     if (!box) return;
     const files = Array.from(input.files || []);
@@ -2597,6 +2741,7 @@ function wireAutosave() {
   root.addEventListener('input', (e) => {
     if (!shouldAutosaveTarget(e.target)) return;
     if (e.target.closest?.('#segments')) markMessageDirty();
+    if (e.target.closest?.('#tab-resume')) state.resumeRevision += 1;
     state.formDirty = true;
     autosaveRevision += 1;
     if (e.isComposing || autosaveComposingTarget === e.target) {
@@ -2613,11 +2758,13 @@ function wireAutosave() {
     }
     if (shouldAutosaveTarget(e.target)) {
       if (e.target.closest?.('#segments')) markMessageDirty();
+      if (e.target.closest?.('#tab-resume')) state.resumeRevision += 1;
       scheduleAutosave();
     }
   }, true);
   root.addEventListener('compositionstart', (e) => {
     if (!shouldAutosaveTarget(e.target)) return;
+    if (e.target.closest?.('#tab-resume')) state.resumeRevision += 1;
     autosaveComposingTarget = e.target;
     state.formDirty = true;
     autosaveRevision += 1;
@@ -2628,6 +2775,7 @@ function wireAutosave() {
   root.addEventListener('compositionend', (e) => {
     if (autosaveComposingTarget && autosaveComposingTarget !== e.target) return;
     autosaveComposingTarget = null;
+    if (e.target.closest?.('#tab-resume')) state.resumeRevision += 1;
     state.formDirty = true;
     autosaveRevision += 1;
     autosavePending = false;
@@ -2800,54 +2948,74 @@ function bindEvents() {
   });
 
   $('btnAddProfile')?.addEventListener('click', async () => {
-    flushActiveProfileForm();
-    const resumes = structuredClone(state.config.resumes);
-    const id = uid('profile');
-    resumes.profiles.push({ id, name: `方案 ${resumes.profiles.length + 1}`, images: [] });
-    if (!resumes.defaultProfileId) resumes.defaultProfileId = id;
-    state.activeProfileId = id;
-    await api(MSG.SAVE_RESUMES, resumes);
-    state.formDirty = false;
-    await refresh({ soft: false });
-    toast('已新建方案', 'success');
+    await enqueueConfigSave(async () => {
+      const dirtyBefore = state.formDirty || state.messageDirty;
+      flushActiveProfileForm();
+      const resumes = structuredClone(state.config.resumes);
+      const id = uid('profile');
+      resumes.profiles.push({ id, name: `方案 ${resumes.profiles.length + 1}`, images: [] });
+      if (!resumes.defaultProfileId) resumes.defaultProfileId = id;
+      state.activeProfileId = id;
+      state.resumeRevision += 1;
+      const revisionAtStart = draftRevisionSnapshot();
+      await api(MSG.SAVE_RESUMES, resumes);
+      settleManagementDirty(revisionAtStart, dirtyBefore);
+      await refresh({ soft: false });
+      toast('已新建方案', 'success');
+    });
   });
 
   $('btnSetDefaultProfile')?.addEventListener('click', async () => {
-    flushActiveProfileForm();
-    const resumes = structuredClone(state.config.resumes);
-    resumes.defaultProfileId = state.activeProfileId || resumes.defaultProfileId;
-    await api(MSG.SAVE_RESUMES, resumes);
-    state.formDirty = false;
-    await refresh({ soft: false });
-    toast('已设为默认方案', 'success');
+    await enqueueConfigSave(async () => {
+      const dirtyBefore = state.formDirty || state.messageDirty;
+      flushActiveProfileForm();
+      const resumes = structuredClone(state.config.resumes);
+      resumes.defaultProfileId = state.activeProfileId || resumes.defaultProfileId;
+      state.resumeRevision += 1;
+      const revisionAtStart = draftRevisionSnapshot();
+      await api(MSG.SAVE_RESUMES, resumes);
+      settleManagementDirty(revisionAtStart, dirtyBefore);
+      await refresh({ soft: false });
+      toast('已设为默认方案', 'success');
+    });
   });
 
   $('btnDeleteProfile')?.addEventListener('click', async () => {
-    const resumes = structuredClone(state.config.resumes);
-    if ((resumes.profiles || []).length <= 1) {
-      toast('至少保留一个方案', 'error');
-      return;
-    }
-    const delId = state.activeProfileId;
-    resumes.profiles = resumes.profiles.filter((p) => p.id !== delId);
-    if (resumes.defaultProfileId === delId) resumes.defaultProfileId = resumes.profiles[0].id;
-    state.activeProfileId = resumes.defaultProfileId;
-    const bindings = { rules: (state.config.bindings?.rules || []).filter((r) => r.profileId !== delId) };
-    await api(MSG.SAVE_RESUMES, resumes);
-    await api(MSG.SAVE_BINDINGS, bindings);
-    state.formDirty = false;
-    await refresh({ soft: false });
-    toast('方案已删除', 'success');
+    await enqueueConfigSave(async () => {
+      const dirtyBefore = state.formDirty || state.messageDirty;
+      const resumes = structuredClone(state.config.resumes);
+      if ((resumes.profiles || []).length <= 1) {
+        toast('至少保留一个方案', 'error');
+        return;
+      }
+      const delId = state.activeProfileId;
+      resumes.profiles = resumes.profiles.filter((p) => p.id !== delId);
+      if (resumes.defaultProfileId === delId) resumes.defaultProfileId = resumes.profiles[0].id;
+      state.activeProfileId = resumes.defaultProfileId;
+      const bindings = { rules: (state.config.bindings?.rules || []).filter((r) => r.profileId !== delId) };
+      state.resumeRevision += 1;
+      const revisionAtStart = draftRevisionSnapshot();
+      await api(MSG.SAVE_RESUMES, resumes);
+      await api(MSG.SAVE_BINDINGS, bindings);
+      settleManagementDirty(revisionAtStart, dirtyBefore);
+      await refresh({ soft: false });
+      toast('方案已删除', 'success');
+    });
   });
 
   $('btnClearImages')?.addEventListener('click', async () => {
-    const resumes = structuredClone(state.config.resumes);
-    const profile = resumes.profiles.find((p) => p.id === state.activeProfileId);
-    if (profile) profile.images = [];
-    await api(MSG.SAVE_RESUMES, resumes);
-    state.formDirty = false;
-    await refresh({ soft: false });
-    toast('已清空图片', 'success');
+    await enqueueConfigSave(async () => {
+      const dirtyBefore = state.formDirty || state.messageDirty;
+      const resumes = structuredClone(state.config.resumes);
+      const profile = resumes.profiles.find((p) => p.id === state.activeProfileId);
+      if (profile) profile.images = [];
+      state.resumeRevision += 1;
+      const revisionAtStart = draftRevisionSnapshot();
+      await api(MSG.SAVE_RESUMES, resumes);
+      settleManagementDirty(revisionAtStart, dirtyBefore);
+      await refresh({ soft: false });
+      toast('已清空图片', 'success');
+    });
   });
 
   $('btnAddBinding')?.addEventListener('click', () => {
@@ -2932,7 +3100,7 @@ function bindEvents() {
       });
     }
     if (data.cmd === 'import-config' && data.data) {
-      Promise.resolve(api(MSG.IMPORT_CONFIG, { data: data.data })).then(async (res) => {
+      Promise.resolve(enqueueConfigSave(() => api(MSG.IMPORT_CONFIG, { data: data.data }))).then(async (res) => {
         state.formDirty = false;
         await refresh({ soft: false });
         window.parent.postMessage({ source: 'bht-panel', type: 'import', ok: res?.ok !== false }, '*');
@@ -3425,7 +3593,7 @@ function bindEvents() {
     try {
       const text = await file.text();
       const data = JSON.parse(text);
-      const res = await api(MSG.IMPORT_CONFIG, { data });
+      const res = await enqueueConfigSave(() => api(MSG.IMPORT_CONFIG, { data }));
       if (!res?.ok) throw new Error(res?.error || '导入失败');
       state.messageDirty = false;
       state.formDirty = false;

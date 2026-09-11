@@ -12,6 +12,7 @@ import { mergeRuntimeLog, sortLogsNewestFirst } from './log-order.js';
 import { normalizeDeliveryScheduleDays, normalizeDeliveryScheduleWindows, formatClock } from './delivery-schedule.js';
 
 let logWriteChain = Promise.resolve();
+let settingsWriteChain = Promise.resolve();
 
 export function normalizeSettings(settings = {}) {
   const normalized = { ...deepClone(DEFAULT_SETTINGS), ...(settings || {}) };
@@ -97,8 +98,14 @@ export async function getAllConfig() {
   };
 }
 
-export async function saveSettings(settings) {
-  await set({ [STORAGE_KEYS.SETTINGS]: normalizeSettings(settings) });
+export function saveSettings(settings) {
+  const write = async () => {
+    const data = await get(STORAGE_KEYS.SETTINGS);
+    const current = data[STORAGE_KEYS.SETTINGS] || {};
+    await set({ [STORAGE_KEYS.SETTINGS]: normalizeSettings({ ...current, ...(settings || {}) }) });
+  };
+  settingsWriteChain = settingsWriteChain.then(write, write);
+  return settingsWriteChain;
 }
 
 export async function saveFilters(filters) {
