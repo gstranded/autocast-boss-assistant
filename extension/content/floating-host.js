@@ -1,5 +1,5 @@
 (() => {
-  const BHT_FLOAT_HOST_VERSION = "1.7.0";
+  const BHT_FLOAT_HOST_VERSION = "1.7.36";
   if (window.__BHT_FLOAT_HOST_VERSION__ === BHT_FLOAT_HOST_VERSION && window.__BHT_FLOAT_HOST__) return;
   window.__BHT_FLOAT_HOST_VERSION__ = BHT_FLOAT_HOST_VERSION;
   window.__BHT_FLOAT_HOST__ = true;
@@ -65,21 +65,21 @@
     root = document.createElement("div");
     root.id = ROOT_ID;
     root.innerHTML = `
-      <button type="button" class="bht-fab" id="bht-fab" title="Boss 海投助手" aria-label="打开 Boss 海投助手">
+      <button type="button" class="bht-fab" id="bht-fab" title="AutoCast-Boss海投助手" aria-label="打开 AutoCast-Boss海投助手">
         <img src="${chrome.runtime.getURL("assets/icons/icon128.png")}" alt="" />
       </button>
       <div class="bht-panel" id="bht-panel" hidden>
         <div class="bht-panel-header" id="bht-drag">
           <div class="bht-panel-title">
             <img src="${chrome.runtime.getURL("assets/icons/icon48.png")}" alt="" />
-            <span>Boss 海投助手</span>
+            <span>AutoCast-Boss海投助手</span>
           </div>
           <div class="bht-panel-actions">
             <button type="button" class="bht-icon-btn" id="bht-min" title="收起">—</button>
             <button type="button" class="bht-icon-btn" id="bht-close" title="关闭">×</button>
           </div>
         </div>
-        <iframe class="bht-frame" id="bht-frame" title="Boss 海投助手面板"></iframe>
+        <iframe class="bht-frame" id="bht-frame" title="AutoCast-Boss海投助手面板"></iframe>
       </div>
     `;
     document.documentElement.appendChild(root);
@@ -124,19 +124,22 @@
     if (!panel || !fab) return;
     panel.hidden = !open;
     fab.classList.toggle("is-hidden", open);
+    const frame = document.getElementById("bht-frame");
     if (open) {
-      const frame = document.getElementById("bht-frame");
       if (frame) {
         // FORCE_IFRAME_RELOAD: 每次打开都带版本号，避免浮窗卡在旧 UI
-        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=1.7.0");
-        if (!frame.src || !frame.src.includes("v=1.7.0")) {
+        const next = chrome.runtime.getURL("sidepanel/index.html?mode=float&v=" + BHT_FLOAT_HOST_VERSION);
+        if (!frame.src || !frame.src.includes("v=" + BHT_FLOAT_HOST_VERSION)) {
           frame.src = next;
         }
+        try { frame.contentWindow?.postMessage({ source: "bht-host", cmd: "resume" }, "*"); } catch (_) {}
       }
       restorePos(panel);
+    } else if (frame) {
+      try { frame.contentWindow?.postMessage({ source: "bht-host", cmd: "suspend" }, "*"); } catch (_) {}
     }
     try {
-      localStorage.setItem(STORAGE_OPEN, open ? "1" : "0");
+      sessionStorage.setItem(STORAGE_OPEN, open ? "1" : "0");
     } catch (_) {}
   }
 
@@ -350,7 +353,9 @@
 
     let shouldOpen = false;
     try {
-      shouldOpen = localStorage.getItem(STORAGE_OPEN) === "1";
+      // 面板开关只属于当前标签页，避免一个页面打开后所有 BOSS 标签都加载面板并轮询。
+      shouldOpen = sessionStorage.getItem(STORAGE_OPEN) === "1";
+      localStorage.removeItem(STORAGE_OPEN);
     } catch (_) {}
     if (shouldOpen) setOpen(true);
     return true;
@@ -452,7 +457,15 @@
         if (/invalidated|Receiving end does not exist|message port closed/i.test(err)) {
           // Receiving end 可能只是 SW 休眠，不一律当失效
           if (/invalidated/i.test(err)) markContextDead(err);
+          return;
         }
+        // 自愈：面板打开状态因页面重载/宿主重建而丢时（分屏搬移窗口等），探测到运行时可用后自动恢复
+        try {
+          if (sessionStorage.getItem(STORAGE_OPEN) === "1") {
+            const panel = document.getElementById("bht-panel");
+            if (panel && panel.hidden) setOpen(true);
+          }
+        } catch (_) {}
       });
     } catch (e) {
       markContextDead(String(e?.message || e));

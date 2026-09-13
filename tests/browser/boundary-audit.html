@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BOSS 插件边界审计</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, "Microsoft YaHei", sans-serif; }
+    body { margin: 0; background: #f4f7fb; color: #172033; }
+    main { width: min(980px, calc(100% - 40px)); margin: 32px auto; }
+    section { padding: 24px; border: 1px solid #dce4ef; border-radius: 12px; background: #fff; }
+    h1 { margin: 0 0 6px; font-size: 24px; }
+    p { margin: 0 0 20px; color: #65738a; }
+    #results { display: grid; gap: 8px; }
+    .check { display: flex; gap: 12px; align-items: baseline; padding: 10px 12px; border-radius: 8px; background: #eef8f2; }
+    .check.fail { background: #fff0f0; }
+    .check strong { color: #137a42; min-width: 38px; }
+    .check.fail strong { color: #b42318; }
+    pre { margin: 20px 0 0; padding: 14px; overflow: auto; border-radius: 8px; background: #172033; color: #f7fafc; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <main id="report" data-status="running">
+    <section>
+      <h1>BOSS 插件边界审计</h1>
+      <p>实际共享模块 + 面板 harness + 后台契约的独立浏览器验证</p>
+      <div id="results"></div>
+      <pre id="summary">运行中…</pre>
+    </section>
+  </main>
+  <script type="module">
+    import { resolvePreviewScanStop } from '/shared/preview-scan-policy.js';
+    import { planMessageSegments } from '/shared/message-planner.js';
+    import { resolveNativeGreetingEvidence } from '/shared/greeting-policy.js';
+    import { MESSAGE_MODES } from '/shared/constants.js';
+    import { collectDoneJobIds, targetDeliveryRemaining, isTargetDeliveryReached } from '/shared/task-model.js';
+    import { evaluateDeliverySchedule, formatDeliveryScheduleStatus } from '/shared/delivery-schedule.js';
+    import { isEnvironmentalFailure, isWorkerTriggerRetryable } from '/shared/environment-failures.js';
+    import { resolvePageOperationTimeoutMs, isScanResultWithinFinalizationWindow } from '/shared/operation-timeouts.js';
+    import { computeSideBySideBounds, windowBoundsMatch } from '/shared/window-layout.js';
+    import { resolveBossJobListUrl, isBossJobListUrl } from '/shared/job-list-navigation.js';
+    import { buildExportPayload, normalizeSettings } from '/shared/storage.js';
+
+    const checks = [];
+    const assert = (condition, message) => {
+      if (!condition) throw new Error(message);
+    };
+    const check = async (name, fn) => {
+      try {
+        const detail = await fn();
+        checks.push({ name, ok: true, detail: detail || '' });
+      } catch (error) {
+        checks.push({ name, ok: false, detail: String(error?.message || error) });
+      }
+    };
+
+    const at = (hour, minute) => new Date(2026, 8, 11, hour, minute, 0, 0);
+
+    await check('TASK-04 截止收尾：超时终态保留已加载结果', () => {
+      const stop = resolvePreviewScanStop({ deadlineAt: 100, now: 100 });
+      const accepted = isScanResultWithinFinalizationWindow({
+        scanMeta: { collectionFinishedAt: 90, workCompletedAt: 120 }
+      }, { collectionDeadlineAt: 100, bridgeDeadlineAt: 130, storageCompletedAt: 110 });
+      assert(stop.done && stop.reason === 'timeout', 'deadline must stop with timeout');
+      assert(accepted, 'results collected before deadline must survive finalization');
+      return 'timeout + finalization window';
+    });
+
+    await check('MSG-10 未知招呼：严格模式阻止 greeting 发送', () => {
+      const evidence = resolveNativeGreetingEvidence({});
+      const plan = planMessageSegments({
+        mode: MESSAGE_MODES.AUTO_DETECT,
+        nativeGreetingState: evidence.state,
+        strictUnknown: true,
+        template: { version: 1, segments: [
+          { id: 'g', kind: 'greeting', enabled: true, text: '您好，我对{职位名称}感兴趣' },
+          { id: 's', kind: 'supplement', enabled: true, text: '期待沟通' }
+        ] },
+        job: { title: '测试岗位' }
+      });
+      assert(evidence.state === 'unknown', 'empty evidence must be unknown');
+      assert(plan.blocked && plan.blockReason === 'NATIVE_GREETING_UNKNOWN', 'greeting must be blocked');
+      return 'NATIVE_GREETING_UNKNOWN';
+    });
+
+    await check('RUN-06 目标口径：跳过/失败不计入成功目标', () => {
+      const task = {
+        targetMode: true,
+        targetCount: 3,
+        counters: { success: 1, skipped: 1, failed: 1, processed: 3 },
+        items: [{ jobId: 'skip', state: 'SKIPPED' }, { jobId: 'fail', state: 'FAILED' }, { jobId: 'ok', state: 'COMPLETED' }]
+      };
+      assert(targetDeliveryRemaining(task) === 2, 'remaining must use success only');
+      assert(!isTargetDeliveryReached(task), 'skip/fail must not reach target');
+      task.counters.success = 3;
+      assert(isTargetDeliveryReached(task), 'only successful sends reach target');
+      assert(collectDoneJobIds(task.items, []).size === 3, 'all terminal items must be deduped');
+      return 'success=1/3 then success=3/3';
+    });
+
+    await check('RUN-12 失败重试：环境错误可重试，取消/筛选不可重试', () => {
+      assert(isEnvironmentalFailure({ ok: false, error: 'CONTENT_INJECT_FAIL' }), 'inject failure is environmental');
+      assert(isWorkerTriggerRetryable({ ok: false, error: 'WORKER_PAGE_NOT_READY' }), 'page not ready is retryable');
+      assert(!isWorkerTriggerRetryable({ ok: false, error: 'OP_CANCELLED' }), 'cancel is not retryable');
+      assert(!isWorkerTriggerRetryable({ ok: false, error: 'FILTER_ACTIVE', filtered: true }), 'filter skip is not retryable');
+      return 'retryable error classes separated';
+    });
+
+    await check('RUN-13 连续失败暂停：后台包含阈值暂停和具体原因路径', async () => {
+      const source = await fetch('/background/service-worker.js').then((response) => response.text());
+      assert(source.includes('consecutiveFailPause'), 'threshold setting missing');
+      assert(source.includes('task.consecutiveFails >='), 'threshold branch missing');
+      assert(source.includes('EXEC_CONSECUTIVE_FAIL'), 'specific pause reason missing');
+      return 'threshold branch present';
+    });
+
+    await check('RUN-14 平台上限：识别后停止而非自动重试', async () => {
+      const [background, content] = await Promise.all([
+        fetch('/background/service-worker.js').then((response) => response.text()),
+        fetch('/content/content-main.js').then((response) => response.text())
+      ]);
+      assert(content.includes('detectBossDailyLimitModal'), 'daily-limit detector missing');
+      assert(background.includes("trig?.error === 'BOSS_DAILY_LIMIT'"), 'daily-limit stop branch missing');
+      assert(!background.includes("BOSS_DAILY_LIMIT' && isEnvironmentalFailure"), 'daily limit must not be auto-skipped');
+      return 'detector + terminal stop branch present';
+    });
+
+    await check('RUN-15 定时边界：时段内允许，边界外给出下次时段', () => {
+      const settings = {
+        scheduledDeliveryEnabled: true,
+        scheduledDeliveryDays: [5],
+        scheduledDeliveryWindows: [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '17:00' }]
+      };
+      assert(evaluateDeliverySchedule(settings, at(9, 30)).allowed, 'inside window must allow');
+      const outside = evaluateDeliverySchedule(settings, at(12, 0));
+      assert(!outside.allowed && outside.nextStart?.getHours() === 14, 'boundary must point to next window');
+      assert(formatDeliveryScheduleStatus(settings, at(12, 0)).includes('14:00'), 'status must expose next start');
+      return '09:30 allowed; 12:00 -> 14:00';
+    });
+
+    await check('LAY-03 窄屏回退：不足双栏宽度时返回安全 fallback', () => {
+      assert(computeSideBySideBounds({ width: 900, height: 900 }, { minWidth: 520 }) === null, 'narrow display must reject split');
+      const bounds = computeSideBySideBounds({ width: 1920, height: 1080 }, { minWidth: 520 });
+      assert(bounds && bounds.left.left + bounds.left.width <= bounds.right.left, 'wide display must not overlap');
+      assert(windowBoundsMatch(bounds.left, bounds.left, { tolerancePx: 0 }), 'bounds matcher must accept exact fallback');
+      return 'narrow=null; wide non-overlap';
+    });
+
+    await check('LAY-06 消息页刷新：只刷新消息页并保留列表标签', async () => {
+      const source = await fetch('/background/service-worker.js').then((response) => response.text());
+      for (const token of ['MESSAGE_TAB_REFRESH_INTERVAL', 'jobsSinceMessageRefresh', 'chrome.tabs.reload(oldId)', 'listTabId']) {
+        assert(source.includes(token), `missing ${token}`);
+      }
+      return 'message tab refresh tokens present; list tab retained';
+    });
+
+    await check('LAY-07 导航恢复：详情/聊天页回到安全职位列表', async () => {
+      const listUrl = resolveBossJobListUrl({ candidate: 'https://www.zhipin.com/web/geek/job_detail/abc', currentUrl: 'https://www.zhipin.com/web/geek/jobs?query=运维' });
+      assert(listUrl === 'https://www.zhipin.com/web/geek/jobs', 'detail page must fall back to safe list');
+      assert(isBossJobListUrl('https://www.zhipin.com/web/geek/jobs?query=运维'), 'list URL must be recognized');
+      await import('/shared/trigger-navigation-recovery.js');
+      const recovered = globalThis.BHTTriggerNavigationRecovery.resolveTriggerNavigationRecovery({
+        opType: 'BHT_TRIGGER_CONVERSATION',
+        job: { jobId: 'job-1', title: '运维工程师', company: '示例科技' },
+        inflightAt: 100,
+        now: 200,
+        href: 'https://www.zhipin.com/web/geek/job_detail/job-1',
+        click: { at: 150, jobId: 'job-1', buttonText: '立即沟通' },
+        receipt: { at: 180, jobId: 'job-1', ok: true, showGreeting: true }
+      });
+      assert(recovered?.ok && recovered.navigationRecovered === true, 'conversation navigation must recover');
+      return 'safe list + CHAT_TRIGGERED recovery';
+    });
+
+    await check('LAY-08 取消/超时：派发门禁清理取消，不放行迟到操作', async () => {
+      const timeout = resolvePageOperationTimeoutMs('BHT_SCAN_JOBS', { deadlineAt: 1000 }, 1000);
+      assert(timeout === 0, 'expired scan deadline must have no operation budget');
+      await import('/shared/operation-dispatch-gate.js');
+      let settled = '';
+      const result = await globalThis.BHTOperationDispatchGate.awaitOperationDispatchPermit({
+        isCancelled: () => true,
+        settleCancellation: async (reason) => { settled = reason; }
+      });
+      assert(result.reason === 'cancelled' && settled, 'cancelled operation must not dispatch');
+      return 'expired deadline + cancellation gate';
+    });
+
+    await check('DATA-13 配额清理：设置归一化并将导出日志限制为 100 条', () => {
+      const settings = normalizeSettings({ autoSendAttachmentResume: true, resumeSendTiming: 'on_request' });
+      const logs = Array.from({ length: 140 }, (_, index) => ({ id: String(index), ts: index }));
+      const exported = buildExportPayload({ settings, logs });
+      assert(!Object.hasOwn(settings, 'autoSendAttachmentResume'), 'legacy attachment setting must be removed');
+      assert(settings.resumeSendTiming === 'after_text', 'legacy timing must normalize');
+      assert(exported.logs.length === 100, 'export log budget must be 100');
+      return 'settings normalized; logs=100';
+    });
+
+    const failed = checks.filter((entry) => !entry.ok);
+    document.getElementById('results').replaceChildren(...checks.map((entry) => {
+      const row = document.createElement('div');
+      row.className = 'check' + (entry.ok ? '' : ' fail');
+      const state = document.createElement('strong');
+      state.textContent = entry.ok ? 'PASS' : 'FAIL';
+      const text = document.createElement('span');
+      text.textContent = entry.name + (entry.detail ? `：${entry.detail}` : '');
+      row.append(state, text);
+      return row;
+    }));
+    document.getElementById('report').dataset.status = failed.length ? 'failed' : 'passed';
+    document.getElementById('summary').textContent = JSON.stringify({
+      status: failed.length ? 'failed' : 'passed',
+      passed: checks.length - failed.length,
+      failed: failed.length,
+      checks: checks.map((entry) => ({ name: entry.name, ok: entry.ok, detail: entry.detail }))
+    }, null, 2);
+  </script>
+</body>
+</html>

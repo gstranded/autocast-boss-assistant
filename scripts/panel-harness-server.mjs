@@ -12,6 +12,8 @@ const harnessCalls = [];
 
 const mounts = [
   ["/sidepanel/", path.join(repoRoot, "extension/sidepanel")],
+  ["/background/", path.join(repoRoot, "extension/background")],
+  ["/content/", path.join(repoRoot, "extension/content")],
   ["/shared/", path.join(repoRoot, "extension/shared")],
   ["/assets/", path.join(repoRoot, "extension/assets")],
   ["/tests/", path.join(repoRoot, "tests")]

@@ -7,6 +7,24 @@ import {
 } from './constants.js';
 import { deepClone, todayKey, uid } from './text-utils.js';
 import { countResumeImages, normalizeResumes } from './resume-images.js';
+import { normalizeMessageTemplateRoles } from './greeting-policy.js';
+import { mergeRuntimeLog, sortLogsNewestFirst } from './log-order.js';
+import { normalizeDeliveryScheduleDays, normalizeDeliveryScheduleWindows, formatClock } from './delivery-schedule.js';
+
+let logWriteChain = Promise.resolve();
+let settingsWriteChain = Promise.resolve();
+
+export function normalizeSettings(settings = {}) {
+  const normalized = { ...deepClone(DEFAULT_SETTINGS), ...(settings || {}) };
+  // v1.7.11：BOSS「发简历」受双向回复门禁限制，平台简历自动发送功能已移除。
+  delete normalized.autoSendAttachmentResume;
+  if (normalized.resumeSendTiming === 'on_request') normalized.resumeSendTiming = 'after_text';
+  normalized.scheduledDeliveryEnabled = normalized.scheduledDeliveryEnabled === true;
+  normalized.scheduledDeliveryDays = normalizeDeliveryScheduleDays(normalized.scheduledDeliveryDays);
+  normalized.scheduledDeliveryWindows = normalizeDeliveryScheduleWindows(normalized.scheduledDeliveryWindows)
+    .map((window) => ({ start: formatClock(window.startMinute), end: formatClock(window.endMinute) }));
+  return normalized;
+}
 
 async function get(keys) {
   return chrome.storage.local.get(keys);
@@ -50,32 +68,44 @@ export async function ensureDefaults() {
 export async function getAllConfig() {
   await ensureDefaults();
   const data = await get(Object.values(STORAGE_KEYS));
-  const settings = { ...(data[STORAGE_KEYS.SETTINGS] || {}) };
-  if (settings.resumeSendTiming === 'on_request') {
-    settings.resumeSendTiming = 'after_text';
+  const storedSettings = data[STORAGE_KEYS.SETTINGS] || {};
+  const settings = normalizeSettings(storedSettings);
+  if (JSON.stringify(settings) !== JSON.stringify(storedSettings)) {
     await set({ [STORAGE_KEYS.SETTINGS]: settings });
   }
   const resumes = normalizeResumes(data[STORAGE_KEYS.RESUMES]);
   if (countResumeImages(resumes) < countResumeImages(data[STORAGE_KEYS.RESUMES])) {
     await set({ [STORAGE_KEYS.RESUMES]: resumes });
   }
+  const messageTemplate = normalizeMessageTemplateRoles(
+    data[STORAGE_KEYS.MESSAGE_TEMPLATE] || DEFAULT_MESSAGE_TEMPLATE
+  );
+  if (JSON.stringify(messageTemplate) !== JSON.stringify(data[STORAGE_KEYS.MESSAGE_TEMPLATE])) {
+    await set({ [STORAGE_KEYS.MESSAGE_TEMPLATE]: messageTemplate });
+  }
   return {
     settings,
     filters: data[STORAGE_KEYS.FILTERS],
-    messageTemplate: data[STORAGE_KEYS.MESSAGE_TEMPLATE],
+    messageTemplate,
     resumes,
     bindings: data[STORAGE_KEYS.BINDINGS],
     lists: data[STORAGE_KEYS.LISTS],
     history: data[STORAGE_KEYS.HISTORY] || [],
     idempotency: data[STORAGE_KEYS.IDEMPOTENCY] || {},
     task: data[STORAGE_KEYS.TASK],
-    logs: data[STORAGE_KEYS.LOGS] || [],
+    logs: sortLogsNewestFirst(data[STORAGE_KEYS.LOGS] || []),
     dailyStats: data[STORAGE_KEYS.DAILY_STATS] || {}
   };
 }
 
-export async function saveSettings(settings) {
-  await set({ [STORAGE_KEYS.SETTINGS]: settings });
+export function saveSettings(settings) {
+  const write = async () => {
+    const data = await get(STORAGE_KEYS.SETTINGS);
+    const current = data[STORAGE_KEYS.SETTINGS] || {};
+    await set({ [STORAGE_KEYS.SETTINGS]: normalizeSettings({ ...current, ...(settings || {}) }) });
+  };
+  settingsWriteChain = settingsWriteChain.then(write, write);
+  return settingsWriteChain;
 }
 
 export async function saveFilters(filters) {
@@ -83,7 +113,7 @@ export async function saveFilters(filters) {
 }
 
 export async function saveMessageTemplate(template) {
-  await set({ [STORAGE_KEYS.MESSAGE_TEMPLATE]: template });
+  await set({ [STORAGE_KEYS.MESSAGE_TEMPLATE]: normalizeMessageTemplateRoles(template) });
 }
 
 export async function saveResumes(resumes) {
@@ -111,17 +141,19 @@ export async function saveTask(task) {
 }
 
 export async function appendLog(entry) {
-  const { [STORAGE_KEYS.LOGS]: logs = [] } = await get(STORAGE_KEYS.LOGS);
-  const next = [
-    {
+  const write = async () => {
+    const { [STORAGE_KEYS.LOGS]: logs = [] } = await get(STORAGE_KEYS.LOGS);
+    const created = {
       id: uid('log'),
       ts: Date.now(),
       ...entry
-    },
-    ...logs
-  ].slice(0, 1000);
-  await set({ [STORAGE_KEYS.LOGS]: next });
-  return next[0];
+    };
+    const next = mergeRuntimeLog(logs, created, 1000);
+    await set({ [STORAGE_KEYS.LOGS]: next });
+    return created;
+  };
+  logWriteChain = logWriteChain.then(write, write);
+  return logWriteChain;
 }
 
 export async function clearLogs() {
@@ -190,32 +222,92 @@ export async function getTodayStats() {
   return stats[day] || { communicate: 0, success: 0, skip: 0, fail: 0, byCompany: {} };
 }
 
-export async function exportAll() {
-  const all = await getAllConfig();
+export const IMPORT_CONFIG_KEYS = {
+  settings: STORAGE_KEYS.SETTINGS,
+  filters: STORAGE_KEYS.FILTERS,
+  messageTemplate: STORAGE_KEYS.MESSAGE_TEMPLATE,
+  resumes: STORAGE_KEYS.RESUMES,
+  bindings: STORAGE_KEYS.BINDINGS,
+  lists: STORAGE_KEYS.LISTS,
+  history: STORAGE_KEYS.HISTORY,
+  dailyStats: STORAGE_KEYS.DAILY_STATS,
+  idempotency: STORAGE_KEYS.IDEMPOTENCY,
+  task: STORAGE_KEYS.TASK
+};
+
+// 导入任务时的安全化：只接受「预览/待确认」类任务快照；运行中/已暂停的任务
+// 统一降为 awaiting_confirm（导入绝不自动开始投递），并清掉运行时执行痕迹。
+export function sanitizeImportedTask(task) {
+  if (!task || typeof task !== 'object') return null;
+  if (!Array.isArray(task.results) || !task.results.length) {
+    // 没有预览数据的任务没有意义（可能是运行中垃圾态），不导入
+    return null;
+  }
+  const copy = {
+    ...task,
+    status: 'awaiting_confirm',
+    awaitingUserRetry: false,
+    uiErrorDismissed: true,
+    retryCurrent: false,
+    pauseReason: '',
+    lastErrorDetail: '',
+    errorKey: '',
+    execution: {},
+    previewRunId: null,
+    nextJobId: null,
+    currentJobId: null,
+    queueCursor: 0,
+    consecutiveFails: 0,
+    completionSignal: null,
+    // 计数是上一次运行的展示值；重新开始投递后重新累计更直观
+    counters: {
+      success: 0,
+      skipped: 0,
+      failed: 0,
+      processed: 0
+    },
+    updatedAt: Date.now()
+  };
+  return copy;
+}
+
+export function buildExportPayload(all = {}, now = new Date()) {
   return {
-    exportedAt: new Date().toISOString(),
+    exportedAt: now.toISOString(),
     version: 1,
     ...all,
-    // 不强制导出巨大日志
+    settings: normalizeSettings(all.settings || {}),
     logs: (all.logs || []).slice(0, 100)
   };
 }
 
-export async function importAll(payload) {
+export function importConfigPatch(payload) {
   if (!payload || typeof payload !== 'object') throw new Error('无效配置文件');
   const put = {};
-  const map = {
-    settings: STORAGE_KEYS.SETTINGS,
-    filters: STORAGE_KEYS.FILTERS,
-    messageTemplate: STORAGE_KEYS.MESSAGE_TEMPLATE,
-    resumes: STORAGE_KEYS.RESUMES,
-    bindings: STORAGE_KEYS.BINDINGS,
-    lists: STORAGE_KEYS.LISTS,
-    history: STORAGE_KEYS.HISTORY
-  };
-  for (const [k, sk] of Object.entries(map)) {
-    if (payload[k] != null) put[sk] = payload[k];
+  for (const [key, storageKey] of Object.entries(IMPORT_CONFIG_KEYS)) {
+    if (payload[key] == null) continue;
+    if (key === 'settings') {
+      put[storageKey] = normalizeSettings(payload[key]);
+    } else if (key === 'task') {
+      const sanitized = sanitizeImportedTask(payload[key]);
+      if (sanitized) put[storageKey] = sanitized;
+    } else if (key === 'history') {
+      put[storageKey] = Array.isArray(payload[key]) ? payload[key].slice(0, 5000) : [];
+    } else if (key === 'idempotency' || key === 'dailyStats') {
+      put[storageKey] = payload[key] && typeof payload[key] === 'object' && !Array.isArray(payload[key]) ? payload[key] : {};
+    } else {
+      put[storageKey] = payload[key];
+    }
   }
+  return put;
+}
+
+export async function exportAll() {
+  return buildExportPayload(await getAllConfig());
+}
+
+export async function importAll(payload) {
+  const put = importConfigPatch(payload);
   await set(put);
   return getAllConfig();
 }

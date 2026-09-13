@@ -21,30 +21,93 @@ import {
   saveSettings,
   saveTask
 } from '../shared/storage.js';
-import { evaluateJob, summarizePreview } from '../shared/filter-engine.js';
+import {
+  evaluateJob,
+  matchActive,
+  normalizeActiveWithin,
+  summarizePreview,
+  looksHunter
+} from '../shared/filter-engine.js';
 import { checkDedup, checkLimits, jobIdempotencyKey, resumeIdempotencyKey } from '../shared/dedup.js';
 import { planMessageSegments } from '../shared/message-planner.js';
+import {
+  NATIVE_GREETING_STATES,
+  resolveNativeGreetingEvidence
+} from '../shared/greeting-policy.js';
 import { pickResumeProfile } from '../shared/template.js';
+import { planResumeSend } from '../shared/resume-policy.js';
 import { REASON, reasonText } from '../shared/reason-codes.js';
-import { TASK_STATUS } from '../shared/constants.js';
+import {
+  TASK_STATUS,
+  normalizeTargetNoNewRetryLimit
+} from '../shared/constants.js';
 import { isBossUrl, isBossTab, bossUrlGuardMessage, BOSS_MATCH_PATTERNS } from '../shared/boss-url.js';
-import { normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
-import { computeSideBySideBounds } from '../shared/window-layout.js';
+import { didContentDocumentChange, isBossJobListUrl, resolveBossJobListUrl, sameJobListUrl } from '../shared/job-list-navigation.js';
+import { normalizeMatchText, normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
+import { computeSideBySideBounds, snapshotWindowBounds, windowBoundsMatch } from '../shared/window-layout.js';
 import { dedupeResumeImages } from '../shared/resume-images.js';
 import { pickNextTestDeliveryJob } from '../shared/test-delivery.js';
 import {
+  buildConversationWorkerAttempts,
+  CONVERSATION_WORKER_MODE,
+  isListDocumentPreserved
+} from '../shared/conversation-worker.js';
+import {
   buildDeliveryQueue,
   collectDoneJobIds,
+  jobMergeKey,
+  jobsShareMergeIdentity,
+  isTargetDeliveryReached,
+  mergeTaskResults,
+  rebuildDeliveryQueue,
+  targetDeliveryRemaining,
   taskCounterSnapshot
 } from '../shared/task-model.js';
+import {
+  JOB_SOURCE_TYPES,
+  sameFilterSignature,
+  sameJobSourceContext
+} from '../shared/job-expect-context.js';
 import { createOperationRegistry } from './operation-registry.js';
 import {
   appendSessionDebugLog,
   getSessionDebugLogs,
   sanitizeDebugValue
 } from '../shared/debug-log.js';
+import {
+  isScanResultWithinFinalizationWindow,
+  OPERATION_TIMEOUTS,
+  resolveBridgeTimeoutMs,
+  resolvePageOperationTimeoutMs
+} from '../shared/operation-timeouts.js';
+import {
+  normalizePreviewScanTerminalState,
+  PREVIEW_SCAN_STOP,
+  resolvePreviewScanStop
+} from '../shared/preview-scan-policy.js';
+import {
+  isEnvironmentalFailure,
+  isWorkerTriggerRetryable,
+  WORKER_TRIGGER_RETRY
+} from '../shared/environment-failures.js';
+import {
+  evaluateDeliverySchedule,
+  formatDeliveryScheduleStatus
+} from '../shared/delivery-schedule.js';
 
 const SPLIT_ZOOM_FACTOR = 0.8;
+const DELIVERY_SCHEDULE_ALARM = 'bht_delivery_schedule';
+// 防卡顿：连续投递多少岗后自动刷新一次消息页（BOSS 聊天页在长会话列表下会渲染卡顿）
+const MESSAGE_TAB_REFRESH_INTERVAL = 10;
+const BHT_RUNTIME_VERSION = String(chrome.runtime.getManifest?.().version || 'unknown');
+const VERSION_GUARDED_MESSAGES = new Set([
+  MSG.RUN_PREVIEW,
+  MSG.CONFIRM_AND_START,
+  MSG.RUN_TEST_DELIVERY,
+  'BHT_RUN_TEST_DELIVERY',
+  MSG.RESUME_TASK,
+  MSG.REFRESH_AND_CONTINUE
+]);
 const JOB_PHASE = Object.freeze({
   CHAT_TRIGGERED: 'CHAT_TRIGGERED',
   CONVERSATION_OPENED: 'CONVERSATION_OPENED',
@@ -63,13 +126,50 @@ let runner = {
   running: false,
   starting: false,
   previewing: false,
+  previewRunId: '',
+  previewStartedAt: 0,
+  previewScanStartedAt: 0,
+  previewScanFinishedAt: 0,
+  previewPhase: '',
+  previewScanned: 0,
+  previewPass: 0,
+  previewPreviousTask: null,
   abort: false,
   pause: false,
+  schedulePauseRequested: false,
   skipCurrent: false,
-  pauseLogged: false
+  pauseLogged: false,
+  consecutiveUnknownActive: 0,
+  targetLoop: false,
+  stopping: false,
+  taskRunId: '',
+  taskRunTaskId: ''
 };
 const operations = createOperationRegistry();
 let debugLoggingEnabled = false;
+let activePreviewRun = null;
+let taskWriteChain = Promise.resolve();
+
+function enqueueTaskWrite(work) {
+  const run = taskWriteChain.then(work, work);
+  taskWriteChain = run.catch(() => {});
+  return run;
+}
+
+function taskPublishMatchesRunner(taskId, taskRunId) {
+  if (!taskRunId || !runner.taskRunId || !runner.taskRunTaskId) return true;
+  return String(taskRunId) === String(runner.taskRunId) &&
+    String(taskId || '') === String(runner.taskRunTaskId || '');
+}
+
+function cloneTaskSnapshot(task) {
+  if (!task || typeof task !== 'object') return null;
+  try {
+    return structuredClone(task);
+  } catch (_) {
+    try { return JSON.parse(JSON.stringify(task)); } catch (_) { return null; }
+  }
+}
 
 async function syncDebugLoggingSetting(settings = null) {
   try {
@@ -103,12 +203,167 @@ function serializeError(error) {
   };
 }
 
+function summarizeBossOperationResult(result) {
+  if (!result || typeof result !== 'object') return result;
+  return {
+    ok: result.ok === true,
+    error: result.error || '',
+    message: result.message || '',
+    count: Number(result.count || 0),
+    contentVersion: result.contentVersion || '',
+    scanMeta: result.scanMeta || null,
+    receipt: result.receipt ? {
+      type: result.receipt.type || '',
+      status: result.receipt.status || '',
+      receiptId: result.receipt.receiptId || ''
+    } : null
+  };
+}
+
 function runnerIsBusy() {
-  return runner.running || runner.starting || runner.previewing;
+  return runner.running || runner.starting || runner.previewing || runner.targetLoop || runner.stopping;
+}
+
+function isPreviewRunActive(runId = '') {
+  return Boolean(runner.previewing && (!runId || runner.previewRunId === runId));
+}
+
+function previewCancelledResult() {
+  return { ok: false, error: 'OP_CANCELLED', message: '已取消本次扫描预览' };
+}
+
+function setPreviewPhase(phase, runId = '') {
+  if (!isPreviewRunActive(runId)) return;
+  runner.previewPhase = String(phase || '');
+}
+
+function setPreviewProgress(scanned = 0, pass = 0, runId = '') {
+  if (!isPreviewRunActive(runId)) return;
+  runner.previewScanned = Math.max(0, Number(scanned || 0));
+  runner.previewPass = Math.max(0, Number(pass || 0));
+}
+
+function runnerSnapshot() {
+  return {
+    running: runner.running && !runner.abort,
+    starting: runner.starting,
+    previewing: runner.previewing,
+    previewStartedAt: runner.previewStartedAt || 0,
+    previewScanStartedAt: runner.previewScanStartedAt || 0,
+    previewScanFinishedAt: runner.previewScanFinishedAt || 0,
+    previewPhase: runner.previewPhase || '',
+    previewScanned: runner.previewScanned || 0,
+    previewPass: runner.previewPass || 0,
+    pause: runner.pause && !runner.abort,
+    schedulePauseRequested: runner.schedulePauseRequested === true,
+    stopping: runner.stopping === true || (runner.running && runner.abort),
+    intervalWaitUntil: Number(runner.intervalWaitUntil || 0),
+    intervalWaitMs: Number(runner.intervalWaitMs || 0),
+    activeOperations: operations.size,
+    targetLoop: runner.targetLoop === true
+  };
+}
+
+async function waitDeliveryInterval(task, waitMs) {
+  const duration = Math.max(0, Number(waitMs) || 0);
+  const until = Date.now() + duration;
+  runner.intervalWaitUntil = until;
+  runner.intervalWaitMs = duration;
+  if (task) {
+    task.intervalWaitUntil = until;
+    task.intervalWaitMs = duration;
+    task.updatedAt = Date.now();
+    await publishTask(task);
+  }
+  try {
+    while (Date.now() < until) {
+      if (runner.abort || runner.pause || runner.schedulePauseRequested) break;
+      const remaining = until - Date.now();
+      await sleep(Math.min(350, Math.max(0, remaining)));
+    }
+  } finally {
+    runner.intervalWaitUntil = 0;
+    runner.intervalWaitMs = 0;
+    if (task) {
+      delete task.intervalWaitUntil;
+      delete task.intervalWaitMs;
+      task.updatedAt = Date.now();
+      await publishTask(task);
+    }
+  }
+}
+
+async function discardCancelledPreviewTask(previewRunId, previousTask = null) {
+  if (!previewRunId) return false;
+  return enqueueTaskWrite(async () => {
+    let current = null;
+    try {
+      current = (await getAllConfig()).task;
+    } catch (_) {
+      return false;
+    }
+    if (String(current?.previewRunId || '') !== String(previewRunId)) return false;
+
+    const restored = cloneTaskSnapshot(previousTask);
+    if (restored) {
+      restored.updatedAt = Date.now();
+      delete restored.previewRunId;
+      await saveTask(restored);
+    } else {
+      await saveTask(null);
+    }
+    try {
+      chrome.runtime.sendMessage({
+        type: MSG.TASK_EVENT,
+        payload: restored,
+        authoritative: true,
+        reason: 'preview_cancel_rollback'
+      }).catch(() => {});
+    } catch (_) {}
+    await debugLog('background.preview', 'discard_cancelled_publish', {
+      previewRunId,
+      restoredTaskId: restored?.id || null
+    }, 'warn');
+    return true;
+  });
+}
+
+async function publishPreviewTask(task, previewRunId, previousTask = null, { deferPublish = false } = {}) {
+  if (!isPreviewRunActive(previewRunId)) return false;
+  // Mark the candidate so STOP_TASK can distinguish a late preview write from
+  // a task that was created before this scan started.
+  task.previewRunId = previewRunId;
+  // Target refreshes are one logical task. Publishing the fresh candidate here
+  // would make the panel accept a new task id, then reject the merged snapshot
+  // when refreshAndContinue restores the original task id.
+  if (deferPublish) {
+    await debugLog('background.preview', 'candidate_deferred_for_target_refresh', {
+      previewRunId,
+      taskId: task.id || null,
+      previousTaskId: previousTask?.id || null
+    });
+    return true;
+  }
+  await publishTask(task);
+  if (!isPreviewRunActive(previewRunId)) {
+    await discardCancelledPreviewTask(previewRunId, previousTask);
+    return false;
+  }
+  return true;
 }
 
 async function withRunnerAdmission(kind, action) {
-  if (runnerIsBusy()) {
+  const isTargetRefreshAdmission = kind === 'previewing' && runner.targetLoop === true &&
+    !runner.running && !runner.starting && !runner.previewing;
+  if (runner.stopping) {
+    await debugLog('background.runner', 'admission_rejected_while_stopping', { requested: kind }, 'warn');
+    return { ok: false, error: 'OP_CANCELLED', message: '任务正在停止，请稍后重试' };
+  }
+  if (isTargetRefreshAdmission && runner.abort) {
+    await debugLog('background.runner', 'admission_rejected_after_stop', { requested: kind }, 'warn');
+    return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，刷新操作已取消' };
+  }
+  if (runnerIsBusy() && !isTargetRefreshAdmission) {
     await debugLog('background.runner', 'admission_rejected', {
       requested: kind,
       running: runner.running,
@@ -123,12 +378,54 @@ async function withRunnerAdmission(kind, action) {
         : '当前已有任务正在启动或执行，请勿重复点击'
     };
   }
+  const admissionId = kind === 'previewing' ? uid('preview') : '';
   runner[kind] = true;
+  if (kind === 'starting') {
+    // A previous stopped task leaves abort=true until the next run starts.
+    // Clear it at the new admission so staging a scheduled/new task is not
+    // mistaken for a late write from the previous run.
+    runner.abort = false;
+    runner.taskRunId = uid('run');
+    runner.taskRunTaskId = '';
+  }
+  if (kind === 'previewing') {
+    // runner 已通过空闲门禁；此时的 pause/abort/skip 只能来自上一轮残留。
+    runner.pause = false;
+    // 目标模式在两个投递批次之间会短暂释放 running，再进入扫描恢复。
+    // 此时用户点「停止」写入的 abort 不能被新的 preview admission 清掉。
+    if (!runner.targetLoop) runner.abort = false;
+    runner.skipCurrent = false;
+    runner.previewRunId = admissionId;
+    runner.previewStartedAt = Date.now();
+    runner.previewScanStartedAt = 0;
+    runner.previewScanFinishedAt = 0;
+    runner.previewPhase = 'locating_list';
+    runner.previewScanned = 0;
+    runner.previewPass = 0;
+    runner.previewPreviousTask = null;
+  }
   await debugLog('background.runner', 'admission_acquired', { kind });
+  let actionPromise = null;
   try {
-    return await action();
+    actionPromise = Promise.resolve().then(() => action(admissionId));
+    if (kind === 'previewing') activePreviewRun = { id: admissionId, promise: actionPromise };
+    return await actionPromise;
   } finally {
-    runner[kind] = false;
+    if (kind === 'previewing' && activePreviewRun?.id === admissionId) activePreviewRun = null;
+    const ownsAdmission = kind !== 'previewing' || runner.previewRunId === admissionId;
+    if (ownsAdmission) {
+      runner[kind] = false;
+      if (kind === 'previewing') {
+        runner.previewStartedAt = 0;
+        runner.previewScanStartedAt = 0;
+        runner.previewScanFinishedAt = 0;
+        runner.previewPhase = '';
+        runner.previewScanned = 0;
+        runner.previewPass = 0;
+        runner.previewRunId = '';
+        runner.previewPreviousTask = null;
+      }
+    }
     await debugLog('background.runner', 'admission_released', { kind });
   }
 }
@@ -140,29 +437,295 @@ function cancelledResult() {
 async function cancelActiveOperations(reason = '任务已停止') {
   const active = operations.clear();
   await debugLog('background.operation', 'cancel_all', { reason, active });
-  await Promise.all(active.map(async ({ opId, tabId, storageKey }) => {
-    try {
-      if (storageKey) {
-        await chrome.storage.local.set({
-          [storageKey]: {
-            status: 'cancelled',
-            opId,
-            reason,
-            at: Date.now()
-          }
-        });
-      }
-    } catch (_) {}
-    try {
-      if (tabId != null) {
-        await chrome.tabs.sendMessage(tabId, {
-          type: MSG.CANCEL_OP,
-          payload: { opId, reason }
-        });
-      }
-    } catch (_) {}
-  }));
+  await Promise.all(active.map((operation) => cancelBridgeOperation({ ...operation, reason })));
   return active.length;
+}
+
+function scheduleBridgeStorageCleanup(storageKey, delayMs = 60000) {
+  if (!storageKey) return;
+  setTimeout(() => {
+    chrome.storage.local.remove(storageKey).catch(() => {});
+  }, Math.max(1000, Number(delayMs) || 60000));
+}
+
+// Cancellation must outlive the background poller: the page may still hold the
+// operation lock while it unwinds a sleep/DOM wait. Keep a tombstone until the
+// content script confirms that its finally block has run.
+async function requestBridgeCancellation({ opId, tabId, storageKey, reason = '任务已停止' } = {}) {
+  if (!opId && !storageKey) return false;
+  const key = storageKey || `bht_op_${opId}`;
+  try {
+    await chrome.storage.local.set({
+      [key]: {
+        status: 'cancelled',
+        opId: opId || '',
+        reason,
+        at: Date.now(),
+        cancelRequestedAt: Date.now(),
+        settled: false
+      }
+    });
+  } catch (_) {}
+  try {
+    if (tabId != null && opId) {
+      await chrome.tabs.sendMessage(tabId, {
+        type: MSG.CANCEL_OP,
+        payload: { opId, reason }
+      });
+    }
+  } catch (_) {}
+  return true;
+}
+
+async function waitForBridgeCancellationSettlement({ opId, storageKey, reason = '任务已停止' } = {}) {
+  const key = storageKey || (opId ? `bht_op_${opId}` : '');
+  if (!key) return false;
+
+  const deadline = Date.now() + OPERATION_TIMEOUTS.BRIDGE_CANCEL_SETTLE_MS;
+  let settled = false;
+  while (Date.now() < deadline) {
+    await sleep(OPERATION_TIMEOUTS.BRIDGE_CANCEL_POLL_MS);
+    try {
+      const bag = await chrome.storage.local.get(key);
+      const row = bag?.[key];
+      if (row?.status === 'done' || (row?.status === 'cancelled' && row.settled === true)) {
+        settled = true;
+        break;
+      }
+    } catch (_) {}
+  }
+  if (settled) {
+    try { await chrome.storage.local.remove(key); } catch (_) {}
+  } else {
+    try {
+      await chrome.storage.local.set({
+        [key]: {
+          status: 'cancelled',
+          opId: opId || '',
+          reason,
+          at: Date.now(),
+          cancelRequestedAt: Date.now(),
+          settled: false,
+          expiresAt: Date.now() + 60000
+        }
+      });
+    } catch (_) {}
+    scheduleBridgeStorageCleanup(key);
+  }
+  return settled;
+}
+
+async function cancelBridgeOperation(operation = {}) {
+  await requestBridgeCancellation(operation);
+  return waitForBridgeCancellationSettlement(operation);
+}
+
+function clearDeliverySchedulePause(task) {
+  if (!task) return;
+  if (task.pauseSource === 'schedule') delete task.pauseSource;
+  delete task.schedulePaused;
+  delete task.schedulePausedAt;
+  delete task.schedulePauseRequested;
+  delete task.scheduleNextStartAt;
+}
+
+function markDeliverySchedulePaused(task, settings, now = new Date()) {
+  const schedule = evaluateDeliverySchedule(settings, now);
+  task.status = TASK_STATUS.PAUSED;
+  task.pauseSource = 'schedule';
+  task.schedulePaused = true;
+  task.schedulePausedAt = task.schedulePausedAt || now.getTime();
+  delete task.schedulePauseRequested;
+  task.scheduleNextStartAt = schedule.nextStart?.getTime() || null;
+  task.pauseReason = '定时投递：' + formatDeliveryScheduleStatus(settings, now);
+  task.updatedAt = Date.now();
+  return schedule;
+}
+
+function stageTaskForDeliverySchedule(task, settings, now = new Date()) {
+  const schedule = evaluateDeliverySchedule(settings, now);
+  clearDeliverySchedulePause(task);
+  delete task.pauseSource;
+  if (schedule.enabled && !schedule.allowed) {
+    markDeliverySchedulePaused(task, settings, now);
+    return { waiting: true, schedule };
+  }
+  task.status = TASK_STATUS.RUNNING;
+  return { waiting: false, schedule };
+}
+
+async function configureDeliveryScheduleAlarm(settings = null) {
+  if (!chrome.alarms?.create) return;
+  const resolved = settings || (await getAllConfig()).settings || {};
+  const schedule = evaluateDeliverySchedule(resolved, new Date());
+  await chrome.alarms.clear(DELIVERY_SCHEDULE_ALARM);
+  if (!schedule.enabled || !schedule.days.length || !schedule.windows.length) return;
+  const when = schedule.allowed
+    ? Date.now() + 1000
+    : Math.max(Date.now() + 1000, schedule.nextStart?.getTime() || Date.now() + 60000);
+  chrome.alarms.create(DELIVERY_SCHEDULE_ALARM, { when, periodInMinutes: 1 });
+}
+
+async function hasScheduleResumeTab(task) {
+  const listTabId = task?.execution?.listTabId;
+  if (listTabId == null) return false;
+  try {
+    const tab = await chrome.tabs.get(listTabId);
+    return isBossTab(tab) && isBossJobListUrl(tab.url || '');
+  } catch (_) {
+    return false;
+  }
+}
+
+async function pauseAtDeliveryScheduleBoundary(task, settings, now = new Date()) {
+  const schedule = evaluateDeliverySchedule(settings, now);
+  if (!schedule.enabled || schedule.allowed) {
+    runner.schedulePauseRequested = false;
+    if (task) delete task.schedulePauseRequested;
+    return false;
+  }
+  if (task?.status === TASK_STATUS.PAUSED && task.pauseSource !== 'schedule') return false;
+
+  runner.schedulePauseRequested = false;
+  runner.pause = true;
+  markDeliverySchedulePaused(task, settings, now);
+  await publishTask(task);
+  await log('warn', task.pauseReason, { taskId: task.id, pauseSource: 'schedule' });
+  return true;
+}
+
+async function waitForRunnableQueueBoundary(taskId) {
+  while (!runner.abort) {
+    let all = await getAllConfig();
+    let task = all.task;
+    if (!task || task.id !== taskId) return { ok: false, error: 'TASK_NOT_FOUND' };
+
+    if (await pauseAtDeliveryScheduleBoundary(task, all.settings || {}, new Date())) {
+      return { ok: false, scheduled: true, config: all, task };
+    }
+
+    await waitWhilePaused();
+    if (runner.abort) return { ok: false, error: 'ABORTED' };
+
+    // 单独收到唤醒信号不足以放行：设置保存或 alarm 可能与队列循环并发。
+    // 必须重新读取持久化状态并再次检查时间窗，才允许进入下一岗。
+    all = await getAllConfig();
+    task = all.task;
+    if (!task || task.id !== taskId) return { ok: false, error: 'TASK_NOT_FOUND' };
+    if (await pauseAtDeliveryScheduleBoundary(task, all.settings || {}, new Date())) {
+      return { ok: false, scheduled: true, config: all, task };
+    }
+
+    if (task.status === TASK_STATUS.PAUSED) {
+      runner.pause = true;
+      continue;
+    }
+    return { ok: true, config: all, task };
+  }
+  return { ok: false, error: 'ABORTED' };
+}
+
+async function enforceDeliverySchedule(source = 'alarm', now = new Date()) {
+  if (runner.stopping || runner.abort) {
+    await debugLog('background.schedule', 'resume_rejected_after_stop', { source }, 'warn');
+    return { ok: false, error: 'OP_CANCELLED', message: '任务正在停止或已停止，定时恢复已取消' };
+  }
+  const all = await getAllConfig();
+  const settings = all.settings || {};
+  const schedule = evaluateDeliverySchedule(settings, now);
+  const task = all.task;
+
+  if (!schedule.enabled) {
+    runner.schedulePauseRequested = false;
+    let changed = false;
+    if (task?.schedulePaused) {
+      clearDeliverySchedulePause(task);
+      task.pauseReason = '定时投递已关闭，任务保持暂停；点击「继续」可立即恢复。';
+      changed = true;
+    } else if (task?.schedulePauseRequested) {
+      delete task.schedulePauseRequested;
+      delete task.scheduleNextStartAt;
+      changed = true;
+    }
+    if (task && changed) {
+      task.updatedAt = Date.now();
+      await publishTask(task);
+    }
+    return { ok: true, action: 'disabled', schedule };
+  }
+  if (!task || [TASK_STATUS.COMPLETED, TASK_STATUS.STOPPED, TASK_STATUS.FAILED].includes(task.status)) {
+    return { ok: true, action: 'idle', schedule };
+  }
+
+  if (!schedule.allowed) {
+    if (task.status === TASK_STATUS.RUNNING && runner.running) {
+      if (!runner.schedulePauseRequested) {
+        runner.schedulePauseRequested = true;
+        task.schedulePauseRequested = true;
+        task.scheduleNextStartAt = schedule.nextStart?.getTime() || null;
+        task.updatedAt = Date.now();
+        await publishTask(task);
+        await log('warn', '定时投递时段已结束，将在当前岗位完成后暂停', {
+          taskId: task.id,
+          source,
+          nextStartAt: task.scheduleNextStartAt
+        });
+      }
+      return { ok: true, action: 'pause_requested', schedule };
+    }
+    if (task.status === TASK_STATUS.RUNNING || task.pauseSource === 'schedule') {
+      markDeliverySchedulePaused(task, settings, now);
+      await publishTask(task);
+      return { ok: true, action: 'paused', schedule };
+    }
+    return { ok: true, action: 'unchanged', schedule };
+  }
+
+  runner.schedulePauseRequested = false;
+  if (task.schedulePauseRequested) {
+    delete task.schedulePauseRequested;
+    task.updatedAt = Date.now();
+    await publishTask(task);
+  }
+  if (task.status !== TASK_STATUS.PAUSED || task.pauseSource !== 'schedule') {
+    return { ok: true, action: 'allowed', schedule };
+  }
+  if (!(await hasScheduleResumeTab(task))) {
+    const reason = '定时投递已进入运行时段，但原职位列表页已关闭或已离开职位列表；请打开 BOSS 职位列表后点「继续」。';
+    if (task.pauseReason !== reason) {
+      task.pauseReason = reason;
+      task.updatedAt = Date.now();
+      await publishTask(task);
+      await log('warn', reason, { taskId: task.id, source });
+    }
+    return { ok: false, action: 'waiting_for_tab', schedule };
+  }
+
+  clearDeliverySchedulePause(task);
+  task.status = TASK_STATUS.RUNNING;
+  task.pauseReason = '';
+  task.updatedAt = Date.now();
+  let split = null;
+  let resumedTaskRunId = '';
+  if (!runner.running) {
+    resumedTaskRunId = uid('run');
+    runner.taskRunId = resumedTaskRunId;
+    runner.taskRunTaskId = task.id;
+    task.execution = { ...(task.execution || {}), taskRunId: resumedTaskRunId };
+    split = await prepareSplitWorkspace(task, settings);
+  }
+  const published = await publishTask(task);
+  if (!published || runner.stopping || runner.abort || task.status === TASK_STATUS.STOPPED ||
+      (!runner.running && !isTaskRunCurrent(task.id, resumedTaskRunId))) {
+    return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，刷新操作已取消' };
+  }
+  runner.pause = false;
+  await log('info', '已进入定时投递时段，自动恢复任务', { taskId: task.id, source });
+  if (!runner.running) {
+    if (task.targetMode === true) runTargetDeliveryLoop(task.id, resumedTaskRunId);
+    else runTaskLoop(task.id, resumedTaskRunId);
+  }
+  return { ok: true, action: 'resumed', schedule, splitView: split };
 }
 
 async function reconcileStaleRunningTask(reason = '扩展后台已重启') {
@@ -170,9 +733,38 @@ async function reconcileStaleRunningTask(reason = '扩展后台已重启') {
     const all = await getAllConfig();
     const task = all.task;
     if (!task) return;
-    if (task.status === TASK_STATUS.RUNNING) {
+    if (task.execution?.workerTabId) {
+      await closeConversationWorkerTab(task, task.execution.workerTabId, {
+        reason: '扩展后台重启，清理遗留沟通执行页'
+      });
+    }
+    const legacyResumeProtocolFailure = /(?:附件简历|BOSS\s*在线简历).*UNKNOWN_TYPE/i.test(
+      [task.pauseReason || '', task.lastErrorDetail || '', ...(task.items || []).flatMap((item) => item.reasons || [])].join(' ')
+    );
+    if (legacyResumeProtocolFailure) {
+      const recoveryMessage = '检测到旧版本后台残留的 BOSS 在线简历协议；该协议已移除。请点「重试」，插件会依据已发送回执跳过文字/图片并完成当前岗位';
       task.status = TASK_STATUS.PAUSED;
-      task.pauseReason = reason + '，任务已安全暂停。请确认页面后点「继续」恢复队列。';
+      task.pauseReason = recoveryMessage;
+      task.lastErrorDetail = recoveryMessage;
+      task.awaitingUserRetry = true;
+      task.uiErrorDismissed = false;
+      task.items = (task.items || []).map((item) => {
+        const hit = /(?:附件简历|BOSS\s*在线简历).*UNKNOWN_TYPE/i.test((item.reasons || []).join(' '));
+        return hit ? { ...item, reasons: [recoveryMessage] } : item;
+      });
+      task.updatedAt = Date.now();
+      await publishTask(task);
+      await log('warn', recoveryMessage, { taskId: task.id || null, legacyProtocol: 'BHT_SEND_RESUME' });
+      return;
+    }
+    if (task.status === TASK_STATUS.RUNNING) {
+      const schedule = evaluateDeliverySchedule(all.settings || {}, new Date());
+      if (schedule.enabled && !schedule.allowed) {
+        markDeliverySchedulePaused(task, all.settings || {}, new Date());
+      } else {
+        task.status = TASK_STATUS.PAUSED;
+        task.pauseReason = reason + '，任务已安全暂停。请确认页面后点「继续」恢复队列。';
+      }
       task.updatedAt = Date.now();
       await publishTask(task);
       await log('warn', task.pauseReason, { taskId: task.id || null });
@@ -194,7 +786,9 @@ async function clearStaleOperationArtifacts() {
 async function recoverBackgroundState(reason) {
   await syncDebugLoggingSetting();
   await clearStaleOperationArtifacts();
+  await configureDeliveryScheduleAlarm();
   await reconcileStaleRunningTask(reason);
+  await enforceDeliverySchedule('background_recovery');
 }
 
 // MV3 service worker 冷启动时内存 runner 为空；避免 storage 仍显示 running 造成假运行
@@ -209,6 +803,11 @@ chrome.runtime.onInstalled.addListener(async () => {
   await recoverBackgroundState('扩展更新/重载后后台已重建');
   // side panel disabled: using floating panel + action popup
   await refreshSidePanelForAllTabs();
+});
+
+chrome.alarms?.onAlarm?.addListener((alarm) => {
+  if (alarm?.name !== DELIVERY_SCHEDULE_ALARM) return;
+  enforceDeliverySchedule('alarm').catch(() => {});
 });
 
 async function setSidePanelForTab(tabId, url) {
@@ -257,7 +856,21 @@ chrome.action?.onClicked?.addListener(async (tab) => {
   }
 });
 
-async function getActiveBossTab({ allowInactiveBossTab = false } = {}) {
+async function tabFromSender(sender) {
+  const raw = sender?.tab;
+  if (!raw?.id) return null;
+  try {
+    const live = await chrome.tabs.get(raw.id);
+    return live || raw;
+  } catch (_) {
+    return raw;
+  }
+}
+
+async function getActiveBossTab({ allowInactiveBossTab = false, sender = null } = {}) {
+  const fromSender = await tabFromSender(sender);
+  if (isBossTab(fromSender)) return fromSender;
+
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   const active = tabs[0];
   if (isBossTab(active)) return active;
@@ -269,27 +882,91 @@ async function getActiveBossTab({ allowInactiveBossTab = false } = {}) {
   return all.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0] || null;
 }
 
-async function forceInjectContent(tabId) {
+function deadlineReached(deadlineAt, now = Date.now()) {
+  const deadline = Number(deadlineAt || 0);
+  return Number.isFinite(deadline) && deadline > 0 && Number(now) >= deadline;
+}
+
+function remainingDeadlineMs(deadlineAt, capMs, now = Date.now()) {
+  const cap = Math.max(0, Number(capMs) || 0);
+  const deadline = Number(deadlineAt || 0);
+  if (!Number.isFinite(deadline) || deadline <= 0) return cap;
+  return Math.max(0, Math.min(cap, deadline - Number(now)));
+}
+
+async function sleepWithinDeadline(waitMs, deadlineAt = 0) {
+  const boundedWaitMs = remainingDeadlineMs(deadlineAt, waitMs);
+  if (deadlineAt && boundedWaitMs <= 0) return false;
+  await sleep(boundedWaitMs);
+  return !deadlineReached(deadlineAt);
+}
+
+function previewScanDeadlineResult(extra = {}) {
+  return {
+    ok: false,
+    error: 'OP_DEADLINE_EXCEEDED',
+    message: '岗位加载时间已结束，开始筛选已收集岗位',
+    ...extra
+  };
+}
+
+// 渲染进程繁忙/冻结时 executeScript 可能长时间不返回（日志里曾有 60-90s 黑洞）；
+// 用竞速限时包一层：超时返回 false，由调用方走失败快路径而不是无限等待。
+async function injectWithBudget(executePromise, budgetMs = 25000) {
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), budgetMs);
+  });
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["shared/conversation-match.js", "content/content-main.js"],
-      injectImmediately: true
-    });
-    await sleep(120);
-    return true;
-  } catch (_) {
-    return false;
+    return await Promise.race([
+      executePromise.then(() => true).catch(() => false),
+      timeout
+    ]);
+  } finally {
+    if (timer != null) clearTimeout(timer);
   }
+}
+
+async function forceInjectContent(tabId, { deadlineAt = 0 } = {}) {
+  if (deadlineReached(deadlineAt)) return false;
+  // MAIN 世界钩子失败可容忍（受限页面拒绝时隔离世界仍可走 DOM 兜底），只检查是否超时截止
+  await injectWithBudget(chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["content/page-network-hook.js"],
+    world: "MAIN",
+    injectImmediately: true
+  }), 20000);
+  if (deadlineReached(deadlineAt)) return false;
+  const isolatedOk = await injectWithBudget(chrome.scripting.executeScript({
+    target: { tabId },
+    files: [
+      "shared/trigger-navigation-recovery.js",
+      "shared/conversation-match.js",
+      "shared/operation-dispatch-gate.js",
+      "content/content-main.js"
+    ],
+    injectImmediately: true
+  }), 25000);
+  if (!isolatedOk) return false;
+  return await sleepWithinDeadline(120, deadlineAt);
 }
 
 
 
-async function waitTabComplete(tabId, timeoutMs = 45000) {
+async function waitTabComplete(tabId, timeoutMs = 45000, {
+  shouldStop = null,
+  requireComplete = false,
+  deadlineAt = 0
+} = {}) {
   const start = Date.now();
+  const timeoutDeadlineAt = start + Math.max(0, Number(timeoutMs) || 0);
+  const waitDeadlineAt = Number(deadlineAt) > 0
+    ? Math.min(timeoutDeadlineAt, Number(deadlineAt))
+    : timeoutDeadlineAt;
   let lastUrl = "";
   let stableSince = 0;
-  while (Date.now() - start < timeoutMs) {
+  while (Date.now() < waitDeadlineAt) {
+    if (typeof shouldStop === 'function' && shouldStop()) return null;
     try {
       const t = await chrome.tabs.get(tabId);
       const url = t.url || t.pendingUrl || "";
@@ -306,8 +983,11 @@ async function waitTabComplete(tabId, timeoutMs = 45000) {
     } catch (e) {
       return null;
     }
-    await sleep(200);
+    const remainingMs = Math.max(0, waitDeadlineAt - Date.now());
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(200, remainingMs));
   }
+  if (requireComplete) return null;
   try { return await chrome.tabs.get(tabId); } catch (_) { return null; }
 }
 
@@ -338,6 +1018,30 @@ async function setNormalWindowBounds(windowId, bounds) {
   });
 }
 
+async function applySplitWindowBounds(windowId, expected) {
+  await setNormalWindowBounds(windowId, expected);
+  const live = await chrome.windows.get(windowId).catch(() => null);
+  if (!live || !windowBoundsMatch(live, expected)) {
+    throw new Error('浏览器未应用分屏窗口尺寸');
+  }
+  return live;
+}
+
+async function restoreWindowSnapshot(windowId, snapshot) {
+  if (windowId == null || !snapshot) return false;
+  try {
+    const state = String(snapshot.state || 'normal');
+    if (state && state !== 'normal') {
+      await chrome.windows.update(windowId, { state }).catch(() => {});
+    } else {
+      await setNormalWindowBounds(windowId, snapshot).catch(() => {});
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function setSplitTabZoom(tabId) {
   if (tabId == null || !chrome.tabs?.setZoom) return false;
   try {
@@ -351,6 +1055,19 @@ async function setSplitTabZoom(tabId) {
     return true;
   } catch (_) {
     return false;
+  }
+}
+
+// 分屏窗口可能因创建时未聚焦而被系统隐藏或最小化（坐标更新无效、state 更新有效）。
+// 显式恢复 normal 并依次前置：先消息窗后列表窗；两窗不重叠，前置后左右都可见。
+async function raiseSplitWindows(listWindowId, messageWindowId) {
+  if (messageWindowId != null) {
+    await chrome.windows.update(messageWindowId, { state: 'normal' }).catch(() => {});
+    await chrome.windows.update(messageWindowId, { focused: true }).catch(() => {});
+  }
+  if (listWindowId != null) {
+    await chrome.windows.update(listWindowId, { state: 'normal' }).catch(() => {});
+    await chrome.windows.update(listWindowId, { focused: true }).catch(() => {});
   }
 }
 
@@ -370,7 +1087,11 @@ export async function prepareSplitWorkspace(task, settings = {}) {
   }
 
   task.execution.listTabId = listTab.id;
-  task.execution.listWindowId = listTab.windowId;
+  // 职位页优先留在用户原来的窗口（除非原窗口拒绝缩放，才搬进新建的可定位窗口，见下方 relocated 回退）
+  const sourceWindowId = listTab.windowId;
+  task.execution.listWindowId = sourceWindowId;
+  const sourceWindow = await chrome.windows.get(sourceWindowId).catch(() => null);
+  const originalListBounds = snapshotWindowBounds(sourceWindow);
   const display = await getDisplayMetrics(listTab.id);
   const bounds = computeSideBySideBounds(display || {}, { minWidth: 520, minHeight: 600 });
   if (!bounds) {
@@ -378,25 +1099,85 @@ export async function prepareSplitWorkspace(task, settings = {}) {
     return { ok: false, error: 'DISPLAY_TOO_SMALL', message: '当前屏幕空间不足，已回退为普通消息标签页' };
   }
 
-  let originalWindow = null;
-  try { originalWindow = await chrome.windows.get(listTab.windowId); } catch (_) {}
-  try {
-    await setNormalWindowBounds(listTab.windowId, bounds.left);
-
-    let messageTab = null;
-    if (task.execution.messageTabId) {
-      messageTab = await chrome.tabs.get(task.execution.messageTabId).catch(() => null);
+  // 1) 复用上一对分屏窗口：职位窗仍是原窗口，聊天窗在右侧，只重新摆放
+  if (task.execution.splitViewActive && task.execution.listWindowId && task.execution.messageWindowId) {
+    const prevListWin = await chrome.windows.get(task.execution.listWindowId).catch(() => null);
+    const prevMsgWin = await chrome.windows.get(task.execution.messageWindowId).catch(() => null);
+    const listTabNow = await chrome.tabs.get(task.execution.listTabId).catch(() => null);
+    const msgTabNow = await chrome.tabs.get(task.execution.messageTabId).catch(() => null);
+    if (
+      prevListWin && prevMsgWin && listTabNow && msgTabNow &&
+      prevListWin.id !== prevMsgWin.id &&
+      listTabNow.windowId === prevListWin.id && msgTabNow.windowId === prevMsgWin.id
+    ) {
+      try {
+        await applySplitWindowBounds(prevListWin.id, bounds.left);
+        await applySplitWindowBounds(prevMsgWin.id, bounds.right);
+        task.execution.splitBounds = bounds;
+        task.execution.phase = 'SPLIT_WORKSPACE_READY';
+        await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
+        await raiseSplitWindows(prevListWin.id, prevMsgWin.id);
+        await debugLog('background.split', 'pair_reused', {
+          listWindowId: prevListWin.id,
+          messageWindowId: prevMsgWin.id,
+          bounds
+        });
+        return {
+          ok: true,
+          reused: true,
+          listTabId: listTab.id,
+          messageTabId: msgTabNow.id,
+          bounds,
+          zoomFactor: SPLIT_ZOOM_FACTOR,
+          zoomApplied: false
+        };
+      } catch (_) {
+        await restoreWindowSnapshot(prevListWin.id, snapshotWindowBounds(prevListWin));
+        await restoreWindowSnapshot(prevMsgWin.id, snapshotWindowBounds(prevMsgWin));
+        // 原窗口坐标未生效时不要假装分屏成功，走下面完整摆放或失败回退
+      }
     }
+  }
+
+  let listWindowId = sourceWindowId;
+  let relocated = false;
+  let originalListIndex = listTab.index;
+  try {
+    // 原窗口拒绝摆放（某些浏览器/ego 固定最大化或最小化）时，把列表页搬进新建的可定位窗口，分屏保持可用
+    try {
+      await applySplitWindowBounds(sourceWindowId, bounds.left);
+    } catch (_) {
+      const movedWindow = await chrome.windows.create({
+        tabId: listTab.id,
+        type: 'normal',
+        focused: false,
+        ...bounds.left
+      });
+      listWindowId = movedWindow.id;
+      relocated = true;
+      task.execution.listWindowId = listWindowId;
+      await applySplitWindowBounds(listWindowId, bounds.left);
+    }
+
+    const savedMsgTab = task.execution.messageTabId
+      ? await chrome.tabs.get(task.execution.messageTabId).catch(() => null)
+      : null;
+    let messageTab = savedMsgTab && savedMsgTab.id !== listTab.id ? savedMsgTab : null;
     if (!messageTab?.id) {
       const bossTabs = await chrome.tabs.query({ url: BOSS_MATCH_PATTERNS });
-      messageTab = bossTabs.find((tab) => tab.id !== listTab.id && /\/chat/i.test(tab.url || tab.pendingUrl || '')) || null;
+      messageTab = bossTabs.find(
+        (tab) => tab.id !== listTab.id && /\/chat/i.test(tab.url || tab.pendingUrl || '')
+      ) || null;
     }
 
     let messageWindow;
-    const existingWindowTabs = messageTab?.windowId != null
-      ? await chrome.tabs.query({ windowId: messageTab.windowId })
-      : [];
-    if (messageTab?.id && (messageTab.windowId === listTab.windowId || existingWindowTabs.length > 1)) {
+    if (!relocated && messageTab?.id && messageTab.windowId != null && messageTab.windowId !== listWindowId) {
+      await applySplitWindowBounds(messageTab.windowId, bounds.right);
+      messageWindow = await chrome.windows.get(messageTab.windowId).catch(() => null)
+        || { id: messageTab.windowId };
+      messageTab = await chrome.tabs.get(messageTab.id).catch(() => messageTab);
+    } else if (messageTab?.id) {
+      // 聊天标签和职位页还在同一窗口：只把聊天标签拆到右侧，职位页留下
       messageWindow = await chrome.windows.create({
         tabId: messageTab.id,
         type: 'normal',
@@ -404,9 +1185,6 @@ export async function prepareSplitWorkspace(task, settings = {}) {
         ...bounds.right
       });
       messageTab = messageWindow.tabs?.[0] || await chrome.tabs.get(messageTab.id);
-    } else if (messageTab?.id) {
-      await setNormalWindowBounds(messageTab.windowId, bounds.right);
-      messageWindow = await chrome.windows.get(messageTab.windowId, { populate: true });
     } else {
       messageWindow = await chrome.windows.create({
         url: 'https://www.zhipin.com/web/geek/chat',
@@ -420,7 +1198,6 @@ export async function prepareSplitWorkspace(task, settings = {}) {
     if (!messageTab?.id) throw new Error('消息窗口已创建，但未获得标签页');
     task.execution.messageTabId = messageTab.id;
     task.execution.messageWindowId = messageWindow.id;
-    await setNormalWindowBounds(messageWindow.id, bounds.right);
     if (!/\/chat/i.test(messageTab.url || messageTab.pendingUrl || '')) {
       messageTab = await chrome.tabs.update(messageTab.id, {
         url: 'https://www.zhipin.com/web/geek/chat',
@@ -441,7 +1218,13 @@ export async function prepareSplitWorkspace(task, settings = {}) {
     task.execution.phase = 'SPLIT_WORKSPACE_READY';
 
     await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
-    await chrome.windows.update(listTab.windowId, { focused: true }).catch(() => {});
+    await raiseSplitWindows(listWindowId, messageWindow.id);
+    const listWinState = await chrome.windows.get(listWindowId).catch(() => null);
+    const msgWinState = await chrome.windows.get(messageWindow.id).catch(() => null);
+    await debugLog('background.split', 'windows_state', {
+      list: listWinState ? { id: listWinState.id, state: listWinState.state, left: listWinState.left, top: listWinState.top, width: listWinState.width, height: listWinState.height } : null,
+      message: msgWinState ? { id: msgWinState.id, state: msgWinState.state, left: msgWinState.left, top: msgWinState.top, width: msgWinState.width, height: msgWinState.height } : null
+    });
     return {
       ok: true,
       listTabId: listTab.id,
@@ -453,16 +1236,16 @@ export async function prepareSplitWorkspace(task, settings = {}) {
   } catch (error) {
     task.execution.splitViewActive = false;
     task.execution.splitViewError = String(error?.message || error);
-    if (originalWindow?.width && originalWindow?.height) {
-      await setNormalWindowBounds(listTab.windowId, {
-        left: originalWindow.left || 0,
-        top: originalWindow.top || 0,
-        width: originalWindow.width,
-        height: originalWindow.height
-      }).catch(() => {});
+    if (relocated) {
+      // 列表页已搬进新窗口：先搬回原窗口再关闭临时窗口，避免丢失标签
+      await chrome.tabs.move(listTab.id, { windowId: sourceWindowId, index: Math.min(originalListIndex, 1000) }).catch(() => {});
+      await chrome.windows.remove(listWindowId).catch(() => {});
+      task.execution.listWindowId = sourceWindowId;
+    } else {
+      await restoreWindowSnapshot(sourceWindowId, originalListBounds);
     }
     await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
-    await chrome.windows.update(listTab.windowId, { focused: true }).catch(() => {});
+    await chrome.windows.update(task.execution.listWindowId || listTab.windowId, { focused: true }).catch(() => {});
     return {
       ok: false,
       error: 'SPLIT_VIEW_FAILED',
@@ -489,11 +1272,38 @@ async function ensureMessageTab(task) {
           try { await chrome.tabs.update(oldId, { active: true }); } catch (_) {}
         }
         if (task.execution.splitViewActive) await setSplitTabZoom(oldId);
-        await log("info", "[消息页] 复用 tab=" + oldId + " url=" + String(t.url || "").slice(0, 120));
+        // 防卡顿：连续投递 N 岗后自动刷新消息页，避免大会话列表累积导致渲染卡顿
+        //（BOSS 聊天页在几十岗复用后出现 73s 等待输入框 + 39s 发送无响应的卡顿）。
+        // 刷新只在「每 N 岗」的边界执行一次；分屏状态会在刷新后重新套用窗口尺寸。
+        const jobsSinceMsgRefresh = Number(task.execution?.jobsSinceMessageRefresh || 0) + 1;
+        task.execution.jobsSinceMessageRefresh = jobsSinceMsgRefresh;
+        let refreshed = false;
+        if (jobsSinceMsgRefresh >= MESSAGE_TAB_REFRESH_INTERVAL) {
+          task.execution.jobsSinceMessageRefresh = 0;
+          await log('info', `[消息页] 已连续处理 ${MESSAGE_TAB_REFRESH_INTERVAL} 岗，自动刷新消息页（防止会话列表累积卡顿）`, {
+            jobId: String(task?.currentJobId || ""),
+            tabId: oldId
+          });
+          try {
+            await chrome.tabs.reload(oldId);
+            await waitTabComplete(oldId, 25000);
+            await forceInjectContent(oldId);
+            if (task.execution.splitViewActive) await setSplitTabZoom(oldId);
+            refreshed = true;
+          } catch (_) {
+            await log('warn', '[消息页] 自动刷新失败，继续基于当前页面发送（等待输入框门禁兜底）', {
+              jobId: String(task?.currentJobId || ""),
+              tabId: oldId
+            });
+          }
+        }
+        await log("info", `[消息页] 复用 tab=${oldId} url=${String(t.url || "").slice(0, 120)}${refreshed ? ' · 已刷新' : ''}`);
         return t;
       }
     } catch (_) {}
   }
+  // 新建消息 tab 时重置刷新计数
+  task.execution.jobsSinceMessageRefresh = 0;
   let tab;
   if (task.execution.splitViewActive && task.execution.splitBounds?.right) {
     const win = await chrome.windows.create({
@@ -505,9 +1315,13 @@ async function ensureMessageTab(task) {
     tab = win.tabs?.[0] || (await chrome.tabs.query({ windowId: win.id }))[0];
     if (!tab?.id) throw new Error('无法在右侧重建消息窗口');
   } else {
+    // 消息页建立在职位列表页所在窗口：openerTabId 必须与新建标签同窗口，
+    // 否则多窗口（或列表页被移到新建窗口）时会报「Tab opener must be in the same window」
+    const listTabForWindow = await chrome.tabs.get(task.execution.listTabId).catch(() => null);
     tab = await chrome.tabs.create({
       url: "https://www.zhipin.com/web/geek/chat",
       active: true,
+      windowId: listTabForWindow?.windowId,
       openerTabId: task.execution.listTabId || undefined
     });
   }
@@ -614,9 +1428,369 @@ async function ensureListTab(task) {
   return t;
 }
 
-async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false, tabId = null } = {}) {
-  const taskBound = runner.running;
-  const isCancelled = () => taskBound && runner.abort;
+async function getListTabFingerprint(tabId) {
+  if (!tabId) return { tabId: null, url: '', contentInstanceId: '' };
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch (_) {}
+  let contentInstanceId = '';
+  try {
+    const pong = await chrome.tabs.sendMessage(tabId, { type: MSG.PING, payload: {} });
+    contentInstanceId = String(pong?.contentInstanceId || '');
+  } catch (_) {}
+  return {
+    tabId,
+    url: String(tab?.url || tab?.pendingUrl || ''),
+    windowId: tab?.windowId || null,
+    contentInstanceId
+  };
+}
+
+async function closeConversationWorkerTab(task, tabId, { reason = '', publish = true } = {}) {
+  const workerTabId = tabId || task?.execution?.workerTabId || null;
+  if (workerTabId) {
+    try { await chrome.tabs.remove(workerTabId); } catch (_) {}
+  }
+  if (task?.execution && (!workerTabId || task.execution.workerTabId === workerTabId)) {
+    delete task.execution.workerTabId;
+    delete task.execution.workerMode;
+    delete task.execution.workerUrl;
+    task.updatedAt = Date.now();
+    if (publish) await publishTask(task);
+  }
+  if (reason && typeof debugLog === 'function') {
+    await debugLog('background.workerTab', 'closed', {
+      taskId: task?.id || null,
+      tabId: workerTabId,
+      reason
+    });
+  }
+  return { ok: true, tabId: workerTabId, closed: Boolean(workerTabId) };
+}
+
+// 从岗位详情 href 提取 jobId（/job_detail/<id>.html）；非详情页返回 ''
+function detailJobIdFromHref(href) {
+  try {
+    const path = String(href || '').split('#')[0];
+    const match = /\/job_detail\/([^/?#]+)/i.exec(path);
+    return match ? String(match[1]) : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+async function restoreTabsAfterWorker(messageTab, listTabId, workerTab, task = null) {
+  const workerId = workerTab?.id || null;
+  if (messageTab?.id && messageTab.id !== workerId) {
+    try { await chrome.tabs.update(messageTab.id, { active: true }); } catch (_) {}
+  }
+  if (!listTabId) return;
+  try {
+    const listTab = await chrome.tabs.get(listTabId);
+    if (!listTab?.id || listTab.id === workerId) return;
+    const messageWindowId = messageTab?.windowId ?? task?.execution?.messageWindowId ?? null;
+    const listWindowId = listTab.windowId ?? task?.execution?.listWindowId ?? null;
+    if (task?.execution?.splitViewActive && listWindowId != null && messageWindowId != null && listWindowId !== messageWindowId) {
+      await chrome.tabs.update(listTab.id, { active: true }).catch(() => {});
+      await raiseSplitWindows(listWindowId, messageWindowId);
+      return;
+    }
+    // 同窗口时保持消息页，避免把用户从聊天切走。
+    if (messageWindowId != null && listTab.windowId === messageWindowId) return;
+    await chrome.tabs.update(listTab.id, { active: true });
+  } catch (_) {}
+}
+
+async function openConversationWorkerTab(task, attempt, messageTab, job, { forceNew = false } = {}) {
+  if (!task.execution) task.execution = {};
+  if (forceNew && task.execution.workerTabId) {
+    await closeConversationWorkerTab(task, task.execution.workerTabId, {
+      reason: '重试立即沟通，关闭旧执行页后重新打开',
+      publish: true
+    });
+  }
+  // 复用上一岗的执行页：直接导航新岗位，避免每岗新建冷加载标签页
+  // （减少 BOSS 限流触发、后台标签页冻结/慢加载，也避免用户看到新标签页反复弹出）。
+  let tab = null;
+  const previousTabId = task.execution.workerTabId || null;
+  if (previousTabId != null) {
+    try { tab = await chrome.tabs.get(previousTabId); } catch (_) { tab = null; }
+  }
+  let reused = Boolean(tab?.id);
+  if (reused) {
+    try {
+      // 必须 active:true：Chrome 会节流后台标签，job_detail 可能一直 loading，executeScript 卡到预算耗尽。
+      await chrome.tabs.update(tab.id, { url: attempt.url, active: true });
+    } catch (_) {
+      tab = null;
+      reused = false;
+    }
+  }
+  if (!reused) {
+    const createOptions = {
+      url: attempt.url,
+      active: true
+    };
+    const targetWindowId = messageTab?.windowId || task.execution.messageWindowId || null;
+    if (targetWindowId != null) createOptions.windowId = targetWindowId;
+    if (messageTab?.id) createOptions.openerTabId = messageTab.id;
+    tab = await chrome.tabs.create(createOptions);
+    if (!tab?.id) throw new Error('临时沟通执行页创建失败');
+  }
+  // autoDiscardable 仅支持 tabs.update：创建后统一设置为不可被内存优化回收
+  try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (_) {}
+  task.execution.workerTabId = tab.id;
+  task.execution.workerMode = attempt.mode;
+  task.execution.workerUrl = attempt.url;
+  task.updatedAt = Date.now();
+  await publishTask(task);
+  if (typeof debugLog === 'function') {
+    await debugLog('background.workerTab', 'wait_complete', {
+      tabId: tab.id,
+      reused,
+      url: String(attempt.url || '').slice(0, 180)
+    });
+  }
+  // 复用导航给更长预算：SPA 冷加载在后台标签页可能超过 30s
+  const ready = await waitTabComplete(tab.id, reused ? 45000 : 30000, { requireComplete: true });
+  const readyUrl = ready?.url || ready?.pendingUrl || '';
+  if (!ready?.id || !isBossUrl(readyUrl)) {
+    throw new Error('临时沟通执行页未能加载 BOSS 岗位：' + String(readyUrl || attempt.url));
+  }
+  // 复用安全护栏：若导航未提交、waitTabComplete 把「上一岗位详情页」判为就绪，
+  // 后续会误点上一岗位的「立即沟通」。两页都是岗位详情且 jobId 不同 → 立即失败跳过。
+  if (reused) {
+    const expectJobId = detailJobIdFromHref(attempt.url);
+    const readyJobId = detailJobIdFromHref(readyUrl);
+    if (expectJobId && readyJobId && expectJobId !== readyJobId) {
+      throw new Error('临时沟通执行页导航未生效（仍停留在上一岗位详情），已跳过该岗位以防误点');
+    }
+  }
+  if (typeof debugLog === 'function') {
+    await debugLog('background.workerTab', 'inject', { tabId: tab.id, url: String(readyUrl).slice(0, 180) });
+  }
+  const injected = await forceInjectContent(tab.id);
+  if (!injected) {
+    throw new Error('临时沟通执行页内容脚本注入超时（页面可能繁忙或被冻结），已跳过该岗位');
+  }
+  await sleep(250);
+  let pingOk = false;
+  const pingType = (typeof MSG !== 'undefined' && MSG.PING) || 'BHT_PING';
+  for (let pingTry = 0; pingTry < 3 && !pingOk; pingTry++) {
+    if (pingTry) await sleep(200);
+    try {
+      const pong = await chrome.tabs.sendMessage(tab.id, { type: pingType, payload: {} });
+      pingOk = Boolean(pong?.ok);
+    } catch (_) {}
+  }
+  if (!pingOk) {
+    throw new Error('临时沟通执行页内容脚本注入超时（页面可能繁忙或被冻结），已跳过该岗位');
+  }
+  return ready;
+}
+
+async function triggerConversationInWorker(task, job, messageTab, listTabId, activeWithin = []) {
+  const listBefore = await getListTabFingerprint(listTabId);
+  const selectedActiveBuckets = normalizeActiveWithin(activeWithin);
+  // 正式投递只能在临时详情页执行。列表页 fallback 会点击左侧岗位卡片，
+  // BOSS 可能因此重建职位列表，导致预览队列与当前页面脱节。
+  const attempts = buildConversationWorkerAttempts({
+    job,
+    listHref: task?.listHref || job?.listHref || ''
+  }).filter((attempt) => attempt.mode === CONVERSATION_WORKER_MODE.DETAIL);
+  if (!attempts.length) {
+    return {
+      ok: false,
+      error: 'WORKER_TARGET_MISSING',
+      message: '岗位缺少可用详情链接；为保护左侧筛选，已跳过本次操作',
+      listBefore
+    };
+  }
+
+  let result = null;
+  const attemptResults = [];
+  let activityInspection = null;
+  let activityAccepted = null;
+
+  for (let index = 0; index < attempts.length; index++) {
+    if (result?.ok || result?.filtered || operationAborted(result)) break;
+    const attempt = attempts[index];
+    const maxTries = Math.max(1, Number(WORKER_TRIGGER_RETRY.maxTries || 3));
+    const retryDelayMs = Math.max(0, Number(WORKER_TRIGGER_RETRY.delayMs || 0));
+    for (let tryIndex = 0; tryIndex < maxTries; tryIndex++) {
+      if (runner.abort) {
+        result = { ok: false, error: 'OP_CANCELLED', message: '已取消' };
+        break;
+      }
+      result = null;
+      let workerTab = null;
+      let triggerStarted = false;
+      const forceNew = tryIndex > 0;
+      const modeLabel = attempt.mode === CONVERSATION_WORKER_MODE.DETAIL ? '详情页' : '列表页';
+      try {
+        activityInspection = null;
+        activityAccepted = null;
+        await log('info', tryIndex === 0
+          ? `[执行页] 正在打开岗位详情并触发沟通（${modeLabel}）`
+          : `[执行页] 第 ${tryIndex + 1}/${maxTries} 次尝试：关闭旧标签后重新打开并点击立即沟通（${modeLabel}）`, {
+          jobId: job.jobId,
+          mode: attempt.mode,
+          tryIndex: tryIndex + 1,
+          maxTries,
+          url: String(attempt.url || '').slice(0, 180)
+        });
+        workerTab = await openConversationWorkerTab(task, attempt, messageTab, job, { forceNew });
+        await log('info', '[执行页] 已打开岗位详情，不会操作左侧职位列表', {
+          jobId: job.jobId,
+          workerTabId: workerTab.id,
+          mode: attempt.mode,
+          tryIndex: tryIndex + 1,
+          url: String(attempt.url || '').slice(0, 180)
+        });
+
+        if (selectedActiveBuckets.length) {
+          // 活跃度核对也必须留在临时详情页；绝不能在左侧列表点卡片。
+          // 详情页读取失败与 HR 活跃度未知分开处理：前者允许按环境错误重试，
+          // 后者按用户筛选安全跳过，不使用预览阶段的旧值兜底。
+          activityInspection = await sendToBoss(
+            MSG.INSPECT_JOB_DETAIL || 'BHT_INSPECT_JOB_DETAIL',
+            { job },
+            { tabId: workerTab.id, forceInject: true }
+          );
+          if (operationAborted(activityInspection)) {
+            result = activityInspection;
+          } else if (isEnvironmentalFailure(activityInspection)) {
+            result = activityInspection;
+          } else {
+            const activeText = String(activityInspection?.activeText || '').trim();
+            job.activeText = activeText;
+            activityAccepted = Boolean(
+              activityInspection?.ok &&
+              activeText &&
+              matchActive(activeText, selectedActiveBuckets)
+            );
+            await log('info', `[执行页] 已在临时详情页核对 HR 活跃度：${activeText || '未知'}（${activityAccepted ? '满足' : '不满足'}）`, {
+              jobId: job.jobId,
+              workerTabId: workerTab.id,
+              activeText,
+              activityAccepted,
+              inspectError: activityInspection?.error || ''
+            });
+            if (!activityAccepted) {
+              result = {
+                ok: false,
+                error: REASON.FILTER_ACTIVE,
+                filtered: true,
+                activeText,
+                activityInspection,
+                message: reasonText(REASON.FILTER_ACTIVE, activeText || '未知')
+              };
+            }
+          }
+        }
+
+        if (!(result?.ok || result?.filtered || operationAborted(result))) {
+          triggerStarted = true;
+          result = await sendToBoss(
+            MSG.TRIGGER_CONVERSATION || 'BHT_TRIGGER_CONVERSATION',
+            {
+              job: { ...job, listHref: task?.listHref || job?.listHref || '' },
+              workerDetail: attempt.mode === CONVERSATION_WORKER_MODE.DETAIL
+            },
+            { tabId: workerTab.id, forceInject: true }
+          );
+        }
+      } catch (error) {
+        result = {
+          ok: false,
+          error: triggerStarted ? 'WORKER_TRIGGER_EXCEPTION' : 'WORKER_TAB_FAILED',
+          message: '临时沟通执行页失败：' + String(error?.message || error)
+        };
+      } finally {
+        await restoreTabsAfterWorker(messageTab, listTabId, workerTab, task);
+      }
+
+      attemptResults.push({
+        mode: attempt.mode,
+        url: attempt.url,
+        tryIndex: tryIndex + 1,
+        ok: Boolean(result?.ok),
+        error: result?.error || '',
+        activeText: activityInspection?.activeText || '',
+        activityAccepted,
+        navigated: Boolean(result?.navigated)
+      });
+
+      if (result?.ok || result?.filtered || operationAborted(result)) break;
+
+      const canRetry = isWorkerTriggerRetryable(result) && tryIndex < maxTries - 1 && !runner.abort;
+      const failedTabId = workerTab?.id || task?.execution?.workerTabId;
+      if (failedTabId && isWorkerTriggerRetryable(result)) {
+        await closeConversationWorkerTab(task, failedTabId, {
+          reason: canRetry
+            ? '立即沟通未成功，关闭执行页后重试'
+            : '执行页加载或注入失败，丢弃冻结标签后再试',
+          publish: true
+        });
+      }
+      if (!canRetry) break;
+      await log('warn', `[执行页] 打开岗位或未找到立即沟通（${result?.message || result?.error || '未知'}），将重新打开标签重试（${tryIndex + 1}/${maxTries}）`, {
+        jobId: job.jobId,
+        error: result?.error || '',
+        tryIndex: tryIndex + 1,
+        maxTries
+      });
+      if (retryDelayMs) await sleep(retryDelayMs);
+    }
+
+    if (result?.ok || result?.filtered || operationAborted(result)) break;
+  }
+
+  const listAfter = await getListTabFingerprint(listTabId);
+  const listPreserved = isListDocumentPreserved(listBefore, listAfter);
+  await debugLog('background.list', 'fingerprint_compare', {
+    jobId: job.jobId,
+    preserved: listPreserved,
+    before: { url: String(listBefore.url || '').slice(0, 160), contentInstanceId: String(listBefore.contentInstanceId || '').slice(0, 24) },
+    after: { url: String(listAfter.url || '').slice(0, 160), contentInstanceId: String(listAfter.contentInstanceId || '').slice(0, 24) },
+    urlChanged: String(listBefore.url || '') !== String(listAfter.url || ''),
+    instanceChanged: String(listBefore.contentInstanceId || '') !== String(listAfter.contentInstanceId || '')
+  }, listPreserved ? 'debug' : 'warn');
+  await log(listPreserved ? 'success' : 'warn', listPreserved
+    ? '[列表页] 左侧职位页保持原样：筛选、滚动位置和页面实例均未变化'
+    : '[列表页] 检测到左侧页面发生外部变化；插件未在左侧触发沟通', {
+    jobId: job.jobId,
+    listBefore,
+    listAfter,
+    attempts: attemptResults
+  });
+  return {
+    ...(result || { ok: false, error: 'WORKER_TRIGGER_EMPTY', message: '临时沟通执行页没有返回结果' }),
+    workerMode: attemptResults[attemptResults.length - 1]?.mode || '',
+    workerTabClosed: false,
+    // 环境类异常（页面未就绪/点击无效果/执行页失败/超时）：队列自动继续，不阻塞等待用户
+    environmental: isEnvironmentalFailure(result),
+    listPreserved,
+    listBefore,
+    listAfter,
+    workerAttempts: attemptResults
+  };
+}
+
+async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false, tabId = null, previewRunId = '' } = {}) {
+  // A preview generation remains authoritative even after STOP invalidates the
+  // runner flags. Otherwise a stale caller created just after STOP could lose
+  // its preview identity and start a new page operation on the hidden worker.
+  const runKind = previewRunId ? 'preview' : runner.running ? 'task' : runner.previewing ? 'preview' : '';
+  const taskBound = Boolean(runKind);
+  const isCancelled = () => runKind === 'task'
+    ? runner.abort
+    : runKind === 'preview'
+      ? !isPreviewRunActive(previewRunId)
+      : false;
+  const scanDeadlineAt = type === MSG.SCAN_JOBS
+    ? Math.max(0, Number(payload?.deadlineAt || 0))
+    : 0;
+  const scanDeadlineResult = () => previewScanDeadlineResult();
   await debugLog('background.sendToBoss', 'begin', {
     type, tabId, retries, forceInject, taskBound,
     job: payload?.job ? {
@@ -627,6 +1801,7 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     } : null
   });
   if (isCancelled()) return cancelledResult();
+  if (scanDeadlineAt && Date.now() >= scanDeadlineAt) return scanDeadlineResult();
   let tab = null;
   if (tabId != null) {
     try {
@@ -654,12 +1829,16 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
   }
 
   const critical = [
+    MSG.INSPECT_JOB_DETAIL,
+    MSG.ENRICH_JOB_ACTIVITY,
     MSG.TRIGGER_CONVERSATION,
     MSG.WAIT_OPEN_CONVERSATION,
     MSG.WAIT_CHAT_EDITOR,
     MSG.SEND_TEXT,
     MSG.SEND_IMAGE,
-    MSG.SEND_RESUME,
+    MSG.GET_BOSS_GREETING,
+    MSG.SET_BOSS_GREETING,
+    MSG.SAVE_BOSS_GREETING_TEXT,
     MSG.SCAN_JOBS,
     MSG.RETURN_TO_LIST,
     MSG.CLOSE_CHAT,
@@ -671,25 +1850,63 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
     MSG.WAIT_CHAT_EDITOR,
     MSG.SEND_TEXT,
     MSG.SEND_IMAGE,
-    MSG.SEND_RESUME,
+    MSG.ENRICH_JOB_ACTIVITY,
     MSG.SCAN_JOBS,
     MSG.RETURN_TO_LIST
   ];
 
   let needInject = forceInject;
+  let contentInstanceId = '';
   if (!needInject && critical.includes(type)) {
     try {
       const pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
-      if (!pong?.ok) needInject = true;
+      contentInstanceId = String(pong?.contentInstanceId || '');
+      const contentVersion = String(pong?.contentVersion || '');
+      if (!pong?.ok || (BHT_RUNTIME_VERSION !== 'unknown' && contentVersion !== BHT_RUNTIME_VERSION)) {
+        needInject = true;
+        await debugLog('background.sendToBoss', 'content_version_reinject', {
+          type,
+          tabId: tab.id,
+          runtimeVersion: BHT_RUNTIME_VERSION,
+          contentVersion: contentVersion || 'unknown'
+        }, 'warn');
+      }
     } catch (_) {
       needInject = true;
     }
   }
   if (needInject) {
     if (isCancelled()) return cancelledResult();
-    await forceInjectContent(tab.id);
-    await sleep(180);
+    if (scanDeadlineAt && Date.now() >= scanDeadlineAt) return scanDeadlineResult();
+    const injectedOk = await forceInjectContent(tab.id, { deadlineAt: scanDeadlineAt });
+    if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) return scanDeadlineResult();
     if (isCancelled()) return cancelledResult();
+    if (!injectedOk) {
+      // 注入超时/失败：立即走环境失败快路径，不等 ping 再绕一轮
+      return {
+        ok: false,
+        error: 'CONTENT_INJECT_FAIL',
+        message: 'BOSS 页面脚本注入失败或超时（页面可能繁忙/被冻结），已自动跳过该岗位',
+        tabId: tab.id
+      };
+    }
+    if (!await sleepWithinDeadline(180, scanDeadlineAt)) return scanDeadlineResult();
+    if (isCancelled()) return cancelledResult();
+    if (scanDeadlineAt && Date.now() >= scanDeadlineAt) return scanDeadlineResult();
+    try {
+      const pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
+      contentInstanceId = String(pong?.contentInstanceId || '');
+      const contentVersion = String(pong?.contentVersion || '');
+      if (BHT_RUNTIME_VERSION !== 'unknown' && contentVersion !== BHT_RUNTIME_VERSION) {
+        return {
+          ok: false,
+          error: 'CONTENT_VERSION_MISMATCH',
+          message: `BOSS 页面脚本仍是旧版本（页面 ${contentVersion || '未知'} / 后台 ${BHT_RUNTIME_VERSION}）。请按 F5 刷新 BOSS 页面后重试`,
+          contentVersion,
+          runtimeVersion: BHT_RUNTIME_VERSION
+        };
+      }
+    } catch (_) {}
   }
 
   // 长操作优先 storage 桥（立即 ACK + 轮询结果），避免 SPA 销毁 channel
@@ -699,25 +1916,40 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       const opId = 'op_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
       bridgeOpId = opId;
       const storageKey = 'bht_op_' + opId;
+      const pageOperationTimeoutMs = resolvePageOperationTimeoutMs(type, payload);
+      const bridgeTimeoutMs = scanDeadlineAt
+        ? Math.max(0, scanDeadlineAt - Date.now())
+        : resolveBridgeTimeoutMs(pageOperationTimeoutMs);
+      if (scanDeadlineAt && bridgeTimeoutMs <= 0) return scanDeadlineResult();
       operations.add({ opId, tabId: tab.id, type, storageKey });
       const finishBridge = async (result, { removeStorage = true } = {}) => {
         operations.delete(opId);
-        if (removeStorage) {
+        // Leave a cancellation tombstone until the page operation's finally
+        // block releases its lock; cancelBridgeOperation cleans it up.
+        if (removeStorage && result?.error !== 'OP_CANCELLED') {
           try { await chrome.storage.local.remove(storageKey); } catch (_) {}
         }
         return result;
       };
       await chrome.storage.local.remove(storageKey).catch(() => {});
       await chrome.storage.local.set({ [storageKey]: { status: 'pending', opType: type, at: Date.now() } });
+      if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) {
+        return await finishBridge(scanDeadlineResult());
+      }
       const fireOp = async () => {
         if (isCancelled()) return false;
+        if (scanDeadlineAt && Date.now() >= scanDeadlineAt) return false;
         await debugLog('background.sendToBoss', 'bridge_fire', { type, opId, tabId: tab.id });
         const ack = await chrome.tabs.sendMessage(tab.id, {
           type: 'BHT_RUN_OP',
           payload: {
             opId,
             opType: type,
-            opPayload: { ...payload, __bhtDebugEnabled: debugLoggingEnabled }
+            opPayload: {
+              ...payload,
+              __bhtDebugEnabled: debugLoggingEnabled,
+              __bhtOperationTimeoutMs: pageOperationTimeoutMs
+            }
           }
         });
         await debugLog('background.sendToBoss', 'bridge_ack', { type, opId, ack });
@@ -734,24 +1966,52 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       }
       if (!fired) {
         if (isCancelled()) return await finishBridge(cancelledResult());
-        await forceInjectContent(tab.id);
-        await sleep(220);
+        if (scanDeadlineAt && Date.now() >= scanDeadlineAt) {
+          return await finishBridge(scanDeadlineResult());
+        }
+        await forceInjectContent(tab.id, { deadlineAt: scanDeadlineAt });
+        if (!await sleepWithinDeadline(220, scanDeadlineAt)) {
+          return await finishBridge(scanDeadlineResult());
+        }
         if (isCancelled()) return await finishBridge(cancelledResult());
+        if (scanDeadlineAt && Date.now() >= scanDeadlineAt) {
+          return await finishBridge(scanDeadlineResult());
+        }
         fired = await fireOp();
       }
       if (!fired) throw new Error('RUN_OP_NOT_SUPPORTED');
       const started = Date.now();
+      // Collection itself still ends at deadlineAt. Keep only the dedicated
+      // result-finalization window so a large delta can finish writing without
+      // extending collection or being discarded as a late transport row.
+      const bridgeDeadlineAt = scanDeadlineAt
+        ? scanDeadlineAt + OPERATION_TIMEOUTS.PREVIEW_RESULT_GRACE_MS
+        : (started + bridgeTimeoutMs);
+      const bridgeStartedUrl = tab.url || '';
+      let navigationProbeAt = started + 700;
       let reinjectAt = started + 8000;
-      while (Date.now() - started < 90000) {
-        await sleep(350);
+      while (Date.now() < bridgeDeadlineAt) {
+        await sleep(Math.min(350, Math.max(0, bridgeDeadlineAt - Date.now())));
         if (isCancelled()) return await finishBridge(cancelledResult());
         const bag = await chrome.storage.local.get(storageKey);
         const row = bag && bag[storageKey];
         if (row?.status === 'cancelled') return await finishBridge(cancelledResult());
         if (row && row.status === 'done') {
           const result = row.result || { ok: false, error: 'EMPTY_OP_RESULT' };
-          await debugLog('background.sendToBoss', 'bridge_done', { type, opId, elapsedMs: Date.now() - started, result });
+          const completedAt = Number(row.at || Date.now());
+          if (!isScanResultWithinFinalizationWindow(result, {
+            collectionDeadlineAt: scanDeadlineAt,
+            bridgeDeadlineAt,
+            storageCompletedAt: completedAt
+          })) continue;
+          await debugLog('background.sendToBoss', 'bridge_done', {
+            type,
+            opId,
+            elapsedMs: Date.now() - started,
+            result: summarizeBossOperationResult(result)
+          });
           if (result && result.error === 'OP_BUSY') {
+            if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
             try {
               await chrome.storage.local.set({
                 [storageKey]: { status: 'pending', opType: type, at: Date.now(), note: 'ignore-op-busy' }
@@ -766,24 +2026,77 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
             await forceInjectContent(tab.id);
             await sleep(350);
             if (isCancelled()) return cancelledResult();
-            return await sendToBoss(type, { ...payload, __navRetried: true }, { retries, forceInject: true, tabId: tab.id });
+            return await sendToBoss(type, { ...payload, __navRetried: true }, {
+              retries,
+              forceInject: true,
+              tabId: tab.id,
+              previewRunId
+            });
           }
           return await finishBridge(result);
+        }
+        // Once collection time is over, only poll for a result that was
+        // computed before the deadline.  Do not probe navigation or reinject
+        // content during the transport grace window.
+        if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) continue;
+        if (type === MSG.SCAN_JOBS && Date.now() >= navigationProbeAt) {
+          navigationProbeAt = Date.now() + 700;
+          try {
+            const latest = await chrome.tabs.get(tab.id);
+            if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
+            const latestUrl = latest?.url || latest?.pendingUrl || '';
+            let latestInstanceId = '';
+            try {
+              const pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
+              latestInstanceId = String(pong?.contentInstanceId || '');
+            } catch (_) {}
+            if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
+            const instanceChanged = didContentDocumentChange({
+              previousInstanceId: contentInstanceId,
+              currentInstanceId: latestInstanceId,
+              previousUrl: bridgeStartedUrl,
+              currentUrl: latestUrl
+            });
+            if (instanceChanged) {
+              const navigated = {
+                ok: false,
+                error: 'NAVIGATED',
+                message: '页面已跳转，正在新页面继续扫描',
+                fromHref: bridgeStartedUrl,
+                href: latestUrl
+              };
+              await debugLog('background.sendToBoss', 'scan_navigation_detected', {
+                type,
+                opId,
+                fromHref: bridgeStartedUrl,
+                href: latestUrl,
+                previousContentInstanceId: contentInstanceId,
+                contentInstanceId: latestInstanceId
+              }, 'info');
+              return await finishBridge(navigated);
+            }
+          } catch (_) {}
         }
         // 超时前若仍 pending：content 被导航销毁时重注入并重发
         if (Date.now() > reinjectAt && longOps.includes(type)) {
           if (isCancelled()) return await finishBridge(cancelledResult());
+          if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
           reinjectAt = Date.now() + 12000;
           try {
             const latest = await chrome.tabs.get(tab.id);
+            if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
             if (!isBossUrl(latest?.url || '')) continue;
 
             let alive = false;
             let pong = null;
             try {
               pong = await chrome.tabs.sendMessage(tab.id, { type: MSG.PING, payload: {} });
-              alive = Boolean(pong?.ok);
+              alive = Boolean(
+                pong?.ok &&
+                (BHT_RUNTIME_VERSION === 'unknown' || String(pong?.contentVersion || '') === BHT_RUNTIME_VERSION)
+              );
             } catch (_) { alive = false; }
+            if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
 
             // 其它长操作：仅当 content 已死时重注入并重发一次（content 侧 opId 幂等）
             if (!alive) {
@@ -791,29 +2104,70 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
                 type, opId, tabId: tab.id, url: latest?.url || ''
               }, 'warn');
               if (isCancelled()) return await finishBridge(cancelledResult());
-              await forceInjectContent(tab.id);
-              await sleep(280);
+              if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
+              await forceInjectContent(tab.id, { deadlineAt: scanDeadlineAt });
+              if (!await sleepWithinDeadline(280, scanDeadlineAt)) break;
+              if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;
               await fireOp();
             }
           } catch (_) {}
         }
       }
-      return await finishBridge({ ok: false, error: 'OP_TIMEOUT', message: '操作超时（岗位定位/发消息）。请保持在职位列表页并重新扫描预览' });
+      if (scanDeadlineAt) {
+        // SCAN_JOBS 的页面内计时器会在结果收尾预算结束时取消工作；此处不再
+        // 用同一个 storage key 写 cancelled，避免覆盖刚写入的 done 结果。
+        operations.delete(opId);
+        scheduleBridgeStorageCleanup(storageKey);
+        await debugLog('background.sendToBoss', 'scan_deadline', {
+          type,
+          opId,
+          pageOperationTimeoutMs,
+          bridgeTimeoutMs,
+          elapsedMs: Date.now() - started
+        });
+        return await finishBridge(scanDeadlineResult(), { removeStorage: false });
+      }
+      const bridgeSettled = await cancelBridgeOperation({
+        opId,
+        tabId: tab.id,
+        storageKey,
+        reason: '操作结果通道超过统一预算，取消页面内旧操作'
+      });
+      await debugLog('background.sendToBoss', 'bridge_timeout', {
+        type,
+        opId,
+        pageOperationTimeoutMs,
+        bridgeTimeoutMs,
+        elapsedMs: Date.now() - started
+      }, 'error');
+      return await finishBridge({
+        ok: false,
+        error: 'OP_BRIDGE_TIMEOUT',
+        message: type === MSG.SCAN_JOBS
+          ? '扫描页长时间没有返回结果，已停止该页操作并使用此前已收集的岗位'
+          : '页面操作长时间没有返回结果，已安全停止；请确认页面状态后重试'
+      }, { removeStorage: bridgeSettled });
     } catch (bridgeErr) {
       await debugLog('background.sendToBoss', 'bridge_failed', {
         type, opId: bridgeOpId, error: serializeError(bridgeErr)
       }, 'error');
       if (bridgeOpId) {
+        const failedOperation = {
+          opId: bridgeOpId,
+          tabId: tab.id,
+          storageKey: 'bht_op_' + bridgeOpId,
+          reason: '存储桥失败，取消旧操作后切换备用通道'
+        };
+        if (type === MSG.SCAN_JOBS) {
+          await requestBridgeCancellation(failedOperation);
+          scheduleBridgeStorageCleanup(failedOperation.storageKey);
+        } else {
+          await cancelBridgeOperation(failedOperation);
+        }
         operations.delete(bridgeOpId);
-        try {
-          await chrome.tabs.sendMessage(tab.id, {
-            type: MSG.CANCEL_OP,
-            payload: { opId: bridgeOpId, reason: '存储桥失败，取消旧操作后切换备用通道' }
-          });
-        } catch (_) {}
-        try { await chrome.storage.local.remove('bht_op_' + bridgeOpId); } catch (_) {}
       }
       if (isCancelled()) return cancelledResult();
+      if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) return scanDeadlineResult();
       console.warn('storage bridge fail', bridgeErr);
       return {
         ok: false,
@@ -832,7 +2186,12 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       if (retries > 0 && /message channel closed|Receiving end does not exist|asynchronous response|Could not establish|PORT_/i.test(msg0)) {
         await forceInjectContent(tab.id);
         await sleep(450);
-        return sendToBoss(type, payload, { retries: retries - 1, forceInject: true, tabId: tab.id });
+        return sendToBoss(type, payload, {
+          retries: retries - 1,
+          forceInject: true,
+          tabId: tab.id,
+          previewRunId
+        });
       }
       await forceInjectContent(tab.id);
       await sleep(200);
@@ -872,15 +2231,17 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
   }
 }
 
-async function assertBossContext() {
-  const tab = await getActiveBossTab({ allowInactiveBossTab: false });
+async function assertBossContext(sender = null) {
+  const tab = await getActiveBossTab({ allowInactiveBossTab: false, sender });
   if (!tab) {
+    const senderTab = await tabFromSender(sender);
     const active = (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+    const fallback = senderTab || active;
     return {
       ok: false,
       error: "NO_BOSS_TAB",
-      message: bossUrlGuardMessage(active?.url || ""),
-      activeTab: active ? { id: active.id, url: active.url, title: active.title } : null
+      message: bossUrlGuardMessage(fallback?.url || ""),
+      activeTab: fallback ? { id: fallback.id, url: fallback.url, title: fallback.title } : null
     };
   }
   return { ok: true, tab };
@@ -896,17 +2257,60 @@ async function log(level, message, extra = {}) {
 }
 
 async function publishTask(task) {
-  // STOP 是不可逆终态：旧异步分支即使稍后返回，也不能把 storage 写回 running/paused。
-  if (runner.running && runner.abort && task?.status !== TASK_STATUS.STOPPED) {
-    task.status = TASK_STATUS.STOPPED;
-    task.updatedAt = Date.now();
-    setTaskTerminalSignal(task, TASK_STATUS.STOPPED);
+  const taskRunId = String(task?.execution?.taskRunId || '');
+  const taskId = String(task?.id || '');
+  if (!taskPublishMatchesRunner(taskId, taskRunId)) {
+    await debugLog('background.task', 'stale_task_publish_rejected', {
+      taskId: taskId || null,
+      taskRunId,
+      activeTaskRunId: runner.taskRunId,
+      activeTaskId: runner.taskRunTaskId || null
+    }, 'warn');
+    return false;
   }
-  task.revision = Number(task.revision || 0) + 1;
-  await saveTask(task);
-  try {
-    chrome.runtime.sendMessage({ type: MSG.TASK_EVENT, payload: task }).catch(() => {});
-  } catch (_) {}
+  return enqueueTaskWrite(async () => {
+    // STOP 或新任务启动可能发生在排队期间；旧代次到这里必须完全失效。
+    if (!taskPublishMatchesRunner(taskId, taskRunId)) {
+      await debugLog('background.task', 'stale_task_publish_rejected_after_queue', {
+        taskId: taskId || null,
+        taskRunId,
+        activeTaskRunId: runner.taskRunId,
+        activeTaskId: runner.taskRunTaskId || null
+      }, 'warn');
+      return false;
+    }
+    // STOP 是不可逆终态：旧异步分支即使稍后返回，也不能把 storage 写回 running/paused。
+    if (runner.abort && task?.status !== TASK_STATUS.STOPPED) {
+      task.status = TASK_STATUS.STOPPED;
+      task.updatedAt = Date.now();
+      setTaskTerminalSignal(task, TASK_STATUS.STOPPED);
+    }
+    task.revision = Number(task.revision || 0) + 1;
+    await saveTask(task);
+    // saveTask 可能跨过 STOP_TASK 的异步边界；若停止在写入期间到达，
+    // 再写一次终态，避免较慢的旧快照覆盖停止结果。
+    if (runner.abort && task?.status !== TASK_STATUS.STOPPED) {
+      task.status = TASK_STATUS.STOPPED;
+      task.updatedAt = Date.now();
+      setTaskTerminalSignal(task, TASK_STATUS.STOPPED);
+      task.revision = Number(task.revision || 0) + 1;
+      await saveTask(task);
+    }
+    // 新代次可能已被接纳；不再向面板广播旧快照，但后续写入仍按同一队列落盘。
+    if (!taskPublishMatchesRunner(taskId, taskRunId)) {
+      await debugLog('background.task', 'stale_task_publish_rejected_after_write', {
+        taskId: taskId || null,
+        taskRunId,
+        activeTaskRunId: runner.taskRunId,
+        activeTaskId: runner.taskRunTaskId || null
+      }, 'warn');
+      return false;
+    }
+    try {
+      chrome.runtime.sendMessage({ type: MSG.TASK_EVENT, payload: task }).catch(() => {});
+    } catch (_) {}
+    return true;
+  });
 }
 
 function operationAborted(result) {
@@ -934,13 +2338,31 @@ function setTaskTerminalSignal(task, status) {
 }
 
 function ensureItem(task, job) {
-  let item = task.items.find((x) => x.jobId === job.jobId);
+  let item = task.items.find((x) => x.jobId === job.jobId) ||
+    task.items.find((x) => jobsShareMergeIdentity(x, job));
+  if (item) {
+    const itemId = String(item.jobId || '');
+    const jobId = String(job.jobId || '');
+    if ((!itemId || itemId.startsWith('name_') || itemId.startsWith('dom_')) &&
+        jobId && !jobId.startsWith('name_') && !jobId.startsWith('dom_')) {
+      item.jobId = job.jobId;
+    }
+    item.bossId = item.bossId || job.bossId;
+    item.company = item.company || job.company;
+    item.title = item.title || job.title;
+    item.location = item.location || job.location || '';
+    item.lid = item.lid || job.lid || '';
+    item.securityId = item.securityId || job.securityId || '';
+  }
   if (!item) {
     item = {
       jobId: job.jobId,
       bossId: job.bossId,
       company: job.company,
       title: job.title,
+      location: job.location || '',
+      lid: job.lid || '',
+      securityId: job.securityId || '',
       state: 'NOT_STARTED',
       reasons: [],
       selected: true
@@ -950,31 +2372,257 @@ function ensureItem(task, job) {
   return item;
 }
 
+async function navigatePreviewToJobList(previewTab, scan = {}, previewRunId = '', deadlineAt = 0) {
+  if (deadlineReached(deadlineAt)) return previewScanDeadlineResult();
+  const targetHref = resolveBossJobListUrl({
+    candidate: scan?.targetHref || scan?.listHref || '',
+    currentUrl: previewTab?.url || ''
+  });
 
-async function runPreview(payload = {}) {
-  await log('info', '开始扫描预览…');
-  const config = await getAllConfig();
-  const previewTab = await getActiveBossTab({ allowInactiveBossTab: false });
-  const scan = await sendToBoss(MSG.SCAN_JOBS, { scroll: payload.scroll !== false, maxRounds: payload.maxRounds || 6 });
-  if (!scan?.ok) {
-    await log('error', scan?.message || '扫描失败', { error: scan?.error });
-    return { ok: false, ...scan };
+  setPreviewPhase('navigating', previewRunId);
+  await log('info', '当前不在职位列表页，正在自动跳转到职位列表…', {
+    from: previewTab?.url || '',
+    targetHref
+  });
+  if (deadlineReached(deadlineAt)) return previewScanDeadlineResult({ targetHref });
+
+  try {
+    await chrome.tabs.update(previewTab.id, { url: targetHref });
+    if (deadlineReached(deadlineAt)) return previewScanDeadlineResult({ targetHref });
+    const navigationWaitMs = remainingDeadlineMs(deadlineAt, OPERATION_TIMEOUTS.PREVIEW_LIST_NAV_MS);
+    if (deadlineAt && navigationWaitMs <= 0) return previewScanDeadlineResult({ targetHref });
+    const readyTab = await waitTabComplete(previewTab.id, navigationWaitMs, {
+      shouldStop: () => !isPreviewRunActive(previewRunId) || deadlineReached(deadlineAt),
+      requireComplete: true,
+      deadlineAt
+    });
+    if (deadlineReached(deadlineAt)) return previewScanDeadlineResult({ targetHref });
+    if (!readyTab || !isBossUrl(readyTab.url || readyTab.pendingUrl || '')) {
+      return {
+        ok: false,
+        error: 'LIST_NAV_FAILED',
+        message: '自动跳转职位列表失败，请手动打开 BOSS 职位推荐/搜索列表页后重试',
+        targetHref
+      };
+    }
+    await forceInjectContent(previewTab.id, { deadlineAt });
+    if (!await sleepWithinDeadline(300, deadlineAt)) {
+      return previewScanDeadlineResult({ targetHref });
+    }
+    if (deadlineReached(deadlineAt)) return previewScanDeadlineResult({ targetHref });
+    return {
+      ok: true,
+      targetHref,
+      tab: readyTab,
+      navigation: {
+        automatic: true,
+        from: previewTab?.url || '',
+        to: readyTab.url || targetHref,
+        reason: 'NON_LIST_PAGE'
+      }
+    };
+  } catch (error) {
+    if (deadlineReached(deadlineAt)) return previewScanDeadlineResult({ targetHref });
+    await debugLog('background.preview', 'list_navigation_failed', {
+      tabId: previewTab?.id || null,
+      targetHref,
+      error: serializeError(error)
+    }, 'error');
+    return {
+      ok: false,
+      error: 'LIST_NAV_FAILED',
+      message: '自动跳转职位列表失败，请手动打开 BOSS 职位推荐/搜索列表页后重试',
+      targetHref
+    };
   }
-  const previewListHref = scan.listHref || '';
-  const previewListExpect = scan.listExpectLabel || scan.expectLabel || '';
+}
 
+function isTaskRunCurrent(taskId, taskRunId) {
+  return String(runner.taskRunId || '') === String(taskRunId || '') &&
+    String(runner.taskRunTaskId || '') === String(taskId || '');
+}
+
+function taskMatchesStopRequest(task, taskId, taskRunId) {
+  if (!task) return false;
+  if (!taskId) return true;
+  if (String(task.id || '') !== String(taskId)) return false;
+  const storedRunId = String(task.execution?.taskRunId || '');
+  return !taskRunId || !storedRunId || storedRunId === String(taskRunId);
+}
+
+async function restoreListTabAfterTriggerNavigation(task, tabId) {
+  if (!tabId) return { ok: false, error: 'LIST_TAB_MISSING', message: '列表标签页不存在' };
+  let before = null;
+  try { before = await chrome.tabs.get(tabId); } catch (_) {}
+  const fromHref = before?.url || before?.pendingUrl || '';
+  if (isBossJobListUrl(fromHref)) return { ok: true, restored: false, href: fromHref };
+  const targetHref = resolveBossJobListUrl({
+    candidate: task?.listHref || '',
+    currentUrl: fromHref
+  });
+  await log('warn', '[列表页] BOSS 在沟通成功后跳到聊天页，正在自动恢复职位列表…', {
+    tabId,
+    fromHref,
+    targetHref
+  });
+  try {
+    await chrome.tabs.update(tabId, { url: targetHref });
+    const ready = await waitTabComplete(tabId, 45000);
+    const href = ready?.url || ready?.pendingUrl || targetHref;
+    if (!ready || !isBossJobListUrl(href)) {
+      return {
+        ok: false,
+        error: 'LIST_RESTORE_FAILED',
+        message: '沟通已创建，但职位列表自动恢复失败。请手动打开职位列表后继续',
+        fromHref,
+        targetHref,
+        href
+      };
+    }
+    await forceInjectContent(tabId);
+    await sleep(300);
+    await log('success', '[列表页] 职位列表已自动恢复，可继续处理下一岗位', {
+      tabId,
+      fromHref,
+      href
+    });
+    return { ok: true, restored: true, fromHref, href };
+  } catch (error) {
+    return {
+      ok: false,
+      error: 'LIST_RESTORE_FAILED',
+      message: '沟通已创建，但职位列表自动恢复失败：' + String(error?.message || error),
+      fromHref,
+      targetHref
+    };
+  }
+}
+
+async function scanPreviewJobs(payload, previewTab, previewRunId = '') {
+  const scanPayload = {
+    scroll: payload.scroll !== false,
+    // 每批短暂滚动并返回 delta，后台持续合并；页面异常时最多只损失最后一批。
+    continuous: payload.continuous === true,
+    maxRounds: payload.maxRounds || 24,
+    scrollWaitMs: payload.scrollWaitMs ?? 100,
+    scanSessionId: payload.scanSessionId || uid('scan'),
+    resetSession: payload.resetSession !== false,
+    deltaOnly: true,
+    deadlineAt: Math.max(0, Number(payload.deadlineAt || 0))
+  };
+  let navigation = null;
+  setPreviewPhase('collecting', previewRunId);
+  let scan = await sendToBoss(MSG.SCAN_JOBS, scanPayload, {
+    tabId: previewTab?.id || null,
+    previewRunId
+  });
+
+  if (!scan?.ok && scan?.error === 'NAVIGATED') {
+    if (deadlineReached(scanPayload.deadlineAt)) {
+      return { scan: previewScanDeadlineResult(), navigation, previewTab };
+    }
+    setPreviewPhase('waiting_navigation', previewRunId);
+    await log('info', '页面正在返回职位列表，等待加载完成后继续扫描…');
+    const navigationWaitMs = remainingDeadlineMs(
+      scanPayload.deadlineAt,
+      OPERATION_TIMEOUTS.PREVIEW_LIST_NAV_MS
+    );
+    if (scanPayload.deadlineAt && navigationWaitMs <= 0) {
+      return { scan: previewScanDeadlineResult(), navigation, previewTab };
+    }
+    const readyTab = await waitTabComplete(previewTab.id, navigationWaitMs, {
+      shouldStop: () => !isPreviewRunActive(previewRunId) || deadlineReached(scanPayload.deadlineAt),
+      requireComplete: true,
+      deadlineAt: scanPayload.deadlineAt
+    });
+    if (deadlineReached(scanPayload.deadlineAt)) {
+      return { scan: previewScanDeadlineResult(), navigation, previewTab };
+    }
+    if (readyTab) {
+      previewTab = readyTab;
+      await forceInjectContent(previewTab.id, { deadlineAt: scanPayload.deadlineAt });
+      if (!await sleepWithinDeadline(300, scanPayload.deadlineAt)) {
+        return { scan: previewScanDeadlineResult(), navigation, previewTab };
+      }
+      if (deadlineReached(scanPayload.deadlineAt)) {
+        return { scan: previewScanDeadlineResult(), navigation, previewTab };
+      }
+      setPreviewPhase('scanning_cards', previewRunId);
+      scan = await sendToBoss(MSG.SCAN_JOBS, scanPayload, {
+        tabId: previewTab.id,
+        previewRunId
+      });
+      navigation = {
+        automatic: true,
+        from: '',
+        to: readyTab.url || '',
+        reason: 'SOFT_RETURN_RELOADED'
+      };
+    }
+  }
+
+  if (!scan?.ok && scan?.shouldNavigate === true) {
+    if (deadlineReached(scanPayload.deadlineAt)) {
+      return { scan: previewScanDeadlineResult(), navigation, previewTab };
+    }
+    const nav = await navigatePreviewToJobList(
+      previewTab,
+      scan,
+      previewRunId,
+      scanPayload.deadlineAt
+    );
+    if (!nav.ok) return { scan: nav, navigation };
+    previewTab = nav.tab || previewTab;
+    navigation = nav.navigation;
+    if (deadlineReached(scanPayload.deadlineAt)) {
+      return { scan: previewScanDeadlineResult(), navigation, previewTab };
+    }
+    setPreviewPhase('scanning_cards', previewRunId);
+    scan = await sendToBoss(MSG.SCAN_JOBS, scanPayload, {
+      tabId: previewTab.id,
+      previewRunId
+    });
+  }
+
+  if (!scan?.ok && navigation) {
+    const currentHref = scan?.page?.href || previewTab?.url || '';
+    if (scan?.shouldNavigate === true && /\/web\/user\/?(?:[?#]|$)|passport|\/login/i.test(currentHref)) {
+      scan = {
+        ...scan,
+        error: 'LOGIN_REQUIRED',
+        message: '已自动打开职位列表，但 BOSS 跳转到了登录页。请先登录后再扫描预览',
+        shouldNavigate: false
+      };
+    } else if (scan?.error === 'LIST_NOT_FOUND' || scan?.shouldNavigate === true) {
+      scan = {
+        ...scan,
+        error: 'LIST_NOT_FOUND',
+        message: '已自动进入 BOSS 职位列表，但仍未找到岗位卡片。请确认已登录、当前筛选下有岗位，或刷新页面后重试',
+        shouldNavigate: false
+      };
+    }
+  }
+
+  return { scan, navigation, previewTab };
+}
+
+function evaluatePreviewResults(jobs = [], config = {}, todayStats = {}) {
   const history = config.history || [];
-  const todayStats = await getTodayStats();
   const idempotency = config.idempotency || {};
   const results = [];
-
-  for (const job of scan.jobs || []) {
-    const filterRes = evaluateJob(job, config.filters, config.lists, config.settings);
+  for (const job of jobs) {
+    const filterRes = evaluateJob(
+      job,
+      config.filters,
+      config.lists,
+      config.settings,
+      { deferUnknownActive: true }
+    );
     let decision = filterRes.decision;
     let reasonCodes = filterRes.reasonCodes || [];
     let reasonTexts = filterRes.reasonTexts || [];
     let passReasons = filterRes.passReasons || [];
-
+    let requiresActiveCheck = filterRes.requiresActiveCheck === true;
     if (decision === 'pass') {
       const dedup = checkDedup(job, {
         settings: config.settings,
@@ -988,26 +2636,392 @@ async function runPreview(payload = {}) {
         reasonCodes = dedup.reasonCodes;
         reasonTexts = dedup.reasonTexts;
         passReasons = [];
+        requiresActiveCheck = false;
       }
     }
-
     results.push({
       job,
       decision,
       reasonCodes,
       reasonTexts,
       passReasons,
+      requiresActiveCheck: decision === 'pass' && requiresActiveCheck,
       selected: decision === 'pass'
     });
   }
+  return results;
+}
 
-  const summary = summarizePreview(results);
-  const passRate = summary.scanned ? summary.pass / summary.scanned : 0;
-  const warnings = [];
-  if (summary.scanned >= 10 && passRate > 0.8) warnings.push('通过率超过 80%，请检查筛选是否过宽');
-  if (summary.scanned >= 10 && passRate < 0.05) warnings.push('通过率低于 5%，请检查筛选是否过严');
+function applyPreviewActivityEnrichment(results = [], activities = [], activeWithin = [], excludeHunter = true) {
+  const byJobId = new Map(
+    (activities || [])
+      .filter((item) => item?.jobId)
+      .map((item) => [String(item.jobId), item])
+  );
+  let resolved = 0;
+  let rejected = 0;
+  for (const row of results || []) {
+    if (row?.decision !== 'pass' || row?.requiresActiveCheck !== true) continue;
+    const activity = byJobId.get(String(row.job?.jobId || ''));
+    const activeText = String(activity?.activeText || '').trim();
+    const goldHunter = activity?.goldHunter === true || row.job?.goldHunter === true;
+    const hrTitle = activity?.hrTitle || row.job?.hrTitle || '';
+    if (!activeText && !goldHunter) continue;
+    row.job = {
+      ...(row.job || {}),
+      activeText,
+      online: activity?.bossOnline === true,
+      goldHunter: activity?.goldHunter === true || row.job?.goldHunter === true,
+      hrTitle: activity?.hrTitle || row.job?.hrTitle || '',
+      bossId: activity?.bossId || row.job?.bossId || '',
+      hrName: activity?.bossName || row.job?.hrName || ''
+    };
+    row.requiresActiveCheck = false;
+    resolved += 1;
+    if (excludeHunter && looksHunter(row.job)) {
+      row.decision = 'reject';
+      row.selected = false;
+      row.reasonCodes = [REASON.FILTER_HUNTER];
+      row.reasonTexts = [reasonText(REASON.FILTER_HUNTER)];
+      rejected += 1;
+    } else if (matchActive(activeText, activeWithin)) {
+      row.passReasons = [...(row.passReasons || []), `HR 活跃：${activeText}`];
+    } else {
+      row.decision = 'reject';
+      row.selected = false;
+      row.reasonCodes = [REASON.FILTER_ACTIVE];
+      row.reasonTexts = [reasonText(REASON.FILTER_ACTIVE, activeText)];
+      rejected += 1;
+    }
+  }
+  return { resolved, rejected };
+}
 
-  const task = {
+function finalizePreviewActivityDecisions(results = [], activeWithin = [], logFn = null) {
+  // 预览用「列表接口网络元数据」核对 HR 活跃度：不点卡片、不拉详情，
+  // 与「左侧职位页保持原样」原则一致（列表 API 已被 page-network-hook 捕获，
+  // activeText/在线状态已存在于 job 上）。
+  // 无网络证据的岗位保留 defer（requiresActiveCheck），投递时还会核对一次。
+  const selected = normalizeActiveWithin(activeWithin);
+  let resolved = 0;
+  let rejected = 0;
+  let unknown = 0;
+  for (const row of results || []) {
+    if (row?.decision !== 'pass' || row?.requiresActiveCheck !== true) continue;
+    const activeText = String(row.job?.activeText || '').trim();
+    if (!activeText) {
+      unknown += 1;
+      continue;
+    }
+    row.job = { ...(row.job || {}), activeText };
+    row.requiresActiveCheck = false;
+    if (selected.length && !matchActive(activeText, selected)) {
+      row.decision = 'reject';
+      row.selected = false;
+      row.reasonCodes = [REASON.FILTER_ACTIVE];
+      row.reasonTexts = [reasonText(REASON.FILTER_ACTIVE, activeText)];
+      rejected += 1;
+    } else {
+      row.passReasons = [...(row.passReasons || []), `HR 活跃：${activeText}`];
+      resolved += 1;
+    }
+  }
+  if (logFn && (resolved || rejected || unknown)) {
+    logFn(`[预览] HR 活跃度核对（列表接口元数据，不点卡片）：通过 ${resolved} · 不满足 ${rejected} · 未知保留 ${unknown}（投递时再核对）`);
+  }
+  return { resolved, rejected, unknown };
+}
+
+function mergePreviewJobBatch(target, jobs = []) {
+  for (const job of jobs || []) {
+    const key = String(job?.jobId || `${normalizeMatchText(job?.title || '')}|${normalizeMatchText(job?.company || '')}`);
+    if (!key) continue;
+    const previous = target.get(key);
+    target.set(key, { ...(previous || {}), ...(job || {}) });
+  }
+  return target.size;
+}
+
+
+async function runPreview(payload = {}, previewTab = null, previewRunId = runner.previewRunId) {
+  const isActive = () => isPreviewRunActive(previewRunId);
+  const cancelled = () => previewCancelledResult();
+  if (!isActive()) return cancelled();
+  await log('info', '开始扫描预览…');
+  if (!isActive()) return cancelled();
+  const config = await getAllConfig();
+  if (!isActive()) return cancelled();
+  runner.previewPreviousTask = cloneTaskSnapshot(config.task);
+  const scanSessionId = uid('scan');
+  const requestedMaxScanMs = Number(payload.maxScanMs);
+  const maxElapsedMs = Number.isFinite(requestedMaxScanMs) && requestedMaxScanMs > 0
+    ? Math.max(1000, Math.min(OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS, requestedMaxScanMs))
+    : OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS;
+  const previewStartedAt = runner.previewStartedAt || Date.now();
+  const sourcePreviewTab = previewTab || await getActiveBossTab({ allowInactiveBossTab: false });
+  if (!sourcePreviewTab?.id) {
+    return { ok: false, error: 'LIST_TAB_NOT_FOUND', message: '请先打开当前要扫描的 BOSS 职位列表页' };
+  }
+  previewTab = sourcePreviewTab;
+  let initialSourceContext = null;
+  if (payload.captureSourceContext !== false) {
+    const sourceCapture = await sendToBoss(
+      MSG.GET_JOB_SOURCE_CONTEXT,
+      { refreshExpectations: true },
+      { tabId: sourcePreviewTab.id, forceInject: true, previewRunId }
+    ).catch(() => null);
+    if (sourceCapture?.ok && sourceCapture.context) {
+      initialSourceContext = sourceCapture.context;
+      await debugLog('background.preview', 'source_context_captured', {
+        sourceType: initialSourceContext.sourceType,
+        expectationKey: initialSourceContext.expectationKey || '',
+        expectationLabel: initialSourceContext.expectationLabel || '',
+        filterSignature: initialSourceContext.filterSignature || null
+      });
+    } else {
+      await log('warn', '[扫描] 未能完整记录 BOSS 求职期望来源；本轮仍可预览，但刷新并继续不可用');
+    }
+  }
+  {
+    // BOSS 的求职期望和部分筛选只存在当前 SPA 状态中。
+    // 直接滚动当前职位页，才能保证扫描的就是用户看到的这批岗位。
+    const scanStartedAt = Date.now();
+    runner.previewScanStartedAt = scanStartedAt;
+    runner.previewScanFinishedAt = 0;
+    setPreviewPhase('collecting', previewRunId);
+    const previewDeadlineAt = scanStartedAt + maxElapsedMs;
+    // 预留固定结果收尾预算；采集到点即停，整个扫描结果通道仍受 60 秒上限约束。
+    const deadlineAt = Math.max(
+      scanStartedAt + 1000,
+      previewDeadlineAt - OPERATION_TIMEOUTS.PREVIEW_RESULT_GRACE_MS
+    );
+    await log('info', '[扫描] 正在当前职位页向下加载岗位，现有求职期望和筛选保持不变', {
+      tabId: sourcePreviewTab.id,
+      url: sourcePreviewTab.url || sourcePreviewTab.pendingUrl || ''
+    });
+    if (!isActive()) return cancelled();
+    const scanResult = await scanPreviewJobs({
+      ...payload,
+      scanSessionId,
+      resetSession: true,
+      deadlineAt,
+      continuous: true,
+      maxRounds: Math.max(64, Math.min(512, Number(payload.maxRounds || 512))),
+      scrollWaitMs: payload.scrollWaitMs ?? 100
+    }, previewTab, previewRunId);
+    if (!isActive()) return cancelled();
+    let scan = scanResult.scan;
+    previewTab = scanResult.previewTab || previewTab;
+    const previewNavigation = scanResult.navigation || null;
+    let continuationError = '';
+    let scanBatches = 1;
+    const collectedJobs = new Map();
+    mergePreviewJobBatch(collectedJobs, scan?.jobs || []);
+    const scanDeadlinePartial = Boolean(
+      scan?.error === 'OP_DEADLINE_EXCEEDED' ||
+      scan?.scanMeta?.timedOut === true
+    );
+    if (!scan?.ok && !(scanDeadlinePartial && collectedJobs.size)) {
+      await log('error', scan?.message || '扫描失败', { error: scan?.error });
+      return { ok: false, ...scan, navigation: previewNavigation };
+    }
+    if (scanDeadlinePartial) {
+      scan = {
+        ...(scan || {}),
+        scanMeta: { ...(scan?.scanMeta || {}), timedOut: true }
+      };
+    }
+    setPreviewProgress(collectedJobs.size, 0, previewRunId);
+
+    // 滚动阶段只采集和去重；确认到底或到达统一截止时间后，才执行一次筛选。
+    while (scan?.scanMeta?.reachedEnd !== true && scan?.scanMeta?.timedOut !== true && Date.now() < deadlineAt) {
+      if (!isActive()) {
+        return cancelled();
+      }
+      setPreviewPhase('collecting', previewRunId);
+      await debugLog('background.preview', 'collection_progress', {
+        collected: collectedJobs.size,
+        scanSessionId,
+        elapsedMs: Date.now() - scanStartedAt,
+        scanBatches,
+        scanMeta: scan.scanMeta || null
+      });
+      const more = await sendToBoss(MSG.SCAN_JOBS, {
+        scroll: true,
+        continuous: true,
+        maxRounds: Math.max(64, Math.min(512, Number(payload.batchRounds || 512))),
+        scrollWaitMs: payload.scrollWaitMs ?? 100,
+        scanSessionId,
+        resetSession: false,
+        deltaOnly: true,
+        deadlineAt
+      }, { tabId: previewTab?.id || null, previewRunId });
+      if (!isActive()) return cancelled();
+      if (operationAborted(more)) {
+        mergePreviewJobBatch(collectedJobs, more?.jobs || []);
+        if (collectedJobs.size) {
+          scan = {
+            ...scan,
+            ...(more || {}),
+            scanMeta: { ...(scan.scanMeta || {}), ...(more?.scanMeta || {}), timedOut: true }
+          };
+          break;
+        }
+        return { ok: false, error: 'OP_CANCELLED', message: '已取消本次扫描预览' };
+      }
+      mergePreviewJobBatch(collectedJobs, more?.jobs || []);
+      if (!more?.ok) {
+        const deadlineReached = Date.now() >= deadlineAt || more?.error === 'OP_DEADLINE_EXCEEDED';
+        if (deadlineReached) {
+          scan = {
+            ...scan,
+            ...(more || {}),
+            scanMeta: { ...(scan.scanMeta || {}), ...(more?.scanMeta || {}), timedOut: true }
+          };
+        } else {
+          continuationError = more?.message || more?.error || '继续滚动扫描失败';
+          await log('warn', '继续滚动扫描未完成，将使用当前已加载岗位：' + continuationError, {
+            error: more?.error || '',
+            scanSessionId
+          });
+        }
+        break;
+      }
+      scanBatches += 1;
+      scan = {
+        ...scan,
+        ...more,
+        listHref: more.listHref || scan.listHref,
+        listExpectLabel: more.listExpectLabel || scan.listExpectLabel
+      };
+      setPreviewProgress(collectedJobs.size, 0, previewRunId);
+    }
+
+    if (!isActive()) return cancelled();
+    let finalSourceContext = initialSourceContext;
+    if (payload.captureSourceContext !== false) {
+      const sourceAfterScan = await sendToBoss(
+        MSG.GET_JOB_SOURCE_CONTEXT,
+        { refreshExpectations: false },
+        { tabId: sourcePreviewTab?.id || previewTab?.id || null, forceInject: true, previewRunId }
+      ).catch(() => null);
+      if (sourceAfterScan?.ok && sourceAfterScan.context) {
+        finalSourceContext = sourceAfterScan.context;
+        if (isRefreshableJobSourceContext(initialSourceContext) && !sameJobSourceContext(initialSourceContext, finalSourceContext)) {
+          await log('warn', '[扫描] 扫描期间求职期望发生变化，已取消本轮结果，避免混入不同来源岗位', {
+            before: initialSourceContext,
+            after: finalSourceContext
+          });
+          return { ok: false, error: 'JOB_SOURCE_CHANGED_DURING_SCAN', message: '扫描期间求职期望发生变化，请恢复后重新扫描' };
+        }
+      }
+    }
+    const collectionResultReceivedAt = Date.now();
+    const collectionFinishedAt = Number(scan.scanMeta?.collectionFinishedAt || 0) ||
+      Math.min(collectionResultReceivedAt, deadlineAt);
+    // 扫描结束回顶：投递从队列开头开始，把职位列表滚回顶部方便用户直接核对队首岗位
+    await sendToBoss(MSG.SCROLL_LIST_TOP, {}, {
+      tabId: sourcePreviewTab?.id || previewTab?.id || null,
+      previewRunId
+    }).catch(() => {});
+    setPreviewPhase('filtering', previewRunId);
+    const todayStats = await getTodayStats();
+    if (!isActive()) return cancelled();
+    const results = evaluatePreviewResults(Array.from(collectedJobs.values()), config, todayStats);
+    // 预览期核对 HR 活跃度：直连列表 detail API（不点卡片、不离开列表页），
+    // 让「预览通过」≈「投递会投」，避免队列尾部混入大量的「投递时才被判跳过」岗位。
+    // 网络元数据（job.activeText）直接过滤；缺失的逐岗抓取 detail API（限时，熔断 429/403）。
+    {
+      const pending = results.filter((row) => row.decision === 'pass' && row.requiresActiveCheck === true);
+      if (pending.length && isActive()) {
+        const enrich = await sendToBoss(
+          MSG.ENRICH_JOB_ACTIVITY,
+          {
+            jobs: pending.slice(0, 80).map((r) => r.job),
+            deadlineAt: Date.now() + 60000
+          },
+          { tabId: sourcePreviewTab?.id || previewTab?.id || null, previewRunId }
+        ).catch(() => null);
+        const activities = Array.isArray(enrich?.activities) ? enrich.activities : [];
+        if (activities.length) {
+          applyPreviewActivityEnrichment(results, activities, config.filters?.activeWithin || []);
+          await log('info', `[预览] HR 活跃度核对（列表接口 detail API，不点卡片）：已核对 ${activities.length}/${pending.length} 岗，不满足的已从队列排除`, { previewRunId });
+        }
+        if (enrich?.halted) {
+          await log('warn', `[预览] HR 活跃度核对提前停止（${enrich.haltError || '未知原因'}），其余岗位保持投递时核对`, { previewRunId });
+        }
+      }
+    }
+    const activityMeta = {
+      requested: 0,
+      eligible: 0,
+      checked: 0,
+      resolved: 0,
+      rejected: 0,
+      halted: false,
+      haltError: '',
+      deferredToDelivery: 0
+    };
+    finalizePreviewActivityDecisions(results, config.filters?.activeWithin || [], (msg) =>
+      log('info', msg).catch(() => {})
+    );
+    activityMeta.deferredToDelivery = results.filter((row) => row.decision === 'pass' && row.requiresActiveCheck === true).length;
+    const summary = summarizePreview(results);
+    setPreviewProgress(summary.scanned, summary.pass, previewRunId);
+    const previewListHref = scan.listHref || '';
+    const previewListExpect = scan.listExpectLabel || scan.expectLabel || '';
+    const passRate = summary.scanned ? summary.pass / summary.scanned : 0;
+    const warnings = [];
+    if (summary.scanned >= 10 && passRate > 0.8) warnings.push('通过率超过 80%，请检查筛选是否过宽');
+    if (summary.scanned >= 10 && passRate < 0.05) warnings.push('通过率低于 5%，请检查筛选是否过严');
+    const { reachedEnd, timedOut } = normalizePreviewScanTerminalState({
+      reachedEnd: scan.scanMeta?.reachedEnd === true,
+      timedOut: scan.scanMeta?.timedOut === true,
+      deadlineAt
+    });
+    const stop = resolvePreviewScanStop({
+      reachedEnd,
+      timedOut,
+      deadlineAt,
+      batchError: continuationError,
+      maxElapsedMs
+    });
+    if (stop.reason === PREVIEW_SCAN_STOP.TIMEOUT) {
+      await debugLog('background.preview', 'collection_deadline', {
+        scanSessionId,
+        collected: collectedJobs.size,
+        elapsedMs: collectionFinishedAt - scanStartedAt,
+        maxElapsedMs
+      });
+    }
+    if (stop.reason === PREVIEW_SCAN_STOP.BATCH_ERROR) warnings.push('继续加载异常：' + continuationError);
+    // 面板上的扫描计时覆盖完整流程：滚动采集、筛选以及 HR 活跃度核对。
+    // collectionFinishedAt / scrollElapsedMs 只用于诊断滚动阶段，不应让 UI
+    // 在进入 filtering 后提前停止计时。
+    const previewFinishedAt = Date.now();
+    runner.previewScanFinishedAt = previewFinishedAt;
+    const scanMeta = {
+      ...(scan.scanMeta || {}),
+      uniqueCount: collectedJobs.size,
+      reachedEnd,
+      timedOut,
+      sourceContextPreserved: true,
+      sourceContext: finalSourceContext,
+      scanTabId: sourcePreviewTab.id,
+      stopReason: stop.reason,
+      stopMessage: stop.message,
+      elapsedMs: previewFinishedAt - previewStartedAt,
+      scrollElapsedMs: collectionFinishedAt - scanStartedAt,
+      collectionFinishedAt,
+      collectionResultReceivedAt,
+      previewDeadlineAt,
+      maxElapsedMs,
+      scanBatches,
+      activity: activityMeta,
+      passRate
+    };
+
+    const task = {
     id: uid('task'),
     status: TASK_STATUS.AWAITING_CONFIRM,
     createdAt: Date.now(),
@@ -1020,6 +3034,9 @@ async function runPreview(payload = {}) {
       bossId: r.job.bossId,
       company: r.job.company,
       title: r.job.title,
+      location: r.job.location || '',
+      lid: r.job.lid || '',
+      securityId: r.job.securityId || '',
       state: r.decision === 'pass' ? 'NOT_STARTED' : 'SKIPPED',
       reasons: r.reasonTexts,
       selected: r.selected,
@@ -1030,14 +3047,19 @@ async function runPreview(payload = {}) {
     currentJobId: null,
     consecutiveFails: 0,
     execution: {
-      listTabId: previewTab?.id || null,
-      listWindowId: previewTab?.windowId || null
-    }
+      listTabId: sourcePreviewTab?.id || previewTab?.id || null,
+      listWindowId: sourcePreviewTab?.windowId || previewTab?.windowId || null
+    },
+    previewNavigation,
+    scanMeta
   };
 
   
-  task.listHref = previewListHref || task.listHref || '';
-  if (previewListExpect) task.listExpectLabel = previewListExpect;
+  task.listHref = previewListHref || '';
+  if (previewListExpect) {
+    task.listExpectLabel = previewListExpect;
+  }
+  task.sourceContext = finalSourceContext;
   task.queue = (task.results || [])
     .filter((r) => r.selected !== false && r.decision === 'pass')
     .map((r, idx) => ({
@@ -1045,21 +3067,413 @@ async function runPreview(payload = {}) {
       jobId: r.job?.jobId,
       title: r.job?.title,
       company: r.job?.company,
+      location: r.job?.location || '',
+      lid: r.job?.lid || '',
       href: r.job?.href || '',
       securityId: r.job?.securityId || '',
       status: 'pending'
     }));
   task.queueCursor = 0;
-  await log('info', '预览队列已建立：' + task.queue.length + ' 个待投；列表锚点 ' + String(task.listHref || '无').slice(0, 140));
-await publishTask(task);
+  await log('info', '预览队列已建立：' + task.queue.length + ' 个待投');
+    if (!isActive()) return cancelled();
+    const published = await publishPreviewTask(task, previewRunId, runner.previewPreviousTask, {
+      deferPublish: payload.deferPublish === true ||
+        (payload.targetMode === true && runner.targetLoop === true)
+    });
+    if (!published) return cancelled();
 
   // highlight
+  if (!isActive()) return cancelled();
   const map = {};
   for (const r of results) map[r.job.jobId] = { decision: r.decision };
-  await sendToBoss(MSG.HIGHLIGHT_JOBS, { map });
+  await sendToBoss(MSG.HIGHLIGHT_JOBS, { map }, {
+    tabId: sourcePreviewTab?.id || previewTab?.id || null,
+    previewRunId
+  });
+  if (!isActive()) return cancelled();
 
-  await log('success', `预览完成：扫描 ${summary.scanned}，通过 ${summary.pass}，排除 ${summary.reject}`);
-  return { ok: true, task, summary, warnings };
+  await log('success', `预览完成：扫描 ${summary.scanned}，通过 ${summary.pass}，排除 ${summary.reject}`, {
+    scanMeta
+  });
+  return { ok: true, task, summary, warnings, scanMeta, navigation: previewNavigation };
+  }
+}
+
+function isRefreshableJobSourceContext(context = {}) {
+  return context?.sourceType === JOB_SOURCE_TYPES.RECOMMEND ||
+    (context?.sourceType === JOB_SOURCE_TYPES.EXPECTATION && Boolean(String(context?.expectationKey || '').trim()));
+}
+
+function mergeRefreshedTask(previousTask, freshTask, refreshMeta = {}) {
+  const previousResults = Array.isArray(previousTask?.results) ? previousTask.results : [];
+  const freshResults = Array.isArray(freshTask?.results) ? freshTask.results : [];
+  const freshNewResults = freshResults.filter((row) => !previousResults.some((previous) =>
+    jobsShareMergeIdentity(previous?.job || previous || {}, row?.job || row || {})
+  ));
+  const mergedResults = mergeTaskResults(previousResults, freshResults);
+  const previousItems = Array.isArray(previousTask?.items) ? previousTask.items : [];
+  const allFreshItems = Array.isArray(freshTask?.items) ? freshTask.items : [];
+  const freshItems = allFreshItems
+    .filter((item) => !previousItems.some((previous) => jobsShareMergeIdentity(previous, item)));
+  const items = previousItems.map((previous) => {
+    const fresh = allFreshItems.find((item) => jobsShareMergeIdentity(previous, item));
+    if (!fresh) return previous;
+    return {
+      ...previous,
+      ...fresh,
+      jobId: !previous.jobId || String(previous.jobId || '').startsWith('name_') || String(previous.jobId || '').startsWith('dom_')
+        ? (fresh.jobId || previous.jobId)
+        : previous.jobId,
+      state: previous.state || fresh.state,
+      reasons: previous.reasons || fresh.reasons,
+      receipts: previous.receipts || fresh.receipts
+    };
+  });
+  const doneIds = collectDoneJobIds(
+    previousItems,
+    previousTask?.queue || [],
+    previousTask?.testedJobIds || []
+  );
+  const rebuiltQueue = rebuildDeliveryQueue(
+    mergedResults.results,
+    previousTask?.queue || [],
+    Array.from(doneIds)
+  );
+  // results/items 保留完整历史，用于去重、累计成功数和展示统计；但刷新后的
+  // 当前投递队列只保留可运行岗位。这样上一批已经 done/skipped/failed 的岗位
+  // 不会再次占据新批次的队列序号，新的批次从第 1 个待投岗位开始。
+  const queue = rebuiltQueue
+    .filter((item) => item.status === 'pending')
+    .map((item, index) => ({ ...item, index }));
+  const queueCursor = 0;
+  const previousRefreshes = Array.isArray(previousTask?.refreshHistory)
+    ? previousTask.refreshHistory
+    : [];
+  const refreshRecord = {
+    at: Date.now(),
+    sourceType: refreshMeta.sourceType || freshTask?.sourceContext?.sourceType || '',
+    expectationLabel: refreshMeta.expectationLabel || freshTask?.sourceContext?.expectationLabel || '',
+    scanned: Number(freshTask?.summary?.scanned || 0),
+    added: freshNewResults.length,
+    duplicates: Math.max(0, freshResults.length - freshNewResults.length),
+    total: mergedResults.results.length
+  };
+  const previousExecution = previousTask?.execution || {};
+  const freshExecution = freshTask?.execution || {};
+  const task = {
+    ...freshTask,
+    ...previousTask,
+    status: TASK_STATUS.AWAITING_CONFIRM,
+    updatedAt: Date.now(),
+    summary: summarizePreview(mergedResults.results),
+    warnings: Array.from(new Set([
+      ...(previousTask?.warnings || []),
+      ...(freshTask?.warnings || [])
+    ].filter(Boolean))),
+    results: mergedResults.results,
+    items: [...items, ...freshItems.filter((item) =>
+      !previousItems.some((previous) => jobsShareMergeIdentity(previous, item))
+    )],
+    queue,
+    queueCursor,
+    sourceContext: freshTask?.sourceContext || previousTask?.sourceContext || null,
+    listHref: freshTask?.listHref || previousTask?.listHref || '',
+    listExpectLabel: freshTask?.listExpectLabel || previousTask?.listExpectLabel || '',
+    execution: {
+      // A refresh candidate only knows about the list tab. Keep the existing
+      // message/split workspace so a checkpoint retry reuses the same chat
+      // tab instead of silently creating a second one.
+      ...previousExecution,
+      ...freshExecution,
+      ...(previousExecution.messageTabId
+        ? { messageTabId: previousExecution.messageTabId }
+        : {}),
+      ...(previousExecution.messageWindowId
+        ? { messageWindowId: previousExecution.messageWindowId }
+        : {}),
+      ...(previousTask?.execution?.taskRunId
+        ? { taskRunId: previousTask.execution.taskRunId }
+        : {})
+    },
+    previewNavigation: freshTask?.previewNavigation || null,
+    scanMeta: {
+      ...(freshTask?.scanMeta || {}),
+      refreshCount: previousRefreshes.length + 1,
+      previousUniqueCount: previousResults.length,
+      newUniqueCount: freshNewResults.length,
+      totalUniqueCount: mergedResults.results.length,
+      duplicateCount: Math.max(0, freshResults.length - freshNewResults.length),
+      sourceContextPreserved: true
+    },
+    refreshHistory: [...previousRefreshes, refreshRecord].slice(-30),
+    testedJobIds: Array.from(new Set([
+      ...(previousTask?.testedJobIds || []).map(String),
+      ...(freshTask?.testedJobIds || []).map(String)
+    ])),
+    counters: { ...(previousTask?.counters || freshTask?.counters || {}) },
+    currentJobId: null,
+    nextJobId: null,
+    completionSignal: null,
+    pauseReason: '',
+    pauseSource: '',
+    awaitingUserRetry: false,
+    uiErrorDismissed: true,
+    retryCurrent: false,
+    errorKey: '',
+    lastErrorDetail: '',
+    consecutiveFails: 0,
+    testDelivery: false,
+    testJobId: null,
+    refreshCount: previousRefreshes.length + 1
+  };
+  return { task, added: freshNewResults.length, duplicates: refreshRecord.duplicates };
+}
+
+async function refreshAndContinue(payload = {}, sourceTab, previewRunId = '') {
+  if (!sourceTab?.id) return { ok: false, error: 'LIST_TAB_NOT_FOUND', message: '未找到当前 BOSS 职位列表页' };
+  const all = await getAllConfig();
+  const previousTask = cloneTaskSnapshot(all.task);
+  if (!previousTask) return { ok: false, error: 'NO_TASK', message: '请先完成一次扫描预览' };
+  if (![TASK_STATUS.COMPLETED, TASK_STATUS.STOPPED].includes(previousTask.status)) {
+    return { ok: false, error: 'TASK_NOT_FINISHED', message: '请先完成或停止当前投递任务，再刷新并继续' };
+  }
+  if (!isRefreshableJobSourceContext(previousTask.sourceContext)) {
+    return { ok: false, error: 'JOB_SOURCE_NOT_RESTORABLE', message: '这批预览没有记录可恢复的求职期望来源，请重新扫描后再使用' };
+  }
+  const tabOpt = { tabId: sourceTab.id, forceInject: true, previewRunId };
+  // “刷新并继续”恢复的是已完成任务的快照。BOSS 刷新时可能先把当前页
+  // 临时切回“推荐”，因此刷新前的页面状态只能用于诊断，不能作为拦截条件。
+  const before = await sendToBoss(MSG.GET_JOB_SOURCE_CONTEXT, { refreshExpectations: true }, tabOpt).catch(() => null);
+  const sourceChangedBeforeRefresh = Boolean(
+    before?.context && !sameJobSourceContext(previousTask.sourceContext, before.context)
+  );
+  const filtersChangedBeforeRefresh = Boolean(
+    before?.context && !sameFilterSignature(previousTask.sourceContext.filterSignature, before.context.filterSignature)
+  );
+  await log('info', '[刷新并继续] 将以已保存任务快照恢复求职期望和普通筛选', {
+    before: before?.context || null,
+    sourceChangedBeforeRefresh,
+    filtersChangedBeforeRefresh
+  });
+
+  setPreviewPhase('restoring_source', previewRunId);
+  await log('info', '[刷新并继续] 正在刷新职位列表并恢复原求职期望', {
+    tabId: sourceTab.id,
+    sourceType: previousTask.sourceContext.sourceType,
+    expectationLabel: previousTask.sourceContext.expectationLabel || '推荐'
+  });
+  try {
+    await chrome.tabs.reload(sourceTab.id);
+    const readyTab = await waitTabComplete(sourceTab.id, 45000, { requireComplete: true });
+    if (!readyTab || !isBossJobListUrl(readyTab.url || readyTab.pendingUrl || '')) {
+      return { ok: false, error: 'LIST_RELOAD_FAILED', message: '职位列表刷新失败，旧任务已保留' };
+    }
+    await forceInjectContent(sourceTab.id);
+    await sleep(650);
+    const restored = await sendToBoss(
+      MSG.RESTORE_JOB_SOURCE_CONTEXT,
+      { sourceContext: previousTask.sourceContext, timeoutMs: 15000 },
+      { tabId: sourceTab.id, forceInject: true, previewRunId }
+    );
+    if (!restored?.ok || !restored.context) {
+      await log('warn', '[刷新并继续] 求职期望恢复失败，未开始扫描', {
+        error: restored?.error || '',
+        message: restored?.message || '',
+        filters: restored?.filters || null,
+        expectedFilterSignature: previousTask.sourceContext.filterSignature || null
+      });
+      return {
+        ok: false,
+        error: restored?.error || 'JOB_SOURCE_RESTORE_FAILED',
+        message: restored?.message || '求职期望恢复失败，旧任务已保留',
+        filters: restored?.filters || null
+      };
+    }
+    if (!sameJobSourceContext(previousTask.sourceContext, restored.context)) {
+      return { ok: false, error: 'JOB_SOURCE_RESTORE_VERIFY_FAILED', message: '恢复后的求职期望与原任务不一致，已停止扫描' };
+    }
+    if (!sameFilterSignature(previousTask.sourceContext.filterSignature, restored.context.filterSignature)) {
+      await log('warn', '[刷新并继续] 刷新后普通筛选未恢复，未开始扫描', {
+        expected: previousTask.sourceContext.filterSignature,
+        current: restored.context.filterSignature
+      });
+      return { ok: false, error: 'FILTER_RESTORE_VERIFY_FAILED', message: '刷新后普通筛选未恢复，已停止扫描；旧任务已保留' };
+    }
+    await log('success', '[刷新并继续] 求职期望和普通筛选恢复验证通过', {
+      sourceType: restored.context.sourceType,
+      expectationKey: restored.context.expectationKey || '',
+      expectationLabel: restored.context.expectationLabel || '推荐',
+      domActiveCount: restored.context.selectionEvidence?.domActiveCount || 0,
+      requestEncryptExpectId: restored.context.selectionEvidence?.requestEncryptExpectId || '',
+      requestMatches: restored.context.selectionEvidence?.requestMatches === true,
+      filterSignature: restored.context.filterSignature || null
+    });
+    setPreviewPhase('collecting', previewRunId);
+    const fresh = await runPreview({
+      ...payload,
+      captureSourceContext: true,
+      // A refresh is one logical task. Keep the temporary scan out of
+      // storage/events until it has been merged back into the original task.
+      deferPublish: true
+    }, readyTab, previewRunId);
+    if (!fresh?.ok || !fresh.task) return fresh;
+    // STOP_TASK can invalidate the preview after runPreview's final check but
+    // before this refresh merges and publishes the candidate task.
+    if (!isPreviewRunActive(previewRunId)) return previewCancelledResult();
+    const merged = mergeRefreshedTask(previousTask, fresh.task, previousTask.sourceContext);
+    if (!isPreviewRunActive(previewRunId)) return previewCancelledResult();
+    await publishTask(merged.task);
+    await log('success', `[刷新并继续] 扫描完成：新增 ${merged.added} 个岗位，重复 ${merged.duplicates} 个，累计 ${merged.task.results.length} 个`, {
+      taskId: merged.task.id,
+      sourceType: merged.task.sourceContext?.sourceType || '',
+      expectationLabel: merged.task.sourceContext?.expectationLabel || ''
+    });
+    return {
+      ...fresh,
+      task: merged.task,
+      summary: merged.task.summary,
+      refresh: { added: merged.added, duplicates: merged.duplicates, total: merged.task.results.length }
+    };
+  } catch (error) {
+    await log('error', '[刷新并继续] 页面刷新或恢复异常，旧任务已保留：' + String(error?.message || error));
+    return { ok: false, error: 'REFRESH_CONTINUE_FAILED', message: '刷新并继续失败，旧任务已保留：' + String(error?.message || error) };
+  }
+}
+
+async function recordTargetModeHalt(task, message, level = 'warn') {
+  if (!task) return;
+  task.targetLastError = String(message || '目标模式已停止');
+  task.status = TASK_STATUS.STOPPED;
+  task.pauseReason = task.targetLastError;
+  task.awaitingUserRetry = false;
+  task.uiErrorDismissed = false;
+  setTaskTerminalSignal(task, TASK_STATUS.STOPPED);
+  task.updatedAt = Date.now();
+  await publishTask(task);
+  await log(level, `[目标模式] ${task.targetLastError}`, {
+    taskId: task.id,
+    targetCount: Number(task.targetCount || 0),
+    success: Number(task.counters?.success || 0),
+    refreshCount: Number(task.targetRefreshCount || 0),
+    noNewRounds: Number(task.targetNoNewRounds || 0),
+    noNewRetryLimit: Number(task.targetNoNewRetryLimit || 0)
+  });
+}
+
+async function runTargetDeliveryLoop(taskId, taskRunId = uid('run')) {
+  if (runner.targetLoop) return { ok: false, error: 'TARGET_LOOP_RUNNING' };
+  if (runner.stopping || runner.abort) return { ok: false, error: 'OP_CANCELLED' };
+  if (runner.taskRunTaskId && !isTaskRunCurrent(taskId, taskRunId)) {
+    return { ok: false, error: 'STALE_TASK_RUN' };
+  }
+  runner.targetLoop = true;
+  runner.taskRunId = taskRunId;
+  runner.taskRunTaskId = taskId;
+  runner.abort = false;
+  try {
+    while (!runner.abort) {
+      let all = await getAllConfig();
+      let task = all.task;
+      if (!task || task.id !== taskId || task.targetMode !== true) {
+        return { ok: false, error: 'TARGET_TASK_NOT_FOUND' };
+      }
+      if (isTargetDeliveryReached(task)) {
+        task.status = TASK_STATUS.COMPLETED;
+        task.targetLastError = '';
+        task.pauseReason = '';
+        task.awaitingUserRetry = false;
+        task.updatedAt = Date.now();
+        setTaskTerminalSignal(task, TASK_STATUS.COMPLETED);
+        await publishTask(task);
+        await log('success', `[目标模式] 已达到目标：成功 ${task.counters?.success || 0}/${task.targetCount}`, { taskId });
+        return { ok: true, task };
+      }
+      if (task.status === TASK_STATUS.PAUSED || task.status === TASK_STATUS.STOPPED || task.status === TASK_STATUS.FAILED) {
+        return { ok: false, error: 'TARGET_TASK_PAUSED', task };
+      }
+
+      const deliveryResult = await runTaskLoop(taskId, taskRunId);
+      if (runner.abort) return { ok: false, error: 'ABORTED' };
+      if (deliveryResult?.ok === false) return deliveryResult;
+
+      all = await getAllConfig();
+      task = all.task;
+      if (!task || task.id !== taskId) return { ok: false, error: 'TARGET_TASK_NOT_FOUND' };
+      if (isTargetDeliveryReached(task)) {
+        await log('success', `[目标模式] 已达到目标：成功 ${task.counters?.success || 0}/${task.targetCount}`, { taskId });
+        return { ok: true, task };
+      }
+      if (task.status !== TASK_STATUS.COMPLETED) return { ok: false, error: 'TARGET_TASK_NOT_COMPLETED', task };
+
+      const refreshCount = Number(task.targetRefreshCount || 0) + 1;
+      task.targetRefreshCount = refreshCount;
+      if (refreshCount > 50) {
+        await recordTargetModeHalt(task, `已刷新 ${refreshCount - 1} 轮仍未达到目标，为避免无限重复已停止；成功 ${task.counters?.success || 0}/${task.targetCount}`);
+        return { ok: false, error: 'TARGET_REFRESH_LIMIT', task };
+      }
+      const listTabId = task.execution?.listTabId;
+      let sourceTab = null;
+      try { sourceTab = listTabId != null ? await chrome.tabs.get(listTabId) : null; } catch (_) {}
+      if (!sourceTab?.id || !isBossJobListUrl(sourceTab.url || sourceTab.pendingUrl || '')) {
+        await recordTargetModeHalt(task, '目标未达成，无法找到原 BOSS 职位列表页，已暂停自动刷新');
+        return { ok: false, error: 'TARGET_LIST_TAB_NOT_FOUND', task };
+      }
+
+      await publishTask(task);
+      await log('info', `[目标模式] 当前批次已结束，成功 ${task.counters?.success || 0}/${task.targetCount}；开始第 ${refreshCount} 轮刷新、恢复筛选并扫描`, {
+        taskId,
+        listTabId,
+        targetRemaining: targetDeliveryRemaining(task)
+      });
+      const refreshed = await withRunnerAdmission('previewing', (previewRunId) => refreshAndContinue({
+        scroll: true,
+        maxScanMs: 60000,
+        forceRestore: true,
+        captureSourceContext: true,
+        targetMode: true
+      }, sourceTab, previewRunId));
+      if (runner.abort) return { ok: false, error: 'ABORTED' };
+      if (!refreshed?.ok || !refreshed.task) {
+        all = await getAllConfig();
+        task = all.task || task;
+        await recordTargetModeHalt(task, refreshed?.message || '目标未达成，刷新恢复失败；旧任务已保留');
+        return { ok: false, error: refreshed?.error || 'TARGET_REFRESH_FAILED', task };
+      }
+      const pending = (refreshed.task.queue || []).some((item) => item.status === 'pending');
+      if (!pending) {
+        const noNewRounds = Number(refreshed.task.targetNoNewRounds || 0) + 1;
+        const noNewRetryLimit = normalizeTargetNoNewRetryLimit(
+          refreshed.task.targetNoNewRetryLimit,
+          all.settings?.targetNoNewRetryLimit
+        );
+        refreshed.task.targetNoNewRounds = noNewRounds;
+        refreshed.task.targetNoNewRetryLimit = noNewRetryLimit;
+        await publishTask(refreshed.task);
+        await log('warn', `[目标模式] 第 ${refreshCount} 轮扫描没有新增可投递岗位；连续无新增重试 ${noNewRounds}/${noNewRetryLimit}，成功 ${refreshed.task.counters?.success || 0}/${refreshed.task.targetCount}`, {
+          taskId,
+          noNewRounds,
+          noNewRetryLimit,
+          refreshCount
+        });
+        if (noNewRounds >= noNewRetryLimit) {
+          await recordTargetModeHalt(refreshed.task, `连续 ${noNewRounds} 轮扫描没有新增可投递岗位，目标未达成；已达到无新增重试上限 ${noNewRetryLimit} 轮，自动停止。成功 ${refreshed.task.counters?.success || 0}/${refreshed.task.targetCount}`);
+          return { ok: false, error: 'TARGET_NO_NEW_JOBS_LIMIT', task: refreshed.task };
+        }
+        // 没有新岗位时继续刷新；下一轮仍会从持久化任务恢复，不需要用户再次点击。
+        continue;
+      }
+      if (Number(refreshed.task.targetNoNewRounds || 0) > 0) {
+        refreshed.task.targetNoNewRounds = 0;
+        refreshed.task.targetLastError = '';
+        await publishTask(refreshed.task);
+      }
+      // refreshAndContinue leaves the merged task in awaiting_confirm. The next
+      // loop consumes its pending queue without requiring another button click.
+    }
+    return { ok: false, error: 'ABORTED' };
+  } finally {
+    runner.targetLoop = false;
+  }
 }
 
 function itemErrorHint(task, row) {
@@ -1073,6 +3487,58 @@ async function waitWhilePaused() {
   while (runner.pause && !runner.abort) {
     await sleep(350);
   }
+}
+
+async function syncTaskBossGreeting(task, tabOpt, { force = false } = {}) {
+  const cached = task?.bossGreetingSnapshot;
+  if (!force && cached?.ok && Date.now() - Number(cached.syncedAt || 0) < 3 * 60 * 1000) {
+    return cached;
+  }
+  const result = await sendToBoss(MSG.GET_BOSS_GREETING, {}, tabOpt);
+  if (result?.ok) {
+    task.bossGreetingSnapshot = {
+      ok: true,
+      enabled: result.enabled === true,
+      status: result.enabled === true ? 'on' : 'off',
+      templateId: result.templateId || '',
+      text: result.text || '',
+      syncedAt: result.syncedAt || Date.now(),
+      source: result.source || 'boss-api'
+    };
+    task.bossGreetingError = '';
+  } else {
+    task.bossGreetingError = result?.message || result?.error || '无法读取 BOSS 自动招呼状态';
+  }
+  task.updatedAt = Date.now();
+  await publishTask(task);
+  return result;
+}
+
+async function waitForFreshSelfMessages(tabOpt, baselineMessages = [], timeoutMs = 2600) {
+  const started = Date.now();
+  const baseline = (baselineMessages || []).map((message) => String(message || '').trim()).filter(Boolean);
+  const baselineKey = JSON.stringify(baseline);
+  let latest = baseline;
+  while (Date.now() - started < timeoutMs) {
+    const result = await sendToBoss(MSG.GET_CHAT_SELF_MESSAGES, { limit: 8 }, tabOpt);
+    if (operationAborted(result)) return [];
+    latest = (result?.messages || []).map((message) => String(message || '').trim()).filter(Boolean);
+    if (JSON.stringify(latest) !== baselineKey) {
+      const baselineCount = new Map();
+      baseline.forEach((message) => baselineCount.set(message, (baselineCount.get(message) || 0) + 1));
+      const fresh = latest.filter((message) => {
+        const remaining = baselineCount.get(message) || 0;
+        if (remaining > 0) {
+          baselineCount.set(message, remaining - 1);
+          return false;
+        }
+        return true;
+      });
+      return fresh.length ? fresh : latest.slice(-1);
+    }
+    await sleep(250);
+  }
+  return [];
 }
 
 async function processOneJob(task, resultRow, config) {
@@ -1170,11 +3636,10 @@ async function processOneJob(task, resultRow, config) {
     listHref: String(job.listHref || task.listHref || '').slice(0, 140)
   });
 
-  // 双页主路径：列表页建会话 + 消息页发送
+  // 三页主路径：左侧列表只读 + 临时执行页建会话 + 右侧消息页发送
   let listTabId = task.execution?.listTabId || null;
-  let listOpt = null;
   if (!resumedFromChat) {
-    const listTab = await ensureListTab(task);
+    let listTab = await ensureListTab(task);
     listTabId = listTab?.id || task.execution?.listTabId || null;
     if (!listTabId) {
       item.state = 'FAILED';
@@ -1183,7 +3648,18 @@ async function processOneJob(task, resultRow, config) {
       await log('error', '[列表页] 未找到列表标签页', { jobId: job.jobId });
       return 'failed';
     }
-    listOpt = { tabId: listTabId, forceInject: true };
+    if (!isBossJobListUrl(listTab?.url || listTab?.pendingUrl || '')) {
+      const restored = await restoreListTabAfterTriggerNavigation(task, listTabId);
+      if (!restored.ok) {
+        item.state = 'FAILED';
+        item.reasons = [restored.message || '未能恢复职位列表'];
+        task.counters.failed += 1;
+        task.pauseReason = item.reasons[0];
+        await log('error', '[列表页] ' + item.reasons[0], { jobId: job.jobId, restored });
+        return 'failed';
+      }
+      try { listTab = await chrome.tabs.get(listTabId); } catch (_) {}
+    }
   }
 
   let messageTab;
@@ -1200,6 +3676,8 @@ async function processOneJob(task, resultRow, config) {
   if (runner.abort) return 'aborted';
   const msgTabId = messageTab.id;
   const msgOpt = { tabId: msgTabId, forceInject: true };
+  // 每个岗位都校验缓存；从安全暂停恢复时也会在消息页重新读取，避免因旧失败快照反复暂停。
+  await syncTaskBossGreeting(task, msgOpt);
 
   let beforeSnap = resumedFromChat
     ? { ok: true, keys: item.beforeConversationKeys || [], count: item.beforeConversationCount || 0 }
@@ -1213,28 +3691,122 @@ async function processOneJob(task, resultRow, config) {
 
   let trig = item.triggerReceipt || { ok: true, already: true, contentVersion: '' };
   if (!resumedFromChat) {
-    // 列表页：定位 + 立即沟通 + 留在此页
-    await log('info', '[列表页] 定位并触发沟通', { jobId: job.jobId, title: job.title, tabId: listTabId });
-    trig = await sendToBoss(
-      MSG.TRIGGER_CONVERSATION || 'BHT_TRIGGER_CONVERSATION',
-      { job },
-      listOpt
+    // 在临时后台执行页触发沟通；左侧真实列表不点击、不导航，完整保留 SPA 筛选和滚动位置。
+    await log('info', '[执行页] 正在后台定位并触发沟通（左侧职位页保持不动）', {
+      jobId: job.jobId,
+      title: job.title,
+      listTabId
+    });
+    trig = await triggerConversationInWorker(
+      task,
+      job,
+      messageTab,
+      listTabId,
+      config.filters?.activeWithin || []
     );
     if (operationAborted(trig)) return 'aborted';
     await log(
-      trig?.ok ? 'success' : 'error',
-      trig?.ok
-        ? ('[列表页] 已触发沟通 btn=' + (trig.buttonText || '') + (trig.stayed ? ' · 已点留在此页' : ' · 未检测到留在此页弹窗') + (trig.already ? ' · 继续沟通' : ''))
-        : ('[列表页] 触发沟通失败：' + (trig?.message || trig?.error || '')),
-      { jobId: job.jobId, detailTitle: trig?.detailTitle, samples: trig?.samples }
+      trig?.ok ? 'success' : (trig?.filtered ? 'info' : 'error'),      trig?.ok
+        ? ('[执行页] 已触发沟通 btn=' + (trig.buttonText || '') +
+          (trig.navigated ? ' · BOSS 跳转在临时页完成' : (trig.stayed ? ' · 已点留在此页' : ' · 无需留在此页弹窗')) +
+          (trig.listPreserved ? ' · 左侧筛选保持' : ' · 左侧页面需检查') +
+          (trig.already ? ' · 继续沟通' : ''))
+        : (trig?.filtered
+          ? ('已跳过：' + (trig?.message || 'HR 活跃时间不满足'))
+          : ('[执行页] 触发沟通失败：' + (trig?.message || trig?.error || ''))),
+      {
+        jobId: job.jobId,
+        detailTitle: trig?.detailTitle,
+        samples: trig?.samples,
+        workerMode: trig?.workerMode,
+        listPreserved: trig?.listPreserved,
+        workerAttempts: trig?.workerAttempts
+      }
     );
+    if (trig?.ok) runner.consecutiveUnknownActive = 0;
     if (!trig?.ok) {
-      item.state = /LIST_JOB_NOT_FOUND|找不到/.test(String(trig?.error || '')) ? 'SKIPPED' : 'FAILED';
+      if (trig?.filtered === true && trig?.error === REASON.FILTER_ACTIVE) {
+        job.activeText = String(trig.activeText || '');
+        // 预览行同步为「投递跳过」：该岗位在投递时因 HR 活跃不匹配被跳过，不被计入投递
+        const skipReason = `投递跳过：HR活跃度为「${job.activeText || '未知'}」不匹配`;
+        resultRow.job = job;
+        const previewRow = (task.results || []).find((r) => r.job?.jobId === job.jobId);
+        if (previewRow) {
+          previewRow.job = { ...previewRow.job, ...job };
+          previewRow.passReasons = [skipReason];
+        }
+        // 防级联①：本次尝试中左侧列表页发生了外部变化（URL/内容脚本实例变化：
+        // 页面被刷新/导航/风控改动），岗位与页面可能对不上 —— 恢复列表后立即暂停，
+        // 让用户确认列表状态，绝不静默跳过整批。
+        if (trig.listPreserved === false) {
+          try { await softReturnToList(task); } catch (_) {}
+          runner.pause = true;
+          task.status = TASK_STATUS.PAUSED;
+          task.awaitingUserRetry = true;
+          task.pauseReason = `左侧职位列表页面发生变化（可能被刷新/导航或风控改动），岗位与页面可能对不上；请检查左侧列表后继续`;
+          await log('warn', '[列表页] ' + task.pauseReason + '：' + (job.title || ''), {
+            jobId: job.jobId,
+            activeText: job.activeText || '',
+            listPreserved: trig.listPreserved
+          });
+          await publishTask(task);
+          return 'limited';
+        }
+        // 防级联②：连续 N 岗读不到 HR 活跃度（未知）→ 左侧列表大概率已失效，
+        // 暂停而不是继续空转跳过。
+        if (job.activeText) {
+          runner.consecutiveUnknownActive = 0;
+        } else {
+          runner.consecutiveUnknownActive = (runner.consecutiveUnknownActive || 0) + 1;
+          if (runner.consecutiveUnknownActive >= 3) {
+            try { await softReturnToList(task); } catch (_) {}
+            runner.pause = true;
+            task.status = TASK_STATUS.PAUSED;
+            task.awaitingUserRetry = true;
+            task.pauseReason = `连续 ${runner.consecutiveUnknownActive} 岗无法读取 HR 活跃度，左侧列表可能已失效（刷新/筛选变化）；请检查左侧列表后继续`;
+            await log('warn', task.pauseReason, { jobId: job.jobId, activeText: job.activeText || '' });
+            await publishTask(task);
+            return 'limited';
+          }
+          await log('warn', `[列表页] HR 活跃度未读取到（${runner.consecutiveUnknownActive}/3），将先回列表恢复状态再核对下一岗`, {
+            jobId: job.jobId
+          });
+        }
+        item.state = 'SKIPPED';
+        item.reasons = [skipReason];
+        task.counters.skipped += 1;
+        await bumpDailyStat('skip');
+        await log('info', `${job.title} - ${item.reasons[0]}`, {
+          jobId: job.jobId,
+          activeText: job.activeText || '',
+          activityCheckedBeforeClick: true
+        });
+        return 'skipped';
+      }
+      // BOSS 平台级每日沟通上限：直接停止任务（不是暂停），避免反复点击空转
+      if (trig?.error === 'BOSS_DAILY_LIMIT') {
+        item.state = 'FAILED';
+        item.reasons = [trig?.message || 'BOSS 今日沟通上限已达'];
+        task.counters.failed += 1;
+        task.status = TASK_STATUS.STOPPED;
+        task.pauseReason = item.reasons[0];
+        task.awaitingUserRetry = false;
+        setTaskTerminalSignal(task, TASK_STATUS.STOPPED);
+        await log('warn', '[任务] ' + task.pauseReason + '（BOSS 每日沟通上限，已停止任务）', { jobId: job.jobId });
+        await publishTask(task);
+        return 'aborted';
+      }
+      item.state = /LIST_JOB_NOT_FOUND|LIST_JOB_IDENTITY_MISMATCH|NON_CHAT_JOB|找不到|不支持站内沟通/.test(String(trig?.error || '')) ? 'SKIPPED' : 'FAILED';
       item.reasons = [trig?.message || trig?.error || '列表页触发沟通失败'];
       if (item.state === 'SKIPPED') {
         task.counters.skipped += 1;
         await appendHistory({ jobId: job.jobId, title: job.title, company: job.company, status: 'skipped_list', taskId: task.id });
         return 'skipped';
+      }
+      // 环境类失败（岗位页未就绪/点击无效果/执行页异常等）：队列自动继续，不阻塞等待用户
+      if (trig?.environmental === true || isEnvironmentalFailure(trig)) {
+        resultRow.envAutoSkip = true;
+        item.reasons = [trig?.message || trig?.error || '岗位页面环境异常'];
       }
       task.counters.failed += 1;
       task.consecutiveFails += 1;
@@ -1271,8 +3843,23 @@ async function processOneJob(task, resultRow, config) {
       already: Boolean(trig.already),
       buttonText: trig.buttonText || '',
       stayed: Boolean(trig.stayed),
+      nativeGreeting: trig.nativeGreeting || null,
+      workerMode: trig.workerMode || '',
+      listPreserved: trig.listPreserved === true,
       contentVersion: trig.contentVersion || ''
     };
+    // 防重复：沟通一旦发起（含「继续沟通」已有会话），立即在幂等簿记录 job:<id>；
+    // 此后任何新任务/新预览都不会再投该岗（当前任务内的重试走检查点不受影响）。
+    // securityId 一并记录：开启 allowRepublishedJob 时，同一岗位换 securityId 视为重新发布可再投。
+    try {
+      await markIdempotent(jobIdempotencyKey(job), {
+        jobId: job.jobId || '',
+        bossId: job.bossId || '',
+        securityId: job.securityId || '',
+        phase: 'triggered',
+        trust: 'trigger-success'
+      });
+    } catch (_) {}
     resultRow.job = job;
     task.updatedAt = Date.now();
     await publishTask(task);
@@ -1283,9 +3870,11 @@ async function processOneJob(task, resultRow, config) {
       beforeKeyCount: item.beforeConversationKeys.length,
       triggerIdentity: item.triggerIdentity
     });
+
   }
 
-  // 独立消息标签页不会可靠接收列表页的新会话；每次执行/重试只在这里刷新一次。
+  // 创建会话成功回执到消息列表可见之间存在短暂传播延迟；稍等后再刷新，避免刷新得比新会话入库更早。
+  if (!resumedFromChat) await sleep(700);
   const refreshResult = await refreshMessageTabOnce(task, msgTabId, {
     jobId: job.jobId,
     resumed: resumedFromChat
@@ -1300,18 +3889,27 @@ async function processOneJob(task, resultRow, config) {
   await log('info', '[消息页] 等待并匹配会话…', { jobId: job.jobId, company: job.company, title: job.title });
   let conv = await sendToBoss(
     MSG.WAIT_OPEN_CONVERSATION || 'BHT_WAIT_OPEN_CONVERSATION',
-    { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 18000 },
+    { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 9000 },
     msgOpt
   );
   if (operationAborted(conv)) return 'aborted';
   if (!conv?.ok && conv?.error === 'CONVERSATION_NOT_FOUND') {
-    await sleep(1000);
+    await log('info', '[消息页] 首次刷新后暂未出现新会话，正在执行第二次刷新…', {
+      jobId: job.jobId,
+      company: job.company,
+      title: job.title
+    });
+    await sleep(700);
     if (runner.abort) return 'aborted';
-    await forceInjectContent(msgTabId);
+    const secondRefresh = await refreshMessageTabOnce(task, msgTabId, {
+      jobId: job.jobId,
+      resumed: false
+    });
+    if (operationAborted(secondRefresh)) return 'aborted';
     try { await chrome.tabs.update(msgTabId, { active: true }); } catch (_) {}
     conv = await sendToBoss(
       MSG.WAIT_OPEN_CONVERSATION || 'BHT_WAIT_OPEN_CONVERSATION',
-      { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 12000 },
+      { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 14000 },
       msgOpt
     );
     if (operationAborted(conv)) return 'aborted';
@@ -1459,7 +4057,7 @@ async function processOneJob(task, resultRow, config) {
   if (chatRes.detailSalary && !job.salary) job.salary = chatRes.detailSalary;
 
   item.state = 'COMMUNICATION_CREATED';
-  await bumpDailyStat('communicate', 1, normalizeText(job.company || ''));
+  await bumpDailyStat('communicate', 1, normalizeMatchText(job.company || ''));
   await log('success', '已进入沟通，开始发送消息', {
     jobId: job.jobId,
     matchedVia: chatRes?.matchedVia,
@@ -1470,7 +4068,40 @@ async function processOneJob(task, resultRow, config) {
   // messages
   const selfRes = await sendToBoss(MSG.GET_CHAT_SELF_MESSAGES, { limit: 8 }, tabOpt);
   if (operationAborted(selfRes)) return 'aborted';
-  const recentSelfMessages = selfRes?.messages || [];
+  let recentSelfMessages = selfRes?.messages || [];
+  const platformReceipt = trig?.nativeGreeting || item.triggerReceipt?.nativeGreeting || null;
+  const settingSnapshot = task.bossGreetingSnapshot?.ok ? task.bossGreetingSnapshot : null;
+  let nativeEvidence = resolveNativeGreetingEvidence({
+    platformReceipt,
+    settingSnapshot,
+    alreadyContacted: Boolean(trig?.already),
+    freshSelfMessages: []
+  });
+  if (
+    nativeEvidence.state === NATIVE_GREETING_STATES.UNKNOWN &&
+    config.settings.pluginTextEnabled !== false &&
+    !trig?.already
+  ) {
+    recentSelfMessages = await waitForFreshSelfMessages(
+      tabOpt,
+      recentSelfMessages,
+      Number(config.settings.nativeGreetingWaitMs || 2600)
+    );
+    nativeEvidence = resolveNativeGreetingEvidence({
+      platformReceipt,
+      settingSnapshot,
+      alreadyContacted: false,
+      freshSelfMessages: recentSelfMessages
+    });
+  }
+  item.nativeGreetingEvidence = nativeEvidence;
+  task.nativeGreetingEvidence = nativeEvidence;
+  await log(
+    nativeEvidence.state === NATIVE_GREETING_STATES.UNKNOWN ? 'warn' : 'info',
+    '原生招呼判断：' + nativeEvidence.state + ' via=' + nativeEvidence.source +
+      (nativeEvidence.text ? (' · ' + nativeEvidence.text.slice(0, 60)) : ''),
+    { jobId: job.jobId, nativeEvidence, platformReceipt, settingSnapshot }
+  );
   const plan = planMessageSegments({
     mode: config.settings.messageMode,
     template: config.messageTemplate,
@@ -1481,12 +4112,27 @@ async function processOneJob(task, resultRow, config) {
     },
     recentSelfMessages,
     threshold: config.settings.similarityThreshold,
-    idempotency
+    idempotency,
+    nativeGreetingState: nativeEvidence.state,
+    strictUnknown: config.settings.strictGreetingGuard !== false,
+    pluginTextEnabled: config.settings.pluginTextEnabled !== false
   });
 
+  if (plan.blocked) {
+    item.state = 'PAUSED';
+    item.reasons = ['无法确认 BOSS 是否已发送自动招呼，已暂停以避免重复。请同步 BOSS 招呼状态后重试'];
+    runner.pause = true;
+    task.status = TASK_STATUS.PAUSED;
+    task.awaitingUserRetry = true;
+    task.pauseReason = item.reasons[0];
+    task.lastErrorDetail = '岗位：' + (job.title || '') + ' @ ' + (job.company || '') + '\n判断来源：' + nativeEvidence.source;
+    await publishTask(task);
+    await log('warn', item.reasons[0], { jobId: job.jobId, nativeEvidence });
+    return 'limited';
+  }
   if (plan.nativeDetected) {
     item.state = 'NATIVE_GREETING_DETECTED';
-    await log('info', '检测到原生/已发打招呼，跳过第一段', { jobId: job.jobId });
+    await log('info', '检测到 BOSS 已发送招呼，跳过插件招呼段，仅发送补充段', { jobId: job.jobId, nativeEvidence });
   }
   if (!plan.plan?.length) {
     await log('warn', '没有待发送的消息段（可能都被跳过或模板为空），将继续尝试简历发送', { jobId: job.jobId });
@@ -1592,34 +4238,31 @@ async function processOneJob(task, resultRow, config) {
   // resume
   const profile = pickResumeProfile(job, config.resumes, config.bindings);
   const resumeImages = dedupeResumeImages(profile?.images);
-  const timing = config.settings.resumeSendTiming || 'after_text';
   const hasImages = resumeImages.length > 0;
-  const flagImage = Boolean(config.settings.autoSendImageResume);
-  // 兼容旧设置字段：现在表示点击 BOSS 聊天页「发简历」，不再上传本地附件。
-  const flagPlatformResume = Boolean(config.settings.autoSendAttachmentResume);
-  const wantAutoImage = Boolean(flagImage && hasImages);
-  const wantPlatformResume = flagPlatformResume;
-  // 仅 after_text 自动发；其余情况写清原因，避免「发了文字没发简历」困惑
-  const doResume = Boolean((wantAutoImage || wantPlatformResume) && timing === 'after_text');
+  const {
+    timing,
+    flagImage,
+    wantAutoImage,
+    doResume
+  } = planResumeSend({ settings: config.settings, hasImages });
   if (!doResume) {
     let why = '';
     if (timing !== 'after_text') why = '发送时机不是「文本发送完成后立即发送」';
-    else if (!flagImage && !flagPlatformResume) why = '未启用图片简历或 BOSS 在线简历';
-    else if (flagImage && !hasImages && !flagPlatformResume) why = '已启用图片简历，但当前方案中无图片';
+    else if (!flagImage) why = '未启用图片简历';
+    else if (!hasImages) why = '已启用图片简历，但当前方案中无图片';
     else why = '当前配置不满足自动发简历条件';
     await log('info', '本次不自动发送简历：' + why, {
       jobId: job.jobId,
       timing,
       flagImage,
-      flagPlatformResume,
       hasImages,
       profileId: profile?.id || null
     });
   } else {
-    await log('info', '将自动发送简历：' + [
-      wantAutoImage ? ('图片' + resumeImages.length + '张') : '',
-      wantPlatformResume ? 'BOSS 在线简历' : ''
-    ].filter(Boolean).join(' + '), { jobId: job.jobId, profileId: profile?.id || null });
+    await log('info', '将自动发送图片简历：' + resumeImages.length + '张', {
+      jobId: job.jobId,
+      profileId: profile?.id || null
+    });
   }
 
   if (doResume) {
@@ -1640,9 +4283,11 @@ async function processOneJob(task, resultRow, config) {
           imgRes?.receipt?.status === 'confirmed';
         if (!imageConfirmed) {
           item.state = 'FAILED';
-          item.reasons = [reasonText(REASON.EXEC_SEND_FILE_FAIL, imgRes?.message || imgRes?.error || '图片发送未确认')];
+          item.reasons = [reasonText(REASON.EXEC_SEND_IMAGE_FAIL, imgRes?.message || imgRes?.error || '图片发送未确认')];
           task.pauseReason = item.reasons[0];
           task.lastErrorDetail = '岗位：' + (job.title || '') + ' @ ' + (job.company || '') + '\n图片简历发送未确认';
+          // 图片发送失败属环境类异常（上传慢/未确认）：标记失败并自动继续下一岗，不暂停整批
+          resultRow.envAutoSkip = true;
           task.counters.failed += 1;
           task.consecutiveFails += 1;
           await bumpDailyStat('fail');
@@ -1661,46 +4306,6 @@ async function processOneJob(task, resultRow, config) {
           confirmedVia: imgRes.receipt.confirmedVia
         });
         await sleep(randomBetween(config.settings.segmentIntervalMs));
-      }
-    }
-    if (wantPlatformResume) {
-      const key = resumeIdempotencyKey(job, 'boss_online', profile?.id || 'boss_online');
-      if (!(await hasIdempotent(key))) {
-        const resumeRes = await sendToBoss(MSG.SEND_RESUME, {
-          jobId: job.jobId,
-          conversationKey: conv?.active?.key || ''
-        }, tabOpt);
-        if (operationAborted(resumeRes)) return 'aborted';
-        const resumeConfirmed =
-          resumeRes?.ok === true &&
-          resumeRes?.confirmed === true &&
-          resumeRes?.receipt?.type === 'RESUME_SENT' &&
-          resumeRes?.receipt?.status === 'confirmed';
-        if (resumeConfirmed) {
-          await markIdempotent(key, { jobId: job.jobId });
-          item.state = 'PLATFORM_RESUME_SENT';
-          item.resumeReceipt = resumeRes.receipt;
-          task.lastReceipt = resumeRes.receipt;
-          task.updatedAt = Date.now();
-          await publishTask(task);
-          await log('success', resumeRes?.already ? 'BOSS 在线简历此前已发送' : 'BOSS 在线简历发送确认', {
-            jobId: job.jobId,
-            receiptId: resumeRes.receipt.receiptId,
-            confirmedVia: resumeRes.receipt.confirmedVia
-          });
-        } else {
-          item.state = 'FAILED';
-          item.reasons = [reasonText(REASON.EXEC_SEND_FILE_FAIL, resumeRes?.message || resumeRes?.error || '')];
-          task.pauseReason = item.reasons[0];
-          task.lastErrorDetail = '岗位：' + (job.title || '') + ' @ ' + (job.company || '') + '\nBOSS 在线简历发送未确认';
-          task.counters.failed += 1;
-          task.consecutiveFails += 1;
-          await bumpDailyStat('fail');
-          await log('error', 'BOSS 在线简历发送失败：' + (resumeRes?.message || resumeRes?.error || '未确认'), {
-            jobId: job.jobId
-          });
-          return 'failed';
-        }
       }
     }
   }
@@ -1729,7 +4334,7 @@ async function processOneJob(task, resultRow, config) {
   task.counters.success += 1;
   task.consecutiveFails = 0;
   await bumpDailyStat('success');
-  await markIdempotent(jobIdempotencyKey(job), { jobId: job.jobId });
+  await markIdempotent(jobIdempotencyKey(job), { jobId: job.jobId, securityId: job.securityId || '' });
   await appendHistory({
     jobId: job.jobId,
     bossId: job.bossId,
@@ -1743,11 +4348,18 @@ async function processOneJob(task, resultRow, config) {
   return 'success';
 }
 
-async function runTaskLoop(taskId) {
+async function runTaskLoop(taskId, taskRunId = uid('run')) {
   if (runner.running) return { ok: false, error: 'ALREADY_RUNNING' };
+  if (runner.stopping || runner.abort) return { ok: false, error: 'OP_CANCELLED' };
+  if (runner.taskRunTaskId && !isTaskRunCurrent(taskId, taskRunId)) {
+    return { ok: false, error: 'STALE_TASK_RUN' };
+  }
   runner.running = true;
+  runner.taskRunId = taskRunId;
+  runner.taskRunTaskId = taskId;
   runner.abort = false;
   runner.pause = false;
+  runner.schedulePauseRequested = false;
   runner.skipCurrent = false;
   runner.pauseLogged = false;
   runner.pausePublished = false;
@@ -1759,24 +4371,31 @@ async function runTaskLoop(taskId) {
       return { ok: false, error: 'TASK_NOT_FOUND' };
     }
 
+    if (!isTaskRunCurrent(taskId, taskRunId)) return { ok: false, error: 'STALE_TASK_RUN' };
+    task.execution = { ...(task.execution || {}), taskRunId };
+    if (await pauseAtDeliveryScheduleBoundary(task, config.settings || {}, new Date())) {
+      return { ok: true, task, scheduled: true };
+    }
+
     task.status = TASK_STATUS.RUNNING;
     task.updatedAt = Date.now();
     await publishTask(task);
 
-    // 队列以预览快照为准（不是回页后再猜）
-    // 始终按 selected 重建 pending 视图，并去重
+    // 队列以预览快照为准（不是回页后再猜）。确认启动时已经按当前
+    // 选择构建了队列；刷新并继续时更要保留“当前刷新批次”，不能从
+    // 合并后的历史 results 重新把上一批岗位放回队列。
     {
-      const rebuilt = buildDeliveryQueue(task.results || [], { selectedOnly: true });
-      // 保留已完成状态
-      const prev = new Map((task.queue || []).map((q) => [String(q.jobId || '') + '|' + normalizeText(q.title || ''), q]));
-      task.queue = rebuilt.map((q) => {
-        const old = prev.get(String(q.jobId || '') + '|' + normalizeText(q.title || '')) ||
-          (task.queue || []).find((x) => x.jobId && x.jobId === q.jobId);
-        if (old && (old.status === 'done' || old.status === 'skipped' || old.status === 'failed')) {
-          return { ...q, status: old.status, outcome: old.outcome, finishedAt: old.finishedAt };
-        }
-        return q;
-      });
+      const persistedQueue = Array.isArray(task.queue) ? task.queue : null;
+      const rebuilt = persistedQueue
+        ? persistedQueue.map((q, index) => ({
+            ...q,
+            index,
+            status: ['pending', 'done', 'skipped', 'failed'].includes(q.status)
+              ? q.status
+              : 'pending'
+          }))
+        : buildDeliveryQueue(task.results || [], { selectedOnly: true });
+      task.queue = rebuilt;
       if (task.queueCursor == null) task.queueCursor = 0;
       await publishTask(task);
     }
@@ -1791,28 +4410,94 @@ async function runTaskLoop(taskId) {
           company: q.company,
           href: q.href,
           securityId: q.securityId,
+          location: q.location || '',
+          lid: q.lid || '',
           listHref: task.listHref
         }
       };
     });
     await log('info', '开始队列投递：共 ' + queue.length + ' 岗；锚点 ' + String(task.listHref || '无').slice(0, 120) + (task.listExpectLabel ? ('；求职期望 ' + String(task.listExpectLabel).slice(0, 40)) : ''));
+    if (task.listHref && /web\/geek\/jobs/.test(String(task.listHref)) && !/city=/.test(String(task.listHref))) {
+      await log('warn', '[列表页] 锚点 URL 缺少 city 参数，返回列表时可能丢失城市/筛选，投递中将持续核对左侧列表状态', {
+        href: String(task.listHref).slice(0, 160)
+      });
+    }
+    // 连续「活跃度未知」计数从本次批次开始
+    runner.consecutiveUnknownActive = 0;
 
-    for (let qi = 0; qi < queue.length; qi++) {
+    // 投递前锚点一致性预检：预览时保存的列表锚点（task.listHref）必须与当前列表页一致。
+    // 若不一致（用户切了搜索词/筛选、页面被替换或刷新成新列表），岗位集合已变化，
+    // 逐岗点卡片会读不到活跃度、连续 3 岗「未知」后被动暂停——不如在投递前就停下来，
+    // 明确提示用户「岗位列表已变化，请重新预览」。
+    if (task.listHref && task.execution?.listTabId) {
+      try {
+        const anchor = resolveBossJobListUrl({ candidate: task.listHref });
+        const fp = await getListTabFingerprint(task.execution.listTabId);
+        const same = sameJobListUrl(anchor, String(fp.url || ''));
+        if (same === false) {
+          try { await softReturnToList(task); } catch (_) {}
+          runner.pause = true;
+          task.status = TASK_STATUS.PAUSED;
+          task.awaitingUserRetry = true;
+          task.pauseReason = `岗位列表已变化（当前列表与预览时不一致，可能切换了搜索/筛选），请重新扫描预览后再投递`;
+          await log('warn', '[列表页] ' + task.pauseReason, {
+            anchor: String(anchor).slice(0, 160),
+            currentUrl: String(fp.url || '').slice(0, 160)
+          });
+          await publishTask(task);
+          return 'limited';
+        }
+        await log('info', '[列表页] 投递前锚点核对：当前列表与预览一致（岗位集合未变化）', {
+          anchor: String(anchor).slice(0, 120),
+          currentUrl: String(fp.url || '').slice(0, 120),
+          same: String(same)
+        });
+      } catch (_) {
+        // 预检失败不阻塞：逐岗核对与防级联保护仍兜底
+      }
+    }
+
+    // 列表页内容脚本版本一次性同步：扩展升级/重载后，未刷新的 BOSS 页仍运行旧版
+    // 内容脚本，投递首个关键操作会触发 sendToBoss 的「版本热更重注入」——
+    // contentInstanceId 变化会被指纹误判为「左侧页面外部变化」而偶发暂停
+    // （用户观察到的「无缘无故刷新」）。批次开始先对准版本，之后指纹全程稳定。
+    if (task.execution?.listTabId) {
+      try {
+        const pong = await chrome.tabs
+          .sendMessage(task.execution.listTabId, { type: MSG.PING, payload: {} })
+          .catch(() => null);
+        const contentVersion = String(pong?.contentVersion || '');
+        if (!pong?.ok || (BHT_RUNTIME_VERSION !== 'unknown' && contentVersion !== BHT_RUNTIME_VERSION)) {
+          await forceInjectContent(task.execution.listTabId);
+          await log('info', `[列表页] 内容脚本版本已同步（v${contentVersion || '未知'} → v${BHT_RUNTIME_VERSION}），本批次页面实例保持稳定`, {});
+        }
+      } catch (_) {
+        // 同步失败不阻塞：后续关键操作仍会按需注入，防级联保护兜底
+      }
+    }
+
+    for (let qi = 0; qi < queue.length && isTaskRunCurrent(taskId, taskRunId); qi++) {
       const row = queue[qi];
-      await waitWhilePaused();
-      if (runner.abort) break;
-
-      // refresh config each item for live setting changes
-      config = await getAllConfig();
-      task = config.task;
-      if (!task) break;
+      const boundary = await waitForRunnableQueueBoundary(taskId);
+      if (!boundary.ok) break;
+      if (!isTaskRunCurrent(taskId, taskRunId)) return { ok: false, error: 'STALE_TASK_RUN' };
+      config = boundary.config;
+      task = boundary.task;
 
       // 持久化游标：queue 状态优先（SW 重启后仍能续跑）
-      const qMeta = (task.queue || [])[qi] || (task.queue || []).find((x) => x.jobId === row.job?.jobId);
-      if (qMeta && (qMeta.status === 'done' || qMeta.status === 'skipped' || qMeta.status === 'failed' && qMeta.skipOnResume)) {
+      const qMeta = (task.queue || [])[qi] || (task.queue || []).find((x) =>
+        jobsShareMergeIdentity(x, row.job || {})
+      );
+      // "继续" means move past a failed job. The explicit retry action resets
+      // its queue entry to pending, so only that action may run it again.
+      if (qMeta && (
+        qMeta.status === 'done' ||
+        qMeta.status === 'skipped' ||
+        qMeta.status === 'failed'
+      )) {
         continue;
       }
-      const item = task.items.find((x) => x.jobId === row.job.jobId);
+      const item = task.items.find((x) => jobsShareMergeIdentity(x, row.job || {}));
       if (item && (item.state === 'COMPLETED' || item.state === 'SKIPPED')) {
         if (qMeta && qMeta.status === 'pending') {
           qMeta.status = item.state === 'COMPLETED' ? 'done' : 'skipped';
@@ -1833,7 +4518,13 @@ async function runTaskLoop(taskId) {
 
       // assertBossContext before process
       {
-        const guard = await assertBossContext();
+        let guard = await assertBossContext();
+        if (!guard.ok && task.execution?.listTabId) {
+          try {
+            const listTab = await chrome.tabs.get(task.execution.listTabId);
+            if (isBossTab(listTab)) guard = { ok: true, tab: listTab };
+          } catch (_) {}
+        }
         if (!guard.ok) {
           runner.pause = true;
           task.status = TASK_STATUS.PAUSED;
@@ -1843,6 +4534,11 @@ async function runTaskLoop(taskId) {
           break;
         }
       }
+
+      // 页面检查可能跨过时间窗边界；在当前岗位产生副作用前再检查一次。
+      config = await getAllConfig();
+      task = config.task;
+      if (!task || await pauseAtDeliveryScheduleBoundary(task, config.settings || {}, new Date())) break;
       let outcome = await processOneJob(task, row, config);
       // processOneJob 会更新 item/reasons/counters；必须先持久化再重新读取配置，
       // 否则失败计数和具体原因会被旧 storage 快照覆盖成 0/空。
@@ -1862,8 +4558,15 @@ async function runTaskLoop(taskId) {
         if (task?.queue) {
           const q = task.queue.find((x) => x.jobId === row.job?.jobId);
           if (q) {
-            q.status = outcome === 'success' ? 'done' : outcome === 'skipped' ? 'skipped' : 'failed';
-            q.finishedAt = Date.now();
+            q.status = outcome === 'success'
+              ? 'done'
+              : outcome === 'skipped'
+                ? 'skipped'
+                : outcome === 'limited' || outcome === 'aborted'
+                  ? 'pending'
+                  : 'failed';
+            if (q.status === 'pending') delete q.finishedAt;
+            else q.finishedAt = Date.now();
             q.outcome = outcome;
           }
           // 一份一份投：成功/跳过/失败都记入已投，避免下一轮又点回同一岗
@@ -1872,15 +4575,112 @@ async function runTaskLoop(taskId) {
             const prev = Array.isArray(task.testedJobIds) ? task.testedJobIds.map(String) : [];
             if (!prev.includes(id)) task.testedJobIds = [...prev, id];
           }
+          // 跳过（HR 活跃不满足等）证明队列健康：打断连续失败计数，失败与跳过穿插时不再误熔断
+          if (outcome === 'skipped') task.consecutiveFails = 0;
           await publishTask(task);
         }
         await log('info', '队列项结果：' + (row.job?.title || '') + ' → ' + outcome + '（' + (qi + 1) + '/' + queue.length + '）', { jobId: row.job?.jobId });
       } catch (_) {}
 
+      // 投递一份：跳过（含 HR 活跃不满足）不算投递，自动顺延下一个待投；遇到满足的投递成功即停
+      if (task.testDelivery && outcome === 'skipped') {
+        const nextPick = pickNextTestDeliveryJob({
+          results: task.results || [],
+          items: task.items || [],
+          queue: task.queue || [],
+          extraDoneIds: task.testedJobIds || []
+        });
+        if (nextPick.ok && nextPick.pick?.job?.jobId) {
+          const nextId = String(nextPick.pick.job.jobId);
+          task.queue = [...(task.queue || [])];
+          if (!task.queue.some((x) => String(x.jobId || '') === nextId)) {
+            task.queue.push({
+              index: task.queue.length,
+              jobId: nextId,
+              title: nextPick.pick.job.title || '',
+              company: nextPick.pick.job.company || '',
+              location: nextPick.pick.job.location || '',
+              lid: nextPick.pick.job.lid || '',
+              href: nextPick.pick.job.href || '',
+              securityId: nextPick.pick.job.securityId || '',
+              status: 'pending'
+            });
+          }
+          queue.push({
+            decision: 'pass',
+            selected: true,
+            job: {
+              jobId: nextId,
+              title: nextPick.pick.job.title || '',
+              company: nextPick.pick.job.company || '',
+              location: nextPick.pick.job.location || '',
+              lid: nextPick.pick.job.lid || '',
+              href: nextPick.pick.job.href || '',
+              securityId: nextPick.pick.job.securityId || '',
+              listHref: task.listHref
+            }
+          });
+          await publishTask(task);
+          await log('info', `[投递一份] 已跳过（不计入投递），顺延下一岗「${nextPick.pick.job.title || ''}」@ ${nextPick.pick.job.company || ''}`, { jobId: nextId });
+          continue;
+        }
+      }
+      if (task.testDelivery && outcome === 'success') {
+        // A single-delivery run exits before the normal batch accounting path;
+        // count the completed job before breaking so success and processed stay consistent.
+        task.counters.processed += 1;
+        task.updatedAt = Date.now();
+        await publishTask(task);
+        break;
+      }
+
       // 失败后等待用户：关闭=保持暂停不自动继续；重试=重置当前岗位后再跑一次
       while (outcome === 'failed') {
         if (runner.abort) {
           outcome = 'aborted';
+          break;
+        }
+        // 环境类失败（页面加载/触发/图片/首段发送等基础设施问题）：自动继续下一岗，
+        // 只连续达到阈值才暂停，避免单个慢页面卡住整批并反复暂停等待用户。
+        if (row?.envAutoSkip === true) {
+          delete row.envAutoSkip;
+          // 图片/首段发送类环境失败可能仍在会话页：先回列表再继续，避免下一岗状态错乱
+          try { await softReturnToList(task); } catch (_) {}
+          const threshold = Math.max(1, Number(config?.settings?.consecutiveFailPause || 3));
+          if (task.consecutiveFails >= threshold) {
+            task.status = TASK_STATUS.PAUSED;
+            task.pauseReason = reasonText(REASON.EXEC_CONSECUTIVE_FAIL);
+            task.awaitingUserRetry = true;
+            task.uiErrorDismissed = false;
+            task.retryCurrent = false;
+            task.errorKey = [task.id || '', row.job?.jobId || '', task.pauseReason || ''].join('|');
+            task.lastErrorDetail = ['岗位：' + (row.job?.title || ''), '公司：' + (row.job?.company || ''), '原因：' + ((task.items.find((x) => x.jobId === row.job.jobId) || {}).reasons || []).join('；')].filter(Boolean).join('\n');
+            runner.pause = true;
+            await publishTask(task);
+            if (!runner.pauseLogged) { runner.pauseLogged = true; await log('error', task.pauseReason); }
+            await waitWhilePaused();
+            if (runner.abort) {
+              outcome = 'aborted';
+              break;
+            }
+            config = await getAllConfig();
+            task = config.task;
+            if (!task) break;
+            task.status = TASK_STATUS.RUNNING;
+            task.pauseReason = '';
+            task.awaitingUserRetry = false;
+            task.consecutiveFails = 0;
+            task.retryCurrent = false;
+            await publishTask(task);
+            break;
+          }
+          task.awaitingUserRetry = false;
+          task.status = TASK_STATUS.RUNNING;
+          task.pauseReason = '';
+          await log('warn', `[自动跳过] 岗位页面环境异常，已自动继续（连续失败 ${task.consecutiveFails}/${threshold} 次，达到 ${threshold} 次将暂停）：` + (itemErrorHint(task, row) || '页面未就绪'), {
+            jobId: row.job?.jobId || ''
+          });
+          await publishTask(task);
           break;
         }
         // 回列表，避免卡在会话页
@@ -1909,6 +4709,10 @@ async function runTaskLoop(taskId) {
         config = await getAllConfig();
         task = config.task;
         if (!task) break;
+        // 唤醒即恢复运行状态：RESUME_TASK 的 RUNNING 写入可能与循环的旧快照发布竞态，
+        // 若循环带着 paused 状态继续发布，面板会一直显示「已暂停」（后台实际仍在投递）。
+        task.status = TASK_STATUS.RUNNING;
+        task.pauseReason = '';
         const it = task.items?.find((x) => x.jobId === row.job.jobId);
         if (it && it.state === 'NOT_STARTED' && task.retryCurrent === true) {
           // 用户点了重试：再试当前岗位
@@ -1935,14 +4739,24 @@ async function runTaskLoop(taskId) {
         break;
       }
 
+      if (task.targetMode === true && isTargetDeliveryReached(task)) {
+        task.counters.processed += 1;
+        task.updatedAt = Date.now();
+        await publishTask(task);
+        await log('success', `[目标模式] 本岗位完成后已达到目标：成功 ${task.counters?.success || 0}/${task.targetCount}`, {
+          taskId: task.id,
+          jobId: row.job?.jobId || ''
+        });
+        break;
+      }
+      if (outcome === 'limited') break;
+      if (outcome === 'aborted') break;
+
       // 双页模式：工作页直接打开下一岗 href，正常路径不再 RETURN_TO_LIST
       // （失败暂停时 while 里仍会尝试回列表，便于用户操作）
       task.counters.processed += 1;
       task.updatedAt = Date.now();
       await publishTask(task);
-
-      if (outcome === 'limited') break;
-      if (outcome === 'aborted') break;
 
       if (task.consecutiveFails >= (config.settings.consecutiveFailPause || 3)) {
         task.status = TASK_STATUS.PAUSED;
@@ -1953,18 +4767,33 @@ async function runTaskLoop(taskId) {
         break;
       }
 
-      // minJobInterval guard
-      {
-        let iv = config.settings.jobIntervalMs || [3500, 6000];
-        if (Array.isArray(iv) && iv[0] < 2500) iv = [3500, 6000];
-        await sleep(randomBetween(iv));
+      // 当前岗位已处理完；若期间越过时间窗，立即暂停，不再等待普通投递间隔。
+      config = await getAllConfig();
+      task = config.task || task;
+      if (await pauseAtDeliveryScheduleBoundary(task, config.settings || {}, new Date())) break;
+
+      // minJobInterval guard：未触发沟通的跳过（HR活跃/去重/环境异常等）不算投递，
+      // 不等待投递间隔直接继续；已触发「立即沟通」的跳过（如会话未确认
+      // conversation_not_found）仍保留间隔，避免对 BOSS 连续触发；
+      // 等待前把间隔写入日志；批次最后一岗不再等待。
+      if (qi >= queue.length - 1) {
+        // 最后一项：批次结束
+      } else if (outcome === 'skipped' && !hasChatCheckpoint(item)) {
+        await log('info', '[队列] 跳过（未投递），无需等待投递间隔，继续下一岗…');
+      } else {
+        let iv = config.settings.jobIntervalMs || [4000, 6000];
+        if (Array.isArray(iv) && iv[0] < 1000) iv = [4000, 6000];
+        const waitMs = randomBetween(iv);
+        await log('info', `[队列] 等待投递间隔 ${Math.max(1, Math.round(waitMs / 1000))} 秒后继续下一岗…`);
+        await waitDeliveryInterval(task, waitMs);
       }
     }
 
+    if (!isTaskRunCurrent(taskId, taskRunId)) return { ok: false, error: 'STALE_TASK_RUN' };
     config = await getAllConfig();
     task = config.task;
     if (task) {
-      if (runner.abort) {
+      if (runner.abort || task.status === TASK_STATUS.STOPPED) {
         task.status = TASK_STATUS.STOPPED;
         setTaskTerminalSignal(task, TASK_STATUS.STOPPED);
         await log('warn', taskSummaryText(task, TASK_STATUS.STOPPED));
@@ -2005,48 +4834,142 @@ async function runTaskLoop(taskId) {
     await debugLog('background.task', 'runner_exception', { taskId, error: serializeError(err) }, 'error');
     await log('error', `任务异常：${err?.message || err}`, { error: serializeError(err) });
     const config = await getAllConfig();
-    if (config.task) {
+    if (config.task?.id === taskId && config.task?.execution?.taskRunId === taskRunId && isTaskRunCurrent(taskId, taskRunId)) {
       config.task.status = TASK_STATUS.FAILED;
       config.task.updatedAt = Date.now();
       await publishTask(config.task);
     }
     return { ok: false, error: String(err?.message || err) };
   } finally {
-    runner.running = false;
+    try {
+      const all = await getAllConfig();
+      if (all.task?.id === taskId && all.task?.execution?.taskRunId === taskRunId && all.task?.execution?.workerTabId) {
+        await closeConversationWorkerTab(all.task, all.task.execution.workerTabId, {
+          reason: '任务循环结束，清理遗留沟通执行页'
+        });
+      }
+    } catch (_) {}
+    if (isTaskRunCurrent(taskId, taskRunId)) {
+      runner.running = false;
+      runner.schedulePauseRequested = false;
+    }
   }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  const { type, payload } = message || {};
+  const { type } = message || {};
+  const clientVersion = String(message?.clientVersion || '');
+  let { payload } = message || {};
   (async () => {
+    if (VERSION_GUARDED_MESSAGES.has(type) && clientVersion !== BHT_RUNTIME_VERSION) {
+      return {
+        ok: false,
+        error: 'EXTENSION_VERSION_MISMATCH',
+        message: `扩展界面与后台版本不一致（界面 ${clientVersion || '未知'} / 后台 ${BHT_RUNTIME_VERSION}）。请在扩展管理页重新加载扩展，再刷新 BOSS 页面`,
+        runtimeVersion: BHT_RUNTIME_VERSION,
+        clientVersion
+      };
+    }
     switch (type) {
+      case MSG.GET_BOSS_GREETING: {
+        const guard = await assertBossContext(sender);
+        if (!guard.ok) return guard;
+        return await sendToBoss(MSG.GET_BOSS_GREETING, {}, { tabId: guard.tab.id });
+      }
+      case MSG.SET_BOSS_GREETING: {
+        const guard = await assertBossContext(sender);
+        if (!guard.ok) return guard;
+        const result = await sendToBoss(MSG.SET_BOSS_GREETING, payload || {}, { tabId: guard.tab.id });
+        await log(result?.ok ? 'success' : 'error', result?.ok
+          ? ('BOSS 自动招呼已' + (result.enabled ? '开启' : '关闭') + '并完成回验')
+          : (result?.message || '修改 BOSS 自动招呼失败'));
+        if (result?.ok) {
+          const all = await getAllConfig();
+          if (all.task) {
+            all.task.bossGreetingSnapshot = {
+              ok: true,
+              enabled: result.enabled === true,
+              status: result.enabled ? 'on' : 'off',
+              templateId: result.templateId || '',
+              text: result.text || '',
+              syncedAt: result.syncedAt || Date.now(),
+              source: result.source || 'boss-api'
+            };
+            await publishTask(all.task);
+          }
+        }
+        return result;
+      }
+      case MSG.SAVE_BOSS_GREETING_TEXT: {
+        const guard = await assertBossContext(sender);
+        if (!guard.ok) return guard;
+        const result = await sendToBoss(MSG.SAVE_BOSS_GREETING_TEXT, payload || {}, { tabId: guard.tab.id });
+        await log(result?.ok ? 'success' : 'error', result?.ok
+          ? 'BOSS 自动招呼话术已保存并完成回验'
+          : (result?.message || '保存 BOSS 自动招呼话术失败'));
+        if (result?.ok) {
+          const all = await getAllConfig();
+          if (all.task) {
+            all.task.bossGreetingSnapshot = {
+              ok: true,
+              enabled: result.enabled === true,
+              status: result.enabled ? 'on' : 'off',
+              templateId: result.templateId || '',
+              text: result.text || '',
+              syncedAt: result.syncedAt || Date.now(),
+              source: result.source || 'boss-api'
+            };
+            await publishTask(all.task);
+          }
+        }
+        return result;
+      }
+      case MSG.OPEN_BOSS_GREETING_SETTINGS: {
+        const contextTab = await getActiveBossTab({ allowInactiveBossTab: true, sender });
+        const tab = await chrome.tabs.create({
+          url: 'https://www.zhipin.com/web/geek/notify-set?type=greetSet',
+          active: true,
+          ...(contextTab?.windowId != null ? { windowId: contextTab.windowId } : {})
+        });
+        return { ok: true, tabId: tab?.id || null, url: tab?.url || '' };
+      }
       case MSG.GET_STATE: {
         const all = await getAllConfig();
-        const tab = await getActiveBossTab();
+        const tab = await getActiveBossTab({ sender });
         return {
           ok: true,
           ...all,
           activeTab: tab ? { id: tab.id, url: tab.url, title: tab.title } : null,
           activeIsBoss: Boolean(tab),
+          senderTab: sender?.tab ? { id: sender.tab.id, url: sender.tab.url || '' } : null,
           bossOnly: true,
-          runner: {
-            running: runner.running && !runner.abort,
-            starting: runner.starting,
-            previewing: runner.previewing,
-            pause: runner.pause && !runner.abort,
-            stopping: runner.running && runner.abort,
-            activeOperations: operations.size
-          }
+          runtimeVersion: BHT_RUNTIME_VERSION,
+          runner: runnerSnapshot()
         };
       }
-      case MSG.SAVE_SETTINGS:
+      case MSG.GET_RUNNER_STATE:
+        return {
+          ok: true,
+          runtimeVersion: BHT_RUNTIME_VERSION,
+          now: Date.now(),
+          runner: runnerSnapshot()
+        };
+      case MSG.SAVE_SETTINGS: {
         await saveSettings(payload);
-        await syncDebugLoggingSetting(payload);
+        // SAVE_SETTINGS accepts a partial patch. Resolve the persisted full
+        // settings before updating in-memory diagnostics and the schedule
+        // alarm, otherwise saving an unrelated field clears the alarm.
+        const savedSettings = (await getAllConfig()).settings || {};
+        await syncDebugLoggingSetting(savedSettings);
+        await configureDeliveryScheduleAlarm(savedSettings);
+        await enforceDeliverySchedule('settings_changed');
         await debugLog('background.settings', 'saved', {
           debugLoggingEnabled,
-          splitViewEnabled: payload?.splitViewEnabled !== false
+          splitViewEnabled: savedSettings.splitViewEnabled !== false,
+          scheduledDeliveryEnabled: savedSettings.scheduledDeliveryEnabled === true
         });
         return { ok: true };
+      }
       case MSG.SAVE_FILTERS:
         await saveFilters(payload);
         return { ok: true };
@@ -2063,20 +4986,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await saveBindings(payload);
         return { ok: true };
       case MSG.RUN_PREVIEW: {
-        return await withRunnerAdmission('previewing', async () => {
-          const guard = await assertBossContext();
+      return await withRunnerAdmission('previewing', async (previewRunId) => {
+          const guard = await assertBossContext(sender);
           if (!guard.ok) {
             await log("warn", guard.message);
             return guard;
           }
-          return await runPreview(payload || {});
+          return await runPreview(payload || {}, guard.tab, previewRunId);
+        });
+      }
+      case MSG.REFRESH_AND_CONTINUE: {
+        return await withRunnerAdmission('previewing', async (previewRunId) => {
+          const guard = await assertBossContext(sender);
+          if (!guard.ok) {
+            await log('warn', guard.message);
+            return guard;
+          }
+          return await refreshAndContinue(payload || {}, guard.tab, previewRunId);
         });
       }
       case MSG.CONFIRM_AND_START: {
         return await withRunnerAdmission('starting', async () => {
         // CONFIRM_AND_START guard
         {
-          const guard = await assertBossContext();
+          const guard = await assertBossContext(sender);
           if (!guard.ok) {
             await log("warn", guard.message);
             return guard;
@@ -2087,6 +5020,54 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!task) return { ok: false, error: 'NO_TASK' };
         if (!(task.results || []).length) {
           return { ok: false, error: 'NO_PREVIEW', message: '请先扫描预览，再批量投递' };
+        }
+
+        const targetMode = payload?.targetMode === true;
+        const requestedTargetCount = Number(payload?.targetCount);
+        const targetCount = Number.isFinite(requestedTargetCount)
+          ? Math.max(1, Math.min(500, Math.floor(requestedTargetCount)))
+          : 0;
+        const targetNoNewRetryLimit = normalizeTargetNoNewRetryLimit(
+          payload?.targetNoNewRetryLimit,
+          all.settings?.targetNoNewRetryLimit
+        );
+        if (targetMode && !targetCount) {
+          return { ok: false, error: 'TARGET_COUNT_INVALID', message: '目标模式需要设置 1-500 份成功投递目标' };
+        }
+        if (targetMode && !isRefreshableJobSourceContext(task.sourceContext)) {
+          return { ok: false, error: 'JOB_SOURCE_NOT_RESTORABLE', message: '目标模式需要先扫描一批带有效求职期望来源的岗位' };
+        }
+        task.targetMode = targetMode;
+        task.targetCount = targetMode ? targetCount : 0;
+        task.targetNoNewRetryLimit = targetMode ? targetNoNewRetryLimit : 0;
+        task.targetNoNewRounds = 0;
+        task.targetLastError = '';
+        if (targetMode && isTargetDeliveryReached(task)) {
+          task.status = TASK_STATUS.COMPLETED;
+          task.pauseReason = '';
+          task.awaitingUserRetry = false;
+          task.updatedAt = Date.now();
+          setTaskTerminalSignal(task, TASK_STATUS.COMPLETED);
+          await publishTask(task);
+          await log('info', `[目标模式] 目标已达到，忽略重复启动：成功 ${task.counters?.success || 0}/${targetCount}`, {
+            taskId: task.id,
+            targetCount
+          });
+          return {
+            ok: true,
+            alreadyCompleted: true,
+            taskId: task.id,
+            task,
+            targetMode: true,
+            targetCount
+          };
+        }
+        if (targetMode && !task.targetStartedAt) task.targetStartedAt = Date.now();
+        if (!targetMode) {
+          delete task.targetStartedAt;
+          delete task.targetRefreshCount;
+          delete task.targetNoNewRetryLimit;
+          delete task.targetNoNewRounds;
         }
 
         // 单份投完后 status 可能是 completed/stopped：允许直接进入批量
@@ -2103,7 +5084,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             .filter((r) => r?.decision === 'pass' && r?.job?.jobId && !doneIds.has(String(r.job.jobId)))
             .map((r) => String(r.job.jobId));
         }
-        if (!selectedIds.length) {
+        if (!selectedIds.length && !targetMode) {
           return {
             ok: false,
             error: 'NO_PENDING',
@@ -2141,6 +5122,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               jobId: id,
               company: row?.job?.company || '',
               title: row?.job?.title || '',
+              location: row?.job?.location || '',
+              lid: row?.job?.lid || '',
+              securityId: row?.job?.securityId || '',
               state: 'NOT_STARTED',
               reasons: [],
               selected: true
@@ -2176,9 +5160,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         task.uiErrorDismissed = false;
         task.retryCurrent = false;
         task.consecutiveFails = 0;
-        task.status = TASK_STATUS.RUNNING;
-        const split = await prepareSplitWorkspace(task, all.settings || {});
+        runner.taskRunTaskId = task.id;
+        task.execution = { ...(task.execution || {}), taskRunId: runner.taskRunId };
+        const scheduledStart = stageTaskForDeliverySchedule(task, all.settings || {}, new Date());
+        const split = scheduledStart.waiting
+          ? { ok: false, skipped: true, reason: 'waiting_for_schedule' }
+          : await prepareSplitWorkspace(task, all.settings || {});
         await publishTask(task);
+        if (runner.abort || task.status === TASK_STATUS.STOPPED) {
+          return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，未开始投递' };
+        }
         if (split.ok) {
           await log('success', '[分屏] 职位列表在左侧，消息中心在右侧', {
             listTabId: split.listTabId,
@@ -2187,20 +5178,51 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } else if (!split.skipped) {
           await log('warn', '[分屏] ' + (split.message || '自动分屏不可用，已回退为普通标签页'));
         }
-        await log('info', '批量投递启动：待投 ' + selectedIds.length + ' 岗（已跳过已完成 ' + doneIds.size + '）');
-        // async loop
-        runTaskLoop(task.id);
-        return { ok: true, taskId: task.id, splitView: split, pending: selectedIds.length };
+        if (scheduledStart.waiting) {
+          await log('info', task.pauseReason + '；待投 ' + selectedIds.length + ' 岗', {
+            taskId: task.id,
+            nextStartAt: task.scheduleNextStartAt
+          });
+        } else {
+          await log('info', '批量投递启动：待投 ' + selectedIds.length + ' 岗（已跳过已完成 ' + doneIds.size + '）');
+          // async loop
+          if (runner.abort || task.status === TASK_STATUS.STOPPED) {
+            return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，未开始投递' };
+          }
+          if (targetMode) runTargetDeliveryLoop(task.id, runner.taskRunId);
+          else runTaskLoop(task.id, runner.taskRunId);
+        }
+        return {
+          ok: true,
+          taskId: task.id,
+          splitView: split,
+          pending: selectedIds.length,
+          scheduled: scheduledStart.waiting,
+          nextStartAt: task.scheduleNextStartAt || null,
+          targetMode,
+          targetCount: targetMode ? targetCount : 0,
+          targetNoNewRetryLimit: targetMode ? targetNoNewRetryLimit : 0
+        };
         });
       }
       case MSG.RUN_TEST_DELIVERY:
       case 'BHT_RUN_TEST_DELIVERY': {
         return await withRunnerAdmission('starting', async () => {
         {
-          const guard = await assertBossContext();
+          await log('info', '[投递一份] 收到启动请求', {
+            senderTab: sender?.tab ? { id: sender.tab.id, url: sender.tab.url || '' } : null
+          });
+          const guard = await assertBossContext(sender);
           if (!guard.ok) {
             await log('warn', guard.message);
             return guard;
+          }
+          if (guard.tab?.id) {
+            payload = {
+              ...(payload || {}),
+              listTabId: guard.tab.id,
+              listWindowId: guard.tab.windowId
+            };
           }
         }
         const all = await getAllConfig();
@@ -2255,6 +5277,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 jobId: onlyId,
                 company: pick.job?.company || '',
                 title: pick.job?.title || '',
+                location: pick.job?.location || '',
+                lid: pick.job?.lid || '',
+                securityId: pick.job?.securityId || '',
                 state: 'NOT_STARTED',
                 reasons: [],
                 selected: true
@@ -2268,6 +5293,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               jobId: pick.job.jobId,
               title: pick.job.title,
               company: pick.job.company,
+              location: pick.job.location || '',
+              lid: pick.job.lid || '',
               href: pick.job.href || '',
               securityId: pick.job.securityId || '',
               status: 'pending'
@@ -2280,14 +5307,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           task.completionSignal = null;
         }
 
+        if (payload?.listTabId) {
+          task.execution = {
+            ...(task.execution || {}),
+            listTabId: payload.listTabId,
+            listWindowId: payload.listWindowId || task.execution?.listWindowId || null
+          };
+        }
         task.testDelivery = true;
         task.testJobId = onlyId;
         task.testedJobIds = Array.from(new Set([...(task.testedJobIds || []).map(String), ...extraForPick]));
-        task.status = TASK_STATUS.RUNNING;
         task.pauseReason = '';
         task.awaitingUserRetry = false;
-        const split = await prepareSplitWorkspace(task, all.settings || {});
+        runner.taskRunTaskId = task.id;
+        task.execution = { ...(task.execution || {}), taskRunId: runner.taskRunId };
+        const scheduledStart = stageTaskForDeliverySchedule(task, all.settings || {}, new Date());
+        const split = scheduledStart.waiting
+          ? { ok: false, skipped: true, reason: 'waiting_for_schedule' }
+          : await prepareSplitWorkspace(task, all.settings || {});
         await publishTask(task);
+        if (runner.abort || task.status === TASK_STATUS.STOPPED) {
+          return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，未开始投递' };
+        }
         if (split.ok) {
           await log('success', '[分屏] 投递一份已打开左右工作区', {
             listTabId: split.listTabId,
@@ -2296,33 +5337,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } else if (!split.skipped) {
           await log('warn', '[分屏] ' + (split.message || '自动分屏不可用，已回退为普通标签页'));
         }
-        await log(
-          'info',
-          '投递一份启动：本轮只投 1 岗「' +
-            (pick.job?.title || '') +
-            '」@ ' +
-            (pick.job?.company || '') +
-            '；剩余未投 ' +
-            remain +
-            ' 岗（再点将自动投下一个）',
-          { jobId: onlyId, remain }
-        );
-        runTaskLoop(task.id);
+        await log('info', scheduledStart.waiting
+          ? task.pauseReason + '；已排队「' + (pick.job?.title || '') + '」'
+          : '投递一份启动：本轮只投 1 岗「' +
+              (pick.job?.title || '') +
+              '」@ ' +
+              (pick.job?.company || '') +
+              '；剩余未投 ' +
+              remain +
+              ' 岗（活跃度不满足将自动顺延，投成功 1 岗后停止）',
+        { jobId: onlyId, remain, nextStartAt: task.scheduleNextStartAt || null });
+        if (!scheduledStart.waiting) {
+          if (runner.abort || task.status === TASK_STATUS.STOPPED) {
+            return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，未开始投递' };
+          }
+          runTaskLoop(task.id, runner.taskRunId);
+        }
         return {
           ok: true,
           testJobId: onlyId,
           job: pick.job,
           remain,
-          splitView: split
+          splitView: split,
+          scheduled: scheduledStart.waiting,
+          nextStartAt: task.scheduleNextStartAt || null
         };
         });
       }
 
       case MSG.PAUSE_TASK:
         runner.pause = true;
+        runner.schedulePauseRequested = false;
         {
           const all = await getAllConfig();
           if (all.task) {
+            clearDeliverySchedulePause(all.task);
+            all.task.pauseSource = 'user';
             all.task.status = TASK_STATUS.PAUSED;
             all.task.pauseReason = reasonText(REASON.EXEC_USER_PAUSE);
             await publishTask(all.task);
@@ -2331,9 +5381,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await log('warn', '用户暂停任务');
         return { ok: true };
       case MSG.RESUME_TASK: {
+        if (runner.stopping || runner.abort) {
+          return { ok: false, error: 'OP_CANCELLED', message: '任务正在停止，请稍后重试' };
+        }
         {
           const all0 = await getAllConfig();
-          if (all0.task) {
+          if (all0.task && all0.task.status !== TASK_STATUS.STOPPED) {
             all0.task.awaitingUserRetry = false;
             // payload.retry === true 表示弹窗「重试」：只重置当前失败岗位
             const wantRetry = Boolean(payload?.retry);
@@ -2401,29 +5454,168 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           runner.pausePublished = false;
         }
         {
-          const guard = await assertBossContext();
+          const guard = await assertBossContext(sender);
           if (!guard.ok) {
             await log("warn", guard.message);
             return guard;
           }
         }
-        runner.pause = false;
-        runner.abort = false;
         const all = await getAllConfig();
         if (!all.task) return { ok: false, error: 'NO_TASK' };
+        if (all.task.status === TASK_STATUS.STOPPED) {
+          return { ok: false, error: 'TASK_STOPPED', message: '任务已停止，请重新扫描或重新启动投递' };
+        }
+        const resumeOwnsLoop = !runner.running;
+        const resumeTaskRunId = resumeOwnsLoop
+          ? uid('run')
+          : String(all.task.execution?.taskRunId || runner.taskRunId || '');
+        // 先把状态写回 RUNNING 再释放暂停：循环唤醒后读到的才是新状态，
+        // 避免循环用旧 paused 快照发布导致面板一直显示「已暂停」。
+        const scheduledResume = stageTaskForDeliverySchedule(all.task, all.settings || {}, new Date());
+        if (scheduledResume.waiting) {
+          runner.pause = true;
+          const published = await publishTask(all.task);
+          if (!published || runner.stopping || runner.abort || all.task.status === TASK_STATUS.STOPPED) {
+            return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，恢复操作已取消' };
+          }
+          await log('info', all.task.pauseReason, {
+            taskId: all.task.id,
+            nextStartAt: all.task.scheduleNextStartAt
+          });
+          return {
+            ok: true,
+            scheduled: true,
+            nextStartAt: all.task.scheduleNextStartAt || null,
+            message: all.task.pauseReason
+          };
+        }
+        if (runner.stopping || runner.abort) {
+          return { ok: false, error: 'OP_CANCELLED', message: '任务正在停止，恢复操作已取消' };
+        }
+        if (resumeOwnsLoop) {
+          runner.taskRunId = resumeTaskRunId;
+          runner.taskRunTaskId = all.task.id;
+          all.task.execution = { ...(all.task.execution || {}), taskRunId: resumeTaskRunId };
+        }
         all.task.status = TASK_STATUS.RUNNING;
-        await publishTask(all.task);
-        if (!runner.running) runTaskLoop(all.task.id);
+        all.task.pauseReason = '';
+        // Clear the old pause generation before the write. A STOP_TASK arriving
+        // during publish must be able to set abort=true and keep it set; doing
+        // this after the await would let a late RESUME undo the stop request.
+        runner.abort = false;
+        const published = await publishTask(all.task);
+        if (!published || runner.stopping || runner.abort || all.task.status === TASK_STATUS.STOPPED) {
+          return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，恢复操作已取消' };
+        }
+        runner.pause = false;
+        if (resumeOwnsLoop) {
+          if (all.task.targetMode === true) runTargetDeliveryLoop(all.task.id, resumeTaskRunId);
+          else runTaskLoop(all.task.id, resumeTaskRunId);
+        }
         await log('info', payload?.retry ? '重试当前岗位' : '继续任务');
         return { ok: true };
       }
-      case MSG.STOP_TASK:
+      case MSG.STOP_TASK: {
+        runner.stopping = true;
+        const stopTaskId = String(runner.taskRunTaskId || '');
+        const stopTaskRunId = String(runner.taskRunId || '');
+        try {
+        if (runner.previewing && !runner.running && !runner.targetLoop) {
+          const cancelledPreviewRunId = runner.previewRunId;
+          const previousPreviewTask = runner.previewPreviousTask;
+          const previewRunPromise = activePreviewRun?.id === cancelledPreviewRunId
+            ? activePreviewRun.promise
+            : null;
+          // 先使本轮 generation 失效，但在清理完成前保持门禁占用，
+          // 防止新扫描读取到尚未回滚的预览任务快照。
+          runner.previewRunId = '';
+          runner.previewPhase = 'cancelling';
+          await cancelActiveOperations('用户取消扫描预览');
+          // Wait for the invalidated run to finish its publish/rollback and
+          // close its worker before releasing admission to a new preview.
+          if (previewRunPromise) {
+            try { await previewRunPromise; } catch (_) {}
+          }
+          await discardCancelledPreviewTask(cancelledPreviewRunId, previousPreviewTask);
+          runner.previewing = false;
+          runner.previewStartedAt = 0;
+          runner.previewScanStartedAt = 0;
+          runner.previewScanFinishedAt = 0;
+          runner.previewPhase = '';
+          runner.previewScanned = 0;
+          runner.previewPass = 0;
+          runner.previewPreviousTask = null;
+          const all = await getAllConfig();
+          await log('warn', '用户已取消扫描预览');
+          return { ok: true, previewCancelled: true, task: all.task || null };
+        }
+        if (runner.previewing && !runner.running && runner.targetLoop) {
+          const cancelledPreviewRunId = runner.previewRunId;
+          const previousPreviewTask = runner.previewPreviousTask;
+          const previewRunPromise = activePreviewRun?.id === cancelledPreviewRunId
+            ? activePreviewRun.promise
+            : null;
+          runner.abort = true;
+          runner.pause = false;
+          runner.previewRunId = '';
+          runner.previewPhase = 'cancelling';
+          await cancelActiveOperations('用户停止目标模式刷新');
+          if (previewRunPromise) {
+            try { await previewRunPromise; } catch (_) {}
+          }
+          await discardCancelledPreviewTask(cancelledPreviewRunId, previousPreviewTask);
+          runner.previewing = false;
+          runner.previewStartedAt = 0;
+          runner.previewScanStartedAt = 0;
+          runner.previewScanFinishedAt = 0;
+          runner.previewPhase = '';
+          runner.previewScanned = 0;
+          runner.previewPass = 0;
+          runner.previewPreviousTask = null;
+          const all = await getAllConfig();
+          if (all.task && !taskMatchesStopRequest(all.task, stopTaskId, stopTaskRunId)) {
+            await debugLog('background.task', 'stale_stop_ignored', {
+              taskId: all.task.id || null,
+              taskRunId: all.task.execution?.taskRunId || '',
+              requestedTaskId: stopTaskId || null,
+              requestedTaskRunId: stopTaskRunId || null
+            }, 'warn');
+            return { ok: true, task: all.task, ignored: true };
+          }
+          if (all.task) {
+            all.task.status = TASK_STATUS.STOPPED;
+            all.task.pauseReason = all.task.targetLastError || '用户停止目标模式';
+            all.task.awaitingUserRetry = false;
+            all.task.updatedAt = Date.now();
+            setTaskTerminalSignal(all.task, TASK_STATUS.STOPPED);
+            await publishTask(all.task);
+            await log('warn', taskSummaryText(all.task, TASK_STATUS.STOPPED));
+            return { ok: true, task: all.task };
+          }
+          return { ok: true, task: null };
+        }
         runner.abort = true;
         runner.pause = false;
+        runner.schedulePauseRequested = false;
         await cancelActiveOperations('用户停止任务');
         {
           const all = await getAllConfig();
           if (all.task) {
+            if (!taskMatchesStopRequest(all.task, stopTaskId, stopTaskRunId)) {
+              await debugLog('background.task', 'stale_stop_ignored', {
+                taskId: all.task.id || null,
+                taskRunId: all.task.execution?.taskRunId || '',
+                requestedTaskId: stopTaskId || null,
+                requestedTaskRunId: stopTaskRunId || null
+              }, 'warn');
+              return { ok: true, task: all.task, ignored: true };
+            }
+            if (all.task.execution?.workerTabId) {
+              await closeConversationWorkerTab(all.task, all.task.execution.workerTabId, {
+                reason: '用户停止任务，关闭临时沟通执行页',
+                publish: false
+              });
+            }
             all.task.status = TASK_STATUS.STOPPED;
             all.task.updatedAt = Date.now();
             setTaskTerminalSignal(all.task, TASK_STATUS.STOPPED);
@@ -2434,6 +5626,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         await log('warn', '用户停止任务：当前没有可汇报的任务');
         return { ok: true, task: null };
+        } finally {
+          runner.stopping = false;
+        }
+      }
       case MSG.SKIP_CURRENT: {
         // 若在等待用户重试的暂停中：直接标记当前岗位跳过，并清掉 skip 标志，避免下一岗被连带跳过
         if (runner.pause) {
@@ -2487,7 +5683,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MSG.EXPORT_CONFIG:
         return { ok: true, data: await exportAll() };
       case MSG.IMPORT_CONFIG:
-        await importAll(payload?.data || payload);
+        {
+          const imported = await importAll(payload?.data || payload);
+          await syncDebugLoggingSetting(imported.settings || {});
+          await configureDeliveryScheduleAlarm(imported.settings || {});
+          await enforceDeliverySchedule('config_imported');
+        }
         return { ok: true };
       case MSG.GET_DEBUG_LOGS:
         {
@@ -2537,6 +5738,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             logs: await getSessionDebugLogs()
           };
         }
+      case MSG.SCAN_PROGRESS: {
+        const count = Math.max(0, Number(payload?.count || 0));
+        if (!runner.previewing || !count) return { ok: true, ignored: true };
+        setPreviewPhase('collecting');
+        setPreviewProgress(count, runner.previewPass || 0);
+        return { ok: true };
+      }
       case MSG.DEBUG_EVENT:
         if (!debugLoggingEnabled) return { ok: true, recorded: false };
         await appendSessionDebugLog({

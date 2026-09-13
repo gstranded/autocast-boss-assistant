@@ -1,0 +1,212 @@
+root
+  container
+    button "打开创作助手" [ref=138, loc=css:button[aria-label="打开创作助手"]]
+      svg_root
+    container
+      container
+        container
+          svg_root
+          text "创作服务平台"
+        container
+          image
+          text "G_.h.zhen."
+          image
+      container
+        container
+          container
+            svg_root
+            text "发布笔记"
+            svg_root
+          container
+            container
+              container
+                svg_root
+                text "首页"
+              container
+                svg_root
+                text "笔记管理"
+              container
+                container
+                  svg_root
+                  text "Builder hub"
+                  svg_root
+                text "Red Skill"
+              container
+                svg_root
+                text "数据看板"
+                svg_root
+              container
+                svg_root
+                text "活动中心"
+              container
+                svg_root
+                text "笔记灵感"
+              container
+                svg_root
+                text "创作学院"
+              container
+                svg_root
+                text "创作百科"
+            container
+              svg_root
+              text "收起侧边栏"
+        container [ref=421, loc=unstable]
+          container
+            container
+              container
+                container
+                  text "图片编辑"
+                  text "7/18"
+                  svg_root
+                container
+                  svg_root
+                  text "获取封面建议"
+              container
+                svg_root
+                container
+                  image
+                  text "1"
+                  container
+                container
+                  image
+                  text "2"
+                  container
+                container
+                  image
+                  text "3"
+                  container
+                container
+                  image
+                  text "4"
+                  container
+                container
+                  image
+                  text "5"
+                  container
+                container
+                  image
+                  text "6"
+                  container
+                container
+                  image
+                  text "7"
+                  container
+            container
+              container
+                textbox [ref=388, loc=css:input[placeholder="填写标题会有更多赞哦"]]
+                  text "家人们，BOSS直聘的海投时代来了"
+                container
+                  image
+                  text "智能标题"
+                  svg_root
+              container
+                container [ref=516, loc=unstable]
+                  textfield [ref=518, loc=unstable]
+                    paragraph
+                      text "Step 1 安装：Edge 商店搜「Boss海投助手」→ 点获取 → 打开 BOSS 直聘职位列表刷新 → 右侧出现粉色公文包悬浮按钮，点开面板"
+                    paragraph
+                    paragraph
+                      text "Step 2 写筛选词（拿我自己举例，找 Java 后端）："
+                    paragraph
+                      text "- 职位名称：Java, 后端"
+                    paragraph
+                      text "- 排除：外包, 驻场, 代招"
+                    paragraph
+                      text "- 公司排除：人力, 咨询"
+                    paragraph
+                      text "- 最低月薪：15000"
+                    paragraph
+                      text "- HR 活跃：一周内"
+                    paragraph
+                    paragraph
+                      text "Step 3 写招呼语：第1段"您好，看到贵司在招{职位名称}，我对这个方向很感兴趣"；第2段"我有{匹配技能}相关经验，简历附上供您参考"。分段、克制、像..."
+                    paragraph
+                    paragraph
+                      text "Step 4 扫描预览：通过的、排除的、为什么排除，全部列出来，先确认再动手"
+                    paragraph
+                    paragraph
+                      text "Step 5 一键投递：先「投递一份」验证完整链路——自动左右分屏，左边职位列表、右边聊天页，消息真实发出、简历真实到位。确认没问题，调上限点�..."
+                    paragraph
+                    paragraph
+                      text "全程不用你点一下鼠标，最后看一眼汇报就行。"
+                    paragraph
+                    paragraph
+                      text "想早日上岸的宝子，Edge 商店搜「Boss海投助手」或者 GitHub 搜 autocast-boss-assistant，免费拿走。"
+                    paragraph
+                    paragraph
+                      text "评论区聊聊：你们海投踩过最离谱的坑是什么？"
+                      anchor [ref=1178, loc=unstable]
+                        text "#求职"
+                        text "[话题]#"
+                      text " "
+                      anchor [ref=1183, loc=unstable]
+                        text "#秋招"
+                        text "[话题]#"
+                      text " "
+                      anchor [ref=1188, loc=unstable]
+                        text "#BOSS直聘"
+                        text "[话题]#"
+                      text " "
+                      anchor [ref=1193, loc=unstable]
+                        text "#海投"
+                        text "[话题]#"
+                      text " "
+                      anchor [ref=1198, loc=unstable]
+                        text "#程序员日常"
+                        text "[话题]#"
+                      text " "
+                      anchor [ref=1203, loc=unstable]
+                        text "#开源工具"
+                        text "[话题]#"
+                      text " "
+                      anchor [ref=1208, loc=unstable]
+                        text "#职场干货"
+                        text "[话题]#"
+                      text " "
+                container
+                  text "#oc"
+                  text "#广告投放"
+                  text "#网站建设"
+                  text "#求职季"
+                  text "#外贸开发"
+                  text "#外贸工具"
+                  container
+                    text "更多"
+                    svg_root
+            container
+              button [ref=720, loc=unstable]
+                text "暂存离开"
+              button [ref=722, loc=unstable]
+                text "发布"
+          container
+            container
+              text "笔记预览"
+              text "封面预览"
+            container
+              container
+                container
+                container
+                  image
+                  text "G_.h.zhen."
+                container [ref=738, loc=unstable]
+                  container
+                    container
+                      container
+                        container
+                          image
+                          container
+                      container
+                        container
+                        container
+                        container
+                        container
+                        container
+                        container
+                    text "1/7"
+                  text "家人们，BOSS直聘的海投时代来了"
+                  container
+                    paragraph
+                      text "家人们谁懂啊，去年秋招我每天在 BOSS 直聘上点「立即沟通」，点了一周，手指头快腱鞘炎了😇"
+                    paragraph
+              container
+  container

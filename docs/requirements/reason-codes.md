@@ -53,7 +53,6 @@
 | EXEC_CLICK_FAIL | 点击立即沟通失败 |
 | EXEC_SEND_TEXT_FAIL | 文本消息发送失败 |
 | EXEC_SEND_IMAGE_FAIL | 图片简历发送失败 |
-| EXEC_SEND_FILE_FAIL | 附件简历发送失败 |
 | EXEC_VAR_RENDER_FAIL | 模板变量渲染失败，已阻止发送 |
 | EXEC_RESUME_MISSING | 绑定简历缺失文件 |
 | EXEC_USER_SKIP | 用户跳过当前岗位 |
@@ -70,5 +69,4 @@
 | OK_COMMUNICATED | 已发起沟通 |
 | OK_TEXT_SENT | 文本段发送成功 |
 | OK_IMAGE_SENT | 图片简历发送成功 |
-| OK_FILE_SENT | 附件简历发送成功 |
 | OK_ITEM_COMPLETED | 岗位处理完成 |

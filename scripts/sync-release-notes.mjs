@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, '..');
 const CATALOG_PATH = path.join(ROOT_DIR, 'docs', 'releases', 'release-notes.json');
-const DEFAULT_REPO = 'gstranded/boss-haitou-assistant';
+const DEFAULT_REPO = 'gstranded/autocast-boss-assistant';
 const DEFAULT_UPGRADE =
   '从旧版本升级后，请在扩展管理页重新加载扩展，再刷新已经打开的 BOSS 页面。原有本地配置会继续保留。';
 

@@ -8,7 +8,7 @@ const KEY = STORAGE_KEYS.ONBOARDING;
 const STEPS = [
   {
     sel: null,
-    title: '欢迎使用 Boss 海投助手',
+    title: '欢迎使用 AutoCast-Boss海投助手',
     body: '接下来 30 秒带你认识这个面板。每一步会高亮对应区域，随时可点「跳过」。'
   },
   {
@@ -32,7 +32,7 @@ const STEPS = [
     tab: 'resume',
     sel: '#tab-resume .card',
     title: '④ 准备简历',
-    body: '上传图片简历，或勾选「自动点击 BOSS 发简历」。发送时机建议选文本完成后立即发送。'
+    body: '上传图片简历并按岗位方向建立方案。发送时机建议选择文本完成后立即发送。'
   },
   {
     tab: 'settings',
@@ -245,6 +245,11 @@ function start() {
 async function init() {
   const replay = document.getElementById('btnReplayTour');
   if (replay) replay.addEventListener('click', function () { start(); });
+  window.addEventListener('message', function (event) {
+    const data = event.data || {};
+    if (data.source !== 'bht-agent') return;
+    if (data.cmd === 'skip-onboarding') finish(false);
+  });
   if (await isDone()) return;
   setTimeout(start, 250);
 }

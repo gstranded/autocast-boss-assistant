@@ -1,5 +1,5 @@
 import { REASON, reasonText } from './reason-codes.js';
-import { normalizeText } from './text-utils.js';
+import { normalizeMatchText } from './text-utils.js';
 
 function daysBetween(ts, now = Date.now()) {
   return (now - ts) / (24 * 3600 * 1000);
@@ -20,9 +20,9 @@ export function checkDedup(job, ctx) {
   const jobId = job.jobId || '';
   const bossId = job.bossId || '';
   const company = job.company || '';
-  const companyKey = normalizeText(company);
+  const companyKey = normalizeMatchText(company);
 
-  if (taskItemKeys.has(jobId || `${companyKey}|${normalizeText(job.title || '')}`)) {
+  if (taskItemKeys.has(jobId || `${companyKey}|${normalizeMatchText(job.title || '')}`)) {
     return {
       ok: false,
       reasonCodes: [REASON.DEDUP_TASK_ITEM],
@@ -30,18 +30,31 @@ export function checkDedup(job, ctx) {
     };
   }
 
-  if (settings.neverRepeatJob && jobId) {
-    const hit = history.find((h) => h.jobId === jobId && h.status === 'success');
-    if (hit) {
-      if (!(settings.allowRepublishedJob && job.securityId && hit.securityId && job.securityId !== hit.securityId)) {
-        return {
-          ok: false,
-          reasonCodes: [REASON.DEDUP_JOB],
-          reasonTexts: [reasonText(REASON.DEDUP_JOB)]
-        };
-      }
+  if (settings.neverRepeatJob) {
+    const hit = jobId
+      ? history.find((h) => h.jobId === jobId && h.status === 'success')
+      : null;
+    const idemEntry = idempotency[jobIdempotencyKey(job)];
+    // 重发证据：history 成功记录与幂等簿条目的 securityId 都可能缺失（旧版本数据）；
+    // 汇总全部可用证据——任一来源的 securityId 与新岗相同即视为同一岗位（绝不重复），
+    // 所有来源的 securityId 都不同于新岗时，才允许「重新发布」放行；无任何证据时保守拦截。
+    const evidence = [hit?.securityId, idemEntry?.securityId]
+      .filter((sid) => sid !== undefined && sid !== null && sid !== '')
+      .map((sid) => String(sid));
+    const republished = Boolean(
+      settings.allowRepublishedJob &&
+      job.securityId &&
+      evidence.length > 0 &&
+      evidence.every((sid) => String(job.securityId) !== sid)
+    );
+    if (hit && !republished) {
+      return {
+        ok: false,
+        reasonCodes: [REASON.DEDUP_JOB],
+        reasonTexts: [reasonText(REASON.DEDUP_JOB)]
+      };
     }
-    if (idempotency[`job:${jobId}`]) {
+    if (idemEntry && !republished) {
       return {
         ok: false,
         reasonCodes: [REASON.DEDUP_JOB],
@@ -93,7 +106,8 @@ export function checkLimits({ settings, taskSuccessCount, todayStats }) {
       reasonTexts: [reasonText(REASON.LIMIT_TASK_MAX, `${taskSuccessCount}/${settings.taskMaxCommunicate}`)]
     };
   }
-  if ((todayStats.communicate || 0) >= settings.dailyMaxCommunicate) {
+  // 0 = 未设每日上限（与界面显示「未设上限」一致；normalizeSettings 允许导入 0）
+  if (settings.dailyMaxCommunicate > 0 && (todayStats.communicate || 0) >= settings.dailyMaxCommunicate) {
     return {
       ok: false,
       reasonCodes: [REASON.LIMIT_DAILY_MAX],
@@ -112,5 +126,5 @@ export function resumeIdempotencyKey(job, kind, profileId) {
 }
 
 export function jobIdempotencyKey(job) {
-  return `job:${job.jobId || normalizeText(job.company || '') + '|' + normalizeText(job.title || '')}`;
+  return `job:${job.jobId || normalizeMatchText(job.company || '') + '|' + normalizeMatchText(job.title || '')}`;
 }

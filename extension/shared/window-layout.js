@@ -23,3 +23,30 @@ export function computeSideBySideBounds(display = {}, options = {}) {
     right: { left: left + leftWidth + gap, top, width: rightWidth, height }
   };
 }
+
+export function windowBoundsMatch(actual = {}, expected = {}, options = {}) {
+  const positionTolerancePx = Math.max(0, Number(options.positionTolerancePx ?? options.tolerancePx ?? 40));
+  const sizeTolerancePx = Math.max(0, Number(options.sizeTolerancePx ?? options.tolerancePx ?? 40));
+  return ['left', 'top', 'width', 'height'].every((key) => {
+    const live = Number(actual[key]);
+    const want = Number(expected[key]);
+    if (!Number.isFinite(live) || !Number.isFinite(want)) return false;
+    const tolerance = (key === 'left' || key === 'top') ? positionTolerancePx : sizeTolerancePx;
+    return Math.abs(live - want) <= tolerance;
+  });
+}
+
+export function snapshotWindowBounds(win = {}) {
+  const left = Number(win.left);
+  const top = Number(win.top);
+  const width = Number(win.width);
+  const height = Number(win.height);
+  if (![left, top, width, height].every(Number.isFinite)) return null;
+  return {
+    left,
+    top,
+    width,
+    height,
+    state: String(win.state || 'normal')
+  };
+}

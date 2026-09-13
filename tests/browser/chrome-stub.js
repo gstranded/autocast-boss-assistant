@@ -13,6 +13,8 @@
   const listeners = [];
   const calls = [];
   const duplicateResumeFixture = new URLSearchParams(location.search).get("duplicateResume") === "1";
+  const runnerFixture = new URLSearchParams(location.search).get("runner") || "";
+  const runnerFixtureStartedAt = Date.now() - 5200;
   const resumeFixtureImage = {
     name: "resume.png",
     size: 68,
@@ -27,6 +29,9 @@
       theme: "dark",
       messageMode: "auto_detect",
       similarityThreshold: 0.85,
+      pluginTextEnabled: true,
+      strictGreetingGuard: true,
+      nativeGreetingWaitMs: 2600,
       taskMaxCommunicate: 1,
       dailyMaxCommunicate: 80,
       companyDailyMax: 3,
@@ -67,9 +72,19 @@
     messageTemplate: {
       version: 1,
       segments: [
-        { id: "seg_1", enabled: true, text: "您好，我对{职位名称}很感兴趣。" },
-        { id: "seg_2", enabled: true, text: "我有相关项目经验，期待进一步沟通。" }
+        { id: "seg_1", kind: "greeting", enabled: true, text: "您好，我对{职位名称}很感兴趣。" },
+        { id: "seg_2", kind: "supplement", enabled: true, text: "我有相关项目经验，期待进一步沟通。" }
       ]
+    },
+    bossGreeting: {
+      ok: true,
+      enabled: true,
+      status: "on",
+      templateId: "harness-template-1",
+      text: "Boss您好，我对贵司这个岗位很感兴趣，方便聊聊吗？",
+      templates: [{ templateId: "harness-template-1", text: "Boss您好，我对贵司这个岗位很感兴趣，方便聊聊吗？" }],
+      syncedAt: Date.now(),
+      source: "harness"
     },
     resumes: {
       profiles: [{
@@ -88,12 +103,31 @@
     task: null,
     logs: [{ id: "log_1", ts: Date.now(), level: "info", message: "测试容器已连接" }],
     dailyStats: {},
-    runner: {}
+    runner: runnerFixture === "filtering"
+      ? {
+          previewing: true,
+          previewStartedAt: runnerFixtureStartedAt,
+          previewScanStartedAt: runnerFixtureStartedAt,
+          previewScanFinishedAt: 0,
+          previewPhase: "filtering"
+        }
+      : {}
   };
   state.settings = { ...state.settings, ...(storage.bht_settings || {}) };
 
   function stateResponse() {
-    return { ok: true, ...clone(state) };
+    return { ok: true, runtimeVersion: "1.7.36", ...clone(state) };
+  }
+
+  function updateTaskStatus(status, patch = {}) {
+    if (!state.task) return;
+    state.task = {
+      ...state.task,
+      ...patch,
+      status,
+      revision: Number(state.task.revision || 0) + 1,
+      updatedAt: Date.now()
+    };
   }
 
   function persistStorage() {
@@ -159,6 +193,43 @@
     await recordCall(type, payload);
 
     if (type === "BHT_GET_STATE") return stateResponse();
+    if (type === "BHT_GET_RUNNER_STATE") {
+      return { ok: true, runtimeVersion: "1.7.36", now: Date.now(), runner: clone(state.runner) };
+    }
+    if (type === "BHT_GET_BOSS_GREETING") return clone(state.bossGreeting);
+    if (type === "BHT_SET_BOSS_GREETING") {
+      state.bossGreeting = {
+        ...state.bossGreeting,
+        ok: true,
+        enabled: payload?.enabled === true,
+        status: payload?.enabled === true ? "on" : "off",
+        syncedAt: Date.now(),
+        previousEnabled: state.bossGreeting.enabled,
+        changed: state.bossGreeting.enabled !== (payload?.enabled === true)
+      };
+      document.documentElement.dataset.harnessBossGreeting = state.bossGreeting.status;
+      return clone(state.bossGreeting);
+    }
+    if (type === "BHT_SAVE_BOSS_GREETING_TEXT") {
+      const text = String(payload?.text || "").trim();
+      const templateId = state.bossGreeting.templateId || "harness-template-1";
+      state.bossGreeting = {
+        ...state.bossGreeting,
+        ok: true,
+        templateId,
+        text,
+        templates: [{ templateId, text, greetingType: 2, editable: true }],
+        syncedAt: Date.now(),
+        textSaved: true,
+        savedTemplateId: templateId
+      };
+      document.documentElement.dataset.harnessBossGreetingText = text;
+      return clone(state.bossGreeting);
+    }
+    if (type === "BHT_OPEN_BOSS_GREETING_SETTINGS") {
+      document.documentElement.dataset.harnessOpenedBossGreetingSettings = "true";
+      return { ok: true, tabId: 202 };
+    }
     if (type === "BHT_SAVE_SETTINGS") {
       state.settings = { ...state.settings, ...(payload || {}) };
       storage.bht_settings = clone(state.settings);
@@ -226,9 +297,13 @@
     }
     if (type === "BHT_EXPORT_CONFIG") return { ok: true, data: clone(state) };
     if (type === "BHT_IMPORT_CONFIG") return { ok: true };
-    if (type === "BHT_PAUSE_TASK") state.task = { ...(state.task || {}), status: "paused" };
-    if (type === "BHT_RESUME_TASK") state.task = { ...(state.task || {}), status: "running" };
-    if (type === "BHT_STOP_TASK") state.task = { ...(state.task || {}), status: "stopped" };
+    if (type === "BHT_PAUSE_TASK") updateTaskStatus("paused");
+    if (type === "BHT_RESUME_TASK") updateTaskStatus("running", {
+      pauseReason: "",
+      awaitingUserRetry: false,
+      retryCurrent: payload?.retry === true
+    });
+    if (type === "BHT_STOP_TASK") updateTaskStatus("stopped");
     return { ok: true };
   }
 

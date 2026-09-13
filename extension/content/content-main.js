@@ -2,38 +2,140 @@
   const MSG = {
     PING: "BHT_PING",
     SCAN_JOBS: "BHT_SCAN_JOBS",
+    SCAN_PROGRESS: "BHT_SCAN_PROGRESS",
     START_CHAT: "BHT_START_CHAT",
     TRIGGER_CONVERSATION: "BHT_TRIGGER_CONVERSATION",
+    INSPECT_JOB_DETAIL: "BHT_INSPECT_JOB_DETAIL",
+    ENRICH_JOB_ACTIVITY: "BHT_ENRICH_JOB_ACTIVITY",
     GET_CONVERSATION_SNAPSHOT: "BHT_GET_CONVERSATION_SNAPSHOT",
     WAIT_OPEN_CONVERSATION: "BHT_WAIT_OPEN_CONVERSATION",
     WAIT_CHAT_EDITOR: "BHT_WAIT_CHAT_EDITOR",
     GET_CHAT_SELF_MESSAGES: "BHT_GET_CHAT_SELF_MESSAGES",
+    GET_BOSS_GREETING: "BHT_GET_BOSS_GREETING",
+    SET_BOSS_GREETING: "BHT_SET_BOSS_GREETING",
+    SAVE_BOSS_GREETING_TEXT: "BHT_SAVE_BOSS_GREETING_TEXT",
     SEND_TEXT: "BHT_SEND_TEXT",
     SEND_IMAGE: "BHT_SEND_IMAGE",
-    SEND_RESUME: "BHT_SEND_RESUME",
     HIGHLIGHT_JOBS: "BHT_HIGHLIGHT_JOBS",
     ENSURE_JOB_LIST: "BHT_ENSURE_JOB_LIST",
     RETURN_TO_LIST: "BHT_RETURN_TO_LIST",
+    SCROLL_LIST_TOP: "BHT_SCROLL_LIST_TOP",
     CLOSE_CHAT: "BHT_CLOSE_CHAT",
     DIAGNOSE: "BHT_DIAGNOSE",
+    GET_JOB_SOURCE_CONTEXT: "BHT_GET_JOB_SOURCE_CONTEXT",
+    RESTORE_JOB_SOURCE_CONTEXT: "BHT_RESTORE_JOB_SOURCE_CONTEXT",
     RUN_OP: "BHT_RUN_OP",
     CANCEL_OP: "BHT_CANCEL_OP",
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.0";
+  const BHT_CONTENT_VERSION = "1.7.36";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
-  if (window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION && window.__BHT_ON_MESSAGE__) {
+  if (
+    window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
+    window.__BHT_ON_MESSAGE__ &&
+    window.__BHT_CONTENT_INSTANCE_ID__
+  ) {
     return;
   }
   if (window.__BHT_ON_MESSAGE__) {
     try { chrome.runtime.onMessage.removeListener(window.__BHT_ON_MESSAGE__); } catch (_) {}
   }
   window.__BHT_CONTENT_VERSION__ = BHT_CONTENT_VERSION;
+  const BHT_CONTENT_INSTANCE_ID = `content_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  window.__BHT_CONTENT_INSTANCE_ID__ = BHT_CONTENT_INSTANCE_ID;
   window.__BHT_OP_LOCK__ = null; // boot: 导航后新脚本不继承旧锁
   window.__BHT_OP_CANCELLED__ = Object.create(null);
+  window.__BHT_OP_TIMED_OUT__ = Object.create(null);
   window.__BHT_ACTIVE_OP_ID__ = null;
+  window.__BHT_ACTIVE_OP_TYPE__ = null;
   window.__BHT_CONTENT_LOADED__ = true;
+  window.__BHT_LAST_TRIGGER_CLICK__ = null;
+  // 岗位身份模块是 ES module（供后台/单元测试复用），不能用经典脚本注入；
+  // 内容脚本隔离世界里通过动态 import 加载后挂到全局供本文件使用。
+  const bhtIdentityReady = (() => {
+    try {
+      return import(chrome.runtime.getURL('shared/job-identity.js'))
+        .then((mod) => {
+          globalThis.BHTJobIdentity = Object.freeze({
+            isSyntheticJobId: mod.isSyntheticJobId,
+            listJobIdentityMismatch: mod.listJobIdentityMismatch
+          });
+          return true;
+        })
+        .catch(() => false);
+    } catch (_) {
+      return Promise.resolve(false);
+    }
+  })();
+  const nativeGreetingReceipts = [];
+  const jobNetworkMetadata = new Map();
+  let latestJobListRequest = null;
+
+  function rememberJobNetworkMetadata(raw = {}) {
+    const jobId = String(raw.jobId || '').trim();
+    if (!jobId) return null;
+    const previous = jobNetworkMetadata.get(jobId) || {};
+    const next = {
+      ...previous,
+      ...raw,
+      jobId,
+      securityId: String(raw.securityId || previous.securityId || ''),
+      lid: String(raw.lid || previous.lid || ''),
+      bossId: String(raw.bossId || previous.bossId || ''),
+      bossName: String(raw.bossName || previous.bossName || '').trim(),
+      bossTitle: String(raw.bossTitle || previous.bossTitle || '').trim(),
+      brandName: String(raw.brandName || previous.brandName || '').trim(),
+      activeText: String(raw.activeText || previous.activeText || '').trim(),
+      bossOnline: typeof raw.bossOnline === 'boolean'
+        ? raw.bossOnline
+        : previous.bossOnline === true,
+      goldHunter: raw.goldHunter === true || raw.goldHunter === 1 || previous.goldHunter === true,
+      receivedAt: Date.now()
+    };
+    jobNetworkMetadata.set(jobId, next);
+    if (jobNetworkMetadata.size > 2000) {
+      const oldest = jobNetworkMetadata.keys().next().value;
+      if (oldest) jobNetworkMetadata.delete(oldest);
+    }
+    return next;
+  }
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window || event.origin !== location.origin) return;
+    const data = event.data;
+    if (!data || data.source !== "bht-page-network-hook") return;
+    if (data.type === "job-list-context") {
+      latestJobListRequest = {
+        href: String(data.href || ""),
+        encryptExpectId: String(data.encryptExpectId || "").trim(),
+        filterParams: data.filterParams && typeof data.filterParams === "object"
+          ? { ...data.filterParams }
+          : {},
+        at: Number(data.at || Date.now())
+      };
+      return;
+    }
+    if (data.type === "job-metadata") {
+      for (const job of Array.isArray(data.jobs) ? data.jobs : []) rememberJobNetworkMetadata(job);
+      return;
+    }
+    if (data.type !== "friend-add-receipt") return;
+    nativeGreetingReceipts.push({
+      at: Number(data.at || Date.now()),
+      jobId: String(data.jobId || ""),
+      ok: data.ok === true,
+      code: Number(data.code),
+      hasShowGreeting: data.hasShowGreeting === true,
+      showGreeting: data.hasShowGreeting === true ? data.showGreeting === true : null,
+      greeting: String(data.greeting || "")
+    });
+    if (nativeGreetingReceipts.length > 30) nativeGreetingReceipts.splice(0, nativeGreetingReceipts.length - 30);
+    debugTrace("friend_add_receipt", nativeGreetingReceipts[nativeGreetingReceipts.length - 1]);
+  });
+  try {
+    window.postMessage({ source: 'bht-content', type: 'job-metadata-request' }, location.origin);
+  } catch (_) {}
 
   function isBossHost(hostname) {
     const host = String(hostname || "").toLowerCase();
@@ -50,8 +152,16 @@
 
   const log = (...args) => console.log("[BHT content]", ...args);
 
-  function debugTrace(event, data = {}, level = "debug") {
+  const debugTraceThrottles = Object.create(null);
+  function debugTrace(event, data = {}, level = "debug", throttleMs = 0) {
     if (window.__BHT_DEBUG_ENABLED__ !== true) return;
+    // 高频事件（DOM 变更/事件）按事件名限流，避免日志洪水挤占运行时消息通道
+    if (throttleMs > 0) {
+      const nowMs = Date.now();
+      const prevMs = Number(debugTraceThrottles[event] || 0);
+      if (nowMs - prevMs < throttleMs) return;
+      debugTraceThrottles[event] = nowMs;
+    }
     try {
       chrome.runtime.sendMessage({
         type: MSG.DEBUG_EVENT,
@@ -77,6 +187,23 @@
       message: String(error.message || error),
       code: error.code || "",
       stack: String(error.stack || "").slice(0, 8000)
+    };
+  }
+
+  function summarizeOperationResult(result) {
+    if (!result || typeof result !== 'object') return result;
+    return {
+      ok: result.ok === true,
+      error: result.error || '',
+      message: result.message || '',
+      count: Number(result.count || 0),
+      contentVersion: result.contentVersion || BHT_CONTENT_VERSION,
+      scanMeta: result.scanMeta || null,
+      receipt: result.receipt ? {
+        type: result.receipt.type || '',
+        status: result.receipt.status || '',
+        receiptId: result.receipt.receiptId || ''
+      } : null
     };
   }
 
@@ -115,7 +242,13 @@
     try { window.__BHT_DEBUG_INSTRUMENTATION_CLEANUP__?.(); } catch (_) {}
     const eventTypes = ["mousedown", "mouseup", "click", "keydown", "input", "change", "submit"];
     const onDomEvent = (event) => {
-      if (window.__BHT_DEBUG_ENABLED__ !== true || !window.__BHT_ACTIVE_OP_ID__) return;
+      if (
+        window.__BHT_DEBUG_ENABLED__ !== true ||
+        !window.__BHT_ACTIVE_OP_ID__ ||
+        window.__BHT_ACTIVE_OP_TYPE__ === MSG.SCAN_JOBS
+      ) return;
+      // mousedown/mouseup/input/change 每操作数十条；只留 click/submit 且限流，日志洪峰不再挤占通道
+      if (event.type !== "click" && event.type !== "submit") return;
       debugTrace("dom_event", {
         type: event.type,
         isTrusted: Boolean(event.isTrusted),
@@ -130,7 +263,7 @@
           shift: Boolean(event.shiftKey)
         },
         target: describeDebugElement(event.target)
-      });
+      }, "debug", 300);
     };
     eventTypes.forEach((type) => document.addEventListener(type, onDomEvent, true));
 
@@ -160,7 +293,11 @@
     let removedCount = 0;
     let mutationSamples = [];
     const observer = new MutationObserver((mutations) => {
-      if (window.__BHT_DEBUG_ENABLED__ !== true || !window.__BHT_ACTIVE_OP_ID__) return;
+      if (
+        window.__BHT_DEBUG_ENABLED__ !== true ||
+        !window.__BHT_ACTIVE_OP_ID__ ||
+        window.__BHT_ACTIVE_OP_TYPE__ === MSG.SCAN_JOBS
+      ) return;
       mutationCount += mutations.length;
       for (const mutation of mutations) {
         addedCount += mutation.addedNodes?.length || 0;
@@ -177,7 +314,7 @@
             addedCount,
             removedCount,
             samples: mutationSamples
-          });
+          }, "debug", 400);
           mutationTimer = 0;
           mutationCount = 0;
           addedCount = 0;
@@ -202,8 +339,10 @@
   
   function isListLikePage(href = location.href) {
     try {
-      const u = String(href || "");
-      return /\/web\/geek\/jobs|recommend|search|rec-job|job-recommend|geek\/job(?!_detail)/i.test(u);
+      const parsed = new URL(String(href || ""), location.origin);
+      // 只按 pathname 判断，避免详情页 query 中的 search/recommend 参数
+      // 被误认成职位列表，导致续批扫描跳过列表恢复。
+      return /\/web\/geek\/jobs|\/recommend(?:\/|$)|\/search(?:\/|$)|\/rec-job(?:\/|$)|\/job-recommend(?:\/|$)|\/geek\/job(?!_detail)(?:\/|$)/i.test(parsed.pathname);
     } catch (_) {
       return false;
     }
@@ -219,8 +358,464 @@
     }
   }
 
+  function normalizeExpectText(value) {
+    return String(value || "")
+      .replace(/[\s\u00a0]+/g, "")
+      .replace(/[（]/g, "(")
+      .replace(/[）]/g, ")")
+      .trim();
+  }
+
+  function expectationDisplayLabel(item = {}) {
+    const position = String(item.positionName || item.position || "").trim();
+    const location = String(item.locationName || item.location || "").trim();
+    if (!position) return location;
+    if (!location || normalizeExpectText(position).includes(normalizeExpectText(location))) return position;
+    return `${position}(${location})`;
+  }
+
+  function expectationKey(item = {}) {
+    return String(item.encryptId || item.encryptExpectId || item.id || "").trim();
+  }
+
+  function getJobExpectTabs() {
+    try {
+      const nodes = Array.from(document.querySelectorAll(
+        ".c-expect-select a, .expect-and-search a, a.expect-item, a.synthesis"
+      ));
+      const seen = new Set();
+      return nodes.filter((el) => {
+        if (seen.has(el)) return false;
+        seen.add(el);
+        const cls = String(el.className || "");
+        const ka = String(el.getAttribute?.("ka") || "");
+        const text = textOf(el).replace(/\s+/g, " ").trim();
+        return text && (
+          /(^|\s)expect-item(\s|$)/.test(cls) ||
+          /(^|\s)synthesis(\s|$)/.test(cls) ||
+          /jobs_recommend_tab_click|expect/.test(ka)
+        );
+      });
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function isActiveJobExpectTab(el) {
+    const cls = String(el?.className || "");
+    return /(^|\s)(active|selected|current|on)(\s|$)/i.test(cls) ||
+      el?.getAttribute?.("aria-selected") === "true";
+  }
+
+  function readLastJobListRequest() {
+    const live = latestJobListRequest && typeof latestJobListRequest === "object"
+      ? latestJobListRequest
+      : null;
+    let latest = live;
+    try {
+      const entries = performance.getEntriesByType("resource")
+        .map((entry) => String(entry.name || ""))
+        .filter((href) => /\/wapi\/zpgeek\/(?:search\/joblist|pc\/recommend\/job\/list|pc\/special\/zone\/joblist)\.json/i.test(href));
+      for (const href of entries) {
+        try {
+          const parsed = new URL(href, location.origin);
+          const filterParams = {};
+          for (const key of ["jobType", "salary", "experience", "degree", "industry", "scale"]) {
+            filterParams[key] = String(parsed.searchParams.get(key) || "").trim();
+          }
+          latest = {
+            href: parsed.href,
+            encryptExpectId: String(parsed.searchParams.get("encryptExpectId") || "").trim(),
+            filterParams,
+            at: Number(latest?.at || 0) || Date.now()
+          };
+        } catch (_) {}
+      }
+    } catch (_) {}
+    return latest || {
+      href: "",
+      encryptExpectId: "",
+      filterParams: {},
+      at: 0
+    };
+  }
+
+  function normalizeFilterSignature(signature = {}) {
+    const request = {};
+    const sourceRequest = signature?.request && typeof signature.request === "object"
+      ? signature.request
+      : {};
+    for (const key of ["jobType", "salary", "experience", "degree", "industry", "scale"]) {
+      request[key] = String(sourceRequest[key] || "").trim();
+    }
+    const hints = Array.from(new Set(
+      (Array.isArray(signature?.hints) ? signature.hints : [])
+        .map((hint) => String(hint || "").replace(/\s+/g, " ").trim())
+        .filter(Boolean)
+    )).sort();
+    return { request, hints, observed: signature?.observed === true };
+  }
+
+  function buildLiveFilterSignature(request = readLastJobListRequest()) {
+    const domRequest = detectActiveFilterRequest();
+    const requestFromPage = request?.filterParams || {};
+    return normalizeFilterSignature({
+      request: Object.fromEntries(FILTER_REQUEST_KEYS.map((key) => [
+        key,
+        String(domRequest[key] || requestFromPage[key] || '').trim()
+      ])),
+      hints: detectActiveFilterHints(),
+      observed: Boolean(request?.href || request?.encryptExpectId || request?.at)
+    });
+  }
+
+  function readEffectiveFilterRequest(request = readLastJobListRequest()) {
+    return buildLiveFilterSignature(request).request;
+  }
+
+  let jobExpectationsCache = { at: 0, items: [] };
+  async function readJobExpectations({ force = false } = {}) {
+    if (!force && Date.now() - jobExpectationsCache.at < 15000) return jobExpectationsCache.items;
+    try {
+      const url = new URL("/wapi/zpgeek/pc/recommend/expect/list.json", location.origin);
+      url.searchParams.set("_", String(Date.now()));
+      const response = await fetch(url.href, { credentials: "include" });
+      const payload = await response.json();
+      const data = payload?.zpData || {};
+      const items = [
+        ...(Array.isArray(data.expectList) ? data.expectList : []),
+        ...(Array.isArray(data.partTimeExpectList) ? data.partTimeExpectList : [])
+      ].map((item) => ({
+        id: String(item?.id || "").trim(),
+        encryptId: String(item?.encryptId || item?.encryptExpectId || "").trim(),
+        positionName: String(item?.positionName || item?.position || "").trim(),
+        locationName: String(item?.locationName || item?.location || "").trim(),
+        label: expectationDisplayLabel(item)
+      })).filter((item) => item.id || item.encryptId || item.label);
+      jobExpectationsCache = { at: Date.now(), items };
+      return items;
+    } catch (_) {
+      return jobExpectationsCache.items || [];
+    }
+  }
+
+  async function getJobSourceContext({ refreshExpectations = false } = {}) {
+    const tabs = getJobExpectTabs();
+    const activeTabs = tabs.filter(isActiveJobExpectTab);
+    const request = readLastJobListRequest();
+    const base = {
+      sourceType: "unknown",
+      expectationKey: "",
+      expectationLabel: "",
+      selectedLabel: activeTabs.length === 1 ? textOf(activeTabs[0]).replace(/\s+/g, " ").trim() : "",
+      filterSignature: buildLiveFilterSignature(request),
+      selectionEvidence: {
+        domActiveCount: activeTabs.length,
+        requestEncryptExpectId: request.encryptExpectId || "",
+        requestMatches: request.encryptExpectId === "",
+        requestHref: request.href || "",
+        requestAt: request.at || 0
+      },
+      capturedAt: Date.now()
+    };
+    if (activeTabs.length !== 1) {
+      return { ok: true, context: { ...base, error: activeTabs.length ? "EXPECTATION_SELECTION_AMBIGUOUS" : "EXPECTATION_SELECTION_NOT_FOUND" } };
+    }
+    const active = activeTabs[0];
+    const activeLabel = base.selectedLabel;
+    const cls = String(active.className || "");
+    const isRecommend = /(^|\s)synthesis(\s|$)/.test(cls) ||
+      String(active.getAttribute?.("ka") || "").includes("jobs_recommend_tab_click") ||
+      activeLabel === "推荐";
+    if (isRecommend) {
+      return { ok: true, context: { ...base, sourceType: "recommend", expectationLabel: "推荐" } };
+    }
+    const items = await readJobExpectations({ force: refreshExpectations });
+    const wanted = normalizeExpectText(activeLabel);
+    const matches = items.filter((item) => {
+      const label = normalizeExpectText(item.label);
+      return label === wanted || normalizeExpectText(item.positionName) === wanted ||
+        (wanted.includes(normalizeExpectText(item.positionName)) &&
+          (!item.locationName || wanted.includes(normalizeExpectText(item.locationName))));
+    });
+    if (matches.length !== 1) {
+      return {
+        ok: true,
+        context: {
+          ...base,
+          sourceType: "expectation",
+          expectationLabel: activeLabel,
+          error: matches.length ? "EXPECTATION_AMBIGUOUS" : "EXPECTATION_ID_NOT_FOUND"
+        }
+      };
+    }
+    const item = matches[0];
+    return {
+      ok: true,
+      context: {
+        ...base,
+        sourceType: "expectation",
+        expectationKey: expectationKey(item),
+        expectationId: item.id,
+        expectationLabel: item.label || activeLabel,
+        selectedLabel: activeLabel,
+        selectionEvidence: {
+          ...base.selectionEvidence,
+          expectedEncryptExpectId: expectationKey(item),
+          requestMatches: request.encryptExpectId === expectationKey(item)
+        }
+      }
+    };
+  }
+
+  const FILTER_REQUEST_KEYS = ["jobType", "salary", "experience", "degree", "industry", "scale"];
+  const FILTER_OPTION_PREFIXES = {
+    jobType: "sel-job-rec-jobType-",
+    salary: "sel-job-rec-salary-",
+    experience: "sel-job-rec-exp-",
+    degree: "sel-job-rec-degree-",
+    industry: "sel-industry-",
+    scale: "sel-job-rec-scale-"
+  };
+
+  function filterRequestMatches(expected = {}, actual = {}) {
+    return FILTER_REQUEST_KEYS.every((key) =>
+      String(expected?.[key] || "").trim() === String(actual?.[key] || "").trim()
+    );
+  }
+
+  function findFilterContainer(key) {
+    const prefix = FILTER_OPTION_PREFIXES[key];
+    if (!prefix) return null;
+    return Array.from(document.querySelectorAll(".condition-filter-select, .condition-industry-select"))
+      .find((container) => Array.from(container.querySelectorAll("[ka]"))
+        .some((el) => String(el.getAttribute("ka") || "").startsWith(prefix))) || null;
+  }
+
+  function findFilterOption(key, value) {
+    const prefix = FILTER_OPTION_PREFIXES[key];
+    if (!prefix) return null;
+    const wanted = `${prefix}${String(value || "").trim()}`;
+    return Array.from(document.querySelectorAll("[ka]"))
+      .find((el) => String(el.getAttribute("ka") || "") === wanted) || null;
+  }
+
+  function filterOptionText(el) {
+    return Array.from(el?.childNodes || [])
+      .filter((node) => node.nodeType === 3)
+      .map((node) => String(node.textContent || ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function filterHintMatches(optionText, hints = []) {
+    const option = normalizeExpectText(optionText);
+    if (!option || option === "不限") return false;
+    return (hints || []).some((hint) => {
+      const normalized = normalizeExpectText(hint);
+      return normalized === option || normalized.includes(option) || option.includes(normalized);
+    });
+  }
+
+  function findFilterOptionByHints(key, hints = []) {
+    const prefix = FILTER_OPTION_PREFIXES[key];
+    if (!prefix) return null;
+    return Array.from(document.querySelectorAll("[ka]"))
+      .filter((el) => String(el.getAttribute("ka") || "").startsWith(prefix))
+      .find((el) => filterHintMatches(filterOptionText(el), hints)) || null;
+  }
+
+  function filterOptionValue(key, option) {
+    const prefix = FILTER_OPTION_PREFIXES[key];
+    const ka = String(option?.getAttribute?.("ka") || "");
+    return prefix && ka.startsWith(prefix) ? ka.slice(prefix.length) : "";
+  }
+
+  async function restoreFilterRequest(signature = {}, deadline = Date.now() + 12000) {
+    const expected = normalizeFilterSignature(signature);
+    const initialRequest = readEffectiveFilterRequest();
+    const requestObserved = expected.observed === true;
+    const targets = FILTER_REQUEST_KEYS
+      .map((key) => {
+        if (expected.request[key]) return { key, value: expected.request[key] };
+        // An observed empty field means "不限". Clear stale selections left
+        // behind by BOSS after a page reload before validating the request.
+        if (requestObserved && initialRequest[key]) return { key, value: "0" };
+        const option = findFilterOptionByHints(key, expected.hints);
+        const value = filterOptionValue(key, option);
+        return value && value !== "0" ? { key, value, option } : null;
+      })
+      .filter(Boolean);
+    const expectedHasRequest = FILTER_REQUEST_KEYS.some((key) => expected.request[key]);
+    for (const target of targets) {
+      const { key, value } = target;
+      const currentValue = readEffectiveFilterRequest()[key];
+      if (value === "0" ? !currentValue : currentValue === value) continue;
+      const container = findFilterContainer(key);
+      if (!container) {
+        return { ok: false, error: "FILTER_CONTAINER_NOT_FOUND", key, value };
+      }
+      clickLikeHuman(container.querySelector(".current-select") || container);
+      let option = null;
+      while (Date.now() < deadline) {
+        option = findFilterOption(key, value);
+        if (option) break;
+        await sleep(120);
+      }
+      if (!option) {
+        return { ok: false, error: "FILTER_OPTION_NOT_FOUND", key, value };
+      }
+      clickLikeHuman(option);
+      let applied = false;
+      while (Date.now() < deadline) {
+        const currentValue = readEffectiveFilterRequest()[key];
+        if (value === "0" ? !currentValue : currentValue === value) {
+          applied = true;
+          break;
+        }
+        await sleep(180);
+      }
+      if (!applied) {
+        return { ok: false, error: "FILTER_REQUEST_NOT_UPDATED", key, value };
+      }
+    }
+    const request = readLastJobListRequest();
+    const effectiveRequest = readEffectiveFilterRequest(request);
+    const actualHints = detectActiveFilterHints();
+    const hintsMatch = !expected.hints.length || expected.hints.every((hint) =>
+      actualHints.some((actual) => normalizeExpectText(actual) === normalizeExpectText(hint))
+    );
+    return {
+      ok: requestObserved
+        ? filterRequestMatches(expected.request, effectiveRequest)
+        : (expectedHasRequest ? filterRequestMatches(expected.request, effectiveRequest) : hintsMatch),
+      request,
+      effectiveRequest,
+      actualHints,
+      expected: expected.request,
+      observed: requestObserved
+    };
+  }
+
+  async function restoreJobSourceContext(payload = {}) {
+    const expected = payload?.sourceContext || payload || {};
+    const sourceType = String(expected.sourceType || "unknown");
+    if (sourceType !== "recommend" && sourceType !== "expectation") {
+      return { ok: false, error: "JOB_SOURCE_UNKNOWN", message: "扫描时没有记录可恢复的求职期望来源" };
+    }
+    const deadline = Date.now() + Math.max(3000, Number(payload?.timeoutMs || 12000));
+    const waitForTabs = async () => {
+      while (Date.now() < deadline) {
+        if (getJobExpectTabs().length) return true;
+        await sleep(250);
+      }
+      return false;
+    };
+    if (!await waitForTabs()) {
+      return { ok: false, error: "EXPECTATION_UI_NOT_READY", message: "BOSS 求职期望区域未加载完成" };
+    }
+    const clickTab = (tab) => {
+      clickLikeHuman(tab);
+      return true;
+    };
+    if (sourceType === "recommend") {
+      const recommend = getJobExpectTabs().find((el) => {
+        const cls = String(el.className || "");
+        return /(^|\s)synthesis(\s|$)/.test(cls) || textOf(el).replace(/\s+/g, " ").trim() === "推荐";
+      });
+      if (!recommend) return { ok: false, error: "RECOMMEND_TAB_NOT_FOUND", message: "未找到 BOSS 的推荐入口" };
+      if (!isActiveJobExpectTab(recommend)) clickTab(recommend);
+    } else {
+      const items = await readJobExpectations({ force: true });
+      const matches = items.filter((item) => expectationKey(item) === String(expected.expectationKey || ""));
+      if (matches.length !== 1) {
+        return { ok: false, error: matches.length ? "EXPECTATION_AMBIGUOUS" : "EXPECTATION_NOT_FOUND", message: "BOSS 当前账号中找不到原求职期望，已停止恢复" };
+      }
+      const wantedLabel = normalizeExpectText(matches[0].label || expected.expectationLabel);
+      let nodes = [];
+      while (Date.now() < deadline) {
+        nodes = getJobExpectTabs().filter((el) => {
+          const cls = String(el.className || "");
+          if (!/(^|\s)expect-item(\s|$)/.test(cls)) return false;
+          const text = normalizeExpectText(textOf(el));
+          return text === wantedLabel || text === normalizeExpectText(expected.expectationLabel) ||
+            text === normalizeExpectText(matches[0].positionName);
+        });
+        if (nodes.length) break;
+        await sleep(250);
+      }
+      if (nodes.length !== 1) {
+        return { ok: false, error: nodes.length ? "EXPECTATION_TAB_AMBIGUOUS" : "EXPECTATION_TAB_NOT_FOUND", message: "未找到唯一的目标求职期望入口，已停止恢复" };
+      }
+      const target = nodes[0];
+      if (!isActiveJobExpectTab(target)) clickTab(target);
+    }
+
+    while (Date.now() < deadline) {
+      const context = await getJobSourceContext({ refreshExpectations: false });
+      const current = context.context || {};
+      const sourceMatches = sourceType === "recommend"
+        ? current.sourceType === "recommend"
+        : current.sourceType === "expectation" && current.expectationKey === String(expected.expectationKey || "");
+      const requestMatches = sourceType === "recommend"
+        ? current.selectionEvidence?.requestEncryptExpectId === ""
+        : current.selectionEvidence?.requestEncryptExpectId === String(expected.expectationKey || "");
+      if (sourceMatches && requestMatches) {
+        const filters = await restoreFilterRequest(expected.filterSignature || {}, deadline);
+        if (!filters.ok) {
+          return {
+            ok: false,
+            error: "FILTER_RESTORE_FAILED",
+            message: `普通筛选恢复失败（${filters.key || filters.error || "请求未匹配"}），已停止扫描`,
+            context: current,
+            filters
+          };
+        }
+        const verified = await getJobSourceContext({ refreshExpectations: false });
+        const verifiedContext = verified.context || {};
+        const verifiedSource = sourceType === "recommend"
+          ? verifiedContext.sourceType === "recommend"
+          : verifiedContext.sourceType === "expectation" && verifiedContext.expectationKey === String(expected.expectationKey || "");
+        const verifiedRequest = sourceType === "recommend"
+          ? verifiedContext.selectionEvidence?.requestEncryptExpectId === ""
+          : verifiedContext.selectionEvidence?.requestEncryptExpectId === String(expected.expectationKey || "");
+        const expectedFilters = normalizeFilterSignature(expected.filterSignature || {});
+        const expectedRequestObserved = expectedFilters.observed === true || Boolean(
+          expected.selectionEvidence?.requestHref || expected.selectionEvidence?.requestEncryptExpectId
+        );
+        const verifiedRequestObserved = verifiedContext.filterSignature?.observed === true || Boolean(
+          verifiedContext.selectionEvidence?.requestHref || verifiedContext.selectionEvidence?.requestEncryptExpectId
+        );
+        const verifiedFilters = expectedRequestObserved && verifiedRequestObserved
+          ? filterRequestMatches(expectedFilters.request, verifiedContext.filterSignature?.request || {})
+          : expectedFilters.hints.every((hint) =>
+            (verifiedContext.filterSignature?.hints || []).some((actual) =>
+              normalizeExpectText(actual) === normalizeExpectText(hint)
+            )
+          );
+        if (verifiedSource && verifiedRequest && verifiedFilters) {
+          return {
+            ok: true,
+            context: verifiedContext,
+            restored: true,
+            filtersRestored: true,
+            filterEvidence: filters
+          };
+        }
+      }
+      await sleep(300);
+    }
+    return { ok: false, error: "JOB_SOURCE_RESTORE_VERIFY_FAILED", message: "已尝试恢复求职期望，但页面状态或岗位请求未验证通过" };
+  }
+
   function detectSelectedJobExpect() {
     try {
+      const exactActive = getJobExpectTabs().filter(isActiveJobExpectTab);
+      if (exactActive.length === 1) {
+        const exactText = textOf(exactActive[0]).replace(/\s+/g, " ").trim();
+        if (exactText) return exactText;
+      }
       const selectors = [
         ".expect-list .active",
         ".expect-list .selected",
@@ -272,10 +867,38 @@
         const t = textOf(el).replace(/\s+/g, " ").trim();
         if (t && t.length <= 30 && !hints.includes(t)) hints.push(t);
       }
+      // BOSS keeps the selected option in the hidden dropdown. Its text is
+      // still reliable, while the visible filter label only says "(1)".
+      for (const key of FILTER_REQUEST_KEYS) {
+        const prefix = FILTER_OPTION_PREFIXES[key];
+        if (!prefix) continue;
+        const selected = Array.from(document.querySelectorAll(`[ka^="${prefix}"]`))
+          .filter((el) => /(^|\s)active(\s|$)/i.test(String(el.className || '')) || el.getAttribute('aria-selected') === 'true');
+        for (const el of selected) {
+          const t = textOf(el).replace(/\s+/g, " ").trim();
+          if (t && t.length <= 30 && t !== '不限' && !hints.includes(t)) hints.push(t);
+        }
+      }
       return hints.slice(0, 12);
     } catch (_) {
       return [];
     }
+  }
+
+  function detectActiveFilterRequest() {
+    const result = Object.fromEntries(FILTER_REQUEST_KEYS.map((key) => [key, '']));
+    try {
+      for (const key of FILTER_REQUEST_KEYS) {
+        const prefix = FILTER_OPTION_PREFIXES[key];
+        if (!prefix) continue;
+        const values = Array.from(document.querySelectorAll(`[ka^="${prefix}"]`))
+          .filter((el) => /(^|\s)active(\s|$)/i.test(String(el.className || '')) || el.getAttribute('aria-selected') === 'true')
+          .map((el) => String(el.getAttribute('ka') || '').slice(prefix.length).trim())
+          .filter((value) => value && value !== '0');
+        result[key] = Array.from(new Set(values)).join(',');
+      }
+    } catch (_) {}
+    return result;
   }
 
   function getSavedListCtx() {
@@ -293,7 +916,7 @@
     try {
       const href = forceHref || location.href;
       const cards = getJobCards().length;
-      if (forceHref || (cards >= 3 && /jobs|recommend|search|geek\/job/i.test(href))) {
+      if (forceHref || (cards >= 3 && isListLikePage(href))) {
         const ctx = {
           href,
           expectLabel: detectSelectedJobExpect(),
@@ -315,6 +938,25 @@
       return window.__BHT_LIST_HREF__ || sessionStorage.getItem("bht_list_href") || "";
     } catch (_) {
       return window.__BHT_LIST_HREF__ || "";
+    }
+  }
+
+  function getSavedJobListNavigationTarget() {
+    const saved = getSavedListHref();
+    try {
+      const parsed = new URL(saved || "", location.origin);
+      if (isBossHost(parsed.hostname) && isListLikePage(parsed.href)) return parsed.href;
+    } catch (_) {}
+    return "";
+  }
+
+  function getJobListNavigationTarget() {
+    const saved = getSavedJobListNavigationTarget();
+    if (saved) return saved;
+    try {
+      return new URL("/web/geek/jobs", location.origin).href;
+    } catch (_) {
+      return "https://www.zhipin.com/web/geek/jobs";
     }
   }
 
@@ -342,6 +984,14 @@
       nodes.sort((a, b) => textOf(a).length - textOf(b).length);
       const hit = nodes[0];
       if (!hit) return { ok: false, error: "EXPECT_TAB_NOT_FOUND", want };
+      debugTrace("expect_restore_click", {
+        want: String(want).slice(0, 60),
+        hitText: String(textOf(hit)).slice(0, 60),
+        hitClass: String(hit.className || "").slice(0, 80),
+        hitTag: String(hit.tagName || "").toUpperCase(),
+        hitRect: (() => { try { const r = hit.getBoundingClientRect(); return { top: Math.round(r.top), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) }; } catch (_) { return null; } })(),
+        matchReason: "manual-call"
+      }, "warn");
       clickLikeHuman(hit);
       await sleep(900);
       const after = detectSelectedJobExpect();
@@ -360,7 +1010,9 @@
         if (getJobCards().length >= 3) break;
         await sleep(250);
       }
-      await restoreJobExpectIfNeeded(want);
+      // 不再自动点击恢复期望：页面结构因人而异，点击可能误触发筛选/刷新。
+      const current = (typeof detectSelectedJobExpect === "function" ? detectSelectedJobExpect() : "") || "";
+      debugTrace("list_after_load_expect_state", { savedExpect: String(want).slice(0, 60), currentExpect: String(current).slice(0, 60), action: "skip-restore" }, "debug");
       try { sessionStorage.removeItem("bht_restore_expect"); } catch (_) {}
     } catch (_) {}
   }
@@ -467,6 +1119,27 @@ const SELECTORS = {
     return error;
   }
 
+  function operationStorageKey(opId) {
+    return opId ? `bht_op_${opId}` : '';
+  }
+
+  async function markOperationCancelled(opId, reason = "任务已停止", settled = false) {
+    const key = operationStorageKey(opId);
+    if (!key) return;
+    try {
+      await chrome.storage.local.set({
+        [key]: {
+          status: "cancelled",
+          opId,
+          reason,
+          at: Date.now(),
+          settled,
+          contentVersion: BHT_CONTENT_VERSION
+        }
+      });
+    } catch (_) {}
+  }
+
   function sleep(ms) {
     const opId = window.__BHT_ACTIVE_OP_ID__;
     if (opId && window.__BHT_OP_CANCELLED__?.[opId]) {
@@ -476,6 +1149,279 @@ const SELECTORS = {
       if (opId && window.__BHT_OP_CANCELLED__?.[opId]) reject(operationCancelledError(opId));
       else resolve();
     }, ms));
+  }
+
+  async function bossGreetingApi(path, options = {}) {
+    const url = new URL(path, location.origin);
+    if (!isBossHost(url.hostname)) throw new Error("BOSS_GREETING_BAD_ORIGIN");
+    const rawZpToken = String(document.cookie || "")
+      .split(";")
+      .map((part) => part.trim())
+      .find((part) => part.startsWith("bst="))
+      ?.slice(4) || "";
+    let zpToken = rawZpToken;
+    try { zpToken = decodeURIComponent(rawZpToken); } catch (_) {}
+    const response = await fetch(url.href, {
+      credentials: "include",
+      cache: "no-store",
+      ...options,
+      headers: {
+        "X-Requested-With": "XMLHttpRequest",
+        ...(zpToken ? { "zp_token": zpToken } : {}),
+        ...(options.headers || {})
+      }
+    });
+    if (!response.ok) throw new Error("BOSS_GREETING_HTTP_" + response.status);
+    return response.json();
+  }
+
+  function normalizeBossGreetingResponse(payload) {
+    const zpData = payload?.zpData || {};
+    const greeting = zpData.greeting || {};
+    const templates = (zpData.greetingTemplateList || []).map((item) => ({
+      templateId: String(item?.templateId || ""),
+      text: String(item?.demo || item?.content || "").trim(),
+      category: item?.category ?? null,
+      greetingType: item?.greetingType ?? null,
+      editable: Number(item?.greetingType) === 2
+    })).filter((item) => item.templateId || item.text);
+    const templateId = String(greeting?.templateId || "");
+    const current = templates.find((item) => item.templateId === templateId) || null;
+    const enabled = Number(greeting?.status || 0) === 1;
+    return {
+      ok: true,
+      enabled,
+      status: enabled ? "on" : "off",
+      templateId,
+      text: String(current?.text || greeting?.demo || greeting?.content || "").trim(),
+      templates,
+      displayButton: zpData.displayButton === true || Number(zpData.displayButton) === 1,
+      syncedAt: Date.now(),
+      source: "boss-api"
+    };
+  }
+
+  async function getBossGreetingSetting() {
+    try {
+      const payload = await bossGreetingApi("/wapi/zpchat/greeting/getGreetingList?_=" + Date.now());
+      if (Number(payload?.code) === 7) {
+        return { ok: false, error: "LOGIN_REQUIRED", message: payload?.message || "请先登录 BOSS 直聘" };
+      }
+      if ([120, 121, 122].includes(Number(payload?.code))) {
+        return {
+          ok: false,
+          error: "BOSS_TOKEN_INVALID",
+          code: Number(payload?.code),
+          message: "BOSS 登录校验已失效（" + Number(payload?.code) + "），请刷新 BOSS 页面后重试"
+        };
+      }
+      if (Number(payload?.code) !== 0) {
+        return { ok: false, error: "BOSS_GREETING_READ_FAILED", message: payload?.message || "读取 BOSS 自动招呼设置失败" };
+      }
+      return normalizeBossGreetingResponse(payload);
+    } catch (error) {
+      return {
+        ok: false,
+        error: "BOSS_GREETING_READ_FAILED",
+        message: "读取 BOSS 自动招呼设置失败：" + String(error?.message || error)
+      };
+    }
+  }
+
+  async function setBossGreetingSetting(payload = {}) {
+    const enabled = payload.enabled === true;
+    const before = await getBossGreetingSetting();
+    if (!before.ok) return before;
+    let templateId = String(payload.templateId || before.templateId || "");
+    if (enabled && !templateId) templateId = String(before.templates?.[0]?.templateId || "");
+    if (enabled && !templateId) {
+      return {
+        ok: false,
+        error: "BOSS_GREETING_TEMPLATE_REQUIRED",
+        message: "BOSS 当前没有可启用的招呼语模板，请先在 BOSS 设置页添加话术"
+      };
+    }
+    try {
+      const body = new URLSearchParams();
+      body.set("status", enabled ? "1" : "0");
+      body.set("templateId", templateId);
+      const result = await bossGreetingApi("/wapi/zpchat/greeting/updateGreetingV2", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString()
+      });
+      if ([120, 121, 122].includes(Number(result?.code))) {
+        return {
+          ok: false,
+          error: "BOSS_TOKEN_INVALID",
+          code: Number(result.code),
+          message: "BOSS 登录校验已失效（" + Number(result.code) + "），请刷新 BOSS 页面后重试"
+        };
+      }
+      if (Number(result?.code) !== 0) {
+        return { ok: false, error: "BOSS_GREETING_WRITE_FAILED", message: result?.message || "修改 BOSS 自动招呼设置失败" };
+      }
+      await sleep(350);
+      const after = await getBossGreetingSetting();
+      if (!after.ok || after.enabled !== enabled) {
+        return {
+          ok: false,
+          error: "BOSS_GREETING_WRITE_NOT_CONFIRMED",
+          message: "BOSS 已响应设置请求，但回读状态不一致。请打开 BOSS 设置页确认",
+          before,
+          after
+        };
+      }
+      return { ...after, changed: before.enabled !== after.enabled, previousEnabled: before.enabled };
+    } catch (error) {
+      return {
+        ok: false,
+        error: "BOSS_GREETING_WRITE_FAILED",
+        message: "修改 BOSS 自动招呼设置失败：" + String(error?.message || error)
+      };
+    }
+  }
+
+  async function saveBossGreetingText(payload = {}) {
+    const text = String(payload.text || "").trim();
+    if (!text) {
+      return { ok: false, error: "BOSS_GREETING_TEXT_REQUIRED", message: "请填写 BOSS 自动招呼话术" };
+    }
+    if (Array.from(text).length > 100) {
+      return { ok: false, error: "BOSS_GREETING_TEXT_TOO_LONG", message: "BOSS 自动招呼话术最多 100 个字" };
+    }
+    const before = await getBossGreetingSetting();
+    if (!before.ok) return before;
+    const current = before.templates?.find((item) => item.templateId === before.templateId) || null;
+    // BOSS 官方页面只原地编辑 greetingType=2；内置模板优先复用账号已有的自定义槽，没有才创建。
+    const editableTemplate = current?.editable
+      ? current
+      : before.templates?.find((item) => item.editable) || null;
+    const editableTemplateId = editableTemplate?.templateId || "";
+    try {
+      const body = new URLSearchParams();
+      body.set("templateId", editableTemplateId);
+      body.set("content", text);
+      body.set("customType", "2");
+      const saved = await bossGreetingApi("/wapi/zpchat/greeting/custom/saveV2", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString()
+      });
+      if ([120, 121, 122].includes(Number(saved?.code))) {
+        return {
+          ok: false,
+          error: "BOSS_TOKEN_INVALID",
+          code: Number(saved.code),
+          message: "BOSS 登录校验已失效（" + Number(saved.code) + "），请刷新 BOSS 页面后重试"
+        };
+      }
+      if (Number(saved?.code) !== 0) {
+        return { ok: false, error: "BOSS_GREETING_TEXT_SAVE_FAILED", message: saved?.message || "保存 BOSS 自动招呼话术失败" };
+      }
+      await sleep(350);
+      let after = await getBossGreetingSetting();
+      if (!after.ok) return after;
+      const primitiveSavedId = ["string", "number"].includes(typeof saved?.zpData)
+        ? saved.zpData
+        : "";
+      const responseTemplateId = String(
+        primitiveSavedId || saved?.zpData?.templateId || saved?.zpData?.greeting?.templateId || saved?.templateId || ""
+      );
+      const target = after.templates?.find((item) =>
+        (responseTemplateId && item.templateId === responseTemplateId) ||
+        (editableTemplateId && item.templateId === editableTemplateId) ||
+        (item.editable && item.text === text)
+      ) || null;
+      if (!target?.templateId) {
+        return {
+          ok: false,
+          error: "BOSS_GREETING_TEXT_NOT_FOUND",
+          message: "BOSS 已响应保存请求，但回读时没有找到新话术。请打开 BOSS 设置页确认"
+        };
+      }
+      if (after.templateId !== target.templateId) {
+        const selectBody = new URLSearchParams();
+        selectBody.set("status", before.enabled ? "1" : "0");
+        selectBody.set("templateId", target.templateId);
+        const selected = await bossGreetingApi("/wapi/zpchat/greeting/updateGreetingV2", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: selectBody.toString()
+        });
+        if (Number(selected?.code) !== 0) {
+          return {
+            ok: false,
+            error: "BOSS_GREETING_TEXT_SELECT_FAILED",
+            message: selected?.message || "话术已保存，但设为当前 BOSS 招呼语失败"
+          };
+        }
+        await sleep(350);
+        after = await getBossGreetingSetting();
+      }
+      if (!after.ok || after.templateId !== target.templateId || String(after.text || "").trim() !== text) {
+        return {
+          ok: false,
+          error: "BOSS_GREETING_TEXT_NOT_CONFIRMED",
+          message: "BOSS 已响应保存请求，但当前话术回读不一致。请打开 BOSS 设置页确认",
+          before,
+          after
+        };
+      }
+      return {
+        ...after,
+        textSaved: true,
+        previousText: before.text || "",
+        created: !editableTemplateId,
+        savedTemplateId: target.templateId
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: "BOSS_GREETING_TEXT_SAVE_FAILED",
+        message: "保存 BOSS 自动招呼话术失败：" + String(error?.message || error)
+      };
+    }
+  }
+
+  function findNativeGreetingReceipt(job = {}, afterTs = 0) {
+    const ids = [job.jobId, job.encryptJobId].map((value) => String(value || "")).filter(Boolean);
+    const rows = nativeGreetingReceipts.filter((row) => row.at >= afterTs && row.ok !== false);
+    return rows.slice().reverse().find((row) => !row.jobId || !ids.length || ids.includes(row.jobId)) || null;
+  }
+
+  async function waitForNativeGreetingReceipt(job = {}, afterTs = 0, timeoutMs = 1800) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      const receipt = findNativeGreetingReceipt(job, afterTs);
+      if (receipt) {
+        return {
+          available: true,
+          showGreeting: receipt.hasShowGreeting ? receipt.showGreeting : null,
+          text: receipt.greeting || "",
+          source: "friend-add-response",
+          at: receipt.at
+        };
+      }
+      await sleep(100);
+    }
+    return { available: false, showGreeting: null, text: "", source: "no-friend-add-receipt" };
+  }
+
+  function buildTriggerNavigationRecovery(inflight = {}) {
+    const job = inflight?.opPayload?.job || inflight?.opPayload || {};
+    const receipt = findNativeGreetingReceipt(job, Number(inflight.at || 0));
+    return globalThis.BHTTriggerNavigationRecovery?.resolveTriggerNavigationRecovery?.({
+      opType: inflight?.opType || "",
+      triggerType: MSG.TRIGGER_CONVERSATION,
+      job,
+      inflightAt: Number(inflight.at || 0),
+      now: Date.now(),
+      click: window.__BHT_LAST_TRIGGER_CLICK__,
+      receipt,
+      href: location.href,
+      contentVersion: BHT_CONTENT_VERSION
+    }) || null;
   }
 
   function textOf(el) {
@@ -523,8 +1469,18 @@ const SELECTORS = {
   }
 
   function classifyPuaDigit(ch, font) {
+    // Salary glyphs are reused across every BOSS card.  Rendering the same
+    // private-use glyph and all ten reference digits for every card made a
+    // later scan batch grow quadratically (the 90-card continuation took
+    // nearly 40 seconds in the 2026-09-01 diagnostic).  Keep a small per-page
+    // cache so only genuinely new glyph/font pairs hit canvas.
+    const cacheKey = String(font || "") + "\u0000" + String(ch || "");
+    if (puaDigitCache.has(cacheKey)) return puaDigitCache.get(cacheKey);
     const target = renderGlyphMatrix(ch, font);
-    if (!target) return null;
+    if (!target) {
+      rememberBoundedCache(puaDigitCache, cacheKey, null, 256);
+      return null;
+    }
     // Cross-font shape match: BOSS PUA glyphs look like digits.
     const fonts = [
       font,
@@ -537,7 +1493,12 @@ const SELECTORS = {
     let bestScore = Infinity;
     for (const f of fonts) {
       for (let d = 0; d <= 9; d++) {
-        const ref = renderGlyphMatrix(String(d), f);
+        const referenceKey = String(f) + "\u0000" + String(d);
+        let ref = puaReferenceCache.get(referenceKey);
+        if (!ref) {
+          ref = renderGlyphMatrix(String(d), f);
+          if (ref) rememberBoundedCache(puaReferenceCache, referenceKey, ref, 64);
+        }
         if (!ref) continue;
         const sc = matrixScore(target, ref);
         if (sc < bestScore) {
@@ -547,8 +1508,24 @@ const SELECTORS = {
       }
     }
     // threshold: 24x32=768 cells; good matches usually << 220
-    if (best != null && bestScore < 260) return best;
-    return null;
+    const result = best != null && bestScore < 260 ? best : null;
+    rememberBoundedCache(puaDigitCache, cacheKey, result, 256);
+    return result;
+  }
+
+  // These caches intentionally live only for the current content document;
+  // a BOSS navigation creates a fresh script instance and cannot retain stale
+  // font or DOM assumptions.
+  const puaDigitCache = new Map();
+  const puaReferenceCache = new Map();
+  const salaryTextCache = new Map();
+  function rememberBoundedCache(cache, key, value, limit = 512) {
+    cache.set(key, value);
+    if (cache.size > limit) {
+      const oldest = cache.keys().next().value;
+      if (oldest !== undefined) cache.delete(oldest);
+    }
+    return value;
   }
 
   function decodeBossSalaryText(raw, salaryEl) {
@@ -568,6 +1545,9 @@ const SELECTORS = {
     try {
       if (salaryEl) font = window.getComputedStyle(salaryEl).font || font;
     } catch (_) {}
+
+    const cacheKey = String(font) + "\u0000" + s;
+    if (salaryTextCache.has(cacheKey)) return salaryTextCache.get(cacheKey);
 
     // A) canvas shape classify (most reliable when font available)
     for (const ch of puaList) {
@@ -601,8 +1581,9 @@ const SELECTORS = {
     }
 
     const decoded = chars.map((ch) => (digitMap[ch] != null ? digitMap[ch] : ch)).join("");
-    if (/[0-9]/.test(decoded)) return decoded;
-    return s.replace(/[\uE000-\uF8FF]/g, "?");
+    const result = /[0-9]/.test(decoded) ? decoded : s.replace(/[\uE000-\uF8FF]/g, "?");
+    rememberBoundedCache(salaryTextCache, cacheKey, result, 512);
+    return result;
   }
 
   function extractSalaryFromComponent(card) {
@@ -636,6 +1617,55 @@ const SELECTORS = {
       } catch (_) {}
     }
     return "";
+  }
+
+  function extractJobMetadataFromComponent(card) {
+    const nodes = [card, card?.firstElementChild, card?.querySelector?.("a.job-name")].filter(Boolean);
+    for (const node of nodes) {
+      try {
+        for (const key of Object.keys(node || {})) {
+          if (!/^__(reactFiber|reactInternalInstance|vueParentComponent|vue__)/.test(key) && key !== "__vueParentComponent" && key !== "__vue__") continue;
+          let cur = node[key];
+          for (let depth = 0; depth < 12 && cur; depth++) {
+            const props = cur.memoizedProps || cur.pendingProps || cur.props || cur.$props || cur.data || cur.ctx || null;
+            const candidates = [
+              props?.data,
+              props?.job,
+              props?.jobInfo,
+              props?.item,
+              props,
+              cur?.data,
+              cur?.ctx?.data,
+              cur?.ctx?.job,
+              cur?.ctx?.jobInfo
+            ].filter((value) => value && typeof value === "object");
+            for (const value of candidates) {
+              const jobInfo = value.jobInfo || {};
+              const bossInfo = value.bossInfo || {};
+              const jobId = String(value.encryptJobId || value.encryptId || value.jobId || jobInfo.encryptId || "");
+              const securityId = String(value.securityId || "");
+              const lid = String(value.lid || "");
+              if (!jobId && !securityId && !lid) continue;
+              const bossOnline = value.bossOnline === true || value.bossOnline === 1 || bossInfo.bossOnline === true || bossInfo.bossOnline === 1;
+              return {
+                jobId,
+                securityId,
+                lid,
+                bossId: String(value.encryptBossId || value.bossId || bossInfo.encryptBossId || ""),
+                bossName: String(value.bossName || bossInfo.name || "").trim(),
+                bossTitle: String(value.bossTitle || bossInfo.title || "").trim(),
+                brandName: String(value.brandName || bossInfo.brandName || "").trim(),
+                bossOnline,
+                goldHunter: value.goldHunter === true || value.goldHunter === 1 || bossInfo.goldHunter === 1,
+                activeText: bossOnline ? "在线" : String(value.activeTimeDesc || bossInfo.activeTimeDesc || "").trim()
+              };
+            }
+            cur = cur.return || cur.parent || cur._ || cur.$parent || null;
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
   }
 
   function extractSalary(card, salaryEl) {
@@ -821,10 +1851,12 @@ function firstEl(selectors, root = document) {
 
   function normalizeText(input = "") {
     return String(input || "")
+      .normalize("NFKC")
       .replace(/【[^】]*】/g, "")
       .replace(/\[[^\]]*\]/g, "")
-      .replace(/\s+/g, "")
-      .replace(/[【】\[\]()（）·•|｜]/g, "")
+      .replace(/[\u200B-\u200D\u2060\uFEFF]/g, "")
+      .replace(/[\uE000-\uF8FF]/g, "")
+      .replace(/[^\p{L}\p{N}+#]+/gu, "")
       .toLowerCase();
   }
 
@@ -932,6 +1964,7 @@ function firstEl(selectors, root = document) {
     const locationEl = firstEl(SELECTORS.location, card);
     const activeEl = firstEl(SELECTORS.activeText, card);
     const tags = allEl(SELECTORS.tags, card).map(textOf).filter(Boolean).slice(0, 12);
+    const componentMeta = extractJobMetadataFromComponent(card) || {};
 
     const linkEl =
       (titleEl && titleEl.tagName === "A" ? titleEl : null) ||
@@ -957,15 +1990,23 @@ function firstEl(selectors, root = document) {
       card.dataset?.jid ||
       linkEl?.getAttribute?.("data-jobid") ||
       linkEl?.getAttribute?.("data-jid") ||
-      extractJobIdFromHref(href);
+      extractJobIdFromHref(href) ||
+      componentMeta.jobId ||
+      "";
+
+    const networkMeta = jobNetworkMetadata.get(String(jobId || '')) || {};
+    if (!href && jobId) href = absolutizeHref("/job_detail/" + jobId + ".html");
 
     // securityId 可能在详情 more link，卡片阶段先空
-    let securityId = extractSecurityId(href);
+    let securityId = extractSecurityId(href) || networkMeta.securityId || componentMeta.securityId || "";
+    const lid = String(networkMeta.lid || componentMeta.lid || "");
 
     const bossId =
       card.getAttribute?.("data-uid") ||
       card.getAttribute?.("data-bossid") ||
       card.getAttribute?.("data-boss-id") ||
+      networkMeta.bossId ||
+      componentMeta.bossId ||
       "";
 
     // 列表卡上通常没有沟通按钮，沟通在右侧详情
@@ -978,14 +2019,25 @@ function firstEl(selectors, root = document) {
     const btnText = textOf(btn);
     const communicated = /继续沟通|沟通中/.test(btnText);
     const title = textOf(titleEl) || textOf(card).slice(0, 40);
-    const company = textOf(companyEl);
+    const company = textOf(companyEl) || networkMeta.brandName || componentMeta.brandName || "";
     const salary = extractSalary(card, salaryEl);
     const locationText = textOf(locationEl);
-    const activeText = textOf(activeEl) || (firstEl(SELECTORS.online, card) ? "在线" : "");
+    const online = Boolean(
+      firstEl(SELECTORS.online, card) ||
+      networkMeta.bossOnline === true ||
+      componentMeta.bossOnline === true
+    );
+    const activeText = textOf(activeEl) || networkMeta.activeText || componentMeta.activeText || (online ? "在线" : "");
     const jd = [textOf(card), tags.join(" ")].join(" ");
 
     if (!jobId) {
-      const stable = hashStr(normalizeText(title) + "|" + normalizeText(company));
+      const stable = hashStr([
+        title,
+        company,
+        locationText,
+        securityId,
+        lid
+      ].map(normalizeText).join("|"));
       jobId = (title || company) ? ("name_" + stable) : ("dom_" + index + "_" + stable);
     }
 
@@ -993,12 +2045,15 @@ function firstEl(selectors, root = document) {
       index,
       jobId,
       securityId,
+      lid,
       bossId,
       title,
       company,
       salary,
       location: locationText,
       activeText,
+      goldHunter: networkMeta.goldHunter === true || componentMeta.goldHunter === true,
+      hrTitle: String(networkMeta.bossTitle || componentMeta.bossTitle || "").trim(),
       tags,
       jd,
       href: href.startsWith("http") ? href : href ? new URL(href, globalThis.location.origin).href : "",
@@ -1015,7 +2070,7 @@ function firstEl(selectors, root = document) {
             ".recruiter-name",
             ".hr-name",
             "[data-role='recruiter-name']"
-          ], scope));
+          ], scope)) || networkMeta.bossName || componentMeta.bossName || "";
           hr = globalThis.BHTConversationMatch?.cleanHrIdentity
             ? globalThis.BHTConversationMatch.cleanHrIdentity(hr)
             : String(hr || "").split(/[·|｜]/)[0].replace(/\s+/g, " ").trim();
@@ -1023,7 +2078,7 @@ function firstEl(selectors, root = document) {
           return hr;
         } catch (_) { return ""; }
       })(),
-      online: Boolean(firstEl(SELECTORS.online, card))
+      online
     };
   }
 
@@ -1045,9 +2100,583 @@ function firstEl(selectors, root = document) {
     }
   }
 
+  function getAdaptiveScanScroller() {
+    const candidates = [];
+    for (const selector of SELECTORS.listScroller || []) {
+      try { candidates.push(...document.querySelectorAll(selector)); } catch (_) {}
+    }
+    candidates.push(document.scrollingElement, document.documentElement, document.body);
+    for (const el of candidates.filter(Boolean)) {
+      try {
+        const isDocumentScroller = el === document.scrollingElement || el === document.documentElement || el === document.body;
+        const style = getComputedStyle(el);
+        const scrollableStyle = /auto|scroll|overlay/i.test(style.overflowY || '');
+        if (el.scrollHeight > el.clientHeight + 80 && (isDocumentScroller || scrollableStyle)) return el;
+      } catch (_) {}
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+
+  function scrollListToTop() {
+    const apply = () => {
+      try {
+        const scroller = getAdaptiveScanScroller();
+        if (
+          scroller &&
+          scroller !== document.scrollingElement &&
+          scroller !== document.documentElement &&
+          scroller !== document.body
+        ) {
+          scroller.scrollTop = 0;
+        }
+        window.scrollTo(0, 0);
+      } catch (_) {}
+    };
+    const read = () => {
+      const scroller = getAdaptiveScanScroller();
+      const isDoc = scroller === document.scrollingElement || scroller === document.documentElement || scroller === document.body;
+      return {
+        containerTop: scroller && !isDoc ? Number(scroller.scrollTop || 0) : 0,
+        windowTop: Number(window.scrollY || 0)
+      };
+    };
+    apply();
+    // BOSS SPA 会在列表就绪后异步恢复滚动位置，稍后补一次确保停在顶部
+    setTimeout(apply, 400);
+    return { ok: true, ...read() };
+  }
+
+  function describeAdaptiveScanScroller(scroller) {
+    const isDocumentScroller =
+      scroller === document.scrollingElement ||
+      scroller === document.documentElement ||
+      scroller === document.body;
+    let overflowY = '';
+    try { overflowY = String(getComputedStyle(scroller).overflowY || ''); } catch (_) {}
+    return {
+      kind: isDocumentScroller ? 'document' : 'element',
+      tag: String(scroller?.tagName || ''),
+      id: String(scroller?.id || ''),
+      className: String(scroller?.className || '').slice(0, 160),
+      overflowY
+    };
+  }
+
+  function adaptiveScrollSnapshot(scroller) {
+    const isDocumentScroller =
+      scroller === document.scrollingElement ||
+      scroller === document.documentElement ||
+      scroller === document.body;
+    const top = isDocumentScroller ? window.scrollY : Number(scroller?.scrollTop || 0);
+    const viewport = isDocumentScroller ? window.innerHeight : Number(scroller?.clientHeight || 0);
+    const height = isDocumentScroller
+      ? Math.max(document.documentElement?.scrollHeight || 0, document.body?.scrollHeight || 0)
+      : Number(scroller?.scrollHeight || 0);
+    return {
+      top,
+      viewport,
+      height,
+      atBottom: height > 0 && top + viewport >= height - 48
+    };
+  }
+
+  function setAdaptiveScrollTop(scroller, top) {
+    const nextTop = Math.max(0, Number(top || 0));
+    const isDocumentScroller =
+      scroller === document.scrollingElement ||
+      scroller === document.documentElement ||
+      scroller === document.body;
+    if (isDocumentScroller) window.scrollTo(0, nextTop);
+    else scroller.scrollTop = nextTop;
+  }
+
+  function nextAdaptiveScrollTop(snapshot) {
+    const viewport = Math.max(1, Number(snapshot?.viewport || 0));
+    const maxTop = Math.max(0, Number(snapshot?.height || 0) - viewport);
+    // 85% 视口步进保留重叠窗口：append-only 列表仍然很快，虚拟列表也不会
+    // 因为直接从顶部跳到尾部而漏掉中间岗位。
+    const step = Math.max(240, Math.floor(viewport * 0.85));
+    return Math.min(maxTop, Math.max(0, Number(snapshot?.top || 0)) + step);
+  }
+
+  function pulseAdaptiveScrollBottom(scroller, snapshot) {
+    const viewport = Math.max(1, Number(snapshot?.viewport || 0));
+    const maxTop = Math.max(0, Number(snapshot?.height || 0) - viewport);
+    const pullback = Math.max(80, Math.min(180, Math.floor(viewport * 0.16)));
+    setAdaptiveScrollTop(scroller, Math.max(0, maxTop - pullback));
+    // 两次不同 scrollTop 会重新触发只监听 scroll 事件的懒加载器。
+    setAdaptiveScrollTop(scroller, maxTop);
+  }
+
+  function hasExplicitJobListEnd(scroller) {
+    const root = scroller?.querySelector ? scroller : document;
+    try {
+      const marker = root.querySelector(
+        ".loadmore-end, .load-more-end, .list-end, .job-list-end, [data-list-end='true'], [data-has-more='false']"
+      );
+      if (marker) return true;
+      const tail = String(root.textContent || '').replace(/\s+/g, ' ').trim().slice(-160);
+      return /没有更多(?:职位|岗位)?|暂无更多(?:职位|岗位)?|已加载全部/.test(tail);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function collectAdaptiveScanJobs(session) {
+    const cards = getJobCards();
+    // BOSS keeps already loaded cards in the DOM while appending the next
+    // result page.  Re-parsing every card on every scroll round made the scan
+    // O(n^2), and the encrypted salary decoder amplified that cost with many
+    // canvas renders.  Cache by DOM node plus a cheap identity fingerprint;
+    // virtualized lists that recycle a node are still re-parsed when its job
+    // id, link, title, activity or button changes.
+    const cardCache = session.cardCache || (session.cardCache = new WeakMap());
+    const cardIdentity = (card) => {
+      try {
+        const id = String(
+          card.getAttribute?.("data-jobid") ||
+          card.getAttribute?.("data-job-id") ||
+          card.getAttribute?.("data-jid") ||
+          card.dataset?.jobid ||
+          card.dataset?.jid ||
+          ""
+        );
+        const link = card.querySelector?.("a.job-name[href], a[href*='job_detail'], a[href*='jobId='], a[href*='jid=']");
+        const href = String(link?.getAttribute?.("href") || link?.href || "");
+        const metadataId = id || extractJobIdFromHref(href);
+        const metadata = jobNetworkMetadata.get(String(metadataId || '')) || {};
+        const title = String(card.querySelector?.("a.job-name, .job-name")?.textContent || "")
+          .replace(/\s+/g, " ").trim();
+        const active = String(card.querySelector?.(".boss-active-time, .boss-info .time, .active-time")?.textContent || "")
+          .replace(/\s+/g, " ").trim();
+        const button = String(card.querySelector?.("a.op-btn-chat, .op-btn-chat, a.op-btn")?.textContent || "")
+          .replace(/\s+/g, " ").trim();
+        return [
+          id,
+          href,
+          title,
+          active,
+          button,
+          metadata.securityId || '',
+          metadata.lid || '',
+          metadata.activeText || '',
+          metadata.bossOnline === true ? '1' : '0'
+        ].join("\u0001");
+      } catch (_) {
+        return "";
+      }
+    };
+    const visibleKeys = [];
+    const newJobs = [];
+    let added = 0;
+    cards.forEach((card, index) => {
+      const identity = cardIdentity(card);
+      const cached = cardCache.get(card);
+      let job = cached && cached.identity === identity ? cached.job : null;
+      if (!job) {
+        job = parseJobCard(card, index);
+        cardCache.set(card, { identity, job });
+      }
+      const key = String(job.jobId || `${normalizeText(job.title || '')}|${normalizeText(job.company || '')}`);
+      if (!key) return;
+      visibleKeys.push(key);
+      const previous = session.jobs.get(key);
+      const merged = {
+        ...(previous || {}),
+        ...job,
+        company: job.company || previous?.company || '',
+        href: job.href || previous?.href || '',
+        securityId: job.securityId || previous?.securityId || '',
+        lid: job.lid || previous?.lid || '',
+        bossId: job.bossId || previous?.bossId || '',
+        hrName: job.hrName || previous?.hrName || '',
+        activeText: job.activeText || previous?.activeText || '',
+        index: previous?.index ?? session.jobs.size
+      };
+      if (!previous) {
+        added += 1;
+        newJobs.push(merged);
+      }
+      session.jobs.set(key, merged);
+    });
+    return {
+      added,
+      newJobs,
+      visibleCount: cards.length,
+      signature: visibleKeys.join('|')
+    };
+  }
+
+  async function scanAdaptiveJobBatch(payload = {}) {
+    const sessionId = String(payload.scanSessionId || 'default');
+    let session = window.__BHT_SCAN_SESSION__;
+    if (payload.resetSession === true || !session || session.id !== sessionId) {
+      session = window.__BHT_SCAN_SESSION__ = {
+        id: sessionId,
+        jobs: new Map(),
+        cardCache: new WeakMap(),
+        rounds: 0,
+        stableRounds: 0,
+        bottomStableRounds: 0,
+        reachedEnd: false,
+        startedAt: Date.now(),
+        lastGrowthAt: Date.now(),
+        growthEvents: 0,
+        initialScrollTop: null,
+        initialScrollHeight: null,
+        scanStartTop: null,
+        lastSignature: ''
+      };
+    }
+
+    let scroller = session.scroller?.isConnected
+      ? session.scroller
+      : getAdaptiveScanScroller();
+    session.scroller = scroller;
+    const initialSnapshot = adaptiveScrollSnapshot(scroller);
+    if (session.initialScrollTop == null) session.initialScrollTop = initialSnapshot.top;
+    if (session.initialScrollHeight == null) session.initialScrollHeight = initialSnapshot.height;
+    const batchJobs = new Map();
+    let batchAdded = 0;
+    let lastVisibleCount = 0;
+    let lastSignature = '';
+    const deadlineAt = Math.max(0, Number(payload.deadlineAt || 0));
+    let timedOut = false;
+    let lastProgressAt = 0;
+    const reportScanProgress = (count) => {
+      const now = Date.now();
+      if (now - lastProgressAt < 250) return;
+      lastProgressAt = now;
+      try {
+        chrome.runtime.sendMessage({
+          type: MSG.SCAN_PROGRESS,
+          payload: { count: Number(count || 0), at: now }
+        }).catch(() => {});
+      } catch (_) {}
+    };
+    const collectWindow = () => {
+      const sizeBefore = session.jobs.size;
+      const collected = collectAdaptiveScanJobs(session);
+      for (const job of collected.newJobs) {
+        batchJobs.set(String(job.jobId || `${normalizeText(job.title)}|${normalizeText(job.company)}`), job);
+      }
+      batchAdded += collected.added;
+      lastVisibleCount = collected.visibleCount;
+      lastSignature = collected.signature;
+      if (collected.added > 0 && sizeBefore > 0) {
+        session.lastGrowthAt = Date.now();
+        session.growthEvents += 1;
+      }
+      reportScanProgress(session.jobs.size);
+      return collected;
+    };
+    const isScanStopError = (error) => error?.code === "OP_CANCELLED";
+    const sleepUntilScanStop = async (ms) => {
+      const remainingMs = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : ms;
+      if (deadlineAt && remainingMs <= 0) {
+        timedOut = true;
+        return;
+      }
+      try {
+        await sleep(Math.min(ms, remainingMs));
+      } catch (error) {
+        if (isScanStopError(error)) {
+          timedOut = true;
+          return;
+        }
+        throw error;
+      }
+      if (deadlineAt && Date.now() >= deadlineAt) timedOut = true;
+    };
+
+    try {
+    // Preserve the current virtual window before returning to the top. BOSS
+    // currently appends cards, but this also covers a future recycled list.
+    collectWindow();
+    if (payload.resetSession === true && initialSnapshot.top > 8) {
+      try {
+        setAdaptiveScrollTop(scroller, 0);
+        let topStableRounds = 0;
+        let previousTopSignature = '';
+        for (let attempt = 0; attempt < 6; attempt++) {
+          if (deadlineAt && Date.now() >= deadlineAt) {
+            timedOut = true;
+            break;
+          }
+          await sleepUntilScanStop(80);
+          scroller = session.scroller?.isConnected
+            ? session.scroller
+            : getAdaptiveScanScroller();
+          session.scroller = scroller;
+          const topWindow = collectWindow();
+          const topSnapshot = adaptiveScrollSnapshot(scroller);
+          if (topSnapshot.top <= 8 && topWindow.signature === previousTopSignature) topStableRounds += 1;
+          else topStableRounds = 0;
+          previousTopSignature = topWindow.signature;
+          if (topStableRounds >= 2 || timedOut) break;
+          if (topSnapshot.top > 8) setAdaptiveScrollTop(scroller, 0);
+        }
+      } catch (error) {
+        if (!isScanStopError(error)) throw error;
+        timedOut = true;
+      }
+    }
+    if (session.scanStartTop == null) session.scanStartTop = adaptiveScrollSnapshot(scroller).top;
+    const requestedRounds = Number(payload.maxRounds);
+    const continuous = payload.continuous === true;
+    // A preview normally owns one content operation for the whole collection
+    // window.  Do not cap that operation at the old eight-round batch; the
+    // shared deadline below is the real stop condition.  Keep a generous
+    // iteration guard for pages that never report a usable bottom.
+    const maxRounds = payload.scroll === false
+      ? 0
+      : continuous
+        ? Math.max(1, Math.min(512, Number.isFinite(requestedRounds) ? requestedRounds : 512))
+        : Math.max(1, Math.min(64, Number.isFinite(requestedRounds) ? requestedRounds : 24));
+    const requestedWaitMs = Number(payload.scrollWaitMs);
+    const waitMs = Math.max(70, Math.min(500, Number.isFinite(requestedWaitMs) ? requestedWaitMs : 100));
+    const bottomWaitMs = Math.max(260, Math.min(600, waitMs * 3));
+
+    for (let round = 0; round < maxRounds && !session.reachedEnd; round++) {
+      if (timedOut || (deadlineAt && Date.now() >= deadlineAt)) {
+        timedOut = true;
+        break;
+      }
+      scroller = session.scroller?.isConnected
+        ? session.scroller
+        : getAdaptiveScanScroller();
+      session.scroller = scroller;
+      const before = adaptiveScrollSnapshot(scroller);
+      try {
+        if (before.atBottom) pulseAdaptiveScrollBottom(scroller, before);
+        else setAdaptiveScrollTop(scroller, nextAdaptiveScrollTop(before));
+      } catch (_) {}
+      const settleMs = before.atBottom ? bottomWaitMs : waitMs;
+      await sleepUntilScanStop(settleMs);
+
+      scroller = session.scroller?.isConnected
+        ? session.scroller
+        : getAdaptiveScanScroller();
+      session.scroller = scroller;
+      const previousSignature = lastSignature;
+      const collected = collectWindow();
+      const after = adaptiveScrollSnapshot(scroller);
+      const moved = Math.abs(after.top - before.top) > 8 || after.height !== before.height;
+      const visibleChanged = Boolean(collected.signature && collected.signature !== previousSignature);
+      session.rounds += 1;
+      if (deadlineAt && Date.now() >= deadlineAt) timedOut = true;
+
+      if (collected.added <= 0 && !moved && !visibleChanged) session.stableRounds += 1;
+      else session.stableRounds = 0;
+      // 虚拟列表替换节点时可能短暂没有卡片；空 DOM 不能作为“到底”证据。
+      if (after.atBottom && collected.visibleCount > 0 && collected.added <= 0 && !visibleChanged) session.bottomStableRounds += 1;
+      else session.bottomStableRounds = 0;
+      const explicitEnd = after.atBottom && hasExplicitJobListEnd(scroller);
+      if (
+        !timedOut &&
+        (
+          explicitEnd ||
+          (session.bottomStableRounds >= 8 && Date.now() - session.lastGrowthAt >= 3000)
+        )
+      ) {
+        session.reachedEnd = true;
+      }
+      if (timedOut) break;
+    }
+    } catch (error) {
+      if (!isScanStopError(error)) throw error;
+      timedOut = true;
+      try { collectWindow(); } catch (_) {}
+    }
+
+    if (!session.reachedEnd && deadlineAt && Date.now() >= deadlineAt) timedOut = true;
+    if (timedOut) session.reachedEnd = false;
+    session.lastSignature = lastSignature;
+    const snapshot = adaptiveScrollSnapshot(scroller);
+    // timedOut 表示采集在 deadlineAt 截止；随后仅允许构造快照和写回结果。
+    const collectionFinishedAt = timedOut && deadlineAt ? deadlineAt : Date.now();
+    const scrollerInfo = describeAdaptiveScanScroller(scroller);
+    const allJobs = Array.from(session.jobs.values()).map((job, index) => ({ ...job, index }));
+    const jobs = payload.deltaOnly === true
+      ? Array.from(batchJobs.values())
+      : allJobs;
+    return {
+      jobs,
+      count: allJobs.length,
+      scanMeta: {
+        sessionId,
+        uniqueCount: allJobs.length,
+        returnedCount: jobs.length,
+        visibleCount: lastVisibleCount,
+        batchAdded,
+        rounds: session.rounds,
+        reachedEnd: session.reachedEnd,
+        timedOut,
+        atBottom: snapshot.atBottom,
+        stableRounds: session.stableRounds,
+        bottomStableRounds: session.bottomStableRounds,
+        growthEvents: session.growthEvents,
+        initialScrollTop: session.initialScrollTop,
+        initialScrollHeight: session.initialScrollHeight,
+        scanStartTop: session.scanStartTop,
+        scrollTop: snapshot.top,
+        scrollHeight: snapshot.height,
+        scrollViewport: snapshot.viewport,
+        scroller: scrollerInfo,
+        lastGrowthAgoMs: Math.max(0, Date.now() - session.lastGrowthAt),
+        collectionFinishedAt,
+        elapsedMs: collectionFinishedAt - session.startedAt
+      }
+    };
+  }
+
+  async function fetchJobActivityDetail(job = {}, deadlineAt = 0) {
+    const securityId = String(job.securityId || '');
+    const lid = String(job.lid || '');
+    if (!securityId || !lid) return { ok: false, skipped: true, error: 'DETAIL_PARAMS_MISSING' };
+    const remainingMs = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : 1800;
+    if (remainingMs < 250) return { ok: false, skipped: true, error: 'ACTIVITY_DEADLINE' };
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), Math.min(1800, remainingMs));
+    try {
+      const url = new URL('/wapi/zpgeek/job/detail.json', location.origin);
+      url.searchParams.set('securityId', securityId);
+      url.searchParams.set('lid', lid);
+      const response = await fetch(url.href, {
+        credentials: 'include',
+        cache: 'no-store',
+        signal: controller.signal,
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+      });
+      if (!response.ok) {
+        return {
+          ok: false,
+          halt: response.status === 429 || response.status === 403,
+          error: 'ACTIVITY_HTTP_' + response.status
+        };
+      }
+      const payload = await response.json();
+      const code = Number(payload?.code);
+      if (code !== 0) {
+        // 任意非零响应都立即熔断，不重试，不放大 BOSS 风控。
+        return { ok: false, halt: true, code, error: 'ACTIVITY_API_' + code };
+      }
+      const zpData = payload?.zpData || {};
+      const actualJobId = String(zpData?.jobInfo?.encryptId || '');
+      const expectedJobId = String(job.jobId || '');
+      if (actualJobId && expectedJobId && actualJobId !== expectedJobId) {
+        return { ok: false, halt: true, error: 'ACTIVITY_JOB_MISMATCH' };
+      }
+      const bossInfo = zpData?.bossInfo || {};
+      const bossOnline = bossInfo.bossOnline === true || bossInfo.bossOnline === 1;
+      const activeText = bossOnline ? '在线' : String(bossInfo.activeTimeDesc || '').trim();
+      const metadata = rememberJobNetworkMetadata({
+        jobId: actualJobId || expectedJobId,
+        securityId,
+        lid,
+        bossId: String(bossInfo.encryptBossId || job.bossId || ''),
+        bossName: String(bossInfo.name || job.hrName || '').trim(),
+        bossTitle: String(bossInfo.title || '').trim(),
+        brandName: String(bossInfo.brandName || job.company || '').trim(),
+        bossOnline,
+        activeText,
+        source: 'activity-prefetch'
+      });
+      return { ok: true, ...(metadata || {}), activeText, bossOnline };
+    } catch (error) {
+      return {
+        ok: false,
+        halt: error?.name !== 'AbortError',
+        error: error?.name === 'AbortError' ? 'ACTIVITY_TIMEOUT' : 'ACTIVITY_FETCH_FAILED'
+      };
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  async function enrichJobActivities(payload = {}) {
+    // 预览期核对 HR 活跃度：直连列表 detail API（BOSS 原生接口，带登录态），
+    // 不点卡片、不导航、不离开列表页（与「左侧职位页保持原样」一致）。
+    // 限频保护：单次最多核对 12 岗、每岗间隔至少 900ms；遇到 429/403 或
+    // BOSS 风控码（如 code 37）立即熔断，避免破坏会话触发投递侧风控。
+    const requested = Array.isArray(payload.jobs) ? payload.jobs : [];
+    const deadlineAt = Number(payload.deadlineAt) || (Date.now() + 60000);
+    const maxChecksRaw = Number(payload.maxChecks);
+    const maxChecks = Math.min(12, maxChecksRaw > 0 ? maxChecksRaw : 12);
+    const activities = [];
+    let eligibleCount = 0;
+    let checkedCount = 0;
+    let halted = false;
+    let haltError = "";
+    for (const job of requested) {
+      if (Date.now() >= deadlineAt) {
+        halted = true;
+        haltError = "ACTIVITY_DEADLINE";
+        break;
+      }
+      if (checkedCount >= maxChecks) {
+        halted = true;
+        haltError = "ACTIVITY_BUDGET_" + maxChecks;
+        break;
+      }
+      eligibleCount += 1;
+      const res = await fetchJobActivityDetail(job, deadlineAt);
+      if (res?.halt) {
+        halted = true;
+        haltError = res.error || res.message || "ACTIVITY_HALT";
+        break;
+      }
+      if (res?.ok) {
+        // 与「点卡片核对」路径一致：activeText 先经 parseBossActiveLabel 归一化
+        // （BOSS 详情接口的原文文案可能与页面标签不同，如「当前在线」），
+        // 无法归一化时保留原文，交给 matchActive 判定（与点击路径的未知判定一致）。
+        activities.push({
+          jobId: String(job?.jobId || ""),
+          activeText: parseBossActiveLabel(String(res.activeText || "")) || String(res.activeText || "").trim(),
+          bossOnline: res.bossOnline === true,
+          goldHunter: res.goldHunter === true,
+          hrTitle: String(res.bossTitle || "").trim(),
+          bossName: String(res.bossName || "").trim(),
+          bossId: String(res.bossId || job?.bossId || "").trim()
+        });
+        checkedCount += 1;
+      }
+      // 每岗之间限频，避免 detail API 突发触发 BOSS 风控（code 37）
+      await sleep(900);
+    }
+    return {
+      ok: true,
+      activities,
+      requestedCount: requested.length,
+      eligibleCount,
+      checkedCount,
+      halted,
+      haltError,
+      skipped: false,
+      source: "list-api-detail"
+    };
+  }
+
   function pageInfo() {
     const cards = getJobCards();
     const hasChat = typeof hasUsableChatInput === "function" ? hasUsableChatInput() : Boolean(getChatInput());
+    const savedListCtx = getSavedListCtx();
+    const onList = isListLikePage();
+    const savedHref = getSavedListHref();
+    const savedExpect = String(savedListCtx?.expectLabel || "");
+    const savedHints = Array.isArray(savedListCtx?.filterHints)
+      ? savedListCtx.filterHints.slice(0, 12)
+      : [];
+    const liveExpect = onList ? String(detectSelectedJobExpect() || "") : "";
+    const liveHints = onList ? detectActiveFilterHints() : [];
+    // PING is also used while the source tab is on a detail/chat page. Expose
+    // the last intact list context for delivery recovery and diagnostics.
+    const listHref = onList ? location.href : savedHref;
+    const listExpectLabel = onList ? (liveExpect || savedExpect) : savedExpect;
+    const listFilterHints = onList
+      ? (liveHints.length ? liveHints : savedHints)
+      : savedHints;
     return {
       href: location.href,
       title: document.title,
@@ -1058,7 +2687,15 @@ function firstEl(selectors, root = document) {
       hasChatBtn: Boolean(firstEl(SELECTORS.chatOnDetail)),
       hasChatInput: hasChat,
       isChatPage: /\/chat/i.test(location.pathname + location.hash),
-      path: location.pathname
+      path: location.pathname,
+      // Keep the last intact list target available when delivery temporarily
+      // operates from a detail or chat page.
+      savedListHref: savedHref,
+      savedListExpectLabel: savedExpect,
+      savedListFilterHints: savedHints,
+      listHref,
+      listExpectLabel,
+      listFilterHints
     };
   }
 
@@ -1091,15 +2728,52 @@ function firstEl(selectors, root = document) {
 
   async function scanJobs(payload = {}) {
     try { rememberListHref(); } catch (_) {}
-    if (payload.scroll) await autoScrollList(payload.maxRounds || 6);
+    const sessionId = String(payload.scanSessionId || 'default');
+    const continuingSession =
+      payload.resetSession === false &&
+      window.__BHT_SCAN_SESSION__?.id === sessionId &&
+      isListLikePage();
+    const ensured = continuingSession
+      ? { ok: true, via: 'scan-session' }
+      : await ensureJobList({
+        maxWaitMs: payload.maxWaitMs || 12000,
+        scroll: false
+      });
+    if (!ensured.ok) {
+      debugTrace("scan_jobs_no_list", { href: location.href, error: ensured.error, message: ensured.message }, "warn");
+      return {
+        ok: false,
+        error: ensured.error || "LIST_NOT_FOUND",
+        message: ensured.message || "未找到职位列表页，请先打开 BOSS 职位列表页再扫描预览",
+        count: 0,
+        jobs: [],
+        shouldNavigate: ensured.shouldNavigate === true,
+        targetHref: ensured.targetHref || "",
+        via: ensured.via || "",
+        page: pageInfo()
+      };
+    }
+    // 不再自动点击求职期望标签：页面结构因人而异（搜索词/城市/推荐 tab 都可能误匹配），
+    // 点击可能导致 BOSS 筛选/刷新，列表与预览不一致。期望状态交给用户自己确认。
+    // 仅在 debug 日志里记录当前期望与保存期望，便于排查。
+    if (payload.resetSession !== false && payload.listExpectLabel && isListLikePage()) {
+      const expectNow = (typeof detectSelectedJobExpect === "function" ? detectSelectedJobExpect() : "") || "";
+      debugTrace("scan_jobs_expect_state", {
+        savedExpect: String(payload.listExpectLabel || "").slice(0, 60),
+        currentExpect: String(expectNow).slice(0, 60),
+        action: "skip-restore"
+      }, expectNow ? "debug" : "warn");
+    }
+    const adaptive = await scanAdaptiveJobBatch(payload);
     const cards = getJobCards();
-    const jobs = cards.map((c, i) => parseJobCard(c, i));
+    const jobs = adaptive.jobs;
     debugTrace("scan_jobs_snapshot", {
       cardCount: cards.length,
-      parsedCount: jobs.length,
+      parsedCount: adaptive.count,
+      returnedCount: jobs.length,
       missingCompanyCount: jobs.filter((job) => !job.company).length,
       page: pageInfo(),
-      jobs: jobs.slice(0, 80).map((job) => ({
+      jobs: jobs.slice(0, 5).map((job) => ({
         index: job.index,
         jobId: job.jobId,
         title: job.title,
@@ -1111,7 +2785,8 @@ function firstEl(selectors, root = document) {
     }, jobs.some((job) => !job.company) ? "warn" : "debug");
     try{rememberListHref();}catch(_){} return { ok: true, listHref: (typeof getSavedListHref==="function"?getSavedListHref():"")||location.href, listExpectLabel: (typeof detectSelectedJobExpect==="function"?detectSelectedJobExpect():"")||"", listFilterHints: (typeof detectActiveFilterHints==="function"?detectActiveFilterHints():[]), page: pageInfo(),
       jobs,
-      count: jobs.length,
+      count: adaptive.count,
+      scanMeta: adaptive.scanMeta,
       diagnose: {
         cardCount: cards.length,
         companySelectorHits: document.querySelectorAll(SELECTORS.company[0]).length,
@@ -1168,6 +2843,20 @@ function firstEl(selectors, root = document) {
     return null;
   }
 
+  async function listCardIdentityMismatch(job, card, detailTitle = "") {
+    await bhtIdentityReady;
+    const identity = globalThis.BHTJobIdentity;
+    if (!identity?.listJobIdentityMismatch) return "列表岗位身份校验模块缺失";
+    const parsed = card ? parseJobCard(card, Math.max(0, getJobCards().indexOf(card))) : {};
+    return identity.listJobIdentityMismatch({
+      wantId: job?.jobId || "",
+      cardId: parsed.jobId || "",
+      hrefId: extractJobIdFromHref(parsed.href || "") || extractJobIdFromHref(location.href),
+      wantTitle: job?.title || "",
+      gotTitle: detailTitle || parsed.title || ""
+    });
+  }
+
   function getChatRoot() {
     const input = (() => {
       try { return document.querySelector("#bht-mock-chat #chat-input, #chat-input, .chat-input [contenteditable='true']"); } catch (_) { return null; }
@@ -1214,12 +2903,107 @@ function firstEl(selectors, root = document) {
 
   
 
+  // 央国企/特定企业岗位详情页没有「立即沟通」，而是「立即网申/立即投递/投递简历」等
+  // 站外或表单类按钮。检测到这些按钮说明该岗位不支持 BOSS 站内沟通，应跳过而非报错暂停。
+  function findNonChatApplyButton(scope = document) {
+    const roots = [scope, document].filter(Boolean);
+    const selector = [
+      ".job-detail-op a",
+      ".job-detail-op button",
+      ".job-detail-box a",
+      ".job-detail-box button",
+      ".job-detail-header a",
+      ".job-detail-header button",
+      "a",
+      "button",
+      "[role='button']"
+    ].join(",");
+    const seen = new Set();
+    for (const root of roots) {
+      let nodes = [];
+      try { nodes = Array.from(root.querySelectorAll(selector)); } catch (_) {}
+      for (const node of nodes) {
+        const interactive = node.matches?.("a,button,[role='button']")
+          ? node
+          : node.closest?.("a,button,[role='button']") || node;
+        if (!interactive || seen.has(interactive)) continue;
+        seen.add(interactive);
+        const label = textOf(interactive).replace(/\s+/g, " ").trim();
+        // 只认明确指向「网申/投递/申请」的动作按钮，避免误伤无关链接
+        if (!/^(立即网申|立即投递|投递简历|立即申请|申请职位|网申)$/.test(label)) continue;
+        try {
+          const style = getComputedStyle(interactive);
+          const rect = interactive.getBoundingClientRect();
+          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity || "1") === 0) continue;
+          if (rect.width < 18 || rect.height < 10) continue;
+        } catch (_) {}
+        return interactive;
+      }
+    }
+    return null;
+  }
+
+  function findConversationActionButton(scope = document) {
+    const roots = [scope, document].filter(Boolean);
+    const selector = [
+      "a.op-btn-chat",
+      "button.op-btn-chat",
+      ".job-detail-op a",
+      ".job-detail-op button",
+      ".job-detail-box a",
+      ".job-detail-box button",
+      "a.btn-startchat",
+      "button.btn-startchat",
+      "[class*='startchat']",
+      "[data-ka*='chat']",
+      "[ka*='chat']",
+      ".btn-container a",
+      ".btn-container button",
+      "a",
+      "button",
+      "[role='button']"
+    ].join(",");
+    const candidates = [];
+    const seen = new Set();
+    for (const root of roots) {
+      let nodes = [];
+      try { nodes = Array.from(root.querySelectorAll(selector)); } catch (_) {}
+      for (const node of nodes) {
+        const interactive = node.matches?.("a,button,[role='button']")
+          ? node
+          : node.closest?.("a,button,[role='button']") || node;
+        if (!interactive || seen.has(interactive)) continue;
+        seen.add(interactive);
+        const label = textOf(interactive).replace(/\s+/g, " ").trim();
+        if (!/^(立即沟通|继续沟通|打招呼)$/.test(label)) continue;
+        const className = String(interactive.className || "");
+        const tag = String(interactive.tagName || "").toUpperCase();
+        const explicitlyInteractive = /^(A|BUTTON)$/.test(tag) || interactive.getAttribute?.("role") === "button";
+        const explicitChatClass = /op-btn-chat|btn-startchat|start-chat|chat-btn/i.test(className);
+        if (!explicitlyInteractive && !explicitChatClass) continue;
+        if (!explicitlyInteractive && /wrap|container/i.test(className)) continue;
+        let area = Number.MAX_SAFE_INTEGER;
+        try {
+          const style = getComputedStyle(interactive);
+          const rect = interactive.getBoundingClientRect();
+          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity || "1") === 0) continue;
+          if (rect.width < 18 || rect.height < 10) continue;
+          area = rect.width * rect.height;
+        } catch (_) {}
+        if (interactive.disabled || interactive.getAttribute?.("aria-disabled") === "true") continue;
+        candidates.push({
+          element: interactive,
+          score: (/^(A|BUTTON)$/.test(tag) ? 100 : 60) + (explicitChatClass ? 20 : 0),
+          area
+        });
+      }
+    }
+    candidates.sort((a, b) => b.score - a.score || a.area - b.area);
+    return candidates[0]?.element || null;
+  }
+
   async function clickChatButton() {
-    let btn =
-      firstEl(SELECTORS.chatOnDetail) ||
-      Array.from(document.querySelectorAll("a.op-btn-chat, a.op-btn, button")).find((el) =>
-        /立即沟通|继续沟通|打招呼/.test(textOf(el))
-      );
+    const btn = findConversationActionButton(document);
 
     if (!btn) return { ok: false, error: "CHAT_BUTTON_NOT_FOUND", buttonText: "" };
     const buttonText = textOf(btn);
@@ -1229,6 +3013,39 @@ function firstEl(selectors, root = document) {
   }
 
   
+  // BOSS 平台级每日沟通上限弹窗：「您已达到沟通上限 / 您今天已与N位BOSS沟通，休息一下，明天再来吧」
+  // 平台限制不随重试恢复，直接停止任务避免反复点击空转。
+  function detectBossDailyLimitModal() {
+    try {
+      const modalRoots = Array.from(
+        document.querySelectorAll(
+          ".dialog-wrap, .dialog-container, .boss-dialog, [class*='dialog'], [class*='modal'], [role='dialog']"
+        )
+      ).filter((el) => {
+        try {
+          const st = getComputedStyle(el);
+          if (st.display === "none" || st.visibility === "hidden") return false;
+          const r = el.getBoundingClientRect();
+          return r.width > 80 && r.height > 80;
+        } catch (_) {
+          return false;
+        }
+      }).slice(0, 8);
+      const text = modalRoots.map((el) => (el.innerText || el.textContent || "").replace(/\s+/g, " ").slice(0, 500)).join(" | ");
+      const markers = [
+        "您已达到沟通上限",
+        "已达沟通上限",
+        "已达到沟通上限",
+        "休息一下，明天再来吧"
+      ];
+      const hit = markers.find((m) => text.includes(m));
+      if (hit) {
+        return { ok: true, message: "BOSS 今日沟通上限已达，平台提示休息一下，请明天再试", marker: hit };
+      }
+    } catch (_) {}
+    return { ok: false };
+  }
+
   function detectLoginModal() {
     // 避免频繁读 body.innerText（BOSS 大页极慢，会导致发消息循环卡死）
     const modalRoots = Array.from(
@@ -1335,49 +3152,91 @@ function dismissCommonDialogs() {
 
   async function ensureJobList({ maxWaitMs = 12000, scroll = true, noHomeNav = false } = {}) {
     const readyCount = () => getJobCards().length;
+    const startedHref = location.href;
     if (readyCount() > 0) {
-      return { ok: true, count: readyCount(), restored: false, href: location.href };
+      return { ok: true, count: readyCount(), restored: false, href: location.href, via: "already-list" };
     }
 
-    // 聊天页先返回（软返回，不硬刷新）
-    if (isChatPage()) {
+    const savedTarget = getSavedJobListNavigationTarget();
+    // 只有存在已保存的 BOSS 列表锚点时才 history.back；否则可能退回外部历史页。
+    if (isChatPage() && savedTarget) {
       try { history.back(); } catch (_) {}
       await sleep(900);
     }
     await closeChatPanel();
     await sleep(300);
 
-    if (scroll) {
+    if (!noHomeNav && !isListLikePage() && savedTarget && !sameListUrl(location.href, savedTarget)) {
+      return {
+        ok: false,
+        count: 0,
+        restored: false,
+        href: location.href,
+        error: "LIST_NAV_REQUIRED",
+        message: "当前不在 BOSS 职位列表页，正在恢复上次职位列表…",
+        shouldNavigate: true,
+        targetHref: savedTarget,
+        via: "saved-list-navigation-required"
+      };
+    }
+
+    if (scroll && isListLikePage()) {
       try { await autoScrollList(6); } catch (_) {}
     }
 
     const start = Date.now();
     let navTried = false;
+    let navAttemptedAt = 0;
     while (Date.now() - start < maxWaitMs) {
       if (readyCount() > 0) {
-        return { ok: true, count: readyCount(), restored: true, href: location.href };
+        return {
+          ok: true,
+          count: readyCount(),
+          restored: location.href !== startedHref,
+          href: location.href,
+          via: navTried ? "job-nav" : "soft-wait"
+        };
       }
 
       // 仅当当前明显不是职位列表页时，才尝试点顶部「职位」入口。
       // 禁止点「推荐/首页」：会把用户选好的求职期望与网页筛选冲掉。
       if (!noHomeNav && !isListLikePage() && !navTried) {
-        const jobNav = Array.from(document.querySelectorAll("a,button,span,div")).find((el) => {
-          const t = textOf(el);
-          // 只允许精确「职位」或明确职位列表入口，避免点到推荐
-          return t === "职位" || t === "职位列表" || t === "找工作";
-        });
+        const jobNav = Array.from(document.querySelectorAll("a,button,[role='link']"))
+          .filter((el) => {
+            try {
+              const rect = el.getBoundingClientRect();
+              return rect.width > 8 && rect.height > 8;
+            } catch (_) {
+              return false;
+            }
+          })
+          .find((el) => {
+            const t = textOf(el).replace(/\s+/g, "").trim();
+            const href = el.getAttribute?.("href") || "";
+            return t === "职位" || t === "职位列表" || t === "找工作" || isListLikePage(href);
+          });
+        navTried = true;
+        navAttemptedAt = Date.now();
         if (jobNav) {
-          navTried = true;
           clickLikeHuman(jobNav);
           await sleep(800);
         }
       }
 
-      // 仍无卡片且不在列表：只等待 SPA，不 location 硬跳到裸 /web/geek/jobs
-      if (!navTried && readyCount() === 0 && /zhipin\.com|bosszhipin\.com/i.test(location.hostname)) {
-        if (!isListLikePage()) {
-          navTried = true;
-          await sleep(1500);
+      if (!isListLikePage() && (navTried || noHomeNav)) {
+        if (!navAttemptedAt) navAttemptedAt = Date.now();
+        if (Date.now() - navAttemptedAt >= 1600) {
+          return {
+            ok: false,
+            count: 0,
+            restored: false,
+            href: location.href,
+            error: "LIST_NAV_REQUIRED",
+            message: "当前不在 BOSS 职位列表页，正在自动跳转到职位列表…",
+            shouldNavigate: !noHomeNav,
+            targetHref: getJobListNavigationTarget(),
+            via: "background-navigation-required"
+          };
         }
       }
       if (scroll && (Date.now() - start) > 2500) {
@@ -1393,7 +3252,10 @@ function dismissCommonDialogs() {
       restored: true,
       href: location.href,
       error: count > 0 ? "" : "LIST_NOT_FOUND",
-      message: count > 0 ? "" : "未找到职位列表卡片。请停留在 BOSS 职位推荐/搜索列表页后重试，或重新扫描预览"
+      message: count > 0 ? "" : "已在 BOSS 职位列表页，但未找到岗位卡片。请确认已登录、当前筛选下有岗位，或刷新页面后重试",
+      shouldNavigate: false,
+      targetHref: "",
+      via: "list-cards-not-found"
     };
   }
 
@@ -1448,13 +3310,13 @@ function dismissCommonDialogs() {
     // 1) 已在列表且有卡片：绝不硬刷新，最多软恢复求职期望
     if (getJobCards().length >= 3 && isListLikePage()) {
       try { rememberListHref(); } catch (_) {}
-      const restored = await restoreJobExpectIfNeeded(expectLabel);
+      debugTrace("return_list_expect_state", { via: "still-on-list", expectLabel: String(expectLabel || "").slice(0, 60), current: (typeof detectSelectedJobExpect === "function" ? detectSelectedJobExpect() : "") || "", action: "skip-restore" }, "debug");
       return {
         ok: true,
         count: getJobCards().length,
         href: location.href,
         via: "still-on-list",
-        expectRestored: restored,
+        expectRestored: { ok: true, skipped: true },
         contentVersion: BHT_CONTENT_VERSION
       };
     }
@@ -1463,11 +3325,11 @@ function dismissCommonDialogs() {
     if (isListLikePage()) {
       let ensured = await ensureJobList({ maxWaitMs: 8000, scroll: true, noHomeNav: true });
       if (ensured?.ok && (ensured.count || 0) > 0) {
-        const restored = await restoreJobExpectIfNeeded(expectLabel);
+        debugTrace("return_list_expect_state", { via: "soft-wait-list", expectLabel: String(expectLabel || "").slice(0, 60), current: (typeof detectSelectedJobExpect === "function" ? detectSelectedJobExpect() : "") || "", action: "skip-restore" }, "debug");
         return {
           ...ensured,
           via: "soft-wait-list",
-          expectRestored: restored,
+          expectRestored: { ok: true, skipped: true },
           contentVersion: BHT_CONTENT_VERSION
         };
       }
@@ -1480,13 +3342,13 @@ function dismissCommonDialogs() {
       try { await closeChatPanel(); } catch (_) {}
       if (getJobCards().length >= 1 || isListLikePage()) {
         await ensureJobList({ maxWaitMs: 5000, scroll: true, noHomeNav: true });
-        const restored = await restoreJobExpectIfNeeded(expectLabel);
+        debugTrace("return_list_expect_state", { via: "history-back", expectLabel: String(expectLabel || "").slice(0, 60), current: (typeof detectSelectedJobExpect === "function" ? detectSelectedJobExpect() : "") || "", action: "skip-restore" }, "debug");
         return {
           ok: getJobCards().length > 0,
           count: getJobCards().length,
           href: location.href,
           via: "history-back",
-          expectRestored: restored,
+          expectRestored: { ok: true, skipped: true },
           contentVersion: BHT_CONTENT_VERSION
         };
       }
@@ -1495,11 +3357,11 @@ function dismissCommonDialogs() {
     // 4) 再软 ensure 一次（不点推荐、不硬跳裸 jobs）
     let ensured = await ensureJobList({ maxWaitMs: 8000, scroll: true, noHomeNav: true });
     if (ensured?.ok && (ensured.count || 0) > 0) {
-      const restored = await restoreJobExpectIfNeeded(expectLabel);
+      debugTrace("return_list_expect_state", { via: "ensure-soft", expectLabel: String(expectLabel || "").slice(0, 60), current: (typeof detectSelectedJobExpect === "function" ? detectSelectedJobExpect() : "") || "", action: "skip-restore" }, "debug");
       return {
         ...ensured,
         via: "ensure-soft",
-        expectRestored: restored,
+        expectRestored: { ok: true, skipped: true },
         contentVersion: BHT_CONTENT_VERSION
       };
     }
@@ -1634,6 +3496,10 @@ async function startChatOnCurrentDetail(job = {}) {
     if (typeof detectLoginModal === "function") {
       const loginHit = detectLoginModal();
       if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+    }
+    if (typeof detectBossDailyLimitModal === "function") {
+      const limitHit = detectBossDailyLimitModal();
+      if (limitHit.ok) return { ok: false, error: "BOSS_DAILY_LIMIT", message: limitHit.message, contentVersion: BHT_CONTENT_VERSION };
     }
     // 已在聊天页/会话已打开：直接成功，避免二次点「立即沟通」失败
     if (hasUsableChatInput()) {
@@ -2380,194 +4246,6 @@ async function startChat(job, opts = {}) {
     };
   }
 
-  function visibleActionElement(el) {
-    if (!el || el.getAttribute?.("aria-hidden") === "true") return false;
-    try {
-      const style = getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-      const rect = el.getBoundingClientRect();
-      return rect.width > 8 && rect.height > 8;
-    } catch (_) {
-      return true;
-    }
-  }
-
-  function compactActionText(el) {
-    return textOf(el).replace(/\s+/g, "");
-  }
-
-  function findPlatformResumeButton({ includeAlreadySent = true } = {}) {
-    const chatRoot = getChatRoot() || document.getElementById("bht-mock-chat") || document;
-    const roots = [chatRoot, chatRoot?.parentElement, document].filter(Boolean);
-    const seen = new Set();
-    const candidates = [];
-    for (const root of roots) {
-      try {
-        for (const el of root.querySelectorAll("button, a, [role='button'], .btn, .chat-tool span, .chat-action span")) {
-          if (seen.has(el)) continue;
-          seen.add(el);
-          if (!visibleActionElement(el)) continue;
-          candidates.push(el);
-        }
-      } catch (_) {}
-    }
-    const sentPattern = /^(已发简历|简历已发送|已发送简历)$/;
-    if (includeAlreadySent) {
-      const already = candidates.find((el) => sentPattern.test(compactActionText(el)));
-      if (already) return { el: already, already: true };
-    }
-    const sendPattern = /^(发简历|发送简历|投递简历)$/;
-    const button = candidates.find((el) =>
-      sendPattern.test(compactActionText(el)) &&
-      !el.disabled &&
-      el.getAttribute?.("aria-disabled") !== "true"
-    );
-    return button ? { el: button, already: false } : null;
-  }
-
-  function findResumeConfirmButton() {
-    const dialogs = Array.from(document.querySelectorAll(
-      "[role='dialog'], .boss-dialog, .dialog-wrap, .dialog-container, .modal, .dialog"
-    )).filter((el) => visibleActionElement(el) && /简历/.test(textOf(el)));
-    for (const dialog of dialogs) {
-      const buttons = Array.from(dialog.querySelectorAll("button, a, [role='button'], .btn"))
-        .filter(visibleActionElement);
-      const confirm = buttons.find((el) =>
-        /^(发送|确定发送|确认发送|确认|确定)$/.test(compactActionText(el)) &&
-        !/取消|关闭/.test(compactActionText(el))
-      );
-      if (confirm) return confirm;
-    }
-    return null;
-  }
-
-  function resumeSuccessTextVisible() {
-    const selectors = [
-      ".toast",
-      ".toast-content",
-      ".message-tip",
-      ".alert",
-      "[role='status']",
-      "[role='dialog']",
-      ".boss-dialog",
-      ".dialog-wrap"
-    ];
-    try {
-      return Array.from(document.querySelectorAll(selectors.join(",")))
-        .filter(visibleActionElement)
-        .slice(-20)
-        .some((el) => {
-          const text = compactActionText(el);
-          return /简历.*(发送成功|已发送)|(发送成功|已发送).*简历/.test(text);
-        });
-    } catch (_) {
-      return false;
-    }
-  }
-
-  async function sendPlatformResume(context = {}) {
-    dismissCommonDialogs();
-    const ready = await waitForChat(10000);
-    if (!ready) {
-      return { ok: false, error: "CHAT_TIMEOUT", message: "聊天输入框未就绪，无法发送 BOSS 在线简历" };
-    }
-
-    const found = findPlatformResumeButton({ includeAlreadySent: true });
-    if (!found) {
-      return {
-        ok: false,
-        error: "RESUME_BUTTON_NOT_FOUND",
-        message: "聊天页未找到「发简历」按钮",
-        contentVersion: BHT_CONTENT_VERSION
-      };
-    }
-
-    const activeConversation = getActiveConversationIdentity();
-    const makeReceipt = (confirmedVia, already = false) => {
-      const sentAt = Date.now();
-      return {
-        type: "RESUME_SENT",
-        status: "confirmed",
-        receiptId: "resume_" + sentAt + "_" + Math.random().toString(36).slice(2, 10),
-        jobId: context.jobId || "",
-        conversationKey: context.conversationKey || activeConversation.key || "",
-        confirmedVia,
-        already,
-        sentAt,
-        contentVersion: BHT_CONTENT_VERSION
-      };
-    };
-
-    if (found.already) {
-      return {
-        ok: true,
-        confirmed: true,
-        already: true,
-        receipt: makeReceipt("button-already-sent", true),
-        activeConversation,
-        contentVersion: BHT_CONTENT_VERSION
-      };
-    }
-
-    const beforeMessages = getSelfMessages(30);
-    clickLikeHuman(found.el);
-
-    // 某些版本会弹出二次确认，只在“包含简历”的对话框内点击一次确认。
-    for (let i = 0; i < 8; i++) {
-      await sleep(200);
-      const confirm = findResumeConfirmButton();
-      if (confirm) {
-        clickLikeHuman(confirm);
-        break;
-      }
-    }
-
-    let confirmedVia = "";
-    let selfTail = beforeMessages;
-    for (let i = 0; i < 28; i++) {
-      await sleep(250);
-      selfTail = getSelfMessages(30);
-      const beforeSignature = beforeMessages.map((message) => String(message).replace(/\s+/g, "")).join("\n");
-      const afterSignature = selfTail.map((message) => String(message).replace(/\s+/g, "")).join("\n");
-      const resumeCardAdded =
-        beforeSignature !== afterSignature &&
-        selfTail.slice(-6).some((message) => /简历|在线简历|附件简历/.test(String(message)));
-      if (resumeCardAdded) {
-        confirmedVia = "self-message-resume-card";
-        break;
-      }
-      if (resumeSuccessTextVisible()) {
-        confirmedVia = "resume-success-status";
-        break;
-      }
-      const afterButton = findPlatformResumeButton({ includeAlreadySent: true });
-      if (afterButton?.already || (afterButton?.el && (afterButton.el.disabled || afterButton.el.getAttribute?.("aria-disabled") === "true"))) {
-        confirmedVia = "resume-button-state";
-        break;
-      }
-    }
-
-    if (!confirmedVia) {
-      return {
-        ok: false,
-        error: "RESUME_SEND_NOT_CONFIRMED",
-        message: "已点击「发简历」，但页面没有返回可验证的发送成功状态",
-        selfTail: selfTail.slice(-5),
-        activeConversation,
-        contentVersion: BHT_CONTENT_VERSION
-      };
-    }
-
-    return {
-      ok: true,
-      confirmed: true,
-      receipt: makeReceipt(confirmedVia),
-      activeConversation,
-      selfTail: selfTail.slice(-5),
-      contentVersion: BHT_CONTENT_VERSION
-    };
-  }
-
   function getSelfMediaSignature(limit = 30) {
     const texts = getSelfMessages(limit).map((message) => String(message).replace(/\s+/g, " "));
     const roots = [
@@ -2622,7 +4300,8 @@ async function startChat(job, opts = {}) {
   async function waitForImageSendConfirm(before, via) {
     let after = before;
     let confirmedVia = "";
-    for (let i = 0; i < 24; i++) {
+    // 图片上传比文本慢：15 秒内轮询，命中即返回（正常 1~2 秒内确认）
+    for (let i = 0; i < 60; i++) {
       await sleep(250);
       after = getSelfMediaSignature(30);
       confirmedVia = confirmImageSent(before, after);
@@ -2747,7 +4426,18 @@ async function startChat(job, opts = {}) {
       input.dispatchEvent(new Event("change", { bubbles: true }));
       input.dispatchEvent(new Event("input", { bubbles: true }));
       await sleep(1000);
-      const sendBtn = findSendButton();
+      // BOSS 的发送按钮在附件未就绪时会处于 disabled：先等按钮真正可用再点，
+      // 避免点击被吞导致图片从未送出（class 恒带 disabled 字样，只能看属性）。
+      const btnReady = (btn) =>
+        Boolean(btn) &&
+        btn.disabled !== true &&
+        btn.getAttribute("disabled") == null &&
+        btn.getAttribute("aria-disabled") !== "true";
+      let sendBtn = findSendButton();
+      for (let i = 0; i < 10 && !btnReady(sendBtn); i++) {
+        await sleep(400);
+        sendBtn = findSendButton();
+      }
       if (sendBtn) clickLikeHuman(sendBtn);
       const confirm = Array.from(document.querySelectorAll("button,a,.btn")).find(
         (el) => /发送|确定|完成/.test(textOf(el)) && !/取消|关闭/.test(textOf(el))
@@ -2838,6 +4528,126 @@ async function startChat(job, opts = {}) {
     return "";
   }
 
+  function parseBossActiveLabel(text = "") {
+    const t = String(text || "").replace(/\s+/g, " ").trim();
+    if (!t) return "";
+    const match = t.match(/((?:刚刚|今日|本周|本月|两周内|半年前|半年内|一年前|1年前|\d+日前|\d+日内|\d+周内|\d+月内)活跃|当前在线)/);
+    if (match) return match[1] === "当前在线" ? "在线" : match[1];
+    if (/(^|[^0-9\u4e00-\u9fff])在线([^0-9\u4e00-\u9fff]|$)/.test(t) && !/活跃/.test(t)) return "在线";
+    return "";
+  }
+
+  function extractDetailActiveText(scope) {
+    const root =
+      scope ||
+      firstEl(SELECTORS.detailRoot) ||
+      document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+      document;
+    const boss = root.querySelector?.(".job-boss-info") || root;
+    return parseBossActiveLabel(textOf(boss.querySelector?.(".boss-online-tag, .online-tag"))) ||
+      parseBossActiveLabel(textOf(boss.querySelector?.(".boss-active-time"))) ||
+      parseBossActiveLabel(textOf(firstEl(SELECTORS.activeText, root))) ||
+      parseBossActiveLabel(textOf(boss));
+  }
+
+  function extractDetailHunter(scope) {
+    const root =
+      scope ||
+      firstEl(SELECTORS.detailRoot) ||
+      document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+      document;
+    const attr = textOf(root.querySelector?.(".job-boss-info .boss-info-attr, .boss-info-attr"));
+    const html = String(root.querySelector?.(".job-boss-info")?.innerHTML || "");
+    const goldHunter = /猎头/.test(attr) || /gold-hunter|goldHunter|icon-gold-hunter/.test(html);
+    return {
+      goldHunter,
+      hrTitle: attr.split(/[·|｜]/).slice(1).join(" · ").trim() || attr
+    };
+  }
+
+  function findJobCard(job = {}) {
+    const jobId = String(job.jobId || "");
+    const title = normalizeText(job.title || "");
+    const cards = getJobCards();
+    for (const card of cards) {
+      const href = card.querySelector?.("a.job-name[href], a[href*='job_detail']")?.href ||
+        card.getAttribute?.("data-jobid") ||
+        "";
+      const cardId = extractJobIdFromHref(href) ||
+        card.getAttribute?.("data-jobid") ||
+        card.getAttribute?.("data-job-id") ||
+        "";
+      if (jobId && cardId && String(cardId) === jobId) return card;
+    }
+    for (const card of cards) {
+      const cardTitle = normalizeText(textOf(card.querySelector?.("a.job-name, .job-name")));
+      if (title && cardTitle && cardTitle === title) return card;
+    }
+    return null;
+  }
+
+  async function inspectListSideDetail(job = {}, deadlineAt = 0) {
+    const card = findJobCard(job);
+    if (!card) return { ok: false, skipped: true, error: "JOB_CARD_NOT_FOUND" };
+    const clickTarget = card.querySelector("a.job-name, .job-name") || card;
+    clickLikeHuman(clickTarget);
+    const expectedJobId = String(job.jobId || "");
+    const expectedTitle = normalizeText(job.title || "");
+    let last = null;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      if (deadlineAt && Date.now() >= deadlineAt) break;
+      const root =
+        firstEl(SELECTORS.detailRoot) ||
+        document.querySelector(".job-detail-box, .job-detail-container, .job-detail");
+      const detailTitle = textOf(firstEl(SELECTORS.title, root || document)) ||
+        textOf(document.querySelector(".job-detail-box .job-name, .job-detail .job-name, h1.job-name"));
+      const detailHref =
+        root?.querySelector?.("a.more-job-btn[href*='job_detail'], a[href*='job_detail']")?.href || "";
+      const actualJobId = extractJobIdFromHref(detailHref);
+      const identityMatches = Boolean(
+        root && (
+          (expectedJobId && actualJobId && expectedJobId === actualJobId) ||
+          (expectedTitle && normalizeText(detailTitle) === expectedTitle)
+        )
+      );
+      const network = jobNetworkMetadata.get(expectedJobId) || {};
+      const hunter = extractDetailHunter(root || document);
+      const activeText = identityMatches
+        ? (extractDetailActiveText(root) || network.activeText || "")
+        : String(network.activeText || "");
+      last = { identityMatches, activeText, hunter, actualJobId, detailTitle };
+      const activeLabel = parseBossActiveLabel(activeText);
+      if (identityMatches && (activeLabel || hunter.goldHunter)) {
+        const hrName = extractDetailHrName(root) || job.hrName || job.bossName || "";
+        rememberJobNetworkMetadata({
+          jobId: expectedJobId || actualJobId,
+          activeText: activeLabel,
+          goldHunter: hunter.goldHunter,
+          bossTitle: hunter.hrTitle,
+          bossName: hrName,
+          source: "list-side-detail"
+        });
+        return {
+          ok: true,
+          jobId: expectedJobId || actualJobId,
+          activeText: activeLabel,
+          bossOnline: activeLabel === "在线",
+          bossName: hrName,
+          goldHunter: hunter.goldHunter === true || network.goldHunter === true,
+          hrTitle: hunter.hrTitle || network.bossTitle || "",
+          source: "list-side-detail"
+        };
+      }
+      await sleep(80);
+    }
+    return {
+      ok: false,
+      error: last?.identityMatches ? "DETAIL_ACTIVE_UNKNOWN" : "DETAIL_IDENTITY_MISMATCH",
+      activeText: last?.activeText || "",
+      jobId: last?.actualJobId || expectedJobId
+    };
+  }
+
   function extractDetailCompany(scope) {
     const root =
       scope ||
@@ -2850,6 +4660,327 @@ async function startChat(job, opts = {}) {
     if (structured) return structured;
     const attr = textOf(root.querySelector?.(".job-boss-info .boss-info-attr, .boss-info-attr"));
     return String(attr || "").split(/[·|｜]/)[0].trim();
+  }
+
+  async function inspectWorkerJobDetail(job = {}) {
+    const expectedJobId = String(job.jobId || "");
+    const expectedTitle = normalizeText(job.title || "");
+    let last = null;
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const root =
+        firstEl(SELECTORS.detailRoot) ||
+        document.querySelector(".job-detail, .job-detail-box, .job-detail-container");
+      const detailHref =
+        (/\/job_detail\//i.test(location.pathname) ? location.href : "") ||
+        (root?.querySelector?.("a.more-job-btn[href*='job_detail'], a[href*='job_detail']")?.href || "");
+      const actualJobId = extractJobIdFromHref(detailHref);
+      const detailTitle = textOf(firstEl(SELECTORS.title, root || document)) ||
+        textOf(document.querySelector(".job-detail .job-name, .job-detail-box .job-name, h1.job-name"));
+      const normalizedDetailTitle = normalizeText(detailTitle || "");
+      const identityMatches = Boolean(
+        root && (
+          (expectedJobId && actualJobId && expectedJobId === actualJobId) ||
+          (!actualJobId && expectedTitle && normalizedDetailTitle === expectedTitle) ||
+          (!expectedJobId && expectedTitle && normalizedDetailTitle === expectedTitle)
+        )
+      );
+      last = { root, detailHref, actualJobId, detailTitle, identityMatches };
+      if (identityMatches) {
+        const activeText = extractDetailActiveText(root);
+        if (activeText) {
+          const result = {
+            ok: true,
+            activeText,
+            jobId: actualJobId || expectedJobId,
+            title: detailTitle || job.title || "",
+            company: extractDetailCompany(root) || job.company || "",
+            hrName: extractDetailHrName(root) || job.hrName || job.bossName || "",
+            contentVersion: BHT_CONTENT_VERSION
+          };
+          debugTrace("worker_detail_activity_ready", result);
+          return result;
+        }
+      }
+      await sleep(125);
+    }
+    const result = {
+      ok: Boolean(last?.identityMatches),
+      error: last?.identityMatches ? "DETAIL_ACTIVE_UNKNOWN" : "DETAIL_IDENTITY_MISMATCH",
+      activeText: "",
+      jobId: last?.actualJobId || "",
+      title: last?.detailTitle || "",
+      message: last?.identityMatches
+        ? "岗位详情未提供 HR 活跃时间"
+        : "临时详情页与待投岗位不一致",
+      contentVersion: BHT_CONTENT_VERSION
+    };
+    debugTrace("worker_detail_activity_unavailable", result, "warn");
+    return result;
+  }
+
+  // 岗位详情页内点击「立即沟通」后，BOSS 会 SPA 跳转/整页刷新到会话页；
+  // 检测是否已开始离开详情页（此时应由导航恢复逻辑收尾，本页不再重复操作）。
+  function isConversationNavigationStarted() {
+    return !/\/job_detail\//i.test(location.pathname) || document.readyState === "loading";
+  }
+
+  async function triggerConversationOnWorkerDetail(job = {}) {
+    debugTrace("worker_detail_trigger_begin", {
+      job: {
+        jobId: job.jobId || "",
+        title: job.title || "",
+        company: job.company || "",
+        href: job.href || ""
+      },
+      page: pageInfo()
+    });
+    dismissCommonDialogs();
+    if (typeof detectLoginModal === "function") {
+      const loginHit = detectLoginModal();
+      if (loginHit.ok) {
+        return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+      }
+    }
+
+    const nativeReceiptStartedAt = Date.now();
+    let clicked = { ok: false, buttonText: "", already: false };
+    let detailTitle = "";
+
+    // 就绪门：岗位详情是重型 SPA，按钮 DOM 可能先于 BOSS 事件绑定出现；
+    // 页面未渲染完整时点击只会无效，随后苦等超时「卡住」。页面就绪判据：
+    //  1) 岗位标题 + 按钮同时出现（最可靠）；或
+    //  2) 文档加载完成且按钮连续存在 ≥1.5s（标题选择器未命中的布局兜底）。
+    // 非详情页（复用标签停在旧页/已跳转）稳定 ≥1.5s 快速失败，不空等 12s。
+    const renderGateAt = Date.now();
+    const RENDER_GATE_MS = 12000;
+    const BUTTON_STABLE_MS = 1500;
+    const WRONG_PAGE_GRACE_MS = 1500;
+    let pageUsable = false;
+    let scopeRoot = document;
+    let gateBtn = null;
+    let btnFirstSeenAt = 0;
+    let nonDetailAt = 0;
+    for (;;) {
+      const isDetailPage = /\/job_detail\//i.test(location.pathname);
+      const nowMs = Date.now();
+      if (isDetailPage) {
+        nonDetailAt = 0;
+        const scope =
+          firstEl(SELECTORS.detailRoot) ||
+          document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+          document;
+        const title = textOf(firstEl(SELECTORS.title, scope)) ||
+          textOf(document.querySelector(".job-detail .job-name, .job-detail-box .job-name, h1.job-name")) ||
+          "";
+        gateBtn = findConversationActionButton(scope);
+        if (gateBtn && !btnFirstSeenAt) btnFirstSeenAt = nowMs;
+        const loginHit = typeof detectLoginModal === "function" ? detectLoginModal() : null;
+        if (loginHit?.ok) {
+          return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+        }
+        const btnStable = gateBtn && (nowMs - btnFirstSeenAt) >= BUTTON_STABLE_MS;
+        if (document.readyState === "complete" && gateBtn && (title || btnStable)) {
+          pageUsable = true;
+          scopeRoot = scope;
+          detailTitle = title;
+          break;
+        }
+      } else if (!nonDetailAt) {
+        nonDetailAt = nowMs;
+      }
+      // 稳定非详情页（旧页/跳转后页）：宽限 1.5s 后立即失败，交给兜底/导航恢复
+      if (!isDetailPage && nonDetailAt && (nowMs - nonDetailAt) >= WRONG_PAGE_GRACE_MS) {
+        break;
+      }
+      if (nowMs - renderGateAt >= RENDER_GATE_MS) {
+        if (!isDetailPage) {
+          // 点击已触发页面跳转：交给导航恢复逻辑，不在此报错
+          break;
+        }
+        const notReady = {
+          ok: false,
+          error: "WORKER_PAGE_NOT_READY",
+          message: "岗位详情页长时间未渲染完成（页面加载慢或可能被 BOSS 限流），已自动跳过该岗位",
+          detailTitle,
+          href: location.href,
+          page: pageInfo(),
+          contentVersion: BHT_CONTENT_VERSION
+        };
+        debugTrace("worker_detail_page_not_ready", notReady, "warn");
+        return notReady;
+      }
+      await sleep(250);
+    }
+    if (!pageUsable) {
+      // 页面已跳转（点击前）：可能已经在建聊，不要当成「找不到按钮」去列表兜底再点。
+      if (!clicked.ok) {
+        const leftDetail = {
+          ok: false,
+          error: "WORKER_LEFT_DETAIL",
+          message: "临时执行页已离开岗位详情（可能已跳转），不再重复点击立即沟通",
+          detailTitle,
+          href: location.href,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+        debugTrace("worker_detail_left_page", leftDetail, "warn");
+        return leftDetail;
+      }
+    } else {
+      const btn = gateBtn || findConversationActionButton(scopeRoot);
+      if (!btn) {
+        const missing = {
+          ok: false,
+          error: "WORKER_CHAT_BUTTON_NOT_FOUND",
+          message: "临时执行页未找到「立即沟通」按钮",
+          detailTitle,
+          href: location.href,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+        debugTrace("worker_detail_chat_button_not_found", missing, "warn");
+        return missing;
+      }
+      const buttonText = textOf(btn);
+      const clickOk = clickLikeHuman(btn);
+      clicked = { ok: clickOk, buttonText, already: /继续沟通/.test(buttonText) };
+      window.__BHT_LAST_TRIGGER_CLICK__ = {
+        at: Date.now(),
+        jobId: String(job.jobId || job.encryptJobId || ""),
+        buttonText,
+        already: clicked.already,
+        detailTitle: detailTitle || job.title || "",
+        hrName: extractDetailHrName(scopeRoot) || job.hrName || job.bossName || "",
+        company: extractDetailCompany(scopeRoot) || job.company || "",
+        title: detailTitle || job.title || "",
+        listHref: job.listHref || ""
+      };
+      debugTrace("worker_detail_chat_button_clicked", {
+        buttonText,
+        clickOk,
+        button: describeDebugElement(btn),
+        page: pageInfo()
+      }, clickOk ? "debug" : "error");
+    }
+
+    const isDetailPageNow = () => /\/job_detail\//i.test(location.pathname);
+    if (!clicked.ok && !isDetailPageNow()) {
+      const leftDetail = {
+        ok: false,
+        error: "WORKER_LEFT_DETAIL",
+        message: "临时执行页已离开岗位详情（可能已跳转），不再重复点击立即沟通",
+        detailTitle,
+        href: location.href,
+        contentVersion: BHT_CONTENT_VERSION
+      };
+      debugTrace("worker_detail_left_page", leftDetail, "warn");
+      return leftDetail;
+    }
+
+    if (!clicked.ok) {
+      if (typeof detectLoginModal === "function") {
+        const loginHit = detectLoginModal();
+        if (loginHit.ok) {
+          return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+        }
+      }
+      const missing = {
+        ok: false,
+        error: "WORKER_CHAT_BUTTON_NOT_FOUND",
+        message: "临时执行页未找到「立即沟通」按钮",
+        detailTitle,
+        href: location.href,
+        contentVersion: BHT_CONTENT_VERSION
+      };
+      debugTrace("worker_detail_chat_button_not_found", missing, "warn");
+      return missing;
+    }
+
+    // 自动招呼开启时仍可能出现“留在此页”；执行页停留或跳转都不会影响左侧真实列表。
+    let stay = { ok: false };
+    for (let i = 0; i < 18 && !stay.ok; i++) {
+      stay = clickStayOnListDialog();
+      if (!stay.ok) await sleep(50);
+    }
+    dismissCommonDialogs();
+    let nativeGreeting = clicked.already
+      ? { available: false, showGreeting: null, text: "", source: "already-contacted" }
+      : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 3200);
+
+    if (!clicked.already && !nativeGreeting.available) {
+      // 无回执且页面既未跳转也未弹窗：BOSS 事件绑定可能晚于 DOM 出现，补点一次后仍无效果才快速失败
+      const retryScope =
+        firstEl(SELECTORS.detailRoot) ||
+        document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+        document;
+      const retryBtn = findConversationActionButton(retryScope);
+      const retryText = retryBtn ? textOf(retryBtn) : "";
+      const noDialog = typeof detectLoginModal !== "function" || !detectLoginModal().ok;
+      const stillOnDetail = isDetailPageNow() && !isConversationNavigationStarted();
+      if (retryBtn && retryText === clicked.buttonText && noDialog && stillOnDetail) {
+        debugTrace("worker_detail_click_retry", {
+          reason: "no-receipt-no-navigation",
+          buttonText: retryText,
+          page: pageInfo()
+        }, "warn");
+        clickLikeHuman(retryBtn);
+        // afterTs 与首次等待尾部重叠，避免回执恰好在两次等待之间到达被漏掉
+        const retryGreeting = await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt + 2500, 4200);
+        if (retryGreeting.available) {
+          nativeGreeting = retryGreeting;
+        } else if (!stillOnDetail || isConversationNavigationStarted()) {
+          // 补点后开始跳转：由导航恢复收尾，本页按成功进入下一阶段（消息页会做最终核对）
+          nativeGreeting = { available: true, showGreeting: null, text: "", source: "navigation-recovery" };
+        } else {
+          const noEffect = {
+            ok: false,
+            error: "WORKER_CHAT_CLICK_NO_EFFECT",
+            message: "已点击「立即沟通」但 BOSS 一直未响应（页面加载未完成或触发未生效），已自动跳过该岗位",
+            buttonText: clicked.buttonText,
+            detailTitle: detailTitle || job.title || "",
+            href: location.href,
+            page: pageInfo(),
+            contentVersion: BHT_CONTENT_VERSION
+          };
+          debugTrace("worker_detail_click_no_effect", noEffect, "error");
+          return noEffect;
+        }
+      } else if (!stillOnDetail) {
+        // 点击后开始跳转：由导航恢复收尾，本页不返回失败
+        nativeGreeting = { available: true, showGreeting: null, text: "", source: "navigation-recovery" };
+      } else {
+        const unconfirmed = {
+          ok: false,
+          error: "CONVERSATION_CREATE_NOT_CONFIRMED",
+          message: "已尝试点击「立即沟通」，但未收到 BOSS 创建会话成功回执；已停止，避免误报成功",
+          buttonText: clicked.buttonText,
+          detailTitle: detailTitle || job.title || "",
+          href: location.href,
+          nativeGreeting,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+        debugTrace("worker_detail_trigger_unconfirmed", unconfirmed, "error");
+        return unconfirmed;
+      }
+    }
+    const result = {
+      ok: true,
+      phase: "CHAT_TRIGGERED",
+      workerDetail: true,
+      buttonText: clicked.buttonText,
+      already: Boolean(clicked.already),
+      stayed: Boolean(stay.ok),
+      nativeGreeting,
+      stayText: stay.text || "",
+      detailTitle: detailTitle || job.title || "",
+      hrName: extractDetailHrName() || job.hrName || job.bossName || "",
+      bossName: extractDetailHrName() || job.hrName || job.bossName || "",
+      company: extractDetailCompany() || job.company || "",
+      title: detailTitle || job.title || "",
+      listHref: job.listHref || "",
+      href: location.href,
+      contentVersion: BHT_CONTENT_VERSION
+    };
+    debugTrace("worker_detail_trigger_done", result);
+    return result;
   }
 
   async function triggerConversationOnList(job = {}) {
@@ -2867,6 +4998,13 @@ async function startChat(job, opts = {}) {
     if (typeof detectLoginModal === "function") {
       const loginHit = detectLoginModal();
       if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
+    }
+    // BOSS 平台级每日沟通上限：直接报 BOSS_DAILY_LIMIT，后台停止任务，不重试空转
+    if (typeof detectBossDailyLimitModal === "function") {
+      const limitHit = detectBossDailyLimitModal();
+      if (limitHit.ok) {
+        return { ok: false, error: "BOSS_DAILY_LIMIT", message: limitHit.message, contentVersion: BHT_CONTENT_VERSION };
+      }
     }
 
     const ensureResult = await ensureJobList({ maxWaitMs: 8000, scroll: true, noHomeNav: true });
@@ -2943,36 +5081,44 @@ async function startChat(job, opts = {}) {
       const want = normalizeText(job.title || "");
       const got = normalizeText(detailTitle || "");
       const titleOk = !want || !got || got.includes(want.slice(0, 8)) || want.includes(got.slice(0, 8));
+      const identityMismatch = await listCardIdentityMismatch(job, card, detailTitle);
       debugTrace("trigger_detail_identity", {
-        requested: { title: job.title || "", company: job.company || "", hrName: job.hrName || job.bossName || "" },
+        requested: { title: job.title || "", company: job.company || "", hrName: job.hrName || job.bossName || "", jobId: job.jobId || "" },
         extracted: {
           title: detailTitle || "",
           company: extractDetailCompany(),
-          hrName: extractDetailHrName()
+          hrName: extractDetailHrName(),
+          jobId: parseJobCard(card, Math.max(0, getJobCards().indexOf(card))).jobId || ""
         },
         normalized: { want, got },
         titleOk,
+        identityMismatch,
         detailRoot: describeDebugElement(firstEl(SELECTORS.detailRoot))
-      }, titleOk ? "debug" : "warn");
+      }, identityMismatch ? "error" : (titleOk ? "debug" : "warn"));
+      if (identityMismatch) {
+        return {
+          ok: false,
+          error: "LIST_JOB_IDENTITY_MISMATCH",
+          message: "克隆列表页岗位对不上，已停止点击立即沟通：" + identityMismatch,
+          requestedJobId: job.jobId || "",
+          detailTitle: detailTitle || "",
+          href: location.href,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+      }
       if (!titleOk) {
         log("list detail title weak match", { want: job.title, got: detailTitle });
       }
 
       // 点立即沟通 / 继续沟通（详情区优先）
       let clicked = { ok: false };
+      const nativeReceiptStartedAt = Date.now();
       for (let i = 0; i < 14; i++) {
         const scope =
           firstEl(SELECTORS.detailRoot) ||
           document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
           document;
-        let btn =
-          firstEl(SELECTORS.chatOnDetail, scope) ||
-          Array.from(scope.querySelectorAll("a,button,div,span")).find((el) =>
-            /立即沟通|继续沟通/.test(textOf(el))
-          ) ||
-          Array.from(document.querySelectorAll("a.op-btn-chat, a.op-btn, button, div[class*='btn']")).find((el) =>
-            /立即沟通|继续沟通/.test(textOf(el))
-          );
+        const btn = findConversationActionButton(scope);
         debugTrace("trigger_chat_button_probe", {
           attempt: i + 1,
           found: Boolean(btn),
@@ -2980,14 +5126,25 @@ async function startChat(job, opts = {}) {
           scope: describeDebugElement(scope),
           selectorCounts: {
             detailButtons: allEl(SELECTORS.chatOnDetail, scope).length,
-            textCandidates: Array.from(scope.querySelectorAll("a,button,div,span"))
-              .filter((el) => /立即沟通|继续沟通/.test(textOf(el))).length
+            textCandidates: Array.from(scope.querySelectorAll("a,button,[role='button']"))
+              .filter((el) => /^(立即沟通|继续沟通|打招呼)$/.test(textOf(el).replace(/\s+/g, " ").trim())).length
           }
         }, btn ? "debug" : "warn");
         if (btn) {
           const buttonText = textOf(btn);
           const clickOk = clickLikeHuman(btn);
           clicked = { ok: clickOk, buttonText, already: /继续沟通/.test(buttonText) };
+          window.__BHT_LAST_TRIGGER_CLICK__ = {
+            at: Date.now(),
+            jobId: String(job.jobId || job.encryptJobId || ""),
+            buttonText,
+            already: clicked.already,
+            detailTitle: detailTitle || job.title || "",
+            hrName: extractDetailHrName() || job.hrName || job.bossName || "",
+            company: extractDetailCompany() || job.company || "",
+            title: detailTitle || job.title || "",
+            listHref: location.href
+          };
           debugTrace("trigger_chat_button_clicked", {
             buttonText,
             clickOk,
@@ -3002,6 +5159,26 @@ async function startChat(job, opts = {}) {
           const loginHit = detectLoginModal();
           if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message, contentVersion: BHT_CONTENT_VERSION };
         }
+        // 央国企等岗位走「立即网申」而无站内沟通：标记为可跳过，不暂停任务
+        const nonChatScope =
+          firstEl(SELECTORS.detailRoot) ||
+          document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
+          document;
+        const nonChatBtn = findNonChatApplyButton(nonChatScope);
+        if (nonChatBtn) {
+          const nonChatLabel = textOf(nonChatBtn).replace(/\s+/g, " ").trim();
+          const nonChat = {
+            ok: false,
+            error: "NON_CHAT_JOB",
+            message: `该岗位为「${nonChatLabel}」流程，不支持站内沟通，已自动跳过`,
+            detailTitle,
+            buttonText: nonChatLabel,
+            href: location.href,
+            contentVersion: BHT_CONTENT_VERSION
+          };
+          debugTrace("trigger_non_chat_job", nonChat, "info");
+          return nonChat;
+        }
         const missingButton = {
           ok: false,
           error: "CHAT_BUTTON_NOT_FOUND",
@@ -3014,15 +5191,30 @@ async function startChat(job, opts = {}) {
         return missingButton;
       }
 
-      await sleep(450);
-      let stay = clickStayOnListDialog();
-      if (!stay.ok) {
-        await sleep(500);
+      // 弹层有时只出现 100~300ms，BOSS 随后就会整页进入聊天；高频短轮询避免固定等待 450ms 错过它。
+      let stay = { ok: false };
+      for (let i = 0; i < 18 && !stay.ok; i++) {
         stay = clickStayOnListDialog();
+        if (!stay.ok) await sleep(50);
       }
       debugTrace("trigger_stay_on_list_dialog", { result: stay, page: pageInfo() }, stay.ok ? "debug" : "warn");
       // 再关一次常见弹层
       dismissCommonDialogs();
+      const nativeGreeting = clicked.already
+        ? { available: false, showGreeting: null, text: "", source: "already-contacted" }
+        : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 3200);
+      if (!clicked.already && !nativeGreeting.available) {
+        return {
+          ok: false,
+          error: "CONVERSATION_CREATE_NOT_CONFIRMED",
+          message: "已尝试点击「立即沟通」，但未收到 BOSS 创建会话成功回执；已停止，避免误报成功",
+          buttonText: clicked.buttonText,
+          detailTitle: detailTitle || "",
+          href: location.href,
+          nativeGreeting,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+      }
 
       const triggerResult = {
         ok: true,
@@ -3030,6 +5222,7 @@ async function startChat(job, opts = {}) {
         buttonText: clicked.buttonText,
         already: Boolean(clicked.already),
         stayed: Boolean(stay.ok),
+        nativeGreeting,
         stayText: stay.text || "",
         detailTitle: detailTitle || "",
         hrName: (typeof extractDetailHrName === "function" ? extractDetailHrName() : "") || job.hrName || job.bossName || "",
@@ -3641,7 +5834,7 @@ async function startChat(job, opts = {}) {
 
 async function runOpByType(type, payload = {}) {
     const lockKey = String(type || '');
-    const needLock = /START_CHAT|TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SEND_RESUME|SCAN_JOBS/.test(lockKey);
+    const needLock = /START_CHAT|INSPECT_JOB_DETAIL|ENRICH_JOB_ACTIVITY|TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SCAN_JOBS|RESTORE_JOB_SOURCE_CONTEXT/.test(lockKey);
     if (needLock) {
       if (window.__BHT_OP_LOCK__) {
         return { ok: false, error: 'OP_BUSY', message: '已有操作进行中', contentVersion: BHT_CONTENT_VERSION };
@@ -3651,13 +5844,30 @@ async function runOpByType(type, payload = {}) {
     try {
     switch (type) {
       case MSG.PING:
-        return { ok: true, page: pageInfo(), contentVersion: BHT_CONTENT_VERSION };
+        return {
+          ok: true,
+          page: pageInfo(),
+          contentVersion: BHT_CONTENT_VERSION,
+          contentInstanceId: BHT_CONTENT_INSTANCE_ID
+        };
       case MSG.DIAGNOSE:
         return { ok: true, ...diagnose(), contentVersion: BHT_CONTENT_VERSION };
+      case MSG.GET_JOB_SOURCE_CONTEXT:
+        return { ...(await getJobSourceContext({ refreshExpectations: payload?.refreshExpectations === true })), contentVersion: BHT_CONTENT_VERSION };
+      case MSG.RESTORE_JOB_SOURCE_CONTEXT:
+        return { ...(await restoreJobSourceContext(payload || {})), contentVersion: BHT_CONTENT_VERSION };
       case MSG.SCAN_JOBS:
         return await scanJobs(payload || {});
+      case MSG.INSPECT_JOB_DETAIL:
+        return isListLikePage()
+          ? await inspectListSideDetail(payload?.job || {})
+          : await inspectWorkerJobDetail(payload?.job || {});
+      case MSG.ENRICH_JOB_ACTIVITY:
+        return await enrichJobActivities(payload || {});
       case MSG.TRIGGER_CONVERSATION:
-        return await triggerConversationOnList((payload && payload.job) || payload || {});
+        return payload?.workerDetail
+          ? await triggerConversationOnWorkerDetail(payload.job || {})
+          : await triggerConversationOnList((payload && payload.job) || payload || {});
       case MSG.GET_CONVERSATION_SNAPSHOT:
         return getConversationSnapshot();
       case MSG.WAIT_OPEN_CONVERSATION:
@@ -3669,12 +5879,16 @@ async function runOpByType(type, payload = {}) {
       case MSG.GET_CHAT_SELF_MESSAGES:
         await waitForChat(8000);
         return { ok: true, messages: getSelfMessages(payload?.limit || 8) };
+      case MSG.GET_BOSS_GREETING:
+        return await getBossGreetingSetting();
+      case MSG.SET_BOSS_GREETING:
+        return await setBossGreetingSetting(payload || {});
+      case MSG.SAVE_BOSS_GREETING_TEXT:
+        return await saveBossGreetingText(payload || {});
       case MSG.SEND_TEXT:
         return await sendText(payload?.text || "", payload || {});
       case MSG.SEND_IMAGE:
         return await sendImageFromDataUrl(payload?.dataUrl, payload?.fileName);
-      case MSG.SEND_RESUME:
-        return await sendPlatformResume(payload || {});
       case MSG.HIGHLIGHT_JOBS:
         return highlightJobs(payload?.map || {});
       case MSG.CLOSE_CHAT:
@@ -3683,6 +5897,8 @@ async function runOpByType(type, payload = {}) {
         return await ensureJobList(payload || {});
       case MSG.RETURN_TO_LIST:
         return await returnToJobList(payload || {});
+      case MSG.SCROLL_LIST_TOP:
+        return scrollListToTop();
       default:
         return { ok: false, error: "UNKNOWN_TYPE", type };
     }
@@ -3700,21 +5916,15 @@ async function runOpByType(type, payload = {}) {
     if (type === MSG.CANCEL_OP) {
       const opId = String(payload?.opId || "");
       debugTrace("operation_cancel_received", { opId, reason: payload?.reason || "任务已停止" }, "warn");
-      if (opId) window.__BHT_OP_CANCELLED__[opId] = true;
+      if (!opId) {
+        sendResponse({ ok: true, cancelled: false, opId: "" });
+        return true;
+      }
+      window.__BHT_OP_CANCELLED__[opId] = true;
       if (opId && window.__BHT_OP_INFLIGHT__?.[opId]) {
         window.__BHT_OP_INFLIGHT__[opId].cancelled = true;
       }
-      try {
-        chrome.storage.local.set({
-          ["bht_op_" + opId]: {
-            status: "cancelled",
-            opId,
-            reason: payload?.reason || "任务已停止",
-            at: Date.now(),
-            contentVersion: BHT_CONTENT_VERSION
-          }
-        });
-      } catch (_) {}
+      markOperationCancelled(opId, payload?.reason || "任务已停止", false);
       sendResponse({ ok: true, cancelled: Boolean(opId), opId });
       return true;
     }
@@ -3745,49 +5955,58 @@ async function runOpByType(type, payload = {}) {
       } catch (_) {}
 
       (async () => {
-        if (opId) inflight[opId] = { opType, at: Date.now() };
+        if (opId) inflight[opId] = { opType, opPayload, at: Date.now() };
 
-        // 若 storage 已是 done，不再重跑
-        try {
-          if (opId) {
+        const isOperationCancelled = () => Boolean(opId && window.__BHT_OP_CANCELLED__?.[opId]);
+        const markSettledCancellation = async (reason = "任务已停止") => {
+          if (opId) await markOperationCancelled(opId, reason, true);
+          if (opId) delete inflight[opId];
+        };
+
+        // Background owns the pending row. Content must never rewrite it:
+        // doing so could overwrite a cancellation tombstone that arrived
+        // between two async bootstrap steps. Yield once for a queued CANCEL_OP,
+        // then re-check memory and storage immediately before dispatch.
+        const dispatchGate = globalThis.BHTOperationDispatchGate?.awaitOperationDispatchPermit;
+        if (typeof dispatchGate !== "function") {
+          await markSettledCancellation("页面操作取消门禁未加载，请刷新 BOSS 页面后重试");
+          return;
+        }
+        const permit = await dispatchGate({
+          isCancelled: isOperationCancelled,
+          readOperationState: async () => {
+            if (!opId) return null;
             const bag = await chrome.storage.local.get("bht_op_" + opId);
-            const row = bag && bag["bht_op_" + opId];
-            if (row && row.status === "done") {
-              log("RUN_OP skip already done", opId, row.result?.error || row.result?.ok);
-              delete inflight[opId];
-              return;
-            }
+            return bag && bag["bht_op_" + opId];
+          },
+          settleCancellation: async (reason) => {
+            if (opId) window.__BHT_OP_CANCELLED__[opId] = true;
+            await markSettledCancellation(reason);
+          },
+          finishCompleted: async (row) => {
+            log("RUN_OP skip already done", opId, row?.result?.error || row?.result?.ok);
+            if (opId) delete inflight[opId];
           }
-        } catch (_) {}
+        });
+        if (!permit.ok) return;
 
-        try {
-          await chrome.storage.local.set({
-            ["bht_op_" + opId]: {
-              status: "pending",
-              opType,
-              at: Date.now(),
-              contentVersion: BHT_CONTENT_VERSION
-            }
-          });
-        } catch (_) {}
-
-        // START_CHAT 允许更长；超时不强制清锁抢跑，由 finally 统一释放
-        const opTimeoutMs = /START_CHAT/.test(String(opType || ""))
-          ? 45000
-          : /TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE|SEND_RESUME|SCAN_JOBS/.test(String(opType || ""))
-            ? 30000
-            : 15000;
+        // 后台统一计算页面操作预算；页面只执行该预算，不再维护另一套冲突的固定超时。
+        const requestedOperationTimeoutMs = Number(opPayload?.__bhtOperationTimeoutMs || 0);
+        const opTimeoutMs = Number.isFinite(requestedOperationTimeoutMs) && requestedOperationTimeoutMs > 0
+          ? Math.max(1000, requestedOperationTimeoutMs)
+          : 15000;
 
         let result;
         let timedOut = false;
         let workPromise;
         try {
           window.__BHT_ACTIVE_OP_ID__ = opId || null;
+          window.__BHT_ACTIVE_OP_TYPE__ = opType || null;
           debugTrace("operation_dispatch_begin", {
             opId,
             opType,
             timeoutMs: opTimeoutMs,
-            payloadKeys: Object.keys(opPayload || {}).filter((key) => key !== "__bhtDebugEnabled")
+            payloadKeys: Object.keys(opPayload || {}).filter((key) => !key.startsWith("__bht"))
           });
           workPromise = (async () => {
             const opResult = await runOpByType(opType, opPayload);
@@ -3802,18 +6021,23 @@ async function runOpByType(type, payload = {}) {
               debugTrace("operation_return_undefined", undefinedResult, "error");
               return undefinedResult;
             }
-            debugTrace("operation_dispatch_return", { opId, opType, result: opResult }, opResult?.ok ? "debug" : "warn");
+            if (opResult?.scanMeta && typeof opResult.scanMeta === "object") {
+              opResult.scanMeta = { ...opResult.scanMeta, workCompletedAt: Date.now() };
+            }
+            debugTrace("operation_dispatch_return", { opId, opType, result: summarizeOperationResult(opResult) }, opResult?.ok ? "debug" : "warn");
             return opResult;
           })();
           let innerTimeoutId = null;
           const innerTimeoutPromise = new Promise((resolve) => {
             innerTimeoutId = setTimeout(() => {
               timedOut = true;
+              if (opId) window.__BHT_OP_CANCELLED__[opId] = true;
+              if (opId) window.__BHT_OP_TIMED_OUT__[opId] = true;
               debugTrace("operation_inner_timeout", { opId, opType, timeoutMs: opTimeoutMs }, "error");
               resolve({
                 ok: false,
-                error: "OP_INNER_TIMEOUT",
-                message: "页面内操作超时",
+                error: "OP_DEADLINE_EXCEEDED",
+                message: "页面操作超过统一时间预算，已终止",
                 contentVersion: BHT_CONTENT_VERSION
               });
             }, opTimeoutMs);
@@ -3826,18 +6050,25 @@ async function runOpByType(type, payload = {}) {
           } finally {
             if (innerTimeoutId != null) clearTimeout(innerTimeoutId);
           }
-          // 超时后仍等原任务收尾（最多再 15s），避免锁被提前清掉后并发
+          // 超时后通知所有可取消等待尽快收尾，只给锁释放留短暂宽限。
           if (timedOut && workPromise) {
-            log("RUN_OP timed out, waiting work settle", opId, opType);
+            log("RUN_OP deadline exceeded, cancelling work", opId, opType);
             try {
               const late = await Promise.race([
-                workPromise,
-                sleep(15000).then(() => null)
+                workPromise.then((value) => ({ value })).catch((error) => ({ error })),
+                new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), 2500))
               ]);
-              if (late && late.ok) result = late;
+              const lateResult = late?.value;
+              if (
+                opType === MSG.SCAN_JOBS &&
+                lateResult &&
+                Array.isArray(lateResult.jobs) &&
+                lateResult.jobs.length
+              ) {
+                result = lateResult;
+              }
             } catch (e) {
               debugTrace("operation_late_settle_error", { opId, opType, error: serializeDebugError(e) }, "error");
-              if (!result) result = { ok: false, error: String(e?.message || e), contentVersion: BHT_CONTENT_VERSION };
             }
           }
         } catch (err) {
@@ -3850,6 +6081,7 @@ async function runOpByType(type, payload = {}) {
           };
         } finally {
           if (window.__BHT_ACTIVE_OP_ID__ === opId) window.__BHT_ACTIVE_OP_ID__ = null;
+          if (window.__BHT_ACTIVE_OP_TYPE__ === opType) window.__BHT_ACTIVE_OP_TYPE__ = null;
         }
         if (!result) {
           result = { ok: false, error: "EMPTY_RESULT", contentVersion: BHT_CONTENT_VERSION };
@@ -3873,13 +6105,13 @@ async function runOpByType(type, payload = {}) {
           }
         } catch (_) {}
 
-        const wasCancelled = Boolean(opId && window.__BHT_OP_CANCELLED__?.[opId]);
+        const wasCancelled = Boolean(!timedOut && opId && isOperationCancelled());
         if (wasCancelled) {
           result = { ok: false, error: "OP_CANCELLED", message: "任务已停止，页面操作已取消", contentVersion: BHT_CONTENT_VERSION };
         }
         try {
           if (wasCancelled) {
-            await chrome.storage.local.remove("bht_op_" + opId);
+            await markOperationCancelled(opId, result.message || "任务已停止，页面操作已取消", true);
           } else {
             await chrome.storage.local.set({
               ["bht_op_" + opId]: {
@@ -3899,13 +6131,23 @@ async function runOpByType(type, payload = {}) {
           opType,
           timedOut,
           wasCancelled,
-          result
+          result: summarizeOperationResult(result)
         }, result?.ok ? "debug" : "warn");
         try {
-          chrome.runtime.sendMessage({ type: "BHT_OP_DONE", payload: { opId, result } }).catch(() => {});
+          chrome.runtime.sendMessage({ type: "BHT_OP_DONE", payload: { opId, result: summarizeOperationResult(result) } }).catch(() => {});
         } catch (_) {}
         if (opId) delete inflight[opId];
-        if (opId) delete window.__BHT_OP_CANCELLED__[opId];
+        if (opId) {
+          if (timedOut || window.__BHT_OP_TIMED_OUT__?.[opId]) {
+            // 原操作可能还在收尾；保留取消墓碑，避免迟到的 sleep/DOM 步骤重新继续。
+            setTimeout(() => {
+              delete window.__BHT_OP_CANCELLED__[opId];
+              delete window.__BHT_OP_TIMED_OUT__[opId];
+            }, 60000);
+          } else {
+            delete window.__BHT_OP_CANCELLED__[opId];
+          }
+        }
       })();
       return true;
     }
@@ -3934,26 +6176,46 @@ async function runOpByType(type, payload = {}) {
   window.addEventListener("pagehide", () => {
     debugTrace("pagehide_pending_operations", {
       inflight: Object.keys(window.__BHT_OP_INFLIGHT__ || {}),
-      reason: "页面导航会中断所有待执行操作，后台不会自动恢复旧动作"
+      reason: "页面导航会中断本页操作；后台将等待新页面并恢复可安全重试的扫描"
     }, "warn");
     try {
-      // best-effort; may not complete if context dies instantly
-      chrome.storage.local.get(null, (all) => {
-        try {
-          const entries = Object.entries(all || {}).filter(([k, v]) => k.startsWith("bht_op_") && v && v.status === "pending");
-          for (const [k, v] of entries) {
-            // 页面离开后统一中断；禁止新页面自行恢复旧操作并继续操控会话。
-            chrome.storage.local.set({
-              [k]: {
-                status: "done",
-                opType: v.opType,
-                result: { ok: false, error: "NAVIGATED", message: "页面跳转，操作中断", contentVersion: BHT_CONTENT_VERSION },
-                at: Date.now()
-              }
-            });
-          }
-        } catch (_) {}
-      });
+      const updates = {};
+      for (const [opId, inflight] of Object.entries(window.__BHT_OP_INFLIGHT__ || {})) {
+        // Do not turn a cancelled/timed-out operation into a synthetic
+        // navigation success. The background owns the cancellation tombstone
+        // and will either observe the settled marker or expire it safely.
+        if (window.__BHT_OP_CANCELLED__?.[opId] || window.__BHT_OP_TIMED_OUT__?.[opId] || inflight?.cancelled) {
+          updates["bht_op_" + opId] = {
+            status: "cancelled",
+            opId,
+            reason: "任务已停止，页面操作已取消",
+            at: Date.now(),
+            settled: true,
+            contentVersion: BHT_CONTENT_VERSION
+          };
+          continue;
+        }
+        const recoveredTrigger = buildTriggerNavigationRecovery(inflight);
+        updates["bht_op_" + opId] = {
+          status: "done",
+          opType: inflight?.opType || "",
+          result: recoveredTrigger || {
+              ok: false,
+              error: "NAVIGATED",
+              message: "页面跳转，操作中断",
+              contentVersion: BHT_CONTENT_VERSION
+            },
+          at: Date.now()
+        };
+        if (recoveredTrigger) {
+          debugTrace("trigger_navigation_recovered", {
+            opId,
+            opType: inflight?.opType || "",
+            result: recoveredTrigger
+          }, "info");
+        }
+      }
+      if (Object.keys(updates).length) chrome.storage.local.set(updates);
     } catch (_) {}
   });
 

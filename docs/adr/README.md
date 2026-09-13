@@ -20,10 +20,11 @@
 | [ADR-0004](./0004-filter-rule-engine-and-or-not.md) | 筛选规则引擎采用 AND/OR/NOT 分字段语义 | Accepted |
 | [ADR-0005](./0005-preview-before-delivery.md) | 投递前预览优先于直接自动投递 | Accepted |
 | [ADR-0006](./0006-idempotent-dedup-control.md) | 三级防重复与幂等控制 | Accepted |
-| [ADR-0007](./0007-resume-delivery-strategy.md) | 图片/附件简历独立开关与绑定策略 | Accepted |
+| [ADR-0007](./0007-resume-delivery-strategy.md) | 图片/附件简历独立开关与绑定策略 | Superseded |
 | [ADR-0008](./0008-rate-limit-and-account-safety.md) | 频率限制与账号安全边界 | Accepted |
 | [ADR-0009](./0009-v1-no-complex-ai.md) | V1 不引入复杂 AI，优先确定性能力 | Accepted |
 | [ADR-0010](./0010-task-control-and-recovery.md) | 任务控制与异常恢复机制 | Accepted |
+| [ADR-0011](./0011-remove-platform-resume-automation.md) | 移除 BOSS“发简历”按钮自动化，仅保留图片简历 | Accepted |
 
 ## 新增 ADR 流程
 

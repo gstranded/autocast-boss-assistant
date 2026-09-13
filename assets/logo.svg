@@ -1,10 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Boss HaiTou Assistant">
-  <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
-    <stop offset="0%" stop-color="#3B82F6"/><stop offset="100%" stop-color="#1D4ED8"/>
-  </linearGradient></defs>
-  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#g)"/>
-  <path d="M120 250 L390 150 L280 260 L360 365 L245 285 Z" fill="#FFFFFF"/>
-  <circle cx="145" cy="330" r="14" fill="#FFD666"/>
-  <circle cx="118" cy="355" r="9" fill="#FFD666" opacity="0.85"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="AutoCast-Boss海投助手">
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="#E73A7A"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="28" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M168 196 h88 a18 18 0 0 1 18 18 v18 h70 a28 28 0 0 1 28 28 v128 a28 28 0 0 1 -28 28 H146 a28 28 0 0 1 -28 -28 V260 a28 28 0 0 1 28 -28 h70 v-18 a18 18 0 0 1 18 -18 z"/>
+    <rect x="176" y="268" width="44" height="44" rx="8"/>
+    <path d="M176 332 h92"/>
+    <path d="M176 368 h70"/>
+    <path d="M286 318 L390 248 L318 338 z"/>
+    <path d="M368 214 l36 -36"/>
+    <path d="M392 278 h52"/>
+    <path d="M368 342 l36 36"/>
+  </g>
 </svg>

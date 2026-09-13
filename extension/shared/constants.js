@@ -21,6 +21,11 @@ export const MESSAGE_MODES = {
   AUTO_DETECT: 'auto_detect'
 };
 
+export const MESSAGE_SEGMENT_KINDS = {
+  GREETING: 'greeting',
+  SUPPLEMENT: 'supplement'
+};
+
 export const TASK_STATUS = {
   AWAITING_CONFIRM: 'awaiting_confirm',
   RUNNING: 'running',
@@ -30,13 +35,26 @@ export const TASK_STATUS = {
   FAILED: 'failed'
 };
 
+export const DEFAULT_TARGET_NO_NEW_RETRY_LIMIT = 5;
+export const MIN_TARGET_NO_NEW_RETRY_LIMIT = 1;
+export const MAX_TARGET_NO_NEW_RETRY_LIMIT = 50;
+
+export function normalizeTargetNoNewRetryLimit(value, fallback = DEFAULT_TARGET_NO_NEW_RETRY_LIMIT) {
+  const fallbackValue = Number.isFinite(Number(fallback))
+    ? Math.max(MIN_TARGET_NO_NEW_RETRY_LIMIT, Math.min(MAX_TARGET_NO_NEW_RETRY_LIMIT, Math.floor(Number(fallback))))
+    : DEFAULT_TARGET_NO_NEW_RETRY_LIMIT;
+  const numeric = Number(value);
+  return Number.isFinite(numeric)
+    ? Math.max(MIN_TARGET_NO_NEW_RETRY_LIMIT, Math.min(MAX_TARGET_NO_NEW_RETRY_LIMIT, Math.floor(numeric)))
+    : fallbackValue;
+}
+
 export const ITEM_STATE = {
   NOT_STARTED: 'NOT_STARTED',
   COMMUNICATION_CREATED: 'COMMUNICATION_CREATED',
   NATIVE_GREETING_DETECTED: 'NATIVE_GREETING_DETECTED',
   TEXT_SEGMENT_SENT_PREFIX: 'TEXT_SEGMENT_',
   IMAGE_RESUME_SENT: 'IMAGE_RESUME_SENT',
-  PLATFORM_RESUME_SENT: 'PLATFORM_RESUME_SENT',
   COMPLETED: 'COMPLETED',
   FAILED: 'FAILED',
   SKIPPED: 'SKIPPED',
@@ -46,9 +64,12 @@ export const ITEM_STATE = {
 export const DEFAULT_SETTINGS = {
   theme: 'dark',
   messageMode: MESSAGE_MODES.AUTO_DETECT,
+  pluginTextEnabled: true,
+  strictGreetingGuard: true,
+  nativeGreetingWaitMs: 2600,
   similarityThreshold: 0.85,
   segmentIntervalMs: [1800, 3200],
-  jobIntervalMs: [3500, 6000],
+  jobIntervalMs: [4000, 6000], // 投递间隔：基准 5 秒 → 4~6 秒随机
   taskMaxCommunicate: 30,
   dailyMaxCommunicate: 80,
   companyDailyMax: 3,
@@ -56,11 +77,14 @@ export const DEFAULT_SETTINGS = {
   neverRepeatJob: true,
   allowRepublishedJob: false,
   consecutiveFailPause: 3,
+  targetNoNewRetryLimit: DEFAULT_TARGET_NO_NEW_RETRY_LIMIT,
   autoSendImageResume: true,
-  autoSendAttachmentResume: false, // 兼容旧字段名：现在表示点击 BOSS「发简历」
   resumeSendTiming: 'after_text', // after_text | manual
   splitViewEnabled: true,
   debugLoggingEnabled: false,
+  scheduledDeliveryEnabled: false,
+  scheduledDeliveryDays: [1, 2, 3, 4, 5],
+  scheduledDeliveryWindows: [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '17:00' }],
   whitelistOnly: false
 };
 
@@ -93,7 +117,7 @@ export const DEFAULT_FILTERS = {
   salaryMax: null,
   experience: [], // empty = any
   degree: [],
-  activeWithin: '', // today | 3d | week | ''
+  activeWithin: ['week'], // 单选 HR 活跃上限：online | just | today | 3d | week | 2w | month | half，默认「本周内」
   excludeHunter: true,
   excludeOutsource: true,
   maxPostAgeDays: null
@@ -105,11 +129,13 @@ export const DEFAULT_MESSAGE_TEMPLATE = {
     {
       id: 'seg_1',
       enabled: true,
+      kind: MESSAGE_SEGMENT_KINDS.GREETING,
       text: '您好，我对{职位名称}很感兴趣，希望能进一步沟通。'
     },
     {
       id: 'seg_2',
       enabled: true,
+      kind: MESSAGE_SEGMENT_KINDS.SUPPLEMENT,
       text: '我具备相关项目经验，方便的话可以看看我的背景，期待您的回复。'
     }
   ]

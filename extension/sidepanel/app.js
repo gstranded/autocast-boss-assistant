@@ -1,19 +1,49 @@
 import { MSG } from '../shared/messaging.js';
 import { parseKeywords, uid } from '../shared/text-utils.js';
 import { reasonText } from '../shared/reason-codes.js';
-import { STORAGE_KEYS } from '../shared/constants.js';
+import { previewReasonLines, normalizeActiveWithin } from '../shared/filter-engine.js';
+import {
+  DEFAULT_TARGET_NO_NEW_RETRY_LIMIT,
+  MESSAGE_SEGMENT_KINDS,
+  STORAGE_KEYS,
+  normalizeTargetNoNewRetryLimit
+} from '../shared/constants.js';
 import { mergeResumeImages } from '../shared/resume-images.js';
+import { normalizeMessageSegmentKind } from '../shared/greeting-policy.js';
 import {
   collectDoneJobIds,
   countPassJobs,
   countPendingPassJobs,
   shouldAcceptTaskSnapshot
 } from '../shared/task-model.js';
+import { HISTORY_STATUS_MAP, filterHistoryRows, filterHistoryByDate, summarizeHistory, normalizeHistoryDateRange } from '../shared/history-view.js';
+import { todayKey } from '../shared/text-utils.js';
+import {
+  formatLogTimestamp,
+  mergeRuntimeLog,
+  sortLogsNewestFirst,
+  sortLogsOldestFirst
+} from '../shared/log-order.js';
+import {
+  evaluateDeliverySchedule,
+  formatDeliveryScheduleStatus,
+  normalizeDeliveryScheduleDays,
+  diagnoseDeliveryScheduleWindows,
+  DEFAULT_DELIVERY_SCHEDULE_WINDOWS,
+  MAX_DELIVERY_SCHEDULE_WINDOWS
+} from '../shared/delivery-schedule.js';
 
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.0";
+const BHT_UI_VERSION = "1.7.36";
+const VERSION_GUARDED_API_MESSAGES = new Set([
+  MSG.RUN_PREVIEW,
+  MSG.CONFIRM_AND_START,
+  MSG.RUN_TEST_DELIVERY,
+  MSG.RESUME_TASK,
+  MSG.REFRESH_AND_CONTINUE
+]);
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
@@ -33,11 +63,161 @@ const state = {
   modalClosedForKey: '',
   config: null,
   selected: new Set(),
+  targetModeEnabled: false,
+  targetModeUserChanged: false,
+  targetCountDraft: '',
+  messageDirty: false,
+  messageRevision: 0,
+  resumeRevision: 0,
+  lastPersistedConfigSections: null,
+  lastRemoteConfigSections: null,
   activeProfileId: null,
   draftBindings: [],
   lastCompletionSignalId: '',
-  theme: 'dark'
+  lastPreviewRenderKey: '',
+  lastLogRenderKey: '',
+  lastHistoryRenderKey: '',
+  theme: 'dark',
+  runtimeVersionChecked: false,
+  runtimeVersionMismatch: true,
+  runtimeVersion: '',
+  hostSuspended: false,
+  bossGreeting: {
+    ok: false,
+    enabled: null,
+    status: 'unknown',
+    templateId: '',
+    text: '',
+    templates: [],
+    syncedAt: 0,
+    loading: false,
+    error: '',
+    pendingEnabled: null,
+    textDraft: '',
+    textDirty: false,
+    textSaving: false
+  }
 };
+
+function stableConfigValue(value) {
+  if (Array.isArray(value)) return value.map(stableConfigValue);
+  if (value && typeof value === 'object') {
+    return Object.keys(value).sort().reduce((out, key) => {
+      out[key] = stableConfigValue(value[key]);
+      return out;
+    }, {});
+  }
+  return value;
+}
+
+function configSectionSignature(value) {
+  return JSON.stringify(stableConfigValue(value));
+}
+
+let configSaveChain = Promise.resolve();
+
+function enqueueConfigSave(work) {
+  const run = configSaveChain.then(work);
+  configSaveChain = run.catch(() => {});
+  return run;
+}
+
+function draftRevisionSnapshot() {
+  return {
+    autosave: autosaveRevision,
+    message: state.messageRevision,
+    resume: state.resumeRevision
+  };
+}
+
+function draftRevisionsStable(snapshot) {
+  return autosaveRevision === snapshot.autosave &&
+    state.messageRevision === snapshot.message &&
+    state.resumeRevision === snapshot.resume;
+}
+
+function settleManagementDirty(snapshot, dirtyBefore) {
+  if (!dirtyBefore && draftRevisionsStable(snapshot) && !state.messageDirty) {
+    state.formDirty = false;
+  } else {
+    // A management request only saves the resume section. Keep any unrelated
+    // draft, or edits made while the request was in flight, eligible for autosave.
+    state.formDirty = true;
+  }
+}
+
+function hasPendingResumeFiles() {
+  return Boolean($('imageFiles')?.files?.length);
+}
+
+function settingsSavePatch(settings) {
+  const baseline = state.lastPersistedConfigSections?.settings;
+  if (!baseline) return settings;
+  return Object.keys(settings || {}).reduce((patch, key) => {
+    if (configSectionSignature(settings[key]) !== configSectionSignature(baseline[key])) {
+      patch[key] = settings[key];
+    }
+    return patch;
+  }, {});
+}
+
+function configSections(config = {}) {
+  return {
+    settings: config.settings || {},
+    filters: config.filters || {},
+    lists: config.lists || {},
+    messageTemplate: config.messageTemplate || {},
+    resumes: config.resumes || {},
+    bindings: config.bindings || {}
+  };
+}
+
+function rememberPersistedConfig(config = state.config) {
+  state.lastPersistedConfigSections = structuredClone(configSections(config));
+}
+
+function rememberPersistedConfigSection(name, value) {
+  const sections = state.lastPersistedConfigSections
+    ? structuredClone(state.lastPersistedConfigSections)
+    : configSections(state.config || {});
+  sections[name] = structuredClone(value);
+  state.lastPersistedConfigSections = sections;
+}
+
+function localConfigSections(remote = {}) {
+  try { flushActiveProfileForm(); } catch (_) {}
+  const base = state.config || remote || {};
+  let messageTemplate = base.messageTemplate || remote.messageTemplate || {};
+  let filters = remote.filters || base.filters || {};
+  let lists = remote.lists || base.lists || {};
+  let bindings = remote.bindings || base.bindings || {};
+  try { messageTemplate = readTemplate(messageTemplate, { bumpVersion: false }); } catch (_) {}
+  try { filters = readFilters(); } catch (_) {}
+  try {
+    lists = {
+      companyBlacklist: parseKeywords(($('blacklist')?.value || '').replace(/\n/g, ',')),
+      companyWhitelist: parseKeywords(($('whitelist')?.value || '').replace(/\n/g, ','))
+    };
+  } catch (_) {}
+  try {
+    bindings = {
+      rules: readBindingsFromDom()
+        .filter((r) => (r.keywords || []).length && r.profileId)
+        .sort((a, b) => (a.priority || 0) - (b.priority || 0))
+    };
+  } catch (_) {}
+  const sections = {
+    settings: (() => {
+      try { return readSettingsPatch(base.settings || remote.settings || {}); } catch (_) { return base.settings || remote.settings || {}; }
+    })(),
+    filters,
+    lists,
+    messageTemplate,
+    resumes: structuredClone(base.resumes || remote.resumes || {}),
+    bindings
+  };
+  return sections;
+}
 
 function applyTheme(theme) {
   const next = theme === 'light' ? 'light' : 'dark';
@@ -66,14 +246,7 @@ function wireThemeSwitch() {
       const theme = button.dataset.themeValue === 'light' ? 'light' : 'dark';
       applyTheme(theme);
       try {
-        let base = state.config?.settings;
-        if (!base) {
-          const bag = await globalThis.chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
-          base = bag?.[STORAGE_KEYS.SETTINGS] || {};
-        }
-        const settings = { ...base, theme };
-        await api(MSG.SAVE_SETTINGS, settings);
-        if (state.config) state.config.settings = settings;
+        await saveSettings({ refresh: false });
       } catch (e) {
         toast('主题保存失败：' + String(e?.message || e), 'error');
       }
@@ -248,17 +421,21 @@ document.addEventListener('click', (event) => {
 
 async function api(type, payload) {
   const startedAt = Date.now();
-  if (type !== MSG.DEBUG_EVENT) panelDebug('api_request', { type, payload: summarizeApiPayload(payload) });
+  const isPollingRequest = type === MSG.GET_STATE || type === MSG.GET_RUNNER_STATE;
+  if (type !== MSG.DEBUG_EVENT && !isPollingRequest) panelDebug('api_request', { type, payload: summarizeApiPayload(payload) });
   try {
     if (!globalThis.chrome?.runtime?.id) throw new Error(extContextHint());
-    const res = await globalThis.chrome.runtime.sendMessage({ type, payload });
+    if (VERSION_GUARDED_API_MESSAGES.has(type) && (!state.runtimeVersionChecked || state.runtimeVersionMismatch)) {
+      throw new Error('扩展界面与后台版本未同步。请重新加载扩展并刷新 BOSS 页面后再操作');
+    }
+    const res = await globalThis.chrome.runtime.sendMessage({ type, payload, clientVersion: BHT_UI_VERSION });
     if (globalThis.chrome.runtime.lastError?.message) {
       throw new Error(globalThis.chrome.runtime.lastError.message);
     }
     if (res == null) {
       throw new Error(type + ' 未收到后台响应');
     }
-    if (type !== MSG.DEBUG_EVENT) {
+    if (type !== MSG.DEBUG_EVENT && !isPollingRequest) {
       panelDebug('api_response', {
         type,
         elapsedMs: Date.now() - startedAt,
@@ -311,6 +488,24 @@ function showContextDeadBanner() {
   } catch (_) {}
 }
 
+function showRuntimeMismatchBanner(runtimeVersion = '') {
+  try {
+    let el = document.getElementById('bhtVersionMismatch');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'bhtVersionMismatch';
+      el.style.cssText = 'position:sticky;top:0;z-index:9998;background:#7f1d1d;color:#fff;padding:10px 12px;font-size:12px;line-height:1.5;border-bottom:1px solid #991b1b';
+      el.innerHTML = '<div style="font-weight:700;margin-bottom:4px">扩展代码版本不一致，已停止投递</div><div class="bht-version-detail"></div><button type="button" style="margin-top:8px;padding:5px 10px;border:0;border-radius:6px;cursor:pointer">重新加载扩展</button>';
+      el.querySelector('button')?.addEventListener('click', () => {
+        try { chrome.runtime.reload(); } catch (_) { location.reload(); }
+      });
+      document.body.prepend(el);
+    }
+    const detail = el.querySelector('.bht-version-detail');
+    if (detail) detail.textContent = `界面 ${BHT_UI_VERSION} / 后台 ${runtimeVersion || '旧版本或未知'}。点击重新加载后，再按 F5 刷新 BOSS 页面。`;
+  } catch (_) {}
+}
+
 function showTab(name) {
   document.querySelectorAll('.tabs button').forEach((b) => {
     b.classList.toggle('active', b.dataset.tab === name);
@@ -318,6 +513,7 @@ function showTab(name) {
   document.querySelectorAll('.panel').forEach((p) => {
     p.classList.toggle('active', p.id === `tab-${name}`);
   });
+  if (name === 'message') syncBossGreeting({ silent: true }).catch(() => {});
 }
 
 function setConn(ok, text) {
@@ -328,11 +524,11 @@ function setConn(ok, text) {
 
 function setBossMode(isBoss, reason = '') {
   // 浮窗只在 BOSS 注入；避免 activeTab 误判导致按钮全灰
-  const effectiveBoss = FLOAT_MODE ? true : Boolean(isBoss);
+  const effectiveBoss = state.runtimeVersionMismatch ? false : (FLOAT_MODE ? true : Boolean(isBoss));
   state.isBoss = effectiveBoss;
   state.bossBlockReason = effectiveBoss ? '' : (reason || '');
   if (!effectiveBoss) {
-    ['btnPreview', 'btnDiagnose', 'btnStart', 'btnTestOne', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
+    ['btnPreview', 'btnDiagnose', 'btnStart', 'btnTestOne', 'btnTargetMode', 'targetDeliveryCount', 'targetNoNewRetryLimit', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
       const el = $(id);
       if (!el) return;
       el.disabled = true;
@@ -357,6 +553,37 @@ function kwJoin(arr) {
   return (arr || []).join(', ');
 }
 
+// 投递间隔：设置基准秒 n → 实际等待 [n-1, n+1] 秒随机（最小下限 1 秒）
+function intervalBaseFromMs(ms) {
+  if (Array.isArray(ms) && ms.length >= 2 && Number.isFinite(ms[1]) && ms[1] > 0) {
+    return Math.max(1, Math.round(ms[1] / 1000 - 1));
+  }
+  return 5;
+}
+
+function intervalMsFromBase(baseSec) {
+  const n = Math.min(60, Math.max(1, Math.round(Number(baseSec) || 5)));
+  return [Math.max(1000, (n - 1) * 1000), (n + 1) * 1000];
+}
+
+function normalizeActiveSelection(value) {
+  return normalizeActiveWithin(value);
+}
+
+function setActiveChips(selected) {
+  const current = normalizeActiveWithin(selected)[0] || 'all';
+  document.querySelectorAll('#activeChips .chip').forEach((chip) => {
+    chip.classList.toggle('active', chip.dataset.active === current);
+  });
+}
+
+function readActiveChips() {
+  const chip = document.querySelector('#activeChips .chip.active');
+  const val = chip?.dataset.active;
+  if (!val || val === 'all') return [];
+  return [val];
+}
+
 function fillFilters(filters, lists, settings) {
   $('titleOr').value = kwJoin(filters.title?.or);
   $('titleAnd').value = kwJoin(filters.title?.and);
@@ -371,7 +598,7 @@ function fillFilters(filters, lists, settings) {
   $('locMode').value = filters.location?.mode || 'contains';
   $('salaryMin').value = filters.salaryMin ?? '';
   $('salaryMax').value = filters.salaryMax ?? '';
-  $('activeWithin').value = filters.activeWithin || '';
+  setActiveChips(normalizeActiveSelection(filters.activeWithin));
   $('excludeHunter').checked = filters.excludeHunter !== false;
   $('excludeOutsource').checked = filters.excludeOutsource !== false;
   $('blacklist').value = (lists.companyBlacklist || []).join('\n');
@@ -434,7 +661,7 @@ function readFilters() {
     salaryMax: $('salaryMax').value === '' ? null : Number($('salaryMax').value),
     experience: [],
     degree: [],
-    activeWithin: $('activeWithin').value,
+    activeWithin: readActiveChips(),
     excludeHunter: $('excludeHunter').checked,
     excludeOutsource: $('excludeOutsource').checked,
     maxPostAgeDays: null
@@ -443,20 +670,278 @@ function readFilters() {
 
 function fillSettings(settings) {
   applyTheme(settings.theme || 'dark');
-  $('messageMode').value = settings.messageMode;
-  $('similarityThreshold').value = settings.similarityThreshold;
+  $('pluginTextEnabled').checked = settings.pluginTextEnabled !== false;
   $('autoSendImageResume').checked = Boolean(settings.autoSendImageResume);
-  $('autoSendAttachmentResume').checked = Boolean(settings.autoSendAttachmentResume);
   $('resumeSendTiming').value = settings.resumeSendTiming || 'after_text';
   $('taskMaxCommunicate').value = settings.taskMaxCommunicate;
   $('dailyMaxCommunicate').value = settings.dailyMaxCommunicate;
   $('companyDailyMax').value = settings.companyDailyMax;
   $('bossCooldownDays').value = settings.bossCooldownDays;
   $('consecutiveFailPause').value = settings.consecutiveFailPause;
+  $('targetNoNewRetryLimit').value = normalizeTargetNoNewRetryLimit(
+    settings.targetNoNewRetryLimit,
+    DEFAULT_TARGET_NO_NEW_RETRY_LIMIT
+  );
+  $('jobIntervalSec').value = intervalBaseFromMs(settings.jobIntervalMs);
   $('neverRepeatJob').checked = settings.neverRepeatJob !== false;
   $('splitViewEnabled').checked = settings.splitViewEnabled !== false;
   $('debugLoggingEnabled').checked = settings.debugLoggingEnabled === true;
+  $('scheduledDeliveryEnabled').checked = settings.scheduledDeliveryEnabled === true;
+  const scheduledDays = new Set(normalizeDeliveryScheduleDays(settings.scheduledDeliveryDays));
+  document.querySelectorAll('[data-schedule-day]').forEach((input) => {
+    input.checked = scheduledDays.has(Number(input.dataset.scheduleDay));
+  });
+  const windows = Array.isArray(settings.scheduledDeliveryWindows)
+    ? settings.scheduledDeliveryWindows
+    : DEFAULT_DELIVERY_SCHEDULE_WINDOWS;
+  ensureScheduleWindowRows(windows.length, windows);
+  updateDeliveryScheduleUi(settings);
   updateDebugUi(settings);
+}
+
+function ensureScheduleWindowRows(count, values = null) {
+  const container = $('deliveryScheduleWindows');
+  if (!container) return;
+  const requested = Math.max(0, Math.min(MAX_DELIVERY_SCHEDULE_WINDOWS, Math.max(1, count)));
+  while (container.children.length > requested) container.lastElementChild.remove();
+  while (container.children.length < requested) {
+    const row = document.createElement('div');
+    row.className = 'schedule-window-row';
+    row.innerHTML = `
+      <span class="schedule-window-index"></span>
+      <input type="time" data-window-start="" value="" aria-label="" />
+      <span class="schedule-window-sep">至</span>
+      <input type="time" data-window-end="" value="" aria-label="" />
+      <button type="button" class="schedule-window-remove" data-remove-window="" aria-label="" title="删除该时段">×</button>`;
+    container.appendChild(row);
+  }
+  const preset = Array.isArray(values) && values.length > 0 ? values : null;
+  [...container.children].forEach((row, index) => {
+    row.dataset.windowRow = String(index);
+    row.querySelector('.schedule-window-index').textContent = `时段 ${index + 1}`;
+    const startInput = row.querySelector('[data-window-start]');
+    const endInput = row.querySelector('[data-window-end]');
+    const removeBtn = row.querySelector('[data-remove-window]');
+    startInput.dataset.windowStart = String(index);
+    endInput.dataset.windowEnd = String(index);
+    startInput.setAttribute('aria-label', `时段${index + 1}开始`);
+    endInput.setAttribute('aria-label', `时段${index + 1}结束`);
+    removeBtn.dataset.removeWindow = String(index);
+    removeBtn.setAttribute('aria-label', `删除时段${index + 1}`);
+    // 只在使用方显式提供值时回填；增删行重排时保留用户已填的时间
+    if (preset) {
+      const windowConfig = preset[index] || {};
+      startInput.value = windowConfig.start || '';
+      endInput.value = windowConfig.end || '';
+    }
+  });
+}
+
+function readScheduledDeliveryDays() {
+  return [...document.querySelectorAll('[data-schedule-day]:checked')]
+    .map((input) => Number(input.dataset.scheduleDay))
+    .filter((day) => Number.isInteger(day));
+}
+
+function readScheduledDeliveryWindows() {
+  const container = $('deliveryScheduleWindows');
+  if (!container) return [];
+  return [...container.querySelectorAll('.schedule-window-row')].map((row) => ({
+    start: row.querySelector('[data-window-start]')?.value || '',
+    end: row.querySelector('[data-window-end]')?.value || ''
+  })).filter((row) => row.start && row.end);
+}
+
+function renderScheduleWindowDiagnosis(enabled) {
+  const container = $('deliveryScheduleWindows');
+  const warnEl = $('deliveryScheduleWarnings');
+  if (!container) return;
+  const rows = [...container.querySelectorAll('.schedule-window-row')].map((row) => ({
+    start: row.querySelector('[data-window-start]')?.value || '',
+    end: row.querySelector('[data-window-end]')?.value || ''
+  }));
+  const diagnosis = diagnoseDeliveryScheduleWindows(rows);
+  [...container.querySelectorAll('.schedule-window-row')].forEach((rowEl, index) => {
+    const item = diagnosis[index] || { status: 'ok', reason: '' };
+    rowEl.classList.toggle('schedule-window-warn', item.status !== 'ok');
+    const indexLabel = rowEl.querySelector('.schedule-window-index');
+    if (indexLabel) indexLabel.title = item.reason || '';
+  });
+  if (!warnEl) return;
+  const problems = diagnosis.filter((d) => d.status !== 'ok');
+  warnEl.hidden = !enabled || !problems.length;
+  warnEl.textContent = problems.map((d) => `时段 ${d.index + 1}：${d.reason}`).join('；');
+}
+
+const UPDATE_CHECK_FEED = 'https://github.com/gstranded/autocast-boss-assistant/releases.atom';
+const UPDATE_CHECK_RELEASE_PAGE = 'https://github.com/gstranded/autocast-boss-assistant/releases';
+const UPDATE_CHECK_HOME_PAGE = 'https://github.com/gstranded/autocast-boss-assistant';
+
+function isNewerVersion(latest, current) {
+  const parse = (v) => String(v || '').replace(/^v/, '').split('.').map((n) => Number(n) || 0);
+  const a = parse(latest);
+  const b = parse(current);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] || 0;
+    const y = b[i] || 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+
+function openUpdateLink(url) {
+  return (e) => {
+    if (e) e.preventDefault();
+    try { chrome.tabs.create({ url, active: true }); } catch (_) {}
+  };
+}
+
+function formatUpdateDate(iso) {
+  try { return new Date(iso).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }); }
+  catch (_) { return ''; }
+}
+
+// 渲染检查结果：有新版 → 引导前往最新 Release；无新版 → 已是最新 + 项目主页入口
+function renderUpdateStatus(statusEl, { latest, current, release }) {
+  statusEl.innerHTML = '';
+  const line = document.createElement('div');
+  const dateText = release?.published_at ? ' · ' + formatUpdateDate(release.published_at) + ' 发布' : '';
+  if (latest && isNewerVersion(latest, current)) {
+    line.textContent = `发现新版本 v${latest}（当前 v${current}）${dateText}。`;
+    statusEl.appendChild(line);
+    const hint = document.createElement('div');
+    hint.textContent = `可前往最新版本下载页获取：${(release?.body || '').replace(/[#>*`\n-]/g, ' ').trim().slice(0, 80) || ''}`;
+    if (hint.textContent.trim().length > 5) statusEl.appendChild(hint);
+  } else {
+    line.textContent = `已是最新版本（v${current}）${dateText}。`;
+    statusEl.appendChild(line);
+  }
+  const links = document.createElement('div');
+  links.className = 'update-links';
+  const releaseLink = document.createElement('a');
+  releaseLink.href = (release && release.html_url) || UPDATE_CHECK_RELEASE_PAGE;
+  releaseLink.target = '_blank';
+  releaseLink.rel = 'noopener';
+  releaseLink.textContent = latest && isNewerVersion(latest, current) ? '前往下载 ›' : '更新日志 ›';
+  releaseLink.addEventListener('click', openUpdateLink(releaseLink.href));
+  const homeLink = document.createElement('a');
+  homeLink.href = UPDATE_CHECK_HOME_PAGE;
+  homeLink.target = '_blank';
+  homeLink.rel = 'noopener';
+  homeLink.textContent = '项目主页 ›';
+  homeLink.addEventListener('click', openUpdateLink(homeLink.href));
+  links.appendChild(releaseLink);
+  links.appendChild(homeLink);
+  statusEl.appendChild(links);
+}
+
+function wireUpdateCheck() {
+  const btn = $('btnCheckUpdate');
+  const statusEl = $('updateStatus');
+  const currentEl = $('updateCurrentVersion');
+  if (!btn || btn.__bhtWired) return;
+  btn.__bhtWired = true;
+  if (currentEl) currentEl.textContent = 'v' + BHT_UI_VERSION;
+  const homeBtn = $('btnRepoHome');
+  if (homeBtn && !homeBtn.__bhtWired) {
+    homeBtn.__bhtWired = true;
+    homeBtn.addEventListener('click', openUpdateLink(UPDATE_CHECK_HOME_PAGE));
+  }
+  btn.addEventListener('click', async () => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    if (statusEl) {
+      statusEl.hidden = false;
+      statusEl.textContent = '正在检查更新…';
+    }
+    try {
+      const res = await fetch(UPDATE_CHECK_FEED);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const xml = await res.text();
+      const parsed = new DOMParser().parseFromString(xml, 'application/xml');
+      const entry = parsed.querySelector('entry');
+      if (!entry) throw new Error('响应缺少版本信息');
+      const title = (entry.querySelector('title')?.textContent || '').trim();
+      const versionMatch = title.match(/v(\d+\.\d+\.\d+)/);
+      const latest = versionMatch ? versionMatch[1] : '';
+      const current = BHT_UI_VERSION;
+      if (!latest) throw new Error('响应缺少版本号');
+      const release = {
+        html_url: entry.querySelector('link[rel="alternate"]')?.getAttribute('href') || UPDATE_CHECK_RELEASE_PAGE,
+        published_at: entry.querySelector('updated')?.textContent || '',
+        body: (entry.querySelector('content')?.textContent || '').replace(/<[^>]+>/g, ' ')
+      };
+      renderUpdateStatus(statusEl, { latest, current, release });
+    } catch (e) {
+      if (statusEl) statusEl.textContent = '检查失败：' + String(e?.message || e) + '（请检查网络后重试）';
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+function wireScheduleWindowButtons() {
+  const container = $('deliveryScheduleWindows');
+  if (!container || container.__bhtScheduleWired) return;
+  container.__bhtScheduleWired = true;
+  container.addEventListener('click', (e) => {
+    const removeBtn = e.target?.closest?.('[data-remove-window]');
+    if (removeBtn) {
+      // 至少保留一行：删除最后一行的行为改为清空该行，避免出现 0 行的空配置状态
+      if (container.children.length <= 1) {
+        const start = container.querySelector('[data-window-start]');
+        const end = container.querySelector('[data-window-end]');
+        if (start) { start.value = ''; start.dispatchEvent(new Event('input', { bubbles: true })); }
+        if (end) { end.value = ''; end.dispatchEvent(new Event('input', { bubbles: true })); }
+      } else {
+        removeBtn.closest('.schedule-window-row')?.remove();
+      }
+      ensureScheduleWindowRows(container.children.length);
+      updateDeliveryScheduleUi();
+      scheduleAutosave();
+      return;
+    }
+  });
+  const addBtn = $('btnAddScheduleWindow');
+  if (addBtn && !addBtn.__bhtWired) {
+    addBtn.__bhtWired = true;
+    addBtn.addEventListener('click', () => {
+      if (container.children.length >= MAX_DELIVERY_SCHEDULE_WINDOWS) return;
+      ensureScheduleWindowRows(container.children.length + 1);
+      updateDeliveryScheduleUi();
+      scheduleAutosave();
+    });
+  }
+}
+
+function updateDeliveryScheduleUi(settings = null) {
+  const enabled = settings
+    ? settings.scheduledDeliveryEnabled === true
+    : $('scheduledDeliveryEnabled')?.checked === true;
+  const resolved = settings || {
+    scheduledDeliveryEnabled: enabled,
+    scheduledDeliveryDays: readScheduledDeliveryDays(),
+    scheduledDeliveryWindows: readScheduledDeliveryWindows()
+  };
+  // 本地变更立即反映到内存配置，避免 1s 定时器用 5s 前的旧配置短暂禁用控件
+  if (state.config?.settings && !settings) {
+    state.config.settings = { ...state.config.settings, ...resolved };
+  }
+  const dayInputs = document.querySelectorAll('[data-schedule-day]');
+  dayInputs.forEach((input) => { input.disabled = !enabled; });
+  document.querySelectorAll('[data-window-start], [data-window-end]').forEach((input) => { input.disabled = !enabled; });
+  document.querySelectorAll('.schedule-window-remove, #btnAddScheduleWindow').forEach((button) => { button.disabled = !enabled; });
+  $('deliveryScheduleConfig')?.classList.toggle('is-disabled', !enabled);
+  renderScheduleWindowDiagnosis(enabled);
+  if ($('deliveryScheduleStatus')) {
+    const schedule = evaluateDeliverySchedule(resolved, new Date());
+    $('deliveryScheduleStatus').textContent = formatDeliveryScheduleStatus(resolved, new Date());
+    $('deliveryScheduleStatus').dataset.state = !schedule.enabled
+      ? 'disabled'
+      : schedule.allowed
+        ? 'active'
+        : 'paused';
+  }
 }
 
 function updateDebugUi(settings = {}) {
@@ -468,19 +953,26 @@ function readSettingsPatch(base) {
   return {
     ...base,
     theme: state.theme,
-    messageMode: $('messageMode').value,
-    similarityThreshold: Number($('similarityThreshold').value || 0.85),
+    messageMode: 'auto_detect',
+    similarityThreshold: Number(base.similarityThreshold || 0.85),
+    pluginTextEnabled: $('pluginTextEnabled')?.checked !== false,
+    strictGreetingGuard: true,
+    nativeGreetingWaitMs: Number(base.nativeGreetingWaitMs || 2600),
     autoSendImageResume: $('autoSendImageResume').checked,
-    autoSendAttachmentResume: $('autoSendAttachmentResume').checked,
     resumeSendTiming: $('resumeSendTiming').value,
     taskMaxCommunicate: Number($('taskMaxCommunicate').value || 30),
     dailyMaxCommunicate: Number($('dailyMaxCommunicate').value || 80),
     companyDailyMax: Number($('companyDailyMax').value || 3),
     bossCooldownDays: Number($('bossCooldownDays').value || 30),
     consecutiveFailPause: Number($('consecutiveFailPause').value || 3),
+    targetNoNewRetryLimit: normalizeTargetNoNewRetryLimit($('targetNoNewRetryLimit').value),
+    jobIntervalMs: intervalMsFromBase(Number($('jobIntervalSec').value || 5)),
     neverRepeatJob: $('neverRepeatJob').checked,
     splitViewEnabled: $('splitViewEnabled').checked,
     debugLoggingEnabled: $('debugLoggingEnabled').checked,
+    scheduledDeliveryEnabled: $('scheduledDeliveryEnabled').checked,
+    scheduledDeliveryDays: readScheduledDeliveryDays(),
+    scheduledDeliveryWindows: readScheduledDeliveryWindows(),
     whitelistOnly: $('whitelistOnly').checked
   };
 }
@@ -489,11 +981,21 @@ function renderSegments(template) {
   const box = $('segments');
   box.innerHTML = '';
   (template.segments || []).forEach((seg, idx) => {
+    const kind = seg.kind === MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+      ? MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+      : MESSAGE_SEGMENT_KINDS.GREETING;
     const div = document.createElement('div');
     div.className = 'seg';
+    div.dataset.kind = kind;
     div.innerHTML = `
       <div class="top">
-        <label class="check"><input type="checkbox" data-en="${seg.id}" ${seg.enabled !== false ? 'checked' : ''}/>启用第 ${idx + 1} 段</label>
+        <div class="seg-main-control">
+          <label class="check"><input type="checkbox" data-en="${seg.id}" ${seg.enabled !== false ? 'checked' : ''}/>第 ${idx + 1} 段</label>
+          <select class="seg-kind" data-kind="${seg.id}" aria-label="第 ${idx + 1} 段消息角色">
+            <option value="greeting" ${kind === MESSAGE_SEGMENT_KINDS.GREETING ? 'selected' : ''}>招呼</option>
+            <option value="supplement" ${kind === MESSAGE_SEGMENT_KINDS.SUPPLEMENT ? 'selected' : ''}>补充</option>
+          </select>
+        </div>
         <button class="btn tiny" data-del="${seg.id}">删除</button>
       </div>
       <textarea rows="3" data-text="${seg.id}"></textarea>
@@ -505,10 +1007,36 @@ function renderSegments(template) {
   box.querySelectorAll('[data-del]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const id = btn.getAttribute('data-del');
-      state.config.messageTemplate.segments = state.config.messageTemplate.segments.filter((s) => s.id !== id);
+      // 删除会重绘整个列表，先把当前 DOM 草稿同步回 state，避免覆盖刚改的角色或文本。
+      const draft = readTemplate(state.config.messageTemplate || { version: 1, segments: [] }, { bumpVersion: false });
+      state.config.messageTemplate = {
+        ...draft,
+        segments: draft.segments.filter((s) => s.id !== id)
+      };
       renderSegments(state.config.messageTemplate);
+      markMessageDirty();
+      state.formDirty = true;
+      scheduleAutosave();
     });
   });
+
+  box.querySelectorAll('[data-kind], [data-en], [data-text]').forEach((control) => {
+    const update = () => {
+      const card = control.closest('.seg');
+      const kindSelect = card?.querySelector('[data-kind]');
+      if (card && kindSelect) card.dataset.kind = kindSelect.value;
+      state.formDirty = true;
+      renderMessageFlowPreview();
+    };
+    control.addEventListener('input', update);
+    control.addEventListener('change', update);
+  });
+  renderMessageFlowPreview();
+}
+
+function markMessageDirty() {
+  state.messageDirty = true;
+  state.messageRevision += 1;
 }
 
 function templateSegmentsSignature(segments = []) {
@@ -516,6 +1044,7 @@ function templateSegmentsSignature(segments = []) {
     .map((seg) => [
       String(seg?.id || ''),
       seg?.enabled === false ? '0' : '1',
+      String(seg?.kind || ''),
       String(seg?.text || '')
     ].join('\t'))
     .join('\n');
@@ -526,9 +1055,11 @@ function readTemplate(base = {}, opts = {}) {
   for (const seg of base?.segments || []) {
     const en = document.querySelector('[data-en="' + seg.id + '"]');
     const tx = document.querySelector('[data-text="' + seg.id + '"]');
+    const kind = document.querySelector('[data-kind="' + seg.id + '"]');
     map.set(seg.id, {
       ...seg,
       enabled: en ? en.checked : seg.enabled !== false,
+      kind: normalizeMessageSegmentKind(kind?.value, seg.kind),
       text: tx ? tx.value : (seg.text || '')
     });
   }
@@ -537,7 +1068,13 @@ function readTemplate(base = {}, opts = {}) {
     const id = tx.getAttribute('data-text');
     if (!id || map.has(id)) return;
     const en = document.querySelector('[data-en="' + id + '"]');
-    map.set(id, { id, enabled: en ? en.checked : true, text: tx.value || '' });
+    const kind = document.querySelector('[data-kind="' + id + '"]');
+    map.set(id, {
+      id,
+      enabled: en ? en.checked : true,
+      kind: normalizeMessageSegmentKind(kind?.value),
+      text: tx.value || ''
+    });
   });
   const domOrder = Array.from(document.querySelectorAll('#segments [data-text]'))
     .map((el) => el.getAttribute('data-text'))
@@ -559,6 +1096,299 @@ function readTemplate(base = {}, opts = {}) {
     version: shouldBump ? prevVersion + 1 : prevVersion,
     segments
   };
+}
+
+function renderBossGreetingControl() {
+  const greeting = state.bossGreeting;
+  const status = $('bossGreetingStatus');
+  const meta = $('bossGreetingMeta');
+  const toggle = $('bossGreetingToggle');
+  const textBox = $('bossGreetingText');
+  const errorBox = $('bossGreetingError');
+  const confirmBox = $('bossGreetingConfirm');
+  const confirmButton = $('btnConfirmBossGreeting');
+  const syncButton = $('btnSyncBossGreeting');
+  const saveTextButton = $('btnSaveBossGreetingText');
+  const textCount = $('bossGreetingTextCount');
+  if (!status || !meta || !toggle || !textBox) return;
+
+  let cls = 'unknown';
+  let label = '未同步';
+  if (greeting.loading) {
+    label = '同步中…';
+  } else if (greeting.ok && greeting.enabled === true) {
+    cls = 'on';
+    label = '已开启';
+  } else if (greeting.ok && greeting.enabled === false) {
+    cls = 'off';
+    label = '已关闭 · 推荐';
+  } else if (greeting.error) {
+    cls = 'error';
+    label = '同步失败';
+  }
+  status.className = `source-status ${cls}`;
+  status.textContent = label;
+  toggle.disabled = greeting.loading || !greeting.ok;
+  toggle.checked = greeting.pendingEnabled == null
+    ? greeting.enabled === true
+    : greeting.pendingEnabled === true;
+
+  if (greeting.loading) {
+    meta.textContent = '正在读取 BOSS 账号设置…';
+  } else if (greeting.ok) {
+    const synced = greeting.syncedAt
+      ? new Date(greeting.syncedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+      : '刚刚';
+    meta.textContent = `已与 BOSS 账号同步 · ${synced}`;
+  } else {
+    meta.textContent = '尚未取得账号真实状态';
+  }
+
+  const currentText = String(greeting.text || '').trim();
+  if (!greeting.textDirty && document.activeElement !== textBox) {
+    greeting.textDraft = currentText;
+    textBox.value = currentText;
+  }
+  textBox.disabled = greeting.loading || greeting.textSaving || !greeting.ok;
+  textBox.placeholder = greeting.ok
+    ? '请输入 BOSS 自动招呼话术（最多 100 字）'
+    : '同步后可在这里编辑 BOSS 当前话术';
+  const draftLength = Array.from(String(textBox.value || '')).length;
+  if (textCount) {
+    textCount.textContent = `${draftLength} / 100`;
+    textCount.classList.toggle('warning', draftLength > 100);
+  }
+  textBox.classList.toggle('is-dirty', greeting.textDirty);
+  if (saveTextButton) {
+    saveTextButton.disabled = !greeting.ok || greeting.loading || greeting.textSaving ||
+      !greeting.textDirty || !String(textBox.value || '').trim() || draftLength > 100;
+    saveTextButton.textContent = greeting.textSaving ? '保存中…' : '保存话术';
+  }
+
+  if (errorBox) {
+    errorBox.hidden = !greeting.error;
+    errorBox.textContent = greeting.error || '';
+  }
+  if (confirmBox) {
+    const pending = greeting.pendingEnabled;
+    confirmBox.hidden = pending == null;
+    if (pending != null) {
+      $('bossGreetingConfirmTitle').textContent = pending ? '确认开启 BOSS 自动招呼？' : '确认关闭 BOSS 自动招呼？';
+      $('bossGreetingConfirmBody').textContent = pending
+        ? '这是 BOSS 账号全局设置。开启后，插件会识别平台回执并跳过“招呼”段，只继续发送“补充”段。'
+        : '这是 BOSS 账号全局设置。关闭后，由插件按下方模板统一发送招呼与补充内容，可最大限度避免重复。';
+    }
+  }
+  if (confirmButton) confirmButton.disabled = greeting.loading;
+  if (syncButton) syncButton.disabled = greeting.loading;
+  renderMessageFlowPreview();
+}
+
+function getDraftMessageSegments() {
+  const base = state.config?.messageTemplate || { version: 1, segments: [] };
+  try {
+    return readTemplate(base, { bumpVersion: false }).segments || [];
+  } catch (_) {
+    return base.segments || [];
+  }
+}
+
+function appendFlowStep(box, index, label, message, cls = '') {
+  const row = document.createElement('div');
+  row.className = `flow-step ${cls}`.trim();
+  const number = document.createElement('span');
+  number.className = 'flow-step-index';
+  number.textContent = String(index);
+  const content = document.createElement('div');
+  const title = document.createElement('div');
+  title.className = 'flow-step-label';
+  title.textContent = label;
+  const textNode = document.createElement('div');
+  textNode.className = 'flow-step-text';
+  textNode.textContent = message;
+  content.append(title, textNode);
+  row.append(number, content);
+  box.appendChild(row);
+}
+
+function renderMessageFlowPreview() {
+  const box = $('messageFlowPreview');
+  if (!box) return;
+  box.innerHTML = '';
+  const greeting = state.bossGreeting;
+  const pluginEnabled = $('pluginTextEnabled')?.checked !== false;
+  const segments = getDraftMessageSegments().filter((seg) => seg.enabled !== false && String(seg.text || '').trim());
+  let index = 1;
+  let sendCount = 0;
+
+  if (greeting.ok && greeting.enabled === true) {
+    appendFlowStep(box, index++, 'BOSS · 自动招呼', greeting.text || '平台将自动发送当前招呼语', 'native');
+    sendCount += 1;
+  } else if (!greeting.ok) {
+    appendFlowStep(
+      box,
+      index++,
+      '安全检测 · 投递时确认',
+      '先读取平台回执并等待本人新消息；仍无法确认时自动暂停，不会冒险重复发送。',
+      'guard'
+    );
+  }
+
+  if (pluginEnabled) {
+    segments.forEach((segment) => {
+      const kind = segment.kind === MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+        ? MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+        : MESSAGE_SEGMENT_KINDS.GREETING;
+      if (greeting.ok && greeting.enabled === true && kind === MESSAGE_SEGMENT_KINDS.GREETING) return;
+      appendFlowStep(
+        box,
+        index++,
+        kind === MESSAGE_SEGMENT_KINDS.GREETING ? '插件 · 招呼' : '插件 · 补充',
+        String(segment.text || '').trim(),
+        kind
+      );
+      sendCount += 1;
+    });
+  }
+
+  if (sendCount === 0) {
+    appendFlowStep(box, index++, '不会发送文字', pluginEnabled
+      ? '请至少启用一个有内容的消息段。'
+      : '插件文字消息已关闭；BOSS 自动招呼也未开启或状态未知。', 'empty');
+  } else if (!pluginEnabled) {
+    appendFlowStep(box, index, '插件 · 已关闭', '插件不会再追加任何自定义文字。', 'disabled');
+  }
+}
+
+async function syncBossGreeting(options = {}) {
+  const force = options.force === true;
+  const greeting = state.bossGreeting;
+  if (greeting.loading) return;
+  if (!force && greeting.ok && Date.now() - Number(greeting.syncedAt || 0) < 60_000) {
+    renderBossGreetingControl();
+    return;
+  }
+  greeting.loading = true;
+  greeting.error = '';
+  greeting.pendingEnabled = null;
+  renderBossGreetingControl();
+  try {
+    const result = await api(MSG.GET_BOSS_GREETING);
+    Object.assign(greeting, {
+      ...result,
+      ok: true,
+      enabled: result.enabled === true,
+      status: result.enabled ? 'on' : 'off',
+      syncedAt: result.syncedAt || Date.now(),
+      loading: false,
+      error: '',
+      pendingEnabled: null,
+      textDraft: result.text || '',
+      textDirty: false,
+      textSaving: false
+    });
+  } catch (error) {
+    greeting.ok = false;
+    greeting.enabled = null;
+    greeting.loading = false;
+    greeting.textSaving = false;
+    greeting.error = String(error?.message || error || '读取 BOSS 自动招呼设置失败');
+    if (!options.silent) toast(greeting.error, 'error', 5000);
+  }
+  renderBossGreetingControl();
+}
+
+function updateBossGreetingTextDraft() {
+  const greeting = state.bossGreeting;
+  const editor = $('bossGreetingText');
+  if (!editor) return;
+  greeting.textDraft = editor.value || '';
+  greeting.textDirty = String(greeting.textDraft).trim() !== String(greeting.text || '').trim();
+  renderBossGreetingControl();
+}
+
+async function saveBossGreetingText() {
+  const greeting = state.bossGreeting;
+  const editor = $('bossGreetingText');
+  const text = String(editor?.value || '').trim();
+  if (!greeting.ok || greeting.loading || greeting.textSaving) return;
+  if (!text) {
+    toast('请填写 BOSS 自动招呼话术', 'error', 3200);
+    return;
+  }
+  if (Array.from(text).length > 100) {
+    toast('BOSS 自动招呼话术最多 100 个字', 'error', 3200);
+    return;
+  }
+  greeting.textSaving = true;
+  greeting.error = '';
+  renderBossGreetingControl();
+  try {
+    const result = await api(MSG.SAVE_BOSS_GREETING_TEXT, { text });
+    Object.assign(greeting, {
+      ...result,
+      ok: true,
+      enabled: result.enabled === true,
+      status: result.enabled ? 'on' : 'off',
+      syncedAt: result.syncedAt || Date.now(),
+      loading: false,
+      textSaving: false,
+      textDraft: result.text || text,
+      textDirty: false,
+      error: ''
+    });
+    toast('BOSS 当前话术已保存，并完成回读确认', 'success', 3200);
+  } catch (error) {
+    greeting.textSaving = false;
+    greeting.error = `${String(error?.message || error || '保存失败')}。可点击“打开 BOSS 设置”手动确认。`;
+    toast(greeting.error, 'error', 6000);
+  }
+  renderBossGreetingControl();
+}
+
+function requestBossGreetingChange(enabled) {
+  if (!state.bossGreeting.ok || state.bossGreeting.loading) {
+    renderBossGreetingControl();
+    return;
+  }
+  if (enabled === state.bossGreeting.enabled) {
+    state.bossGreeting.pendingEnabled = null;
+  } else {
+    state.bossGreeting.pendingEnabled = enabled;
+  }
+  renderBossGreetingControl();
+}
+
+async function confirmBossGreetingChange() {
+  const greeting = state.bossGreeting;
+  const enabled = greeting.pendingEnabled;
+  if (enabled == null || greeting.loading) return;
+  greeting.loading = true;
+  greeting.error = '';
+  renderBossGreetingControl();
+  try {
+    const result = await api(MSG.SET_BOSS_GREETING, {
+      enabled,
+      templateId: greeting.templateId || ''
+    });
+    Object.assign(greeting, {
+      ...result,
+      ok: true,
+      enabled: result.enabled === true,
+      status: result.enabled ? 'on' : 'off',
+      syncedAt: result.syncedAt || Date.now(),
+      loading: false,
+      error: '',
+      pendingEnabled: null
+    });
+    toast(`BOSS 自动招呼已${greeting.enabled ? '开启' : '关闭'}，并完成回读确认`, 'success', 3200);
+  } catch (error) {
+    greeting.loading = false;
+    greeting.pendingEnabled = null;
+    greeting.error = `${String(error?.message || error || '修改失败')}。可点击“打开 BOSS 设置”手动确认。`;
+    toast(greeting.error, 'error', 6000);
+  }
+  renderBossGreetingControl();
 }
 
 function getActiveProfile() {
@@ -586,7 +1416,7 @@ function renderProfileList() {
         ${isDefault ? '<span class="pill default">默认</span>' : ''}
         ${isActive ? '<span class="pill">编辑中</span>' : ''}
       </div>
-      <div class="meta">图片 ${(p.images || []).length} 张 · 可发送 BOSS 在线简历</div>
+      <div class="meta">图片 ${(p.images || []).length} 张</div>
       <div class="actions">
         <button class="btn tiny" data-switch="${p.id}">切换编辑</button>
         <button class="btn tiny" data-default="${p.id}">设默认</button>
@@ -599,6 +1429,7 @@ function renderProfileList() {
     btn.addEventListener('click', () => {
       // flush current form into memory first
       flushActiveProfileForm();
+      state.resumeRevision += 1;
       state.activeProfileId = btn.getAttribute('data-switch');
       renderResumeEditor();
       renderProfileList();
@@ -606,12 +1437,17 @@ function renderProfileList() {
   });
   box.querySelectorAll('[data-default]').forEach((btn) => {
     btn.addEventListener('click', async () => {
-      flushActiveProfileForm();
-      state.config.resumes.defaultProfileId = btn.getAttribute('data-default');
-      await api(MSG.SAVE_RESUMES, state.config.resumes);
-      state.formDirty = false;
-  await refresh({ soft: false });
-      toast('已更新默认方案', 'success');
+      await enqueueConfigSave(async () => {
+        const dirtyBefore = state.formDirty || state.messageDirty;
+        flushActiveProfileForm();
+        state.config.resumes.defaultProfileId = btn.getAttribute('data-default');
+        state.resumeRevision += 1;
+        const revisionAtStart = draftRevisionSnapshot();
+        await api(MSG.SAVE_RESUMES, state.config.resumes);
+        settleManagementDirty(revisionAtStart, dirtyBefore);
+        await refresh({ soft: false });
+        toast('已更新默认方案', 'success');
+      });
     });
   });
 }
@@ -626,10 +1462,67 @@ function renderResumeEditor() {
   (profile.images || []).forEach((img, idx) => {
     const el = document.createElement('img');
     el.src = img.dataUrl;
-    el.title = `${idx + 1}. ${img.name || ''}`;
+    el.title = `点击预览：${idx + 1}. ${img.name || ''}`;
+    el.dataset.idx = String(idx);
     thumbs.appendChild(el);
   });
-  $('attachInfo').textContent = '无需上传本地附件；启用发送策略后会点击聊天页「发简历」。';
+}
+
+// —— 图片简历全屏预览（独立窗口，避免受面板尺寸限制）——
+const IMG_PREVIEW_KEY = 'bht_img_preview';
+
+async function openImageLightbox(payload) {
+  // payload 两种形态：
+  //  - { profileId, imageIndex }：已保存图片 → 预览窗直接从 storage.local 读方案，
+  //    不走 storage.session，避免「多张/大图」超过 session 10MB 配额导致点击无反应；
+  //  - { images, index }：临时（未保存）图片 → 写入前已压缩为小尺寸 dataUrl。
+  try {
+    await chrome.storage.session.set({ [IMG_PREVIEW_KEY]: payload });
+  } catch (e) {
+    console.warn('[BHT] 图片预览写入失败', e);
+    toast('图片过大，无法打开预览，请压缩后重试', 'error', 3200);
+    return;
+  }
+  const url = chrome.runtime.getURL('sidepanel/image-preview.html');
+  try {
+    // 注意：type:'popup' 时 Chrome 会忽略 state:'maximized'（实测窗口只有 1x33px 隐形细条），
+    // 因此显式给出大尺寸并居中。
+    const availW = globalThis.screen?.availWidth || 1440;
+    const availH = globalThis.screen?.availHeight || 900;
+    const width = Math.max(720, Math.round(availW * 0.86));
+    const height = Math.max(560, Math.round(availH * 0.88));
+    await chrome.windows.create({
+      url,
+      type: 'popup',
+      width,
+      height,
+      left: Math.max(0, Math.round((availW - width) / 2)),
+      top: Math.max(0, Math.round((availH - height) / 2))
+    });
+  } catch (_) {
+    // 极少数环境不支持弹窗时回退为标签页
+    await chrome.tabs.create({ url });
+  }
+}
+
+function bindImageLightbox() {
+  $('imagePreview').addEventListener('click', (event) => {
+    const thumb = event.target.closest('img[data-idx]');
+    if (!thumb) return;
+    // 上传后尚未保存的临时预览图：压缩后直接展示（原始大图会撑爆 storage.session 配额）
+    if (thumb.dataset.tmp === '1') {
+      const files = Array.from($('imageFiles')?.files || []);
+      const f = files[Number(thumb.dataset.idx)];
+      if (!f) return;
+      fileToCompressedDataUrl(f).then((dataUrl) => {
+        openImageLightbox({ images: [{ dataUrl, name: f.name }], index: 0 });
+      });
+      return;
+    }
+    const profile = getActiveProfile();
+    if (!profile) return;
+    openImageLightbox({ profileId: profile.id, imageIndex: Number(thumb.dataset.idx) });
+  });
 }
 
 function flushActiveProfileForm() {
@@ -729,8 +1622,22 @@ function describeTaskPhase(task, status) {
   const qCur = Number.isFinite(task?.queueCursor) ? Number(task.queueCursor) + 1 : 0;
 
   if (status === 'running') {
+    const waitUntil = Number(task?.intervalWaitUntil || 0);
+    if (waitUntil > Date.now()) {
+      const remain = Math.max(1, Math.ceil((waitUntil - Date.now()) / 1000));
+      return `投递间隔等待中 · 还剩 ${remain} 秒`;
+    }
+    const target = task?.targetMode && task?.targetCount
+      ? `成功投递 ${task.counters?.success || 0}/${task.targetCount}` +
+        (Number(task.targetRefreshCount || 0) > 0
+          ? ` · 刷新轮次 ${task.targetRefreshCount}`
+          : '') +
+        (Number(task.targetNoNewRounds || 0) > 0
+          ? ` · 无新增重试 ${task.targetNoNewRounds}/${normalizeTargetNoNewRetryLimit(task.targetNoNewRetryLimit)}`
+          : '')
+      : '';
     const prog = qLen ? `第 ${Math.min(qCur || 1, qLen)}/${qLen} 岗` : (pass ? `进度 ${done}/${pass}` : '运行中');
-    return curTitle ? `${prog} · 当前：${curTitle}` : prog;
+    return [target, prog, curTitle ? `当前：${curTitle}` : ''].filter(Boolean).join(' · ');
   }
   if (status === 'paused') {
     return (task?.pauseReason || '已暂停') + (curTitle ? ` · 当前：${curTitle}` : '');
@@ -760,13 +1667,48 @@ function setControlArmed(id, { enabled, armed, title }) {
   el.title = title || '';
 }
 
+function intervalWaitRemainingSeconds(task, runner = {}) {
+  const until = Math.max(
+    Number(runner?.intervalWaitUntil || 0),
+    Number(task?.intervalWaitUntil || 0)
+  );
+  if (!until) return 0;
+  return Math.max(0, Math.ceil((until - Date.now()) / 1000));
+}
+
 function updateTaskUI(task, runner = {}) {
   const status = task?.status || 'idle';
-  const phase = describeTaskPhase(task, status);
+  const waitRemain = intervalWaitRemainingSeconds(task, runner);
+  const waitingInterval = status === 'running' && waitRemain > 0;
+  const phase = waitingInterval
+    ? `投递间隔等待中 · 还剩 ${waitRemain} 秒`
+    : describeTaskPhase(task, status);
   if ($('taskStatus')) {
-    const pauseBit = status === 'paused' && task?.pauseReason ? '' : (task?.pauseReason && status !== 'paused' ? `（${task.pauseReason}）` : '');
-    $('taskStatus').textContent = `状态：${statusLabel(status)}${phase ? ` · ${phase}` : ''}${pauseBit}`;
-    $('taskStatus').dataset.status = status;
+    if (runner.previewing) {
+      const previewPhaseText = {
+        opening_worker: '正在准备岗位',
+        locating_list: '正在准备岗位',
+        navigating: '正在准备岗位',
+        restoring_source: '正在恢复筛选',
+        waiting_navigation: '正在加载岗位',
+        scanning_cards: '正在加载岗位',
+        scanning_more: '正在加载岗位',
+        collecting: '正在加载岗位',
+        checking_activity: '正在核对 HR 状态',
+        filtering: '正在筛选岗位'
+      }[runner.previewPhase] || '正在加载岗位';
+      const timerStartedAt = Number(runner.previewScanStartedAt || runner.previewStartedAt || 0);
+      const timerFinishedAt = Number(runner.previewScanFinishedAt || 0);
+      const elapsedSeconds = timerStartedAt
+        ? Math.max(0, Math.floor(((timerFinishedAt || Date.now()) - timerStartedAt) / 1000))
+        : 0;
+      $('taskStatus').textContent = `状态：扫描中 · ${previewPhaseText} · ${elapsedSeconds} 秒`;
+      $('taskStatus').dataset.status = 'previewing';
+    } else {
+      const pauseBit = status === 'paused' && task?.pauseReason ? '' : (task?.pauseReason && status !== 'paused' ? `（${task.pauseReason}）` : '');
+      $('taskStatus').textContent = `状态：${statusLabel(status)}${phase ? ` · ${phase}` : ''}${pauseBit}`;
+      $('taskStatus').dataset.status = waitingInterval ? 'waiting' : status;
+    }
   }
   const c = task?.counters || { success: 0, skipped: 0, failed: 0, processed: 0 };
   const pending = countPendingPassJobs(task);
@@ -775,15 +1717,37 @@ function updateTaskUI(task, runner = {}) {
       `成功 ${c.success || 0} · 跳过 ${c.skipped || 0} · 失败 ${c.failed || 0} · 已处理 ${c.processed || 0}` +
       (pending ? ` · 未投 ${pending}` : '');
   }
+  if ($('taskWarnings') && (status !== 'idle' || (task?.warnings || []).length)) {
+    const warnText = (task?.warnings || []).join('；');
+    if (warnText) $('taskWarnings').textContent = warnText;
+  }
   if ($('taskHint')) {
     let hint = '';
-    if (status === 'running') hint = '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
+    if (runner.previewing) {
+      hint = '正在加载岗位…';
+    }
+    else if (status === 'running' && task?.schedulePauseRequested) {
+      hint = waitingInterval
+        ? '当前投递时段已结束：当前岗位已完成，投递间隔结束后自动暂停。'
+        : '当前投递时段已结束：完成当前岗位后自动暂停。';
+    }
+    else if (waitingInterval) hint = `上一岗已处理完，正在等待投递间隔（还剩 ${waitRemain} 秒），随后继续下一岗。可暂停或停止。`;
+    else if (status === 'running') hint = task?.targetMode
+      ? `目标模式运行中：成功投递 ${task.counters?.success || 0}/${task.targetCount}` +
+        (Number(task.targetRefreshCount || 0) > 0 ? `；刷新轮次 ${task.targetRefreshCount}` : '') +
+        `；没有新岗位时最多连续重试 ${normalizeTargetNoNewRetryLimit(task.targetNoNewRetryLimit)} 轮。`
+      : '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
+    else if (status === 'paused' && task?.pauseSource === 'schedule') hint = `${task.pauseReason || '等待下一个投递时段'}；进入时段后自动继续。`;
     else if (status === 'paused') hint = '已暂停：点「继续」恢复当前队列；或「停止」后重新批量投递。';
-    else if (status === 'awaiting_confirm') hint = '预览已就绪：可「投递一份」试投，或「批量投递」勾选岗位。';
+    else if (status === 'awaiting_confirm') hint = state.targetModeEnabled
+      ? `目标模式已${task?.targetMode ? '保存' : '开启'}：设置成功投递目标和无新增重试上限后点「批量投递」。`
+      : '预览已就绪：可「投递一份」试投，或「批量投递」勾选岗位。';
     else if (status === 'completed' || status === 'stopped') {
       hint = pending > 0
         ? '上一轮已结束，但仍有未投岗位：「投递一份」逐个投，或「批量投递」一次投剩余。'
-        : '本轮已结束。重新「扫描预览」后再投。';
+        : (task?.targetMode && task?.targetLastError
+          ? `目标模式暂未达成：${task.targetLastError}`
+          : '本轮已结束。重新「扫描预览」后再投。');
     } else if (status === 'failed') hint = '任务失败。可停止后重新扫描，或对剩余岗位批量投递。';
     else hint = '先扫描预览，再投递一份或批量投递。';
     $('taskHint').textContent = hint;
@@ -792,7 +1756,8 @@ function updateTaskUI(task, runner = {}) {
   const onBoss = FLOAT_MODE || state.isBoss !== false;
   const isRunning = status === 'running';
   const isPaused = status === 'paused';
-  const executionBusy = Boolean(runner.running || runner.starting || runner.previewing || runner.stopping);
+  const isPreviewing = Boolean(runner.previewing);
+  const executionBusy = Boolean(runner.running || runner.starting || runner.previewing || runner.stopping || runner.targetLoop);
   const activeRun = isRunning || isPaused;
   // 控制条：按状态点亮当前可操作按钮，其它变暗
   setControlArmed('btnPause', {
@@ -803,7 +1768,9 @@ function updateTaskUI(task, runner = {}) {
   setControlArmed('btnResume', {
     enabled: onBoss && isPaused,
     armed: isPaused,
-    title: isPaused ? '继续当前任务' : '仅在暂停后可继续'
+    title: isPaused
+      ? (task?.pauseSource === 'schedule' ? '当前由定时规则暂停，进入时段后会自动继续' : '继续当前任务')
+      : '仅在暂停后可继续'
   });
   setControlArmed('btnSkip', {
     enabled: onBoss && activeRun,
@@ -811,17 +1778,33 @@ function updateTaskUI(task, runner = {}) {
     title: activeRun ? '跳过当前岗位，进入下一岗' : '仅在运行/暂停时可跳过'
   });
   setControlArmed('btnStop', {
-    enabled: onBoss && activeRun,
-    armed: activeRun && isRunning,
-    title: activeRun ? '停止任务（可之后批量投剩余）' : '当前没有运行中的任务'
+    enabled: onBoss && (activeRun || isPreviewing),
+    armed: isPreviewing || (activeRun && isRunning),
+    title: isPreviewing
+      ? '取消本次扫描（保留上一次预览结果）'
+      : activeRun
+        ? '停止任务（可之后批量投剩余）'
+        : '当前没有运行中的任务'
   });
 
   const hasPass = countPassJobs(task) > 0 || Array.from(state.selected || []).length > 0;
   const hasPending = countPendingPassJobs(task) > 0 || Array.from(state.selected || []).length > 0;
   // 批量投递：不限 awaiting_confirm；单份投完(completed/stopped)后也应可点
+  const sourceReady = task?.sourceContext?.sourceType === 'recommend' ||
+    (task?.sourceContext?.sourceType === 'expectation' && String(task?.sourceContext?.expectationKey || '').trim());
+  // Restore an active target task on first load, but keep an explicit user
+  // toggle and completed historical tasks from being overwritten by refresh.
+  const targetTaskActive = status === 'running' || status === 'paused' || runner.targetLoop === true;
+  if (!state.targetModeUserChanged && task?.targetMode === true && targetTaskActive) {
+    state.targetModeEnabled = true;
+  }
+  const targetEnabled = state.targetModeEnabled === true;
+  const targetCanRefresh = targetEnabled && Boolean(sourceReady) &&
+    (status === 'awaiting_confirm' || status === 'completed' || status === 'stopped') &&
+    Array.isArray(task?.results) && task.results.length > 0;
   const canBatch =
     onBoss &&
-    hasPass &&
+    (hasPass || targetCanRefresh) &&
     !executionBusy &&
     status !== 'previewing' &&
     // 暂停中应走「继续」，避免和队列冲突
@@ -830,7 +1813,7 @@ function updateTaskUI(task, runner = {}) {
     $('btnStart').disabled = !canBatch;
     $('btnStart').classList.toggle('is-armed', canBatch && (status === 'awaiting_confirm' || status === 'completed' || status === 'stopped'));
     $('btnStart').title = canBatch
-      ? (hasPending ? '批量投递当前勾选/剩余通过岗位' : '批量投递勾选岗位')
+      ? (targetEnabled ? `目标模式：成功投递 ${$('targetDeliveryCount')?.value || task?.targetCount || 10} 份` : (hasPending ? '批量投递当前勾选/剩余通过岗位' : '批量投递勾选岗位'))
       : (isRunning ? '任务运行中，请先停止' : isPaused ? '任务已暂停，请点继续或先停止' : '请先扫描预览');
   }
   if ($('btnTestOne')) {
@@ -839,6 +1822,35 @@ function updateTaskUI(task, runner = {}) {
     $('btnTestOne').disabled = !canOne;
     $('btnTestOne').classList.toggle('is-armed', canOne && (status === 'completed' || status === 'stopped' || status === 'awaiting_confirm'));
     $('btnTestOne').title = canOne ? '每次只投 1 个尚未投过的通过岗位' : (isPaused ? '请先停止或继续当前任务' : '请先扫描预览');
+  }
+  if ($('btnTargetMode')) {
+    const active = state.targetModeEnabled === true;
+    $('btnTargetMode').disabled = !onBoss || executionBusy;
+    $('btnTargetMode').classList.toggle('is-armed', active);
+    $('btnTargetMode').setAttribute('aria-pressed', active ? 'true' : 'false');
+    $('btnTargetMode').textContent = active ? '目标模式：开启' : '目标模式：关闭';
+    $('btnTargetMode').title = active
+      ? `批量投递将持续刷新列表，直到成功达到目标份数；连续无新增达到 ${normalizeTargetNoNewRetryLimit($('targetNoNewRetryLimit')?.value)} 轮后停止`
+      : '开启后批量投递会自动刷新列表，直到成功达到目标份数';
+  }
+  if ($('targetDeliveryCount')) {
+    const targetInput = $('targetDeliveryCount');
+    const targetCountValue = state.targetCountDraft ||
+      (task?.targetMode && Number(task.targetCount) > 0 ? String(task.targetCount) : '');
+    if (targetCountValue && document.activeElement !== targetInput) {
+      targetInput.value = targetCountValue;
+    }
+    targetInput.disabled = !onBoss || executionBusy || !targetEnabled;
+  }
+  if ($('targetNoNewRetryLimit')) {
+    const retryInput = $('targetNoNewRetryLimit');
+    const retryValue = task?.targetMode && Number(task.targetNoNewRetryLimit) > 0
+      ? String(task.targetNoNewRetryLimit)
+      : String(retryInput.value || DEFAULT_TARGET_NO_NEW_RETRY_LIMIT);
+    if (retryValue && document.activeElement !== retryInput) retryInput.value = retryValue;
+    // 这是设置项，不依赖目标模式开关；用户可以先在「设置」里配置，
+    // 开启目标模式后直接使用。运行中的任务仍锁定，避免修改当前任务快照。
+    retryInput.disabled = !onBoss || executionBusy;
   }
   if ($('btnPreview')) $('btnPreview').disabled = !(onBoss && !executionBusy && status !== 'running');
   if ($('btnDiagnose')) $('btnDiagnose').disabled = !onBoss;
@@ -888,13 +1900,30 @@ function formatPreviewReasonLine(code, count, settings = {}) {
 }
 
 function renderPreview(task) {
+  const settings = state.config?.settings || {};
+  const renderKey = JSON.stringify([
+    task?.id || '',
+    task?.revision || 0,
+    task?.updatedAt || 0,
+    task?.status || '',
+    task?.results?.length || 0,
+    task?.summary?.pass || 0,
+    task?.summary?.reject || 0,
+    (task?.warnings || []).join('|'),
+    settings.companyDailyMax,
+    settings.dailyMaxCommunicate,
+    settings.taskMaxCommunicate,
+    settings.bossCooldownDays,
+    settings.neverRepeatJob
+  ]);
+  if (renderKey === state.lastPreviewRenderKey) return;
+  state.lastPreviewRenderKey = renderKey;
   if (!task?.summary) {
     $('summaryBox').textContent = '尚未扫描';
     $('previewList').innerHTML = '';
     return;
   }
   const s = task.summary;
-  const settings = state.config?.settings || {};
   const lines = [
     `扫描岗位：${s.scanned}`,
     `符合规则：${s.pass}`,
@@ -912,9 +1941,13 @@ function renderPreview(task) {
   }
   lines.push('');
   lines.push(
-    `生效设置：同公司每天最多 ${settings.companyDailyMax ?? '—'} · 每日最多 ${settings.dailyMaxCommunicate ?? '—'} · 本次最多 ${settings.taskMaxCommunicate ?? '—'} · 同HR冷却 ${settings.bossCooldownDays ?? '—'} 天 · 永不重复 ${settings.neverRepeatJob ? '开' : '关'}`
+    `生效设置：同公司每天最多 ${settings.companyDailyMax ?? '—'} · 每日最多 ${Number(settings.dailyMaxCommunicate) > 0 ? settings.dailyMaxCommunicate : '未设上限'} · 本次最多 ${settings.taskMaxCommunicate ?? '—'} · 同HR冷却 ${settings.bossCooldownDays ?? '—'} 天 · 永不重复 ${settings.neverRepeatJob ? '开' : '关'}`
   );
-  lines.push('说明：「本次/每日最多沟通」在正式投递时拦截，预览阶段主要做筛选词、永不重复、同公司已达今日上限等判断。');
+  lines.push('说明：「本次/每日最多沟通」和缺文案的 HR 活跃在正式投递时拦截；预览阶段主要做筛选词、永不重复、同公司已达今日上限等判断。');
+  if (Array.isArray(task.warnings) && task.warnings.length) {
+    lines.push('');
+    lines.push('提示：' + task.warnings.join('；'));
+  }
   $('summaryBox').textContent = lines.join('\n');
 
 const list = $('previewList');
@@ -923,9 +1956,11 @@ const list = $('previewList');
     (task.results || []).filter((r) => r.selected && r.decision === 'pass').map((r) => r.job.jobId)
   );
 
+  const fragment = document.createDocumentFragment();
   (task.results || []).forEach((r) => {
     const div = document.createElement('div');
     div.className = `item ${r.decision}`;
+    div.dataset.job = String(r.job.jobId || '');
     const canSelect = r.decision === 'pass';
     div.innerHTML = `
       <div class="row">
@@ -941,18 +1976,70 @@ const list = $('previewList');
       <div class="m">${escapeHtml(r.job.company || '')} · ${escapeHtml(r.job.location || '')} · ${escapeHtml(
       r.job.salary || ''
     )}</div>
-      <div class="r">${escapeHtml((r.decision === 'pass' ? r.passReasons : r.reasonTexts)?.join('；') || '')}</div>
+      <div class="r">${escapeHtml(previewReasonLines(r).join('；'))}</div>
     `;
-    list.appendChild(div);
+    fragment.appendChild(div);
   });
-
-  list.querySelectorAll('input[data-job]').forEach((input) => {
-    input.addEventListener('change', () => {
+  list.appendChild(fragment);
+  if (!list.__bhtSelectionBound) {
+    list.__bhtSelectionBound = true;
+    list.addEventListener('change', (event) => {
+      const input = event.target?.closest?.('input[data-job]');
+      if (!input) return;
       const id = input.getAttribute('data-job');
       if (input.checked) state.selected.add(id);
       else state.selected.delete(id);
     });
-  });
+  }
+  markCurrentDeliveryJob();
+}
+
+// 批量投递时标记「当前正在投递的岗位」：橙色描边 + 「投递中」徽标 + 自动滚动到该岗位。
+// 仅在岗位 id 变化时滚动一次，避免持续抢占用户滚动位置。
+function markCurrentDeliveryJob() {
+  const list = $('previewList');
+  if (!list) return;
+  const task = state.config?.task || {};
+  const currentId = String(task.currentJobId || '');
+  const active = currentId && (task.status === 'running' || task.status === 'paused');
+  let target = null;
+  for (const el of list.querySelectorAll('.item[data-job]')) {
+    const isCurrent = Boolean(active && el.dataset.job === currentId);
+    el.classList.toggle('current-delivery', isCurrent);
+    const badge = el.querySelector('.delivery-badge');
+    if (isCurrent && !badge) {
+      const b = document.createElement('span');
+      b.className = 'delivery-badge';
+      b.textContent = '投递中';
+      const t = el.querySelector('.t');
+      (t || el).prepend(b);
+    } else if (!isCurrent && badge) {
+      badge.remove();
+    }
+    if (isCurrent) target = el;
+  }
+  if (target && state.lastDeliveryScrollJob !== currentId) {
+    state.lastDeliveryScrollJob = currentId;
+    // 只滚动「预览列表」自身的滚动条（#previewList），主页面/外层滚动条保持不动，
+    // 用户停留在哪一屏都不影响，向下滑即可看到当前投递中的岗位。
+    const scroller = document.getElementById('previewList');
+    try {
+      if (scroller) {
+        const boxRect = scroller.getBoundingClientRect();
+        const elRect = target.getBoundingClientRect();
+        const targetTop = scroller.scrollTop + (elRect.top - boxRect.top);
+        const y = Math.max(0, targetTop + elRect.height / 2 - boxRect.height / 2);
+        if (typeof scroller.scrollTo === 'function') {
+          scroller.scrollTo({ top: y, behavior: 'smooth' });
+        } else {
+          scroller.scrollTop = y;
+        }
+      }
+    } catch (_) {
+      // 兜底：仅尝试滚动，不影响高亮
+    }
+  }
+  if (!target && state.lastDeliveryScrollJob) state.lastDeliveryScrollJob = '';
 }
 
 function escapeHtml(s) {
@@ -969,44 +2056,72 @@ function escapeAttr(s) {
 
 function renderLogs(logs = []) {
   const box = $('logList');
+  const sorted = sortLogsNewestFirst(logs).slice(0, 100);
+  const renderKey = `${logs.length}|${sorted[0]?.id || sorted[0]?.ts || ''}|${sorted[0]?.message || ''}`;
+  if (renderKey === state.lastLogRenderKey) return;
+  state.lastLogRenderKey = renderKey;
   box.innerHTML = '';
-  logs.slice(0, 100).forEach((l) => {
+  sorted.forEach((l) => {
     const div = document.createElement('div');
     div.className = `log ${l.level || 'info'}`;
-    const time = new Date(l.ts || Date.now()).toLocaleTimeString();
+    const time = formatLogTimestamp(l.ts, { includeDate: true });
     div.textContent = `[${time}] ${l.message}`;
     box.appendChild(div);
   });
 }
 
 
-const HISTORY_STATUS_MAP = {
-  success: { label: '成功', cls: 'success' },
-  skipped_list: { label: '跳过', cls: 'skipped' },
-  conversation_not_found: { label: '跳过', cls: 'skipped' },
-  skipped_missing: { label: '跳过', cls: 'skipped' },
-  failed: { label: '失败', cls: 'failed' }
-};
+// 当前筛选下可见的记录行（与渲染、导出共用同一逻辑，保证口径一致）
+function visibleHistoryRows(history = []) {
+  const filter = $('historyFilter')?.value || 'all';
+  const range = normalizeHistoryDateRange($('historyFrom')?.value || '', $('historyTo')?.value || '');
+  const fromTs = range.fromVal ? new Date(range.fromVal + 'T00:00:00').getTime() : 0;
+  const toTs = range.toVal ? new Date(range.toVal + 'T00:00:00').getTime() : 0;
+  const byDate = filterHistoryByDate(history, fromTs, toTs);
+  return {
+    rows: filterHistoryRows(byDate, filter),
+    filter,
+    fromVal: range.fromVal,
+    toVal: range.toVal,
+    hasFilter: Boolean(range.fromVal || range.toVal || (filter && filter !== 'all'))
+  };
+}
 
 function renderHistory(history = []) {
   const box = $('historyList');
   if (!box) return;
   const filter = $('historyFilter')?.value || 'all';
-  const filtered = history.filter((h) => {
-    if (filter === 'all') return true;
-    const info = HISTORY_STATUS_MAP[h.status] || { cls: 'skipped' };
-    return info.cls === filter;
-  });
+  const fromVal = $('historyFrom')?.value || '';
+  const toVal = $('historyTo')?.value || '';
+  const dayKey = todayKey();
+  const dayStat = (state.config?.dailyStats || {})[dayKey] || {};
+  const dailyMax = Number(state.config?.settings?.dailyMaxCommunicate || 0);
+  // renderKey 纳入今日统计与跨日：dailyStats 变化（运行中沟通+1）或跨日时今日行也要刷新
+  const renderKey = `${filter}|${fromVal}|${toVal}|${dayKey}|${dayStat.communicate || 0}|${dailyMax}|${history.length}|${history[0]?.id || history[0]?.ts || ''}|${history[0]?.status || ''}`;
+  if (renderKey === state.lastHistoryRenderKey) return;
+  state.lastHistoryRenderKey = renderKey;
+  // 日期范围（含边界）+ 状态筛选
+  const filtered = visibleHistoryRows(history).rows;
+  const stats = summarizeHistory(filtered);
 
-  const total = history.length;
-  const successCount = history.filter((h) => h.status === 'success').length;
-  const skipCount = history.filter((h) => (HISTORY_STATUS_MAP[h.status] || {}).cls === 'skipped').length;
-  const failCount = total - successCount - skipCount;
+  // 顶部今日行：今日已投 x / 每日上限（x 与每日限制使用同一计数器 communicate）
+  const todayEl = $('historyToday');
+  if (todayEl) {
+    const used = Number(dayStat.communicate || 0);
+    todayEl.innerHTML = dailyMax > 0
+      ? `今日已投 <b>${used}</b> / ${dailyMax}`
+      : `今日已投 <b>${used}</b>（未设上限）`;
+  }
+
   const statsEl = $('historyStats');
   if (statsEl) {
-    statsEl.textContent = total
-      ? `共 ${total} 条 · 成功 ${successCount} · 跳过 ${skipCount} · 失败 ${failCount}`
+    let text = stats.total
+      ? `共 ${stats.total} 条 · 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed}`
       : '尚无记录';
+    if (stats.total > 200) {
+      text = `已显示前 200 条，共 ${stats.total} 条 · 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed}`;
+    }
+    statsEl.textContent = text;
   }
 
   box.innerHTML = '';
@@ -1015,13 +2130,25 @@ function renderHistory(history = []) {
     const div = document.createElement('div');
     div.className = 'history-item ' + info.cls;
     const time = new Date(h.ts || Date.now()).toLocaleString();
-    const title = h.title || '未知岗位';
-    const company = h.company || '';
-    div.innerHTML =
-      '<span class="hist-badge ' + info.cls + '">' + info.label + '</span>' +
-      '<span class="hist-title">' + title + '</span>' +
-      (company ? '<span class="hist-company">' + company + '</span>' : '') +
-      '<span class="hist-time">' + time + '</span>';
+    // DOM API 组装，title/company 作为文本节点，避免内容注入 HTML
+    const badge = document.createElement('span');
+    badge.className = 'hist-badge ' + info.cls;
+    badge.textContent = info.label;
+    const titleEl = document.createElement('span');
+    titleEl.className = 'hist-title';
+    titleEl.textContent = h.title || '未知岗位';
+    const timeEl = document.createElement('span');
+    timeEl.className = 'hist-time';
+    timeEl.textContent = time;
+    div.appendChild(badge);
+    div.appendChild(titleEl);
+    if (h.company) {
+      const companyEl = document.createElement('span');
+      companyEl.className = 'hist-company';
+      companyEl.textContent = String(h.company);
+      div.appendChild(companyEl);
+    }
+    div.appendChild(timeEl);
     box.appendChild(div);
   });
 }
@@ -1039,19 +2166,31 @@ function isEditingForm() {
 /** soft: 仅刷新任务/连接/日志，不覆盖正在编辑的表单 */
 async function refresh(options = {}) {
   const soft = options.soft === true;
+  const authoritativeTask = options.authoritativeTask === true;
+  lastFullRefreshAt = Date.now();
   const res = await api(MSG.GET_STATE);
   if (!res?.ok) return;
+  const remoteConfigSections = configSections(res);
+  state.lastRemoteConfigSections = structuredClone(remoteConfigSections);
+  if (!state.lastPersistedConfigSections || (!state.formDirty && !state.messageDirty)) {
+    state.lastPersistedConfigSections = structuredClone(remoteConfigSections);
+  }
+  state.runtimeVersion = String(res.runtimeVersion || '');
+  state.runtimeVersionChecked = true;
+  state.runtimeVersionMismatch = state.runtimeVersion !== BHT_UI_VERSION;
+  if (state.runtimeVersionMismatch) showRuntimeMismatchBanner(state.runtimeVersion);
   const currentTask = state.config?.task;
-  if (!shouldAcceptTaskSnapshot(currentTask, res.task)) res.task = currentTask;
+  if (!shouldAcceptTaskSnapshot(currentTask, res.task, { authoritative: authoritativeTask })) res.task = currentTask;
   const prevTemplate = state.config?.messageTemplate;
   const prevSettings = state.config?.settings;
   const prevFilters = state.config?.filters;
   const prevLists = state.config?.lists;
   const wasDirty = state.formDirty;
   const editingNow = typeof isEditingForm === 'function' ? isEditingForm() : false;
+  const keepMessage = soft || state.messageDirty || editingNow;
 
   state.config = res;
-  if ((wasDirty || editingNow || soft) && prevTemplate) {
+  if ((wasDirty || editingNow || soft || state.messageDirty) && prevTemplate) {
     try {
       // soft/dirty 路径只同步 DOM 草稿，不抬升版本（真正保存时再按内容决定）
       state.config.messageTemplate = readTemplate(prevTemplate, { bumpVersion: false });
@@ -1080,11 +2219,12 @@ async function refresh(options = {}) {
     }));
     fillFilters(res.filters, res.lists, res.settings);
     fillSettings(res.settings);
-    renderSegments(res.messageTemplate);
+    if (!keepMessage) renderSegments(res.messageTemplate);
     renderProfileList();
     renderResumeEditor();
     renderBindings();
   }
+  renderMessageFlowPreview();
 
   if (!editing && !state.formDirty) {
     renderPreview(res.task);
@@ -1098,64 +2238,151 @@ async function refresh(options = {}) {
   renderLogs(res.logs || []);
   renderHistory(res.history || []);
 
-  const isBoss = Boolean(res.activeIsBoss || res.activeTab);
+  const isBoss = Boolean(res.activeIsBoss || res.activeTab) && !state.runtimeVersionMismatch;
   if (isBoss) {
     setConn(true, '已连接 BOSS · v' + BHT_UI_VERSION);
     setBossMode(true);
   } else {
-    const reason = '当前不是 BOSS 直聘页面，助手仅在 zhipin.com 生效';
-    setConn(false, '未连接 BOSS');
+    const reason = state.runtimeVersionMismatch
+      ? `扩展界面 ${BHT_UI_VERSION} 与后台 ${state.runtimeVersion || '旧版本或未知'} 不一致，请重新加载扩展并刷新页面`
+      : '当前不是 BOSS 直聘页面，助手仅在 zhipin.com 生效';
+    setConn(false, state.runtimeVersionMismatch ? '版本不一致 · 已锁定' : '未连接 BOSS');
     setBossMode(false, reason);
   }
   if (isBoss) updateTaskUI(res.task, res.runner);
 }
 
-async function saveFilters(opts = {}) {
+let runnerPollPromise = null;
+let lastFullRefreshAt = Date.now();
+async function refreshRunnerState() {
+  if (runnerPollPromise) return runnerPollPromise;
+  runnerPollPromise = (async () => {
+    const res = await api(MSG.GET_RUNNER_STATE);
+    if (!res?.ok) return null;
+    state.runtimeVersion = String(res.runtimeVersion || '');
+    state.runtimeVersionChecked = true;
+    state.runtimeVersionMismatch = state.runtimeVersion !== BHT_UI_VERSION;
+    if (state.runtimeVersionMismatch) {
+      showRuntimeMismatchBanner(state.runtimeVersion);
+      setConn(false, '版本不一致 · 已锁定');
+      setBossMode(false, `扩展界面 ${BHT_UI_VERSION} 与后台 ${state.runtimeVersion || '未知'} 不一致`);
+      return res;
+    }
+    if (!state.config) state.config = {};
+    state.config.runner = res.runner || {};
+    updateTaskUI(state.config.task, state.config.runner);
+    return res;
+  })().finally(() => { runnerPollPromise = null; });
+  return runnerPollPromise;
+}
+
+async function saveFiltersNow(opts = {}) {
+  const revisionAtStart = autosaveRevision;
+  const requestedSections = opts.sections ? new Set(opts.sections) : null;
+  const saveFilterSection = !requestedSections || requestedSections.has('filters');
+  const saveListSection = !requestedSections || requestedSections.has('lists');
+  const saveSettingsSection = !requestedSections || requestedSections.has('settings');
   const filters = readFilters();
   const lists = {
     companyBlacklist: parseKeywords($('blacklist').value.replace(/\n/g, ',')),
     companyWhitelist: parseKeywords($('whitelist').value.replace(/\n/g, ','))
   };
   const settings = readSettingsPatch(state.config?.settings || {});
-  await api(MSG.SAVE_FILTERS, filters);
-  await api(MSG.SAVE_LISTS, lists);
-  await api(MSG.SAVE_SETTINGS, settings);
+  const settingsPatch = settingsSavePatch(settings);
+  if (saveFilterSection) await api(MSG.SAVE_FILTERS, filters);
+  if (saveListSection) await api(MSG.SAVE_LISTS, lists);
+  if (saveSettingsSection && Object.keys(settingsPatch).length) await api(MSG.SAVE_SETTINGS, settingsPatch);
+  const currentFilters = readFilters();
+  const currentLists = {
+    companyBlacklist: parseKeywords($('blacklist').value.replace(/\n/g, ',')),
+    companyWhitelist: parseKeywords($('whitelist').value.replace(/\n/g, ','))
+  };
+  const currentSettings = readSettingsPatch(state.config?.settings || {});
+  const filtersStable = !saveFilterSection || configSectionSignature(currentFilters) === configSectionSignature(filters);
+  const listsStable = !saveListSection || configSectionSignature(currentLists) === configSectionSignature(lists);
+  const settingsStable = !saveSettingsSection || configSectionSignature(currentSettings) === configSectionSignature(settings);
   if (state.config) {
-    state.config.filters = filters;
-    state.config.lists = lists;
-    state.config.settings = { ...(state.config.settings || {}), ...settings };
+    if (saveFilterSection && filtersStable) state.config.filters = filters;
+    if (saveListSection && listsStable) state.config.lists = lists;
+    if (saveSettingsSection && settingsStable) state.config.settings = { ...(state.config.settings || {}), ...settings };
   }
   if (opts.refresh !== false) {
-    state.formDirty = false;
+    if (autosaveRevision === revisionAtStart && filtersStable && listsStable && settingsStable) {
+      state.formDirty = false;
+    }
     await refresh({ soft: true });
   }
+  if (saveFilterSection && filtersStable) rememberPersistedConfigSection('filters', filters);
+  if (saveListSection && listsStable) rememberPersistedConfigSection('lists', lists);
+  if (saveSettingsSection && settingsStable) rememberPersistedConfigSection('settings', settings);
 }
 
-async function saveMessage(opts = {}) {
+function saveFilters(opts = {}) {
+  return enqueueConfigSave(() => saveFiltersNow(opts));
+}
+
+async function saveMessageNow(opts = {}) {
   if (!state.config) state.config = {};
   // 永远以 DOM 为准，不依赖可能被 refresh 冲掉的 base
+  const revisionAtStart = state.messageRevision;
+  const autosaveRevisionAtStart = autosaveRevision;
   const template = readTemplate(state.config.messageTemplate || { version: 1, segments: [] });
   const settings = readSettingsPatch(state.config.settings || {});
+  const settingsPatch = settingsSavePatch(settings);
   await api(MSG.SAVE_TEMPLATE, template);
-  await api(MSG.SAVE_SETTINGS, settings);
-  state.config.messageTemplate = template;
-  state.config.settings = { ...(state.config.settings || {}), ...settings };
+  if (Object.keys(settingsPatch).length) await api(MSG.SAVE_SETTINGS, settingsPatch);
+  // 保存期间若用户继续编辑，只更新实际写入的 section 基线，让下一轮
+  // autosave 接着落盘最新 DOM 草稿。
+  let latestTemplate = template;
+  let latestSettings = settings;
+  try {
+    latestTemplate = readTemplate(state.config.messageTemplate || template, { bumpVersion: false });
+  } catch (_) {}
+  try { latestSettings = readSettingsPatch(state.config.settings || settings); } catch (_) {}
+  const messageStable = state.messageRevision === revisionAtStart &&
+    templateSegmentsSignature(latestTemplate.segments) === templateSegmentsSignature(template.segments);
+  const settingsStable = configSectionSignature(latestSettings) === configSectionSignature(settings);
+  if (messageStable) {
+    state.config.messageTemplate = template;
+    state.messageDirty = false;
+    rememberPersistedConfigSection('messageTemplate', template);
+  } else {
+    state.messageDirty = true;
+  }
+  if (settingsStable) {
+    state.config.settings = { ...(state.config.settings || {}), ...settings };
+    rememberPersistedConfigSection('settings', settings);
+  }
   if (opts.refresh !== false) {
-    state.formDirty = false;
-    renderSegments(template);
+    if (!state.messageDirty) state.formDirty = false;
+    renderSegments(latestTemplate);
     await refresh({ soft: true });
   }
+  if (autosaveRevision !== autosaveRevisionAtStart || !settingsStable) state.formDirty = true;
   return true;
 }
 
-async function saveSettings(opts = {}) {
+function saveMessage(opts = {}) {
+  return enqueueConfigSave(() => saveMessageNow(opts));
+}
+
+async function saveSettingsNow(opts = {}) {
+  const revisionAtStart = autosaveRevision;
   const settings = readSettingsPatch(state.config?.settings || {});
-  await api(MSG.SAVE_SETTINGS, settings);
-  if (state.config) state.config.settings = { ...(state.config.settings || {}), ...settings };
+  const settingsPatch = settingsSavePatch(settings);
+  if (Object.keys(settingsPatch).length) await api(MSG.SAVE_SETTINGS, settingsPatch);
+  const currentSettings = readSettingsPatch(state.config?.settings || {});
+  const settingsStable = configSectionSignature(currentSettings) === configSectionSignature(settings);
+  if (state.config && settingsStable) state.config.settings = { ...(state.config.settings || {}), ...settings };
   if (opts.refresh !== false) {
-    state.formDirty = false;
+    if (autosaveRevision === revisionAtStart && settingsStable) state.formDirty = false;
     await refresh({ soft: true });
   }
+  if (settingsStable) rememberPersistedConfigSection('settings', settings);
+}
+
+function saveSettings(opts = {}) {
+  return enqueueConfigSave(() => saveSettingsNow(opts));
 }
 
 
@@ -1227,13 +2454,16 @@ async function fileToCompressedDataUrl(file, maxEdge = 1280, quality = 0.72) {
 let resumeSaveChain = Promise.resolve();
 
 function saveResume(opts = {}) {
-  const run = resumeSaveChain.then(() => saveResumeNow(opts));
+  const run = resumeSaveChain.then(() => enqueueConfigSave(() => saveResumeNow(opts)));
   resumeSaveChain = run.catch(() => {});
   return run;
 }
 
 async function saveResumeNow(opts = {}) {
+  const resumeRevisionAtStart = state.resumeRevision;
+  const autosaveRevisionAtStart = autosaveRevision;
   const shouldRefresh = opts.refresh !== false;
+  const shouldRender = opts.render !== false;
   const clearInputs = opts.clearInputs !== false;
   const appendImages = opts.append !== false; // 默认追加，不覆盖已有图
   const includePendingFiles = opts.includePendingFiles !== false;
@@ -1291,70 +2521,196 @@ async function saveResumeNow(opts = {}) {
   await assertResumeStorageCapacity(resumes);
 
   const settings = readSettingsPatch(state.config?.settings || {});
+  const settingsPatch = settingsSavePatch(settings);
   // 仅当后台 ok 时继续（api 会抛错）
   await api(MSG.SAVE_RESUMES, resumes);
-  await api(MSG.SAVE_SETTINGS, settings);
+  if (Object.keys(settingsPatch).length) await api(MSG.SAVE_SETTINGS, settingsPatch);
+
+  let currentSettings = settings;
+  try { currentSettings = readSettingsPatch(state.config?.settings || settings); } catch (_) {}
+  const resumesStable = state.resumeRevision === resumeRevisionAtStart;
+  const settingsStable = configSectionSignature(currentSettings) === configSectionSignature(settings);
 
   // 成功后才改本地状态/清输入
   if (state.config) {
+    // 即使保存期间用户改了简历表单，也要把已成功写入的图片快照放回内存；
+    // 否则下一次自动保存可能用旧 state 覆盖刚写入的图片。unstable 时再把
+    // 当前名称草稿写回这个新快照，供下一轮按基线继续保存。
     state.config.resumes = resumes;
-    state.config.settings = { ...(state.config.settings || {}), ...settings };
+    if (!resumesStable) {
+      try { flushActiveProfileForm(); } catch (_) {}
+    }
+    if (settingsStable) state.config.settings = { ...(state.config.settings || {}), ...settings };
   }
-  state.formDirty = false;
-  if (clearInputs) {
+  if (resumesStable && settingsStable && autosaveRevision === autosaveRevisionAtStart) state.formDirty = false;
+  if (clearInputs && resumesStable) {
     if ($('imageFiles')) $('imageFiles').value = '';
   }
-  try { renderResumeEditor(); } catch (_) {}
-  try { renderProfileList(); } catch (_) {}
+  if (shouldRender && resumesStable) {
+    try { renderResumeEditor(); } catch (_) {}
+    try { renderProfileList(); } catch (_) {}
+  }
   if (shouldRefresh) await refresh({ soft: true });
+  if (resumesStable) rememberPersistedConfigSection('resumes', resumes);
+  if (settingsStable) rememberPersistedConfigSection('settings', settings);
   return { resumes, added, skipped, duplicates };
 }
 
-async function saveBindings(opts = {}) {
+async function saveBindingsNow(opts = {}) {
+  const revisionAtStart = autosaveRevision;
   const rules = readBindingsFromDom()
     .filter((r) => (r.keywords || []).length && r.profileId)
     .sort((a, b) => (a.priority || 0) - (b.priority || 0));
   await api(MSG.SAVE_BINDINGS, { rules });
-  if (state.config) state.config.bindings = { rules };
+  const currentRules = readBindingsFromDom()
+    .filter((r) => (r.keywords || []).length && r.profileId)
+    .sort((a, b) => (a.priority || 0) - (b.priority || 0));
+  const bindingsStable = configSectionSignature({ rules: currentRules }) === configSectionSignature({ rules });
+  if (state.config && bindingsStable) state.config.bindings = { rules };
   if (opts.refresh !== false) {
-    state.formDirty = false;
+    if (autosaveRevision === revisionAtStart && bindingsStable) state.formDirty = false;
     await refresh({ soft: true });
   }
+  if (bindingsStable) rememberPersistedConfigSection('bindings', { rules });
+}
+
+function saveBindings(opts = {}) {
+  return enqueueConfigSave(() => saveBindingsNow(opts));
 }
 
 
+const AUTOSAVE_DELAY_MS = 1800;
 let autosaveTimer = null;
 let autosaving = false;
-async function flushAutosave() {
-  if (autosaving) return;
+let autosaveRevision = 0;
+let autosavePending = false;
+let autosaveComposingTarget = null;
+async function flushAutosave(options = {}) {
+  const force = options.force === true;
+  if (autosaveComposingTarget && !force) {
+    autosavePending = true;
+    return;
+  }
+  if (autosaving) {
+    autosavePending = true;
+    return;
+  }
   if (!globalThis.chrome?.runtime?.id) return;
+  clearTimeout(autosaveTimer);
+  autosaveTimer = null;
+  const revisionAtStart = autosaveRevision;
   autosaving = true;
+  let saveFailed = false;
   try {
-    // 关键：先读齐草稿再写，中间禁止 refresh，避免新消息段被旧 storage 覆盖
-    const ok = [];
-    try { await saveMessage({ refresh: false }); ok.push('消息'); } catch (e) { console.warn('autosave message', e); }
-    try { await saveFilters({ refresh: false }); ok.push('筛选'); } catch (e) { console.warn('autosave filters', e); }
-    try { await saveSettings({ refresh: false }); ok.push('设置'); } catch (e) { console.warn('autosave settings', e); }
-    try {
-      await saveResume({ refresh: false, clearInputs: false, includePendingFiles: false });
-      ok.push('简历');
-    } catch (e) { console.warn('autosave resume', e); }
-    try { await saveBindings({ refresh: false }); ok.push('绑定'); } catch (e) { console.warn('autosave bind', e); }
-    state.formDirty = false;
-    // 保存后用本地草稿重绘消息段，再 soft refresh 同步任务状态
-    try {
-      if (state.config?.messageTemplate) renderSegments(state.config.messageTemplate);
-    } catch (_) {}
-    try { await refresh({ soft: true }); } catch (_) {}
-    if (ok.length) toast('已自动保存', 'success', 900);
+    // 关键：按基线比较后只保存真实变更的 section，并拒绝跨面板冲突。
+    try { await persistDirtyConfigSections(); } catch (e) { saveFailed = true; console.warn('autosave config', e); }
+    // 输入期间不重建表单、不触发 refresh、不弹 toast；周期状态刷新会单独更新任务与日志。
+    if (!saveFailed && autosaveRevision === revisionAtStart && !autosaveComposingTarget && !hasPendingResumeFiles()) {
+      state.formDirty = false;
+    } else {
+      state.formDirty = true;
+    }
   } finally {
     autosaving = false;
+    const needsAnotherSave = autosavePending || autosaveRevision !== revisionAtStart;
+    autosavePending = false;
+    if (needsAnotherSave && !autosaveComposingTarget) {
+      scheduleAutosave({ bumpRevision: false });
+    }
   }
 }
-function scheduleAutosave() {
+function scheduleAutosave(options = {}) {
   state.formDirty = true;
+  if (options.bumpRevision !== false) autosaveRevision += 1;
   clearTimeout(autosaveTimer);
-  autosaveTimer = setTimeout(() => { flushAutosave(); }, 650);
+  autosaveTimer = null;
+  if (autosaveComposingTarget) {
+    autosavePending = true;
+    return;
+  }
+  const delayMs = Number(options.delayMs || AUTOSAVE_DELAY_MS);
+  autosaveTimer = setTimeout(() => { flushAutosave(); }, delayMs);
+}
+
+async function persistDirtyConfigSections() {
+  if (!state.formDirty && !state.messageDirty) return;
+  const pendingResumeFiles = hasPendingResumeFiles();
+  const autosaveRevisionAtStart = autosaveRevision;
+  const messageRevisionAtStart = state.messageRevision;
+  // 多个 BOSS 标签页都可能挂着浮窗。启动前重新读取后台配置，并把当前面板
+  // 与上次落盘基线逐 section 比较，避免旧浮窗把另一面板的新配置整包覆盖。
+  const latest = await api(MSG.GET_STATE);
+  const remoteSections = configSections(latest || {});
+  const baseSections = state.lastPersistedConfigSections || remoteSections;
+  const localSections = localConfigSections(latest || {});
+  const localChanged = new Set();
+  const conflicts = [];
+  for (const name of Object.keys(remoteSections)) {
+    const base = configSectionSignature(baseSections[name]);
+    const local = configSectionSignature(localSections[name]);
+    const remote = configSectionSignature(remoteSections[name]);
+    const changedLocally = local !== base;
+    const changedRemotely = remote !== base;
+    if (changedLocally) localChanged.add(name);
+    if (changedLocally && changedRemotely && local !== remote) conflicts.push(name);
+  }
+  // soft refresh 会把消息 DOM 草稿同步进 state.config；这时仅靠
+  // state.config 与 DOM 的签名比较会把真实编辑误判成“没有变化”。
+  // dirty 标记来自用户输入，因此消息 section 必须进入保存候选；
+  // 若远端同时改过且内容不同，仍按冲突处理，避免覆盖其他面板的更新。
+  if (state.messageDirty) {
+    const base = configSectionSignature(baseSections.messageTemplate);
+    const local = configSectionSignature(localSections.messageTemplate);
+    const remote = configSectionSignature(remoteSections.messageTemplate);
+    if (remote !== base && local !== remote && !conflicts.includes('messageTemplate')) {
+      conflicts.push('messageTemplate');
+    }
+    localChanged.add('messageTemplate');
+  }
+  if (!localChanged.size) {
+    state.formDirty = pendingResumeFiles;
+    state.messageDirty = false;
+    state.config = { ...(state.config || {}), ...latest };
+    state.lastPersistedConfigSections = structuredClone(remoteSections);
+    return;
+  }
+  if (conflicts.length) {
+    throw new Error('配置已在其他面板更新（' + conflicts.join('、') + '），请刷新当前面板后再投递');
+  }
+  // saveMessage/saveFilters/saveResume 都会顺带保存 settings。若设置不是本面板
+  // 的改动但远端已更新，先把最新 settings 回填，避免 section 级保存再次覆盖它。
+  if (!localChanged.has('settings') &&
+      configSectionSignature(remoteSections.settings) !== configSectionSignature(baseSections.settings)) {
+    state.config = { ...(state.config || {}), settings: remoteSections.settings };
+    fillSettings(remoteSections.settings);
+  }
+  const errors = [];
+  if (localChanged.has('messageTemplate')) {
+    try { await saveMessage({ refresh: false }); } catch (e) { errors.push('消息：' + (e?.message || e)); }
+  }
+  if (localChanged.has('settings')) {
+    try { await saveSettings({ refresh: false }); } catch (e) { errors.push('设置：' + (e?.message || e)); }
+  }
+  if (localChanged.has('resumes')) {
+    // 文件必须通过简历页的显式保存导入；投递前只保存已落盘的方案元数据。
+    try { await saveResume({ refresh: false, render: false, clearInputs: false, includePendingFiles: false }); } catch (e) { errors.push('简历：' + (e?.message || e)); }
+  }
+  if (localChanged.has('filters') || localChanged.has('lists')) {
+    try { await saveFilters({ refresh: false, sections: localChanged }); } catch (e) { errors.push('筛选：' + (e?.message || e)); }
+  }
+  if (localChanged.has('bindings')) {
+    try { await saveBindings({ refresh: false }); } catch (e) { errors.push('绑定：' + (e?.message || e)); }
+  }
+  if (errors.length) {
+    throw new Error(errors.join('；'));
+  }
+  const saved = await api(MSG.GET_STATE);
+  state.config = saved || state.config;
+  // 保存函数已按 section 更新成功写入的基线。这里仅在整个保存期间没有
+  // 新输入时清除 dirty；否则保留最新草稿，下一轮继续保存。
+  if (autosaveRevision === autosaveRevisionAtStart && !pendingResumeFiles) state.formDirty = false;
+  if (pendingResumeFiles) state.formDirty = true;
+  if (state.messageRevision === messageRevisionAtStart) state.messageDirty = false;
 }
 
 async function ensureConfigSavedBeforeDelivery() {
@@ -1364,20 +2720,10 @@ async function ensureConfigSavedBeforeDelivery() {
   for (let i = 0; i < 40 && autosaving; i++) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  const errors = [];
-  try { await saveMessage({ refresh: false }); } catch (e) { errors.push('消息：' + (e?.message || e)); }
-  try { await saveSettings({ refresh: false }); } catch (e) { errors.push('设置：' + (e?.message || e)); }
-  try {
-    await saveResume({ refresh: false, clearInputs: false, includePendingFiles: false });
-  } catch (e) {
-    errors.push('简历：' + (e?.message || e));
+  if (hasPendingResumeFiles()) {
+    throw new Error('检测到待保存的图片简历，请先点击“保存简历”完成导入，或清除本次选择后再投递');
   }
-  try { await saveFilters({ refresh: false }); } catch (e) { errors.push('筛选：' + (e?.message || e)); }
-  try { await saveBindings({ refresh: false }); } catch (e) { errors.push('绑定：' + (e?.message || e)); }
-  if (errors.length) {
-    throw new Error(errors.join('；'));
-  }
-  state.formDirty = false;
+  await persistDirtyConfigSections();
 }
 
 function wireResumeFilePreview() {
@@ -1385,6 +2731,8 @@ function wireResumeFilePreview() {
   if (!input || input.__bhtPreview) return;
   input.__bhtPreview = true;
   input.addEventListener('change', () => {
+    state.resumeRevision += 1;
+    state.formDirty = true;
     const box = $('imagePreview');
     if (!box) return;
     const files = Array.from(input.files || []);
@@ -1400,8 +2748,10 @@ function wireResumeFilePreview() {
       const img = document.createElement('img');
       img.src = url;
       img.alt = f.name;
-      img.title = f.name + ' (' + Math.round(f.size / 1024) + 'KB)';
-      img.style.cssText = 'max-width:72px;max-height:72px;object-fit:cover;border-radius:6px;border:1px solid #ddd;margin:4px';
+      img.dataset.idx = String(files.indexOf(f));
+      img.dataset.tmp = '1';
+      img.title = `点击预览：${f.name} (${Math.round(f.size / 1024)}KB)`;
+      img.style.cssText = 'max-width:72px;max-height:72px;object-fit:cover;border-radius:6px;border:1px solid #ddd;margin:4px;cursor:zoom-in';
       frag.appendChild(img);
     }
     box.prepend(frag);
@@ -1410,7 +2760,8 @@ function wireResumeFilePreview() {
 function shouldAutosaveTarget(target) {
   return Boolean(
     target?.matches?.('input, textarea, select') &&
-    String(target.type || '').toLowerCase() !== 'file'
+    String(target.type || '').toLowerCase() !== 'file' &&
+    target?.id !== 'bossGreetingText'
   );
 }
 function wireAutosave() {
@@ -1418,10 +2769,52 @@ function wireAutosave() {
   if (!root || root.__bhtAutosave) return;
   root.__bhtAutosave = true;
   root.addEventListener('input', (e) => {
-    if (shouldAutosaveTarget(e.target)) scheduleAutosave();
+    if (!shouldAutosaveTarget(e.target)) return;
+    if (e.target.closest?.('#segments')) markMessageDirty();
+    if (e.target.closest?.('#tab-resume')) state.resumeRevision += 1;
+    state.formDirty = true;
+    autosaveRevision += 1;
+    if (e.isComposing || autosaveComposingTarget === e.target) {
+      clearTimeout(autosaveTimer);
+      autosaveTimer = null;
+      autosavePending = true;
+      return;
+    }
+    scheduleAutosave({ bumpRevision: false });
   }, true);
   root.addEventListener('change', (e) => {
-    if (shouldAutosaveTarget(e.target)) scheduleAutosave();
+    if (e.target?.id === 'scheduledDeliveryEnabled' || e.target?.matches?.('[data-schedule-day]') || e.target?.matches?.('[data-window-start], [data-window-end]')) {
+      updateDeliveryScheduleUi();
+    }
+    if (shouldAutosaveTarget(e.target)) {
+      if (e.target.closest?.('#segments')) markMessageDirty();
+      if (e.target.closest?.('#tab-resume')) state.resumeRevision += 1;
+      scheduleAutosave();
+    }
+  }, true);
+  root.addEventListener('compositionstart', (e) => {
+    if (!shouldAutosaveTarget(e.target)) return;
+    if (e.target.closest?.('#tab-resume')) state.resumeRevision += 1;
+    autosaveComposingTarget = e.target;
+    state.formDirty = true;
+    autosaveRevision += 1;
+    autosavePending = true;
+    clearTimeout(autosaveTimer);
+    autosaveTimer = null;
+  }, true);
+  root.addEventListener('compositionend', (e) => {
+    if (autosaveComposingTarget && autosaveComposingTarget !== e.target) return;
+    autosaveComposingTarget = null;
+    if (e.target.closest?.('#tab-resume')) state.resumeRevision += 1;
+    state.formDirty = true;
+    autosaveRevision += 1;
+    autosavePending = false;
+    scheduleAutosave({ bumpRevision: false });
+  }, true);
+  root.addEventListener('focusout', (e) => {
+    if (shouldAutosaveTarget(e.target) && autosaveComposingTarget !== e.target && state.formDirty) {
+      scheduleAutosave({ bumpRevision: false, delayMs: 300 });
+    }
   }, true);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') flushAutosave();
@@ -1473,8 +2866,40 @@ function showErrorModal(title, body, { showRetry = true, force = false } = {}) {
 }
 
 function bindEvents() {
+  bindImageLightbox();
+  document.querySelectorAll('#activeChips .chip').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      document.querySelectorAll('#activeChips .chip').forEach((c) => c.classList.toggle('active', c === chip));
+    });
+  });
+
   document.querySelectorAll('.tabs button').forEach((btn) => {
     btn.addEventListener('click', () => showTab(btn.dataset.tab));
+  });
+
+  $('bossGreetingToggle')?.addEventListener('change', (event) => {
+    requestBossGreetingChange(event.target.checked === true);
+  });
+  $('btnCancelBossGreeting')?.addEventListener('click', () => {
+    state.bossGreeting.pendingEnabled = null;
+    renderBossGreetingControl();
+  });
+  $('btnConfirmBossGreeting')?.addEventListener('click', () => {
+    confirmBossGreetingChange().catch((error) => toast(String(error?.message || error), 'error', 5000));
+  });
+  $('btnSyncBossGreeting')?.addEventListener('click', () => {
+    syncBossGreeting({ force: true }).catch((error) => toast(String(error?.message || error), 'error', 5000));
+  });
+  $('bossGreetingText')?.addEventListener('input', updateBossGreetingTextDraft);
+  $('btnSaveBossGreetingText')?.addEventListener('click', () => {
+    saveBossGreetingText().catch((error) => toast(String(error?.message || error), 'error', 5000));
+  });
+  $('btnOpenBossGreetingSettings')?.addEventListener('click', () => {
+    toast('正在打开 BOSS 官方招呼语设置…', 'success', 1800);
+  });
+  $('pluginTextEnabled')?.addEventListener('change', () => {
+    state.formDirty = true;
+    renderMessageFlowPreview();
   });
 
   $('btnSaveFilter').addEventListener('click', async () => {
@@ -1539,9 +2964,13 @@ function bindEvents() {
     template.segments.push({
       id: 'seg_' + Date.now().toString(36),
       enabled: true,
+      kind: template.segments.some((segment) => segment.kind === MESSAGE_SEGMENT_KINDS.GREETING)
+        ? MESSAGE_SEGMENT_KINDS.SUPPLEMENT
+        : MESSAGE_SEGMENT_KINDS.GREETING,
       text: ''
     });
     state.config.messageTemplate = template;
+    markMessageDirty();
     state.formDirty = true;
     renderSegments(template);
     toast('已新增消息段（填写后自动保存）', 'success', 2200);
@@ -1549,54 +2978,74 @@ function bindEvents() {
   });
 
   $('btnAddProfile')?.addEventListener('click', async () => {
-    flushActiveProfileForm();
-    const resumes = structuredClone(state.config.resumes);
-    const id = uid('profile');
-    resumes.profiles.push({ id, name: `方案 ${resumes.profiles.length + 1}`, images: [] });
-    if (!resumes.defaultProfileId) resumes.defaultProfileId = id;
-    state.activeProfileId = id;
-    await api(MSG.SAVE_RESUMES, resumes);
-    state.formDirty = false;
-    await refresh({ soft: false });
-    toast('已新建方案', 'success');
+    await enqueueConfigSave(async () => {
+      const dirtyBefore = state.formDirty || state.messageDirty;
+      flushActiveProfileForm();
+      const resumes = structuredClone(state.config.resumes);
+      const id = uid('profile');
+      resumes.profiles.push({ id, name: `方案 ${resumes.profiles.length + 1}`, images: [] });
+      if (!resumes.defaultProfileId) resumes.defaultProfileId = id;
+      state.activeProfileId = id;
+      state.resumeRevision += 1;
+      const revisionAtStart = draftRevisionSnapshot();
+      await api(MSG.SAVE_RESUMES, resumes);
+      settleManagementDirty(revisionAtStart, dirtyBefore);
+      await refresh({ soft: false });
+      toast('已新建方案', 'success');
+    });
   });
 
   $('btnSetDefaultProfile')?.addEventListener('click', async () => {
-    flushActiveProfileForm();
-    const resumes = structuredClone(state.config.resumes);
-    resumes.defaultProfileId = state.activeProfileId || resumes.defaultProfileId;
-    await api(MSG.SAVE_RESUMES, resumes);
-    state.formDirty = false;
-    await refresh({ soft: false });
-    toast('已设为默认方案', 'success');
+    await enqueueConfigSave(async () => {
+      const dirtyBefore = state.formDirty || state.messageDirty;
+      flushActiveProfileForm();
+      const resumes = structuredClone(state.config.resumes);
+      resumes.defaultProfileId = state.activeProfileId || resumes.defaultProfileId;
+      state.resumeRevision += 1;
+      const revisionAtStart = draftRevisionSnapshot();
+      await api(MSG.SAVE_RESUMES, resumes);
+      settleManagementDirty(revisionAtStart, dirtyBefore);
+      await refresh({ soft: false });
+      toast('已设为默认方案', 'success');
+    });
   });
 
   $('btnDeleteProfile')?.addEventListener('click', async () => {
-    const resumes = structuredClone(state.config.resumes);
-    if ((resumes.profiles || []).length <= 1) {
-      toast('至少保留一个方案', 'error');
-      return;
-    }
-    const delId = state.activeProfileId;
-    resumes.profiles = resumes.profiles.filter((p) => p.id !== delId);
-    if (resumes.defaultProfileId === delId) resumes.defaultProfileId = resumes.profiles[0].id;
-    state.activeProfileId = resumes.defaultProfileId;
-    const bindings = { rules: (state.config.bindings?.rules || []).filter((r) => r.profileId !== delId) };
-    await api(MSG.SAVE_RESUMES, resumes);
-    await api(MSG.SAVE_BINDINGS, bindings);
-    state.formDirty = false;
-    await refresh({ soft: false });
-    toast('方案已删除', 'success');
+    await enqueueConfigSave(async () => {
+      const dirtyBefore = state.formDirty || state.messageDirty;
+      const resumes = structuredClone(state.config.resumes);
+      if ((resumes.profiles || []).length <= 1) {
+        toast('至少保留一个方案', 'error');
+        return;
+      }
+      const delId = state.activeProfileId;
+      resumes.profiles = resumes.profiles.filter((p) => p.id !== delId);
+      if (resumes.defaultProfileId === delId) resumes.defaultProfileId = resumes.profiles[0].id;
+      state.activeProfileId = resumes.defaultProfileId;
+      const bindings = { rules: (state.config.bindings?.rules || []).filter((r) => r.profileId !== delId) };
+      state.resumeRevision += 1;
+      const revisionAtStart = draftRevisionSnapshot();
+      await api(MSG.SAVE_RESUMES, resumes);
+      await api(MSG.SAVE_BINDINGS, bindings);
+      settleManagementDirty(revisionAtStart, dirtyBefore);
+      await refresh({ soft: false });
+      toast('方案已删除', 'success');
+    });
   });
 
   $('btnClearImages')?.addEventListener('click', async () => {
-    const resumes = structuredClone(state.config.resumes);
-    const profile = resumes.profiles.find((p) => p.id === state.activeProfileId);
-    if (profile) profile.images = [];
-    await api(MSG.SAVE_RESUMES, resumes);
-    state.formDirty = false;
-    await refresh({ soft: false });
-    toast('已清空图片', 'success');
+    await enqueueConfigSave(async () => {
+      const dirtyBefore = state.formDirty || state.messageDirty;
+      const resumes = structuredClone(state.config.resumes);
+      const profile = resumes.profiles.find((p) => p.id === state.activeProfileId);
+      if (profile) profile.images = [];
+      state.resumeRevision += 1;
+      const revisionAtStart = draftRevisionSnapshot();
+      await api(MSG.SAVE_RESUMES, resumes);
+      settleManagementDirty(revisionAtStart, dirtyBefore);
+      await refresh({ soft: false });
+      toast('已清空图片', 'success');
+    });
   });
 
   $('btnAddBinding')?.addEventListener('click', () => {
@@ -1608,20 +3057,234 @@ function bindEvents() {
     toast('已新增一条自动选简历规则', 'success');
   });
 
+  window.addEventListener('message', (event) => {
+    const data = event.data || {};
+    if (data.source === 'bht-host') {
+      if (data.cmd === 'suspend') state.hostSuspended = true;
+      if (data.cmd === 'resume') {
+        state.hostSuspended = false;
+        lastFullRefreshAt = Date.now();
+        refresh({ soft: true }).catch(() => {});
+      }
+      return;
+    }
+    if (data.source !== 'bht-agent') return;
+    const ack = (extra = {}) => {
+      try {
+        window.parent.postMessage({ source: 'bht-panel', type: 'ack', cmd: data.cmd, extra }, '*');
+      } catch (_) {}
+    };
+    if (data.cmd === 'scan-preview') { $('btnPreview')?.click(); ack({ has: !!$('btnPreview') }); }
+    if (data.cmd === 'test-one') {
+      const btn = $('btnTestOne');
+      ack({ has: !!btn, disabled: !!btn?.disabled, title: btn?.title || '' });
+      btn?.click();
+    }
+    if (data.cmd === 'pause') { $('btnPause')?.click(); ack({ has: !!$('btnPause') }); }
+    if (data.cmd === 'resume') { $('btnResume')?.click(); ack({ has: !!$('btnResume') }); }
+    if (data.cmd === 'stop') { $('btnStop')?.click(); ack({ has: !!$('btnStop') }); }
+    if (data.cmd === 'skip') { $('btnSkip')?.click(); ack({ has: !!$('btnSkip') }); }
+    if (data.cmd === 'switch-tab' && data.tab) {
+      const tab = document.querySelector(`#tabs [data-tab="${data.tab}"]`);
+      tab?.click();
+      ack({ has: !!tab, tab: data.tab });
+    }
+    if (data.cmd === 'scroll-y' && typeof data.y === 'number') {
+      document.querySelector('main')?.scrollTo(0, data.y);
+      ack({ y: document.querySelector('main')?.scrollTop || 0 });
+    }
+    if (data.cmd === 'set-title-or') {
+      if ($('titleOr')) $('titleOr').value = String(data.value || '');
+      if ($('titleOrEnabled')) $('titleOrEnabled').checked = true;
+      $('titleOr')?.dispatchEvent(new Event('input', { bubbles: true }));
+      Promise.resolve(saveFilters({ refresh: false })).catch(() => {});
+      ack({ titleOr: $('titleOr')?.value || '' });
+    }
+    if (data.cmd === 'set-active') {
+      const values = (Array.isArray(data.values) ? data.values : [data.value]).map((v) => String(v || '')).filter(Boolean);
+      const wantAll = !values.length || values.includes('all');
+      document.querySelectorAll('#activeChips .chip').forEach((chip) => {
+        const key = chip.dataset.active;
+        chip.classList.toggle('active', wantAll ? key === 'all' : values.includes(key));
+      });
+      Promise.resolve(saveFilters({ refresh: false })).catch(() => {});
+      ack({
+        selected: [...document.querySelectorAll('#activeChips .chip.active')].map((chip) => chip.dataset.active)
+      });
+    }
+    if (data.cmd === 'set-history-filter') {
+      if ($('historyFilter')) $('historyFilter').value = String(data.value || 'all');
+      $('historyFilter')?.dispatchEvent(new Event('change', { bubbles: true }));
+      ack({ filter: $('historyFilter')?.value || '' });
+    }
+    if (data.cmd === 'set-task-max') {
+      if ($('taskMaxCommunicate')) $('taskMaxCommunicate').value = String(data.value ?? '');
+      Promise.resolve(saveSettings({ refresh: false })).catch(() => {});
+      ack({ taskMaxCommunicate: $('taskMaxCommunicate')?.value || '' });
+    }
+    if (data.cmd === 'export-config') {
+      Promise.resolve(api(MSG.EXPORT_CONFIG)).then((res) => {
+        window.parent.postMessage({ source: 'bht-panel', type: 'export', ok: !!res?.ok, payload: res?.data || null }, '*');
+      }).catch((e) => {
+        window.parent.postMessage({ source: 'bht-panel', type: 'export', ok: false, error: String(e?.message || e) }, '*');
+      });
+    }
+    if (data.cmd === 'import-config' && data.data) {
+      Promise.resolve(enqueueConfigSave(() => api(MSG.IMPORT_CONFIG, { data: data.data }))).then(async (res) => {
+        state.formDirty = false;
+        await refresh({ soft: false });
+        window.parent.postMessage({ source: 'bht-panel', type: 'import', ok: res?.ok !== false }, '*');
+      }).catch((e) => {
+        window.parent.postMessage({ source: 'bht-panel', type: 'import', ok: false, error: String(e?.message || e) }, '*');
+      });
+    }
+    if (data.cmd === 'dump-state') {
+      window.__bhtAgentDump = {
+        ts: Date.now(),
+        tab: document.querySelector('#tabs button.active')?.dataset?.tab || '',
+        activeChips: [...document.querySelectorAll('#activeChips .chip')].map((chip) => ({
+          value: chip.dataset.active,
+          active: chip.classList.contains('active')
+        })),
+        status: $('taskStatus')?.textContent || '',
+        counters: $('taskCounters')?.textContent || '',
+        hint: $('taskHint')?.textContent || '',
+        warnings: $('taskWarnings')?.textContent || '',
+        summary: $('summaryBox')?.textContent || '',
+        logs: $('logList')?.innerText?.slice(0, 4000) || '',
+        toast: $('bht-toast')?.textContent || '',
+        buttons: {
+          preview: { disabled: !!$('btnPreview')?.disabled },
+          testOne: { disabled: !!$('btnTestOne')?.disabled, title: $('btnTestOne')?.title || '' },
+          targetMode: { enabled: state.targetModeEnabled === true, disabled: !!$('btnTargetMode')?.disabled, title: $('btnTargetMode')?.title || '' },
+          targetCount: $('targetDeliveryCount')?.value || '',
+          targetNoNewRetryLimit: $('targetNoNewRetryLimit')?.value || '',
+          start: { disabled: !!$('btnStart')?.disabled }
+        },
+        runner: state.config?.runner || null,
+        senderTab: state.config?.senderTab || null,
+        activeIsBoss: state.config?.activeIsBoss,
+        previewSample: [...document.querySelectorAll('#previewList .item')].slice(0, 8).map((el) => el.innerText.slice(0, 200)),
+        historySample: [...document.querySelectorAll('#historyList .history-item, #historyList .item')].slice(0, 8).map((el) => el.innerText.slice(0, 200)),
+        historyStats: $('historyStats')?.textContent || '',
+        historyFilter: $('historyFilter')?.value || '',
+        ioButtons: (() => {
+          const exp = $('btnExport');
+          const imp = $('btnImport');
+          const er = exp?.getBoundingClientRect();
+          const ir = imp?.getBoundingClientRect();
+          return {
+            export: er ? { w: Math.round(er.width), h: Math.round(er.height) } : null,
+            import: ir ? { w: Math.round(ir.width), h: Math.round(ir.height) } : null
+          };
+        })(),
+        settings: {
+          messageMode: state.config?.settings?.messageMode || 'auto_detect',
+          pluginTextEnabled: $('pluginTextEnabled')?.checked !== false,
+          bossGreetingEnabled: state.bossGreeting?.enabled,
+          bossGreetingSyncedAt: state.bossGreeting?.syncedAt || 0,
+          taskMaxCommunicate: $('taskMaxCommunicate')?.value || '',
+          dailyMaxCommunicate: $('dailyMaxCommunicate')?.value || '',
+          companyDailyMax: $('companyDailyMax')?.value || '',
+          neverRepeatJob: !!$('neverRepeatJob')?.checked,
+          autoSendImageResume: !!$('autoSendImageResume')?.checked,
+          resumeSendTiming: $('resumeSendTiming')?.value || ''
+        },
+        messages: (state.config?.messageTemplate?.segments || []).map((s) => ({
+          id: s.id,
+          kind: s.kind || '',
+          enabled: s.enabled !== false,
+          text: String(s.text || '').slice(0, 80)
+        })),
+        resumes: {
+          defaultProfileId: state.config?.resumes?.defaultProfileId || '',
+          profiles: (state.config?.resumes?.profiles || []).map((p) => ({
+            id: p.id,
+            name: p.name,
+            images: (p.images || []).length,
+            hasAttachment: Boolean(p.attachment?.name)
+          }))
+        },
+        task: {
+          status: state.config?.task?.status || '',
+          pass: (state.config?.task?.results || []).filter((r) => r.decision === 'pass').length,
+          reject: (state.config?.task?.results || []).filter((r) => r.decision === 'reject').length,
+          scanMeta: state.config?.task?.scanMeta || null,
+          activitySample: (state.config?.task?.results || []).slice(0, 12).map((row) => ({
+            title: row?.job?.title || '',
+            activeText: row?.job?.activeText || '',
+            requiresActiveCheck: row?.requiresActiveCheck === true,
+            passReasons: row?.passReasons || [],
+            reasonTexts: row?.reasonTexts || []
+          })),
+          unknownPass: (state.config?.task?.results || []).filter((row) => (
+            row?.decision === 'pass' &&
+            (row?.requiresActiveCheck === true || !String(row?.job?.activeText || '').trim())
+          )).length,
+          rejectReasons: (state.config?.task?.results || [])
+            .filter((row) => row?.decision === 'reject')
+            .reduce((acc, row) => {
+              const key = String((row?.reasonTexts || [])[0] || '未知原因');
+              acc[key] = (acc[key] || 0) + 1;
+              return acc;
+            }, {}),
+          currentJobId: state.config?.task?.currentJobId || '',
+          pauseReason: state.config?.task?.pauseReason || '',
+          targetMode: state.config?.task?.targetMode === true,
+          targetCount: state.config?.task?.targetCount || 0,
+          targetRefreshCount: state.config?.task?.targetRefreshCount || 0,
+          targetNoNewRounds: state.config?.task?.targetNoNewRounds || 0,
+          targetNoNewRetryLimit: state.config?.task?.targetNoNewRetryLimit || 0,
+          targetLastError: state.config?.task?.targetLastError || '',
+          testedJobIds: state.config?.task?.testedJobIds || [],
+          items: (state.config?.task?.items || []).slice(-3).map((it) => ({
+            jobId: it.jobId,
+            title: it.title,
+            state: it.state,
+            phase: it.phase || '',
+            reasons: it.reasons || []
+          }))
+        }
+      };
+      try {
+        window.parent.postMessage({ source: 'bht-panel', type: 'dump', payload: window.__bhtAgentDump }, '*');
+      } catch (_) {}
+    }
+  });
+
   $('btnPreview').addEventListener('click', async () => {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
-    toast('开始扫描预览…', 'warn', 1500);
+    toast('正在扫描岗位…', 'warn', 2500);
     $('btnPreview').disabled = true;
     $('taskStatus').textContent = '状态：扫描中…';
     try {
-      await saveFilters();
-      const res = await api(MSG.RUN_PREVIEW, { scroll: true });
+      await saveFilters({ refresh: false });
+      state.formDirty = false;
+      if (!state.config) state.config = {};
+      state.config.runner = {
+        ...(state.config.runner || {}),
+        previewing: true,
+        previewStartedAt: Date.now(),
+        previewScanStartedAt: Date.now(),
+        previewScanFinishedAt: 0,
+        previewPhase: 'locating_list',
+        previewScanned: 0,
+        previewPass: 0
+      };
+      updateTaskUI(state.config.task, state.config.runner);
+      const res = await api(MSG.RUN_PREVIEW, { scroll: true, maxScanMs: 60000, captureSourceContext: true });
       if (!res?.ok) {
+        if (res?.error === 'OP_CANCELLED') {
+          toast('已取消本次扫描，上一次预览结果已保留', 'warn', 3500);
+          return;
+        }
         toast(res?.message || res?.error || '扫描失败，请打开职位列表页', 'error', 3500);
-        setConn(false, '页面未就绪');
+        const disconnected = ['NO_BOSS_TAB', 'NOT_BOSS_URL', 'CONTENT_INJECT_FAIL'].includes(res?.error);
+        setConn(!disconnected, disconnected ? '页面未就绪' : '已连接 BOSS · 列表未就绪');
         showErrorModal('扫描失败', res?.message || res?.error || '请打开 BOSS 职位列表页后重试', { showRetry: false });
       } else if (res.summary) {
-        toast(`扫描完成：通过 ${res.summary.pass} / 共 ${res.summary.scanned}`, 'success');
+        const navText = res.navigation?.automatic ? '已自动回到职位列表；' : '';
+        toast(`${navText}扫描完成：通过 ${res.summary.pass} / 共 ${res.summary.scanned}`, 'success', 4200);
       } else {
         toast('预览完成', 'success');
       }
@@ -1638,6 +3301,39 @@ function bindEvents() {
         updateTaskUI(state.config?.task, state.config?.runner);
       }
     }
+  });
+
+  $('btnTargetMode')?.addEventListener('click', () => {
+    if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
+    state.targetModeUserChanged = true;
+    state.targetModeEnabled = !state.targetModeEnabled;
+    if (state.targetModeEnabled && !$('targetDeliveryCount')?.value) {
+      $('targetDeliveryCount').value = '10';
+    }
+    if (state.targetModeEnabled && !$('targetNoNewRetryLimit')?.value) {
+      $('targetNoNewRetryLimit').value = String(DEFAULT_TARGET_NO_NEW_RETRY_LIMIT);
+    }
+    if (state.targetModeEnabled && !state.targetCountDraft) {
+      state.targetCountDraft = String($('targetDeliveryCount')?.value || '10');
+    }
+    updateTaskUI(state.config?.task, state.config?.runner || {});
+    toast(state.targetModeEnabled ? '目标模式已开启：批量投递会自动刷新补充岗位' : '目标模式已关闭：按当前批次投递', 'success', 2200);
+  });
+
+  $('targetDeliveryCount')?.addEventListener('input', () => {
+    state.targetCountDraft = String($('targetDeliveryCount').value || '');
+  });
+
+  $('targetDeliveryCount')?.addEventListener('change', () => {
+    const input = $('targetDeliveryCount');
+    const value = Math.max(1, Math.min(500, Math.floor(Number(input.value) || 1)));
+    input.value = String(value);
+    state.targetCountDraft = String(value);
+  });
+
+  $('targetNoNewRetryLimit')?.addEventListener('change', () => {
+    const input = $('targetNoNewRetryLimit');
+    input.value = String(normalizeTargetNoNewRetryLimit(input.value));
   });
 
   $('btnDiagnose')?.addEventListener('click', async () => {
@@ -1665,6 +3361,9 @@ function bindEvents() {
     if (state.isBoss === false) return toast(state.bossBlockReason || '仅在 BOSS 直聘页面可用', 'error');
     let selectedJobIds = Array.from(state.selected || []);
     const task = state.config?.task;
+    const targetMode = state.targetModeEnabled === true;
+    const targetCount = Math.max(1, Math.min(500, Math.floor(Number($('targetDeliveryCount')?.value || 0))));
+    const targetNoNewRetryLimit = normalizeTargetNoNewRetryLimit($('targetNoNewRetryLimit')?.value);
     const doneIds = collectDoneJobIds(task?.items, task?.queue, task?.testedJobIds);
     // 若没勾选，或勾选的都已投完：自动改选剩余未投通过岗
     const pendingPassIds = (task?.results || [])
@@ -1676,7 +3375,7 @@ function bindEvents() {
     } else {
       selectedJobIds = selectedPending;
     }
-    if (!selectedJobIds.length) {
+    if (!selectedJobIds.length && !(targetMode && task?.results?.length)) {
       toast('没有可批量投递的岗位：请重新扫描，或勾选尚未投过的通过岗位', 'error', 4000);
       return;
     }
@@ -1687,20 +3386,31 @@ function bindEvents() {
     try {
       await ensureConfigSavedBeforeDelivery();
     } catch (e) {
+      $('btnStart').disabled = false;
       toast('保存配置失败，已取消投递：' + (e?.message || e), 'error', 4000);
       showErrorModal('保存失败', String(e?.message || e || '无法保存当前配置'), { showRetry: false });
       return;
     }
-    const res = await api(MSG.CONFIRM_AND_START, { selectedJobIds, mode: 'batch' });
+    const res = await api(MSG.CONFIRM_AND_START, {
+      selectedJobIds,
+      mode: 'batch',
+      targetMode,
+      targetCount,
+      targetNoNewRetryLimit
+    });
     if (!res?.ok) {
       toast(res?.message || res?.error || '启动失败', 'error', 3500);
       showErrorModal('启动失败', res?.message || res?.error || '无法开始任务', { showRetry: false });
     } else {
-      toast(
-        res.splitView?.ok ? '已开始投递 · 已打开左右分屏' : '已开始投递 · 消息页使用普通标签',
-        res.splitView?.ok ? 'success' : 'warn',
-        2600
-      );
+      state.targetCountDraft = '';
+      const message = res.targetMode
+        ? `目标模式已开始：成功投递目标 ${res.targetCount} 份，无新增最多连续重试 ${res.targetNoNewRetryLimit || targetNoNewRetryLimit} 轮`
+        : res.scheduled
+        ? '已加入定时队列，将在下一个投递时段自动开始'
+        : res.splitView?.ok
+          ? '已开始投递 · 已打开左右分屏'
+          : '已开始投递 · 消息页使用普通标签';
+      toast(message, res.scheduled || !res.splitView?.ok ? 'warn' : 'success', res.scheduled ? 4200 : 2600);
     }
     await refresh({ soft: true });
   });
@@ -1711,6 +3421,7 @@ function bindEvents() {
     try {
       await ensureConfigSavedBeforeDelivery();
     } catch (e) {
+      $('btnTestOne').disabled = false;
       toast('保存配置失败，已取消投递一份：' + (e?.message || e), 'error', 4000);
       showErrorModal('保存失败', String(e?.message || e || '无法保存当前配置'), { showRetry: false });
       return;
@@ -1737,25 +3448,34 @@ function bindEvents() {
     const settings = {
       ...(state.config?.settings || {}),
       autoSendImageResume: !!$('autoSendImageResume')?.checked,
-      autoSendAttachmentResume: !!$('autoSendAttachmentResume')?.checked,
       resumeSendTiming: $('resumeSendTiming')?.value || 'after_text'
     };
-    if ((settings.autoSendImageResume || settings.autoSendAttachmentResume) && settings.resumeSendTiming !== 'after_text') {
+    if (settings.autoSendImageResume && settings.resumeSendTiming !== 'after_text') {
       toast('提示：已启用简历发送，但时机不是「文本发送完成后」，本次不会自动发简历', 'warn', 3500);
-    } else if (!settings.autoSendImageResume && !settings.autoSendAttachmentResume) {
-      toast('提示：未启用图片或 BOSS 在线简历，本次只发文字', 'warn', 2800);
+    } else if (!settings.autoSendImageResume) {
+      toast('提示：未启用图片简历，本次只发文字', 'warn', 2800);
     }
     $('btnTestOne').disabled = true;
     toast('正在启动投递一份…', 'warn', 1500);
-    const res = await api(MSG.RUN_TEST_DELIVERY || 'BHT_RUN_TEST_DELIVERY', {
-      jobId: selectedJobIds[0],
-      selectedJobIds
-    });
+    let res;
+    try {
+      res = await api(MSG.RUN_TEST_DELIVERY || 'BHT_RUN_TEST_DELIVERY', {
+        jobId: selectedJobIds[0],
+        selectedJobIds
+      });
+    } catch (e) {
+      toast(String(e?.message || e || '投递一份启动失败'), 'error', 4000);
+      showErrorModal('投递一份失败', String(e?.message || e || '无法启动'), { showRetry: false });
+      await refresh({ soft: true });
+      return;
+    }
     if (!res?.ok) {
       toast(res?.message || res?.error || '投递一份启动失败', 'error', 3500);
       showErrorModal('投递一份失败', res?.message || res?.error || '无法启动', { showRetry: false });
     } else {
-      const suffix = res.splitView?.ok ? ' · 已左右分屏' : ' · 普通标签模式';
+      const suffix = res.scheduled
+        ? ' · 已加入定时队列'
+        : res.splitView?.ok ? ' · 已左右分屏' : ' · 普通标签模式';
       const remainTxt = typeof res.remain === 'number' ? (' · 还剩 ' + res.remain + ' 个未投') : '';
       toast('投递一份已开始：' + (res.job?.title || selectedJobIds[0]) + suffix + remainTxt, res.splitView?.ok ? 'success' : 'warn', 3200);
     }
@@ -1771,7 +3491,7 @@ function bindEvents() {
       const res = await api(MSG.GET_DEBUG_LOGS);
       if (!res?.ok) throw new Error(res?.message || res?.error || '读取调试日志失败');
       const payload = {
-        product: 'Boss海投助手',
+        product: 'AutoCast-Boss海投助手',
         version: res.meta?.version || BHT_UI_VERSION,
         exportedAt: res.meta?.exportedAt || new Date().toISOString(),
         sessionOnly: true,
@@ -1798,11 +3518,9 @@ function bindEvents() {
 
   $('btnCopyLogs')?.addEventListener('click', async () => {
     const logs = state.config?.logs || [];
-    const text = logs
-      .slice()
-      .reverse()
+    const text = sortLogsOldestFirst(logs)
       .map((l) => {
-        const time = new Date(l.ts || Date.now()).toLocaleTimeString();
+        const time = formatLogTimestamp(l.ts, { includeDate: true });
         return `[${time}] ${l.message || ''}`;
       })
       .join('\n');
@@ -1824,12 +3542,40 @@ function bindEvents() {
     await api(MSG.CLEAR_LOGS);
     toast('日志已清空', 'success');
     await refresh({ soft: true });
+  });
 
   $('historyFilter')?.addEventListener('change', () => {
     renderHistory(state.config?.history || []);
   });
 
+  $('historyFrom')?.addEventListener('change', () => {
+    // 日期防错：开始日期晚于结束日期时，把结束日期修正为同一天
+    const range = normalizeHistoryDateRange($('historyFrom')?.value || '', $('historyTo')?.value || '');
+    if (range.adjusted && $('historyTo')) {
+      $('historyTo').value = range.toVal;
+      toast('结束日期不能早于开始日期，已自动调整为开始日期当天', 'warn', 3000);
+    }
+    renderHistory(state.config?.history || []);
+  });
+  $('historyTo')?.addEventListener('change', () => {
+    const range = normalizeHistoryDateRange($('historyFrom')?.value || '', $('historyTo')?.value || '');
+    if (range.adjusted && $('historyTo')) {
+      $('historyTo').value = range.toVal;
+      toast('结束日期不能早于开始日期，已自动调整为开始日期当天', 'warn', 3000);
+    }
+    renderHistory(state.config?.history || []);
+  });
+  $('btnHistoryDateReset')?.addEventListener('click', () => {
+    // 清除筛选：日期范围与状态一并重置
+    if ($('historyFrom')) $('historyFrom').value = '';
+    if ($('historyTo')) $('historyTo').value = '';
+    if ($('historyFilter')) $('historyFilter').value = 'all';
+    renderHistory(state.config?.history || []);
+  });
+
   $('btnClearHistory')?.addEventListener('click', async () => {
+    // 清空全部记录：二次确认，防止误触清空
+    if (!window.confirm('确定要清空全部投递记录吗？此操作不可恢复（不影响每日统计与防重复台账）。')) return;
     try {
       await api(MSG.CLEAR_HISTORY);
       if (state.config) state.config.history = [];
@@ -1843,14 +3589,17 @@ function bindEvents() {
   $('btnExportHistory')?.addEventListener('click', () => {
     const history = state.config?.history || [];
     if (!history.length) { toast('暂无记录可导出', 'warn'); return; }
-    const blob = new Blob([JSON.stringify(history, null, 2)], { type: 'application/json' });
+    // 有筛选（日期范围或状态）导出筛选后的记录；无筛选导出全部
+    const { rows, hasFilter } = visibleHistoryRows(history);
+    if (!rows.length) { toast('当前筛选下没有记录可导出', 'warn'); return; }
+    const exportData = hasFilter ? rows : history;
+    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'boss-haitou-history-' + new Date().toISOString().slice(0, 10) + '.json';
+    a.download = 'boss-haitou-history-' + new Date().toISOString().slice(0, 10) + (hasFilter ? '-filtered' : '') + '.json';
     a.click();
     URL.revokeObjectURL(a.href);
-    toast('已导出 ' + history.length + ' 条记录', 'success');
-  });
+    toast(hasFilter ? `已导出筛选后的 ${rows.length} 条记录` : `已导出全部 ${history.length} 条记录`, 'success');
   });
 
   $('selectAllPass').addEventListener('change', () => {
@@ -1862,6 +3611,10 @@ function bindEvents() {
       else state.selected.delete(id);
     });
     toast(on ? '已全选通过项' : '已取消全选', 'success', 1200);
+  });
+
+  $('btnImport')?.addEventListener('click', () => {
+    $('importFile')?.click();
   });
 
   $('btnExport').addEventListener('click', async () => {
@@ -1883,8 +3636,9 @@ function bindEvents() {
     try {
       const text = await file.text();
       const data = JSON.parse(text);
-      const res = await api(MSG.IMPORT_CONFIG, { data });
+      const res = await enqueueConfigSave(() => api(MSG.IMPORT_CONFIG, { data }));
       if (!res?.ok) throw new Error(res?.error || '导入失败');
+      state.messageDirty = false;
       state.formDirty = false;
       await refresh({ soft: false });
       toast('导入成功', 'success');
@@ -1899,7 +3653,7 @@ function bindEvents() {
 
 globalThis.chrome?.runtime?.onMessage?.addListener((msg) => {
   if (msg?.type === MSG.TASK_EVENT) {
-    if (!shouldAcceptTaskSnapshot(state.config?.task, msg.payload)) return;
+    if (!shouldAcceptTaskSnapshot(state.config?.task, msg.payload, { authoritative: msg.authoritative === true })) return;
     if (state.config) state.config.task = msg.payload;
     updateTaskUI(msg.payload, state.config?.runner || {});
     announceTaskCompletion(msg.payload);
@@ -1919,7 +3673,7 @@ globalThis.chrome?.runtime?.onMessage?.addListener((msg) => {
     }
   }
   if (msg?.type === MSG.LOG_EVENT) {
-    const logs = [msg.payload, ...(state.config?.logs || [])].slice(0, 100);
+    const logs = mergeRuntimeLog(state.config?.logs || [], msg.payload, 1000);
     if (state.config) state.config.logs = logs;
     renderLogs(logs);
   }
@@ -2002,7 +3756,14 @@ function wireControlButtons() {
     if (modal) modal.hidden = true;
     toast('继续任务…', 'warn', 1200);
     const res = await api(MSG.RESUME_TASK);
-    toast(res?.ok === false ? (res.message || res.error || '继续失败') : '已继续投递', res?.ok === false ? 'error' : 'success');
+    toast(
+      res?.ok === false
+        ? (res.message || res.error || '继续失败')
+        : res?.scheduled
+          ? '当前不在投递时段，已等待自动恢复'
+          : '已继续投递',
+      res?.ok === false ? 'error' : res?.scheduled ? 'warn' : 'success'
+    );
     await refresh({ soft: true });
   });
 
@@ -2024,10 +3785,14 @@ function wireControlButtons() {
     const res = await api(MSG.STOP_TASK);
     if (res?.ok === false) {
       toast(res.message || '停止失败', 'error');
+    } else if (res?.previewCancelled) {
+      if (state.config) state.config.task = Object.prototype.hasOwnProperty.call(res, 'task') ? res.task : null;
+      updateTaskUI(state.config?.task || null, state.config?.runner || {});
+      toast('已取消本次扫描，上一次预览结果已保留', 'warn', 3500);
     } else if (res?.task) {
       announceTaskCompletion(res.task);
     }
-    await refresh({ soft: true });
+    await refresh({ soft: true, authoritativeTask: res?.previewCancelled === true });
   });
 }
 
@@ -2048,8 +3813,24 @@ refreshControlEnablement();
 wireControlButtons();
 try { wireAutosave();
 try { wireResumeFilePreview(); } catch (_) {} } catch (_) {}
+try { wireScheduleWindowButtons(); } catch (_) {}
+try { wireUpdateCheck(); } catch (_) {}
 refresh().catch(() => {});
 setInterval(() => {
+  if (state.hostSuspended) return;
   refreshControlEnablement();
-  refresh({ soft: true }).catch(() => {});
-}, 3000);
+  if (state.config?.settings) updateDeliveryScheduleUi(state.config.settings);
+  const runnerState = state.config?.runner || {};
+  if (runnerState.previewing || intervalWaitRemainingSeconds(state.config?.task, runnerState) > 0) {
+    // 扫描计时、投递间隔倒计时：每秒本地刷新；后台只取轻量 runner。
+    updateTaskUI(state.config?.task, runnerState);
+    refreshRunnerState().catch(() => {});
+    return;
+  }
+  if (Date.now() - lastFullRefreshAt >= 5000) {
+    lastFullRefreshAt = Date.now();
+    refresh({ soft: true }).catch(() => {});
+  }
+  // 投递进行中：高亮当前岗位并保持滚动定位
+  markCurrentDeliveryJob();
+}, 1000);

@@ -1,13 +1,213 @@
 import assert from "assert";
 import fs from "fs";
 import { isBossUrl } from "../extension/shared/boss-url.js";
+import { isBossJobListUrl } from "../extension/shared/job-list-navigation.js";
 import { planMessageSegments } from "../extension/shared/message-planner.js";
 import { MESSAGE_MODES } from "../extension/shared/constants.js";
 
 console.log("8) delivery flow contracts");
+const registeredTests = [];
 function test(name, fn) {
-  try { fn(); console.log("  PASS", name); }
-  catch (e) { console.error("  FAIL", name, e.message); process.exitCode = 1; }
+  registeredTests.push({ name, fn });
+}
+
+async function runRegisteredTests() {
+  for (const { name, fn } of registeredTests) {
+    try { await fn(); console.log("  PASS", name); }
+    catch (e) { console.error("  FAIL", name, e.message); process.exitCode = 1; }
+  }
+}
+
+function extractFunctionSource(source, startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start);
+  assert.ok(start >= 0, `missing function marker: ${startMarker}`);
+  assert.ok(end > start, `missing function boundary: ${endMarker}`);
+  return source.slice(start, end).trim();
+}
+
+function createVirtualScanHarness({
+  totalJobs = 12,
+  visibleJobs = 3,
+  initialTop = 0,
+  replaceScrollerAfterSleeps = 0,
+  initialLoadedJobs = totalJobs,
+  appendBatchSize = 0,
+  cancelAfterSleeps = 0
+} = {}) {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const functionSource = extractFunctionSource(
+    content,
+    "async function scanAdaptiveJobBatch",
+    "async function fetchJobActivityDetail"
+  );
+  const itemHeight = 100;
+  const viewport = visibleJobs * itemHeight;
+  let loadedJobs = appendBatchSize > 0
+    ? Math.max(1, Math.min(totalJobs, initialLoadedJobs))
+    : totalJobs;
+  const currentHeight = () => loadedJobs * itemHeight;
+  const assignments = [];
+  const collections = [];
+  const events = [];
+  let clock = 0;
+  let sleepCount = 0;
+  let scrollerGeneration = 1;
+
+  function makeScroller(top, generation) {
+    let scrollTop = Math.max(0, Math.min(currentHeight() - viewport, top));
+    const scroller = {
+      isConnected: true,
+      tagName: "DIV",
+      id: `virtual-scroller-${generation}`,
+      className: "virtual-job-list",
+      clientHeight: viewport,
+      get scrollHeight() { return currentHeight(); },
+      get scrollTop() { return scrollTop; },
+      set scrollTop(next) {
+        scrollTop = Math.max(0, Math.min(currentHeight() - viewport, Number(next) || 0));
+        assignments.push({ generation, requested: Number(next) || 0, actual: scrollTop });
+        events.push({ type: "scroll", generation, top: scrollTop });
+      }
+    };
+    return scroller;
+  }
+
+  let activeScroller = makeScroller(initialTop, scrollerGeneration);
+  const documentElement = { get scrollHeight() { return currentHeight(); } };
+  const body = { get scrollHeight() { return currentHeight(); } };
+  const document = { scrollingElement: documentElement, documentElement, body };
+  const window = {
+    __BHT_SCAN_SESSION__: null,
+    innerHeight: viewport,
+    scrollY: 0,
+    scrollTo(_x, top) { this.scrollY = Number(top) || 0; }
+  };
+  const scrollHelperSource = extractFunctionSource(
+    content,
+    "function setAdaptiveScrollTop",
+    "function collectAdaptiveScanJobs"
+  );
+  const scrollHelpers = new Function(
+    "window",
+    "document",
+    `${scrollHelperSource}; return { setAdaptiveScrollTop, nextAdaptiveScrollTop, pulseAdaptiveScrollBottom, hasExplicitJobListEnd };`
+  )(window, document);
+
+  function adaptiveScrollSnapshot(scroller) {
+    const top = Number(scroller.scrollTop || 0);
+    return {
+      top,
+      viewport: scroller.clientHeight,
+      height: scroller.scrollHeight,
+      atBottom: top + scroller.clientHeight >= scroller.scrollHeight - 48
+    };
+  }
+
+  function collectAdaptiveScanJobs(session) {
+    const firstIndex = Math.max(0, Math.floor(activeScroller.scrollTop / itemHeight));
+    const firstRenderedIndex = appendBatchSize > 0 ? 0 : firstIndex;
+    const renderedCount = appendBatchSize > 0
+      ? loadedJobs
+      : Math.min(visibleJobs, totalJobs - firstIndex);
+    const visible = Array.from(
+      { length: renderedCount },
+      (_, offset) => ({
+        jobId: `job-${firstRenderedIndex + offset}`,
+        title: `Job ${firstRenderedIndex + offset}`,
+        company: "Virtual Co"
+      })
+    );
+    collections.push({
+      generation: scrollerGeneration,
+      top: activeScroller.scrollTop,
+      ids: visible.map((job) => job.jobId)
+    });
+    events.push({ type: "collect", generation: scrollerGeneration, top: activeScroller.scrollTop });
+    const newJobs = [];
+    for (const job of visible) {
+      if (!session.jobs.has(job.jobId)) newJobs.push(job);
+      session.jobs.set(job.jobId, job);
+    }
+    return {
+      added: newJobs.length,
+      newJobs,
+      visibleCount: visible.length,
+      signature: visible.map((job) => job.jobId).join("|")
+    };
+  }
+
+  const sleep = async (ms) => {
+    clock += Math.max(0, Number(ms) || 0);
+    sleepCount += 1;
+    const wasAtBottom = activeScroller.scrollTop + viewport >= activeScroller.scrollHeight - 48;
+    if (appendBatchSize > 0 && wasAtBottom && loadedJobs < totalJobs) {
+      loadedJobs = Math.min(totalJobs, loadedJobs + appendBatchSize);
+      events.push({ type: "load", at: clock, loadedJobs });
+    }
+    if (replaceScrollerAfterSleeps > 0 && sleepCount === replaceScrollerAfterSleeps) {
+      const previous = activeScroller;
+      previous.isConnected = false;
+      scrollerGeneration += 1;
+      activeScroller = makeScroller(previous.scrollTop, scrollerGeneration);
+    }
+    if (cancelAfterSleeps > 0 && sleepCount === cancelAfterSleeps) {
+      const error = new Error("任务已停止，页面操作已取消");
+      error.code = "OP_CANCELLED";
+      throw error;
+    }
+  };
+  const getAdaptiveScanScroller = () => activeScroller;
+  const describeAdaptiveScanScroller = (scroller) => ({
+    kind: "element",
+    tag: scroller.tagName,
+    id: scroller.id,
+    className: scroller.className,
+    overflowY: "auto"
+  });
+  const normalizeText = (value) => String(value || "").toLowerCase();
+  const FakeDate = { now: () => clock };
+  const scanAdaptiveJobBatch = new Function(
+    "window",
+    "document",
+    "getAdaptiveScanScroller",
+    "describeAdaptiveScanScroller",
+    "adaptiveScrollSnapshot",
+    "collectAdaptiveScanJobs",
+    "normalizeText",
+    "sleep",
+    "Date",
+    "setAdaptiveScrollTop",
+    "nextAdaptiveScrollTop",
+    "pulseAdaptiveScrollBottom",
+    "hasExplicitJobListEnd",
+    `return (${functionSource});`
+  )(
+    window,
+    document,
+    getAdaptiveScanScroller,
+    describeAdaptiveScanScroller,
+    adaptiveScrollSnapshot,
+    collectAdaptiveScanJobs,
+    normalizeText,
+    sleep,
+    FakeDate,
+    scrollHelpers.setAdaptiveScrollTop,
+    scrollHelpers.nextAdaptiveScrollTop,
+    scrollHelpers.pulseAdaptiveScrollBottom,
+    scrollHelpers.hasExplicitJobListEnd
+  );
+
+  return {
+    scanAdaptiveJobBatch,
+    assignments,
+    collections,
+    events,
+    get activeScroller() { return activeScroller; },
+    get sleepCount() { return sleepCount; },
+    get clock() { return clock; },
+    get loadedJobs() { return loadedJobs; }
+  };
 }
 
 test("content exposes return/ensure/close handlers", () => {
@@ -23,10 +223,178 @@ test("content exposes return/ensure/close handlers", () => {
   ]) assert.ok(s.includes(k), "missing " + k);
 });
 
+test("preview auto-recovers non-list pages without silent zero results", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(content.includes('error: "LIST_NAV_REQUIRED"'));
+  assert.ok(content.includes("shouldNavigate: !noHomeNav"));
+  assert.ok(content.includes("getJobListNavigationTarget"));
+  assert.ok(content.includes("if (isChatPage() && savedTarget)"));
+  assert.ok(content.includes("只有存在已保存的 BOSS 列表锚点时才 history.back"));
+  assert.ok(content.includes("BHT_CONTENT_INSTANCE_ID"));
+  assert.ok(content.includes("window.__BHT_CONTENT_INSTANCE_ID__"));
+  assert.ok(content.includes("const updates = {}"));
+  assert.ok(content.includes('via: "saved-list-navigation-required"'));
+  assert.ok(background.includes("navigatePreviewToJobList"));
+  assert.ok(background.includes("scan?.error === 'NAVIGATED'"));
+  assert.ok(background.includes("scan_navigation_detected"));
+  assert.ok(background.includes("didContentDocumentChange"));
+  assert.ok(background.includes("resolvePageOperationTimeoutMs"));
+  assert.ok(background.includes("resolveBridgeTimeoutMs"));
+  assert.ok(background.includes("OP_BRIDGE_TIMEOUT"));
+  assert.ok(!background.includes("扫描等待超过 38 秒"));
+  assert.ok(background.includes("scan?.shouldNavigate === true"));
+  assert.ok(panel.includes("正在扫描岗位"));
+  assert.ok(!panel.includes("下方暂时仍是上一次预览"));
+  assert.ok(panel.includes("取消本次扫描（保留上一次预览结果）"));
+  assert.ok(panel.includes("已连接 BOSS · 列表未就绪"));
+});
+
 test("background force-injects content on critical ops", () => {
   const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
   assert.ok(s.includes("forceInjectContent"));
   assert.ok(s.includes("critical.includes"));
+});
+
+test("refresh and continue restores the saved source after BOSS resets the page", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const refresh = extractFunctionSource(
+    background,
+    "async function refreshAndContinue",
+    "function itemErrorHint"
+  );
+  assert.ok(content.includes("FILTER_OPTION_PREFIXES"));
+  assert.ok(content.includes("restoreFilterRequest"));
+  assert.ok(content.includes("readEffectiveFilterRequest"));
+  assert.ok(content.includes("filterRequestMatches(expected.request, effectiveRequest)"));
+  assert.ok(content.includes('if (requestObserved && initialRequest[key]) return { key, value: "0" }'));
+  assert.ok(content.includes("observed: Boolean(request?.href || request?.encryptExpectId || request?.at)"));
+  assert.ok(content.includes("expectedRequestObserved"));
+  assert.ok(content.includes("filtersRestored"));
+  assert.ok(refresh.includes("sourceChangedBeforeRefresh"));
+  assert.ok(refresh.includes("filtersChangedBeforeRefresh"));
+  assert.ok(refresh.includes("RESTORE_JOB_SOURCE_CONTEXT"));
+  assert.ok(refresh.includes("deferPublish: true"), "refresh scans must defer the temporary task publish");
+  assert.ok(refresh.includes("requestMatches"));
+  assert.ok(refresh.includes("FILTER_RESTORE_VERIFY_FAILED"));
+  assert.ok(!refresh.includes("error: 'JOB_SOURCE_CHANGED'"), "refresh preflight must not reject BOSS's temporary recommendation state");
+});
+
+test("target mode refreshes in the background and preserves stop/duplicate guards", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  assert.ok(html.includes('id="btnTargetMode"'));
+  assert.ok(html.includes('id="targetDeliveryCount"'));
+  assert.ok(html.includes('id="targetNoNewRetryLimit"'));
+  assert.ok(html.includes('成功投递目标'));
+  assert.ok(html.includes('目标模式无新增岗位时重试'));
+  assert.ok(!html.includes('连续无新增重试上限'));
+  assert.ok(!html.includes('id="btnRefreshContinue"'));
+  assert.ok(panel.includes("targetMode"));
+  assert.ok(panel.includes("targetCount"));
+  assert.ok(panel.includes("targetCountDraft"));
+  assert.ok(panel.includes("targetNoNewRetryLimit"));
+  assert.ok(panel.includes("retryInput.disabled = !onBoss || executionBusy"));
+  assert.ok(panel.includes("targetModeUserChanged"));
+  assert.ok(panel.includes("const targetTaskActive = status === 'running' || status === 'paused' || runner.targetLoop === true"));
+  assert.ok(panel.includes("!state.targetModeUserChanged && task?.targetMode === true && targetTaskActive"));
+  assert.ok(panel.includes("state.targetModeUserChanged = true"));
+  assert.ok(panel.includes("state.targetCountDraft = String($('targetDeliveryCount').value || '')"));
+  assert.ok(panel.includes("const targetCountValue = state.targetCountDraft ||"));
+  assert.ok(background.includes("async function runTargetDeliveryLoop"));
+  assert.ok(background.includes("async function runTargetDeliveryLoop(taskId, taskRunId = uid('run'))"),
+    "target loop must accept the caller generation");
+  assert.ok(background.includes("runTargetDeliveryLoop(task.id, runner.taskRunId)"),
+    "confirm start must pass the current generation into target loop");
+  assert.ok(background.includes("runTargetDeliveryLoop(all.task.id, resumeTaskRunId)"),
+    "resume must pass the current generation into target loop");
+  assert.ok(background.includes("if (runner.stopping || runner.abort) return { ok: false, error: 'OP_CANCELLED' }"),
+    "late delivery loops must not clear a stop gate");
+  assert.ok(background.includes("if (runner.taskRunTaskId && !isTaskRunCurrent(taskId, taskRunId))"),
+    "late delivery loops must reject stale generations");
+  assert.ok(background.includes("任务正在停止，恢复操作已取消"),
+    "resume must recheck a stop request before changing the run generation");
+  assert.ok(background.includes("targetDeliveryRemaining(task)"));
+  assert.ok(background.includes("withRunnerAdmission('previewing'"));
+  assert.ok(background.includes("refreshAndContinue({"));
+  assert.ok(background.includes("TARGET_REFRESH_LIMIT"));
+  assert.ok(background.includes("TARGET_NO_NEW_JOBS_LIMIT"));
+  assert.ok(background.includes("连续无新增重试"));
+  assert.ok(background.includes("if (noNewRounds >= noNewRetryLimit)"));
+  assert.ok(background.includes("if (task.targetMode === true) runTargetDeliveryLoop"));
+  assert.ok(background.includes("alreadyCompleted: true"));
+  assert.ok(background.includes("[目标模式] 目标已达到，忽略重复启动"));
+  assert.ok(background.includes("task.status = TASK_STATUS.COMPLETED;"));
+  assert.ok(content.includes("detectActiveFilterRequest"));
+  assert.ok(content.includes("[ka^=\"${prefix}\"]"));
+  assert.ok(content.includes("selected option in the hidden dropdown"));
+  assert.ok(background.includes("jobMergeKey") && background.includes("mergeRefreshedTask"));
+  assert.ok(content.includes("locationText") && content.includes("securityId") && content.includes("lid"),
+    "synthetic job identities must include stable location/identity evidence");
+  assert.ok(background.includes("lid: r.job?.lid || ''") && background.includes("lid: q.lid || ''"),
+    "queue snapshots must retain synthetic identity evidence");
+  assert.ok(background.includes("candidate_deferred_for_target_refresh"));
+  assert.ok(background.includes("payload.deferPublish === true"));
+  const refreshMergeStart = background.indexOf("function mergeRefreshedTask");
+  const refreshMergeEnd = background.indexOf("async function refreshAndContinue", refreshMergeStart);
+  const refreshMerge = background.slice(refreshMergeStart, refreshMergeEnd);
+  assert.ok(refreshMerge.includes("...previousExecution") && refreshMerge.includes("...freshExecution"),
+    "refresh merge must retain the existing execution context while updating list context");
+  assert.ok(refreshMerge.includes("messageTabId: previousExecution.messageTabId"),
+    "refresh merge must retain the reusable message tab");
+  assert.ok(refreshMerge.includes(".filter((item) => item.status === 'pending')"),
+    "refresh merge must keep only the current pending delivery batch");
+  assert.ok(refreshMerge.includes("const queueCursor = 0"),
+    "a refreshed delivery batch must restart its queue cursor");
+  assert.ok(background.includes("const persistedQueue = Array.isArray(task.queue) ? task.queue : null"),
+    "delivery loop must consume the persisted current-batch queue instead of historical results");
+  assert.ok(background.includes("qMeta.status === 'failed'"),
+    "resume must skip failed queue entries unless an explicit retry reset them to pending");
+  assert.ok(background.includes("jobsShareMergeIdentity(x, row.job || {})"),
+    "queue resume lookup must tolerate synthetic job ids being upgraded after refresh");
+  assert.ok(background.includes("payload.targetMode === true && runner.targetLoop === true"));
+  assert.ok(background.includes("async function recordTargetModeHalt"));
+  assert.ok(background.includes("task.status = TASK_STATUS.STOPPED;"));
+  assert.ok(background.includes("setTaskTerminalSignal(task, TASK_STATUS.STOPPED)"));
+  const targetStopStart = background.indexOf("case MSG.STOP_TASK");
+  const targetStopEnd = background.indexOf("case MSG.SKIP_CURRENT", targetStopStart);
+  const targetStop = background.slice(targetStopStart, targetStopEnd);
+  assert.ok(targetStop.includes("runner.previewing && !runner.running && runner.targetLoop"));
+  assert.ok(targetStop.indexOf("runner.previewRunId = ''") < targetStop.indexOf("await cancelActiveOperations('用户停止目标模式刷新')"));
+  assert.ok(targetStop.includes("all.task.status = TASK_STATUS.STOPPED"));
+  assert.ok(targetStop.includes("setTaskTerminalSignal(all.task, TASK_STATUS.STOPPED)"));
+  assert.ok(background.includes("admission_rejected_after_stop"));
+  assert.ok(background.includes("if (runner.abort && task?.status !== TASK_STATUS.STOPPED)"));
+  assert.ok(background.includes("未开始投递"), "start path must not revive a task stopped during setup");
+  assert.ok(background.includes("runner.taskRunTaskId = task.id"), "start path must bind generation before split setup");
+  const refreshStart = background.indexOf("async function refreshAndContinue");
+  const refreshEnd = background.indexOf("async function recordTargetModeHalt", refreshStart);
+  const refresh = background.slice(refreshStart, refreshEnd);
+  assert.ok(refresh.includes("if (!isPreviewRunActive(previewRunId)) return previewCancelledResult()"));
+});
+
+test("single delivery counts the successful job before leaving the loop", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const marker = "if (task.testDelivery && outcome === 'success')";
+  const start = background.indexOf(marker);
+  assert.ok(start >= 0, "single-delivery success branch exists");
+  const branch = background.slice(start, start + 420);
+  assert.ok(branch.includes("task.counters.processed += 1"), "single delivery increments processed");
+  assert.ok(branch.includes("await publishTask(task)"), "single delivery persists the counter before break");
+  assert.ok(branch.includes("break"), "single delivery exits after one successful job");
+});
+
+test("boss context prefers the panel sender tab over the focused window tab", () => {
+  const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(s.includes("async function tabFromSender"));
+  assert.ok(s.includes("assertBossContext(sender)"));
+  assert.ok(s.includes("getActiveBossTab({ sender })"));
+  assert.ok(s.includes("isBossTab(fromSender)"));
+  assert.ok(s.includes("let { payload }"));
 });
 
 test("background uses the two-page trigger flow and returns safely after failures", () => {
@@ -38,6 +406,715 @@ test("background uses the two-page trigger flow and returns safely after failure
   assert.ok(s.includes("retryCurrent"));
   assert.ok(s.includes("payload?.retry"));
   assert.ok(s.includes("while (outcome === 'failed')"));
+});
+
+test("successful conversation creation survives a forced list-to-chat navigation", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const recovery = fs.readFileSync("extension/shared/trigger-navigation-recovery.js", "utf8");
+  const manifest = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
+  const isolated = manifest.content_scripts.find((entry) => !entry.world || entry.world === "ISOLATED");
+  assert.ok(isolated?.js?.includes("shared/trigger-navigation-recovery.js"));
+  assert.ok(!isolated?.js?.includes("shared/job-identity.js"), "esm identity module must not be a classic content script");
+  // 身份模块改为内容脚本内动态 import（ESM，classic 注入会 SyntaxError）
+  assert.ok(content.includes("import(chrome.runtime.getURL('shared/job-identity.js'))"));
+  assert.ok(content.includes("bhtIdentityReady"));
+  assert.ok(content.includes("await bhtIdentityReady"));
+  assert.ok(content.includes("trigger_navigation_recovered"));
+  assert.ok(content.includes("window.__BHT_LAST_TRIGGER_CLICK__"));
+  assert.ok(content.includes("for (let i = 0; i < 18 && !stay.ok; i++)"));
+  assert.ok(recovery.includes("receiptMatches"));
+  assert.ok(recovery.includes("navigationRecovered: true"));
+  assert.ok(background.includes("restoreListTabAfterTriggerNavigation"));
+  assert.ok(background.includes("BOSS 在沟通成功后跳到聊天页"));
+});
+
+test("conversation trigger uses a temporary worker tab and never navigates the left list", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const worker = fs.readFileSync("extension/shared/conversation-worker.js", "utf8");
+  assert.ok(worker.includes("buildConversationWorkerAttempts"));
+  assert.ok(worker.includes("isListDocumentPreserved"));
+  assert.ok(background.includes("triggerConversationInWorker"));
+  assert.ok(background.includes("openConversationWorkerTab"));
+  assert.ok(background.includes("await chrome.tabs.update(tab.id, { url: attempt.url, active: true })"), "worker tab is activated so Chrome does not freeze job_detail");
+  assert.ok(background.includes("url: attempt.url,\n      active: true"), "new worker tab is created active");
+  assert.ok(background.includes("restoreTabsAfterWorker"), "focus returns to chat/list after worker load");
+  assert.ok(background.includes("workerDetail: attempt.mode === CONVERSATION_WORKER_MODE.DETAIL"));
+  assert.ok(background.includes("closeConversationWorkerTab"));
+  assert.ok(background.includes("左侧职位页保持原样"));
+  assert.ok(content.includes("triggerConversationOnWorkerDetail"));
+  assert.ok(content.includes("worker_detail_chat_button_clicked"));
+  assert.ok(!background.includes("let listOpt = null"));
+});
+
+test("worker detail clicks the exact chat action and requires a creation receipt", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  assert.ok(content.includes("findConversationActionButton"));
+  assert.ok(content.includes("/^(立即沟通|继续沟通|打招呼)$/"));
+  assert.ok(content.includes("if (!explicitlyInteractive && /wrap|container/i.test(className)) continue"));
+  assert.ok(content.includes('error: "CONVERSATION_CREATE_NOT_CONFIRMED"'));
+  assert.ok(content.includes("!clicked.already && !nativeGreeting.available"));
+  assert.ok(content.includes("worker_detail_trigger_unconfirmed"));
+  assert.ok(content.includes('error: "WORKER_LEFT_DETAIL"'));
+  assert.ok(content.includes("LIST_JOB_IDENTITY_MISMATCH"));
+  assert.ok(content.includes("克隆列表页岗位对不上，已停止点击立即沟通"));
+  assert.ok(content.includes("function listCardIdentityMismatch"));
+  assert.ok(content.includes("BHTJobIdentity"));
+});
+
+test("HR activity is inspected on the temporary detail before any conversation click", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const messaging = fs.readFileSync("extension/shared/messaging.js", "utf8");
+  const worker = extractFunctionSource(
+    background,
+    "async function triggerConversationInWorker",
+    "async function sendToBoss"
+  );
+  const inspectAt = worker.indexOf("MSG.INSPECT_JOB_DETAIL");
+  const triggerAt = worker.indexOf("MSG.TRIGGER_CONVERSATION");
+  assert.ok(inspectAt >= 0 && triggerAt > inspectAt);
+  assert.ok(worker.includes("matchActive(activeText, selectedActiveBuckets)"));
+  assert.ok(worker.includes("活跃度核对也必须留在临时详情页"), "activity checked on the temporary detail page");
+  assert.ok(worker.includes("tabId: workerTab.id"), "activity inspection targets the worker tab");
+  assert.ok(!worker.includes("tabId: listTabId"), "activity inspection never targets the left list tab");
+  assert.ok(worker.includes("if (result?.ok || result?.filtered || operationAborted(result)) break;"));
+  assert.ok(worker.includes("filtered: true"));
+  assert.ok(worker.includes("result?.filtered"));
+  assert.ok(worker.includes("执行页加载或注入失败，丢弃冻结标签后再试"));
+  assert.ok(background.includes("{ deferUnknownActive: true }"));
+  assert.ok(background.includes("requiresActiveCheck: decision === 'pass' && requiresActiveCheck"));
+  assert.ok(background.includes("finalizePreviewActivityDecisions"));
+  assert.ok(content.includes("async function inspectWorkerJobDetail"));
+  assert.ok(content.includes("extractDetailActiveText"));
+  assert.ok(content.includes('case MSG.INSPECT_JOB_DETAIL'));
+  assert.ok(messaging.includes("INSPECT_JOB_DETAIL: 'BHT_INSPECT_JOB_DETAIL'"));
+});
+
+test("preview captures native job metadata and bounds read-only HR activity enrichment", () => {
+  const hook = fs.readFileSync("extension/content/page-network-hook.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const messaging = fs.readFileSync("extension/shared/messaging.js", "utf8");
+  assert.ok(hook.includes("/wapi\\/zpgeek\\/(?:search\\/joblist|pc\\/recommend\\/job\\/list"));
+  assert.ok(hook.includes("/wapi\\/zpgeek\\/job\\/detail"));
+  assert.ok(hook.includes("securityId"));
+  assert.ok(hook.includes("lid"));
+  assert.ok(hook.includes("bossOnline"));
+  assert.ok(hook.includes("activeTimeDesc"));
+  assert.ok(hook.includes("job-metadata-request"));
+  assert.ok(content.includes("extractJobMetadataFromComponent"));
+  assert.ok(content.includes("inspectListSideDetail"));
+  assert.ok(content.includes("extractDetailHunter"));
+  assert.ok(content.includes("source: \"list-api-detail\""));
+  assert.ok(content.includes("fetchJobActivityDetail(job, deadlineAt)"));
+  assert.ok(!content.includes("preview-no-click"));
+  assert.ok(background.includes("applyPreviewActivityEnrichment"));
+  assert.ok(background.includes("finalizePreviewActivityDecisions"));
+  assert.ok(background.includes("deferredToDelivery"));
+  assert.ok(!background.includes("activityCandidates.slice(0, 80)"));
+  assert.ok(content.includes("parseBossActiveLabel"));
+  assert.ok(content.includes(".boss-online-tag"));
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  assert.ok(html.includes('data-active="half"'));
+  assert.ok(html.includes(">半年内<"));
+  assert.ok(html.includes(">单选<"));
+  assert.ok(!html.includes("3日前活跃"));
+  assert.ok(messaging.includes("ENRICH_JOB_ACTIVITY: 'BHT_ENRICH_JOB_ACTIVITY'"));
+});
+
+test("message conversation matching performs a second real reload after propagation delay", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const branchStart = background.indexOf("首次刷新后暂未出现新会话");
+  assert.ok(branchStart > 0);
+  const retryBranch = background.slice(branchStart, branchStart + 1300);
+  assert.ok(retryBranch.includes("refreshMessageTabOnce"));
+  assert.ok(retryBranch.includes("timeoutMs: 14000"));
+  assert.ok(background.includes("if (!resumedFromChat) await sleep(700)"));
+});
+
+test("autosave protects IME composition and never rebuilds message inputs", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(app.includes("AUTOSAVE_DELAY_MS = 1800"));
+  assert.ok(app.includes("messageDirty"));
+  assert.ok(app.includes("messageRevision"));
+  assert.ok(app.includes("if (!keepMessage) renderSegments(res.messageTemplate)"));
+  assert.ok(app.includes("const revisionAtStart = state.messageRevision"));
+  assert.ok(app.includes("compositionstart"));
+  assert.ok(app.includes("compositionend"));
+  assert.ok(app.includes("e.isComposing"));
+  assert.ok(app.includes("autosaveComposingTarget"));
+  const flushStart = app.indexOf("async function flushAutosave");
+  const flushEnd = app.indexOf("function scheduleAutosave", flushStart);
+  const flush = app.slice(flushStart, flushEnd);
+  assert.ok(flush.includes("persistDirtyConfigSections"));
+  assert.ok(!flush.includes("renderSegments("));
+  assert.ok(!flush.includes("refresh({ soft: true })"));
+  assert.ok(!flush.includes("toast("));
+  assert.ok(app.includes("render: false"));
+  assert.ok(app.includes("function rememberPersistedConfigSection"));
+  assert.ok(app.includes("resumeRevision: 0"));
+  assert.ok(app.includes("const resumesStable = state.resumeRevision === resumeRevisionAtStart"));
+  assert.ok(app.includes("state.config.resumes = resumes"));
+  assert.ok(!app.includes("currentResumes = structuredClone(state.config?.resumes || {})"));
+  assert.ok(app.includes("try { flushActiveProfileForm(); } catch (_) {}"));
+  assert.ok(app.includes("const messageStable = state.messageRevision === revisionAtStart"));
+  assert.ok(app.includes("if (messageStable)"));
+  assert.ok(app.includes("if (state.messageDirty)"));
+  assert.ok(app.includes("localChanged.add('messageTemplate')"));
+  assert.ok(app.includes("const requestedSections = opts.sections ? new Set(opts.sections) : null"));
+  assert.ok(app.includes("saveFilters({ refresh: false, sections: localChanged })"));
+  assert.ok(app.includes("if (autosaveRevision === autosaveRevisionAtStart && !pendingResumeFiles) state.formDirty = false"));
+  assert.ok(app.includes("await saveSettings({ refresh: false });"), "theme saves must use the config queue");
+  assert.ok(app.includes("enqueueConfigSave(() => api(MSG.IMPORT_CONFIG"), "imports must wait for pending saves");
+  const profileActions = app.slice(app.indexOf("$('btnAddProfile')"), app.indexOf("$('btnAddBinding')"));
+  assert.ok(profileActions.includes("enqueueConfigSave"), "resume management writes must use the config queue");
+  assert.ok(!app.includes("rememberPersistedConfig();\n  return true;"));
+});
+
+test("preview accumulates virtualized jobs until bottom or the 60 second deadline", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const timeouts = fs.readFileSync("extension/shared/operation-timeouts.js", "utf8");
+  assert.ok(content.includes("scanAdaptiveJobBatch"));
+  assert.ok(content.includes("window.__BHT_SCAN_SESSION__"));
+  assert.ok(content.includes("session.jobs = new Map") || content.includes("jobs: new Map()"));
+  assert.ok(content.includes("visibleChanged"));
+  assert.ok(content.includes("bottomStableRounds"));
+  assert.ok(content.includes("lastGrowthAt"));
+  assert.ok(content.includes("pulseAdaptiveScrollBottom"));
+  assert.ok(content.includes("nextAdaptiveScrollTop"));
+  assert.ok(content.includes("setAdaptiveScrollTop(scroller, nextAdaptiveScrollTop(before))"));
+  assert.ok(content.includes("deadlineAt"));
+  assert.ok(content.includes("timedOut"));
+  assert.ok(content.includes("Math.floor(viewport * 0.85)"));
+  assert.ok(content.includes("Number.isFinite(requestedWaitMs) ? requestedWaitMs : 100"));
+  assert.ok(content.includes("payload.deltaOnly === true"));
+  assert.ok(content.includes("returnedCount"));
+  assert.ok(content.includes("payload.continuous === true"));
+  assert.ok(content.includes("collectionFinishedAt"));
+  assert.ok(content.includes("workCompletedAt"));
+  assert.ok(content.includes("session.cardCache"));
+  assert.ok(content.includes("puaDigitCache"));
+  assert.ok(content.includes("continuingSession"));
+  assert.ok(content.includes("sleepUntilScanStop"));
+  assert.ok(content.includes("isScanStopError"));
+  assert.ok(content.includes("opType === MSG.SCAN_JOBS"));
+  assert.ok(content.includes("lateResult.jobs.length"));
+  assert.ok(background.includes("scanDeadlinePartial"));
+  assert.ok(background.includes("continuous: true"));
+  const continuationStart = content.indexOf("const continuingSession =");
+  const continuationEnd = content.indexOf("const ensured = continuingSession", continuationStart);
+  const continuationGuard = content.slice(continuationStart, continuationEnd);
+  assert.ok(continuationGuard.includes("isListLikePage()"));
+  assert.ok(!continuationGuard.includes("jobs?.size > 0"));
+  assert.ok(!continuationGuard.includes("getJobCards().length"));
+  assert.ok(content.includes("只按 pathname 判断"));
+  assert.ok(content.includes("collected.visibleCount > 0"));
+  assert.ok(background.includes("const requestedMaxScanMs = Number(payload.maxScanMs)"));
+  assert.ok(background.includes("Number.isFinite(requestedMaxScanMs) && requestedMaxScanMs > 0"));
+  assert.ok(background.includes("Math.min(OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS, requestedMaxScanMs)"));
+  assert.ok(background.includes("mergePreviewJobBatch"));
+  assert.ok(background.includes("deltaOnly: true"));
+  assert.ok(background.includes("continuous: payload.continuous === true"));
+  assert.ok(background.includes("maxRounds: payload.maxRounds || 24"));
+  assert.ok(background.includes("scanDeadlineAt + OPERATION_TIMEOUTS.PREVIEW_RESULT_GRACE_MS"));
+  assert.ok(timeouts.includes("result?.scanMeta?.collectionFinishedAt"));
+  assert.ok(timeouts.includes("result?.scanMeta?.workCompletedAt"));
+  assert.ok(background.includes("滚动阶段只采集和去重；确认到底或到达统一截止时间后，才执行一次筛选"));
+  assert.ok(!background.includes("targetPass"));
+  assert.ok(!background.includes("maxScanJobs"));
+  assert.ok(background.includes("collecting"));
+  assert.ok(background.includes("const previewDeadlineAt = scanStartedAt + maxElapsedMs"));
+  assert.ok(background.includes("scrollElapsedMs: collectionFinishedAt - scanStartedAt"));
+  assert.ok(!background.includes("scrollElapsedMs: Math.min"));
+  assert.ok(background.includes("resolvePreviewScanStop"));
+  assert.ok(background.includes("滚动阶段只采集和去重"));
+  assert.ok(!background.includes("SCAN_WORKER_OPEN_FAILED"));
+  assert.ok(background.includes("正在当前职位页向下加载岗位"));
+  assert.ok(background.includes("SCAN_PROGRESS"));
+  assert.ok(content.includes("reportScanProgress"));
+  assert.ok(content.includes("SCAN_PROGRESS: \"BHT_SCAN_PROGRESS\""));
+  assert.ok(!panel.includes("到达列表底部或 60 秒"));
+  assert.ok(!panel.includes("滚动用时"));
+  assert.ok(panel.includes("elapsedSeconds"));
+  assert.ok(panel.includes("previewScanFinishedAt"));
+  assert.ok(panel.includes("正在加载岗位…"));
+  const previewStart = background.indexOf("async function runPreview");
+  const previewEnd = background.indexOf("function isRefreshableJobSourceContext", previewStart);
+  const preview = background.slice(previewStart, previewEnd);
+  assert.ok(preview.indexOf("setPreviewPhase('filtering'") < preview.indexOf("const previewFinishedAt = Date.now()"),
+    "preview timer must finish after filtering begins");
+  assert.ok(preview.includes("runner.previewScanFinishedAt = previewFinishedAt"),
+    "preview timer must finish after filtering and activity checks");
+  assert.ok(!panel.includes("滚动已达到 60 秒上限"));
+  assert.ok(!panel.includes("已加载 ${runner.previewScanned} 岗"));
+});
+
+test("continuous preview does not stop at the legacy 16-round cap", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 600,
+    visibleJobs: 5,
+    initialLoadedJobs: 15,
+    appendBatchSize: 15
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "continuous-large-list",
+    resetSession: true,
+    deltaOnly: false,
+    continuous: true,
+    scroll: true,
+    maxRounds: 512,
+    scrollWaitMs: 100,
+    deadlineAt: 60000
+  });
+
+  assert.equal(result.count, 600);
+  assert.equal(result.scanMeta.reachedEnd, true);
+  assert.equal(result.scanMeta.timedOut, false);
+  assert.ok(result.scanMeta.rounds > 16, `expected >16 rounds, got ${result.scanMeta.rounds}`);
+});
+
+test("virtual preview preserves the starting window and walks every overlapping viewport", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 12,
+    visibleJobs: 4,
+    initialTop: 400
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "virtual-mid-list",
+    resetSession: true,
+    deltaOnly: false,
+    scroll: true,
+    maxRounds: 24,
+    scrollWaitMs: 100,
+    deadlineAt: 60000
+  });
+
+  assert.equal(
+    harness.events[0]?.type,
+    "collect",
+    "the currently rendered jobs must be captured before resetting to the top"
+  );
+  assert.deepEqual(
+    harness.collections[0]?.ids,
+    ["job-4", "job-5", "job-6", "job-7"],
+    "a scan started midway down the list must not discard that rendered window"
+  );
+  assert.equal(
+    result.count,
+    12,
+    `all virtualized windows should be accumulated exactly once; got ${result.count} from ${JSON.stringify(harness.collections)}`
+  );
+  assert.deepEqual(
+    result.jobs.map((job) => job.jobId).sort(),
+    Array.from({ length: 12 }, (_, index) => `job-${index}`).sort()
+  );
+
+  const firstForwardScroll = harness.assignments.find((entry) => entry.actual > 0);
+  assert.ok(firstForwardScroll, "the scan should move down after resetting to the top");
+  assert.equal(firstForwardScroll.actual, 340, "each round should advance by 85% of one viewport");
+});
+
+test("large virtual preview does not skip middle windows", async () => {
+  const harness = createVirtualScanHarness({ totalJobs: 100, visibleJobs: 5 });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "virtual-100",
+    resetSession: true,
+    deltaOnly: false,
+    continuous: true,
+    scroll: true,
+    maxRounds: 256,
+    scrollWaitMs: 100,
+    deadlineAt: 60000
+  });
+  assert.equal(result.count, 100);
+  assert.deepEqual(
+    result.jobs.map((job) => job.jobId).sort(),
+    Array.from({ length: 100 }, (_, index) => `job-${index}`).sort()
+  );
+});
+
+test("append-only preview loads 15 to 50 jobs at the fast cadence", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 50,
+    visibleJobs: 5,
+    initialLoadedJobs: 15,
+    appendBatchSize: 15
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "append-only-fast",
+    resetSession: true,
+    deltaOnly: false,
+    scroll: true,
+    maxRounds: 32,
+    scrollWaitMs: 100,
+    deadlineAt: 60000
+  });
+
+  assert.deepEqual(
+    harness.events.filter((event) => event.type === "load").map((event) => event.loadedJobs),
+    [30, 45, 50]
+  );
+  assert.equal(result.count, 50);
+  assert.equal(result.scanMeta.reachedEnd, true);
+  assert.equal(result.scanMeta.timedOut, false);
+  assert.ok(harness.clock <= 7000, `fast lazy loading took ${harness.clock}ms in the fake clock`);
+});
+
+test("preview keeps already collected jobs when a wait is cancelled", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 90,
+    visibleJobs: 5,
+    initialLoadedJobs: 60,
+    appendBatchSize: 15,
+    cancelAfterSleeps: 1
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "keep-jobs-on-cancel",
+    resetSession: true,
+    deltaOnly: false,
+    continuous: true,
+    scroll: true,
+    maxRounds: 64,
+    scrollWaitMs: 100,
+    deadlineAt: 60000
+  });
+
+  assert.ok(result.count >= 60, `deadline cancel must keep the already loaded jobs; got ${result.count}`);
+  assert.equal(result.scanMeta.timedOut, true);
+  assert.equal(result.scanMeta.reachedEnd, false);
+});
+
+test("preview collection stops exactly at a mid-round deadline", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 100,
+    visibleJobs: 5,
+    initialLoadedJobs: 15,
+    appendBatchSize: 15
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "hard-deadline",
+    resetSession: true,
+    deltaOnly: false,
+    scroll: true,
+    maxRounds: 16,
+    scrollWaitMs: 300,
+    deadlineAt: 750
+  });
+
+  assert.equal(harness.clock, 750);
+  assert.equal(result.scanMeta.elapsedMs, 750);
+  assert.equal(result.scanMeta.timedOut, true);
+  assert.equal(result.scanMeta.reachedEnd, false);
+});
+
+test("preview top stabilization consumes only the shared deadline budget", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 100,
+    visibleJobs: 5,
+    initialTop: 400,
+    initialLoadedJobs: 15,
+    appendBatchSize: 15
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "top-reset-hard-deadline",
+    resetSession: true,
+    deltaOnly: false,
+    scroll: true,
+    maxRounds: 16,
+    scrollWaitMs: 300,
+    deadlineAt: 120
+  });
+
+  assert.equal(harness.clock, 120);
+  assert.equal(result.scanMeta.elapsedMs, 120);
+  assert.equal(result.scanMeta.timedOut, true);
+  assert.equal(result.scanMeta.reachedEnd, false);
+});
+
+test("virtual preview reacquires a replaced scroll container between rounds", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 8,
+    visibleJobs: 4,
+    initialTop: 0,
+    replaceScrollerAfterSleeps: 1
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "virtual-replaced-scroller",
+    resetSession: true,
+    deltaOnly: false,
+    scroll: true,
+    maxRounds: 12,
+    scrollWaitMs: 300,
+    deadlineAt: 60000
+  });
+
+  assert.ok(
+    harness.assignments.some((entry) => entry.generation === 2),
+    "later rounds must scroll the replacement container instead of a detached node"
+  );
+  assert.ok(
+    harness.collections.some((entry) => entry.generation === 2),
+    "jobs rendered by the replacement container must be collected"
+  );
+  assert.equal(
+    result.count,
+    8,
+    `container replacement must not truncate the accumulated scan; got ${result.count} from ${JSON.stringify(harness.collections)}`
+  );
+});
+
+test("preview terminal metadata keeps reachedEnd and timedOut mutually exclusive", async () => {
+  const policy = await import("../extension/shared/preview-scan-policy.js");
+  assert.equal(
+    typeof policy.normalizePreviewScanTerminalState,
+    "function",
+    "preview-scan-policy must expose the terminal-state normalizer used by background finalization"
+  );
+  assert.deepEqual(
+    policy.normalizePreviewScanTerminalState({ reachedEnd: true, timedOut: true }),
+    { reachedEnd: false, timedOut: true }
+  );
+  assert.deepEqual(
+    policy.normalizePreviewScanTerminalState({
+      reachedEnd: true,
+      timedOut: false,
+      deadlineAt: 1000,
+      now: 1001
+    }),
+    { reachedEnd: true, timedOut: false },
+    "a bottom confirmed before return processing must remain a bottom result"
+  );
+  assert.deepEqual(
+    policy.normalizePreviewScanTerminalState({
+      reachedEnd: false,
+      timedOut: false,
+      deadlineAt: 1000,
+      now: 1001
+    }),
+    { reachedEnd: false, timedOut: true }
+  );
+
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const runStart = background.indexOf("async function runPreview");
+  const runEnd = background.indexOf("function itemErrorHint", runStart);
+  const runPreview = background.slice(runStart, runEnd);
+  assert.ok(
+    runPreview.includes("normalizePreviewScanTerminalState"),
+    "runPreview finalization must normalize the two terminal flags before publishing scanMeta"
+  );
+});
+
+test("page operations consume the background budget and keep timeout terminal states distinct", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const dispatchGate = fs.readFileSync("extension/shared/operation-dispatch-gate.js", "utf8");
+  const policy = fs.readFileSync("extension/shared/operation-timeouts.js", "utf8");
+  assert.ok(policy.includes("PREVIEW_SCROLL_MS: 60000"));
+  assert.ok(policy.includes("BRIDGE_GRACE_MS: 5000"));
+  assert.ok(policy.includes("BRIDGE_CANCEL_SETTLE_MS: 3000"));
+  assert.ok(background.includes("__bhtOperationTimeoutMs: pageOperationTimeoutMs"));
+  assert.ok(background.includes("操作结果通道超过统一预算，取消页面内旧操作"));
+  assert.ok(background.includes("waitForBridgeCancellationSettlement"));
+  assert.ok(background.includes("removeStorage: bridgeSettled"));
+  assert.ok(background.includes("operations.delete(bridgeOpId)"));
+  assert.ok(background.includes("more?.error === 'OP_DEADLINE_EXCEEDED'"));
+  assert.ok(!background.includes("['OP_DEADLINE_EXCEEDED', 'OP_BRIDGE_TIMEOUT']"));
+  assert.ok(content.includes("requestedOperationTimeoutMs"));
+  assert.ok(content.includes("__BHT_ACTIVE_OP_TYPE__ === MSG.SCAN_JOBS"));
+  assert.ok(content.includes("原操作可能还在收尾；保留取消墓碑"));
+  assert.ok(!content.includes("if (window.__BHT_DEBUG_ENABLED__ !== true || !window.__BHT_ACTIVE_OP_ID__) return;"));
+  assert.ok(content.includes('error: "OP_DEADLINE_EXCEEDED"'));
+  assert.ok(content.includes("if (opId && window.__BHT_OP_CANCELLED__?.[opId])"));
+  assert.ok(content.includes("!timedOut && opId"));
+  assert.ok(content.includes("markSettledCancellation"));
+  const gateStart = content.indexOf("const dispatchGate");
+  const bootstrapEnd = content.indexOf("const requestedOperationTimeoutMs", gateStart);
+  const bootstrap = content.slice(gateStart, bootstrapEnd);
+  assert.ok(bootstrap.includes("await dispatchGate"));
+  assert.ok(bootstrap.includes("readOperationState"));
+  assert.ok(bootstrap.includes("settleCancellation"));
+  assert.ok(!bootstrap.includes('status: "pending"'));
+  assert.ok(bootstrap.indexOf("if (!permit.ok) return") < content.indexOf("workPromise =", gateStart));
+  assert.ok(dispatchGate.includes('row?.status === "cancelled"'));
+  assert.ok(content.includes('settled: true'));
+  assert.ok(!content.includes('error: "OP_INNER_TIMEOUT"'));
+  assert.ok(!content.includes("sleep(15000).then"));
+});
+
+test("preview navigation recovery and scan bridge failures share the hard deadline", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const waitTabComplete = extractFunctionSource(
+    background,
+    "async function waitTabComplete",
+    "async function getDisplayMetrics"
+  );
+  const navigatePreview = extractFunctionSource(
+    background,
+    "async function navigatePreviewToJobList",
+    "async function restoreListTabAfterTriggerNavigation"
+  );
+  const scanPreview = extractFunctionSource(
+    background,
+    "async function scanPreviewJobs",
+    "function evaluatePreviewResults"
+  );
+  const sendToBoss = extractFunctionSource(
+    background,
+    "async function sendToBoss",
+    "async function assertBossContext"
+  );
+
+  assert.ok(waitTabComplete.includes("Math.min(timeoutDeadlineAt, Number(deadlineAt))"));
+  assert.ok(waitTabComplete.includes("Math.min(200, remainingMs)"));
+  assert.ok(navigatePreview.includes("deadlineAt = 0"));
+  assert.ok(navigatePreview.includes(
+    "remainingDeadlineMs(deadlineAt, OPERATION_TIMEOUTS.PREVIEW_LIST_NAV_MS)"
+  ));
+  assert.ok(navigatePreview.includes("deadlineAt\n    })"));
+  assert.ok(navigatePreview.includes("previewScanDeadlineResult"));
+  assert.ok(scanPreview.includes(
+    "remainingDeadlineMs(\n      scanPayload.deadlineAt,\n      OPERATION_TIMEOUTS.PREVIEW_LIST_NAV_MS"
+  ));
+  assert.ok(scanPreview.includes("deadlineAt: scanPayload.deadlineAt"));
+  assert.ok(scanPreview.includes("setPreviewPhase('collecting', previewRunId)"));
+  assert.ok(!scanPreview.includes("setPreviewPhase('locating_list'"));
+  assert.ok(scanPreview.includes("scanPayload.deadlineAt\n    )"));
+  assert.ok(scanPreview.includes("error: 'OP_DEADLINE_EXCEEDED'") ||
+    scanPreview.includes("previewScanDeadlineResult()"));
+
+  assert.ok(sendToBoss.includes("forceInjectContent(tab.id, { deadlineAt: scanDeadlineAt })"));
+  assert.ok(sendToBoss.includes("sleepWithinDeadline(220, scanDeadlineAt)"));
+  assert.ok(sendToBoss.includes("sleepWithinDeadline(280, scanDeadlineAt)"));
+  const deadlineCheckAt = sendToBoss.indexOf("if (scanDeadlineAt && deadlineReached(scanDeadlineAt)) break;");
+  const navigationProbeAt = sendToBoss.indexOf("if (type === MSG.SCAN_JOBS && Date.now() >= navigationProbeAt)");
+  assert.ok(deadlineCheckAt >= 0 && deadlineCheckAt < navigationProbeAt);
+
+  const failedOperationAt = sendToBoss.indexOf("const failedOperation =");
+  const failedOperationEnd = sendToBoss.indexOf("operations.delete(bridgeOpId)", failedOperationAt);
+  const failedOperationBlock = sendToBoss.slice(failedOperationAt, failedOperationEnd);
+  const scanCatchAt = failedOperationBlock.indexOf("if (type === MSG.SCAN_JOBS)");
+  const nonScanElseAt = failedOperationBlock.indexOf("} else {", scanCatchAt);
+  const scanCatch = failedOperationBlock.slice(scanCatchAt, nonScanElseAt);
+  assert.ok(scanCatch.includes("await requestBridgeCancellation(failedOperation)"));
+  assert.ok(scanCatch.includes("scheduleBridgeStorageCleanup(failedOperation.storageKey)"));
+  assert.ok(!scanCatch.includes("cancelBridgeOperation"));
+  assert.ok(failedOperationBlock.slice(nonScanElseAt).includes("await cancelBridgeOperation(failedOperation)"));
+});
+
+test("cancelled preview generations cannot filter or publish late results", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const runPreviewStart = background.indexOf("async function runPreview");
+  const runPreviewEnd = background.indexOf("function itemErrorHint", runPreviewStart);
+  const runPreview = background.slice(runPreviewStart, runPreviewEnd);
+  const stopStart = background.indexOf("case MSG.STOP_TASK");
+  const stopEnd = background.indexOf("case MSG.SKIP_CURRENT", stopStart);
+  const stop = background.slice(stopStart, stopEnd);
+  assert.ok(background.includes("previewRunId"));
+  assert.ok(background.includes("isPreviewRunActive"));
+  assert.ok(runPreview.includes("if (!isActive()) return cancelled();"));
+  assert.ok(runPreview.includes("const results = evaluatePreviewResults"));
+  assert.ok(runPreview.indexOf("if (!isActive()) return cancelled();", runPreview.indexOf("const todayStats")) > -1);
+  assert.ok(runPreview.includes("await publishPreviewTask(task, previewRunId"));
+  assert.ok(background.includes("task.previewRunId = previewRunId"));
+  assert.ok(background.includes("discardCancelledPreviewTask(previewRunId"));
+  const previewPublisherStart = background.indexOf("async function publishPreviewTask");
+  const previewPublisherEnd = background.indexOf("async function withRunnerAdmission", previewPublisherStart);
+  const previewPublisher = background.slice(previewPublisherStart, previewPublisherEnd);
+  assert.ok(previewPublisher.indexOf("task.previewRunId = previewRunId") < previewPublisher.indexOf("await publishTask(task)"));
+  assert.ok(stop.includes("const cancelledPreviewRunId = runner.previewRunId"));
+  assert.ok(stop.includes("const previousPreviewTask = runner.previewPreviousTask"));
+  assert.ok(stop.includes("const previewRunPromise = activePreviewRun?.id === cancelledPreviewRunId"));
+  assert.ok(stop.indexOf("await cancelActiveOperations('用户取消扫描预览')") < stop.indexOf("await discardCancelledPreviewTask(cancelledPreviewRunId, previousPreviewTask)"));
+  assert.ok(stop.indexOf("await previewRunPromise") < stop.indexOf("await discardCancelledPreviewTask(cancelledPreviewRunId, previousPreviewTask)"));
+  assert.ok(background.includes("String(current?.previewRunId || '') !== String(previewRunId)"));
+  assert.ok(background.includes("authoritative: true"));
+  assert.ok(background.includes("preview_cancel_rollback"));
+  assert.ok(panel.includes("authoritativeTask"));
+  assert.ok(panel.includes("msg.authoritative === true"));
+  assert.ok(panel.includes("Object.prototype.hasOwnProperty.call(res, 'task')"));
+  assert.ok(stop.indexOf("runner.previewRunId = ''") < stop.indexOf("await cancelActiveOperations"));
+  assert.ok(stop.indexOf("runner.previewing = false") > stop.indexOf("await discardCancelledPreviewTask"));
+  const publishTaskStart = background.indexOf("async function publishTask");
+  const publishTaskEnd = background.indexOf("function setTaskTerminalSignal", publishTaskStart);
+  const publishTask = background.slice(publishTaskStart, publishTaskEnd);
+  assert.ok(publishTask.includes("await saveTask(task)") && publishTask.lastIndexOf("await saveTask(task)") > publishTask.indexOf("if (runner.abort && task?.status !== TASK_STATUS.STOPPED)"),
+    "stop must converge after a slow task write");
+  const sendStart = background.indexOf("async function sendToBoss");
+  const sendEnd = background.indexOf("async function assertBossContext", sendStart);
+  const sendToBoss = background.slice(sendStart, sendEnd);
+  assert.ok(sendToBoss.includes("const runKind = previewRunId ? 'preview'"));
+  assert.ok(runPreview.includes("const sourcePreviewTab = previewTab || await getActiveBossTab"));
+  assert.ok(runPreview.indexOf("if (!isActive()) return cancelled();", runPreview.indexOf("const scanResult")) > -1);
+});
+
+test("preview scans the current SPA list and uses lightweight one-second status updates", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const host = fs.readFileSync("extension/content/floating-host.js", "utf8");
+  const debugLog = fs.readFileSync("extension/shared/debug-log.js", "utf8");
+  assert.ok(background.includes("previewTab = sourcePreviewTab"));
+  assert.ok(background.includes("sourceContextPreserved: true"));
+  assert.ok(!background.includes("openPreviewScanWorker"));
+  assert.ok(!background.includes("SCAN_WORKER_OPEN_FAILED"));
+  assert.ok(content.includes("savedListHref: savedHref"));
+  assert.ok(content.includes("savedListFilterHints"));
+  assert.ok(content.includes("listHref,"));
+  assert.ok(content.includes("listFilterHints"));
+  assert.ok(content.includes("describeAdaptiveScanScroller"));
+  assert.ok(content.includes("growthEvents"));
+  assert.ok(content.includes("bottomStableRounds >= 8"));
+  assert.ok(content.includes("if (timedOut) session.reachedEnd = false"));
+  assert.ok(background.includes("GET_RUNNER_STATE"));
+  assert.ok(background.includes("pause/abort/skip 只能来自上一轮残留"));
+  assert.ok(panel.includes("refreshRunnerState"));
+  assert.ok(panel.includes("}, 1000)"));
+  assert.ok(panel.includes("isPollingRequest"));
+  assert.ok(panel.includes("lastPreviewRenderKey"));
+  assert.ok(panel.includes("document.createDocumentFragment"));
+  assert.ok(panel.includes("lastLogRenderKey"));
+  assert.ok(panel.includes("lastHistoryRenderKey"));
+  assert.ok(host.includes("sessionStorage.setItem(STORAGE_OPEN"));
+  assert.ok(host.includes("cmd: \"suspend\""));
+  assert.ok(content.includes("summarizeOperationResult"));
+  assert.ok(background.includes("summarizeBossOperationResult"));
+  assert.ok(debugLog.includes("items omitted"));
+  assert.ok(!content.includes("jobs.slice(0, 80)"));
+});
+
+test("preview continuously collects on the source tab and filters once afterwards", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const runStart = background.indexOf("async function runPreview");
+  const runEnd = background.indexOf("function itemErrorHint", runStart);
+  const run = background.slice(runStart, runEnd);
+  assert.ok(run.includes("previewTab = sourcePreviewTab"));
+  assert.ok(run.includes("const collectedJobs = new Map()"));
+  assert.ok(run.includes("mergePreviewJobBatch(collectedJobs, more?.jobs || [])"));
+  assert.ok(run.indexOf("while (scan.scanMeta?.reachedEnd") < run.indexOf("const results = evaluatePreviewResults"));
+  assert.equal((run.match(/evaluatePreviewResults\(/g) || []).length, 1);
+  assert.ok(run.includes("const previewDeadlineAt = scanStartedAt + maxElapsedMs"));
+  assert.ok(run.includes("previewDeadlineAt - OPERATION_TIMEOUTS.PREVIEW_RESULT_GRACE_MS"));
+  assert.ok(run.includes("scanDeadlinePartial"));
+  assert.ok(run.includes("continuous: true"));
+  assert.ok(!run.includes("listExpectLabel: scanWorkerTab"));
+});
+
+test("panel and background reject mixed extension versions before delivery", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(background.includes("EXTENSION_VERSION_MISMATCH"));
+  assert.ok(background.includes("BHT_RUNTIME_VERSION"));
+  assert.ok(background.includes("content_version_reinject"));
+  assert.ok(background.includes("CONTENT_VERSION_MISMATCH"));
+  assert.ok(background.includes("legacyProtocol: 'BHT_SEND_RESUME'"));
+  assert.ok(panel.includes("clientVersion: BHT_UI_VERSION"));
+  assert.ok(panel.includes("showRuntimeMismatchBanner"));
+  assert.ok(panel.includes("已停止投递"));
 });
 
 test("content operation bridge is versioned and cancellable", () => {
@@ -65,6 +1142,7 @@ test("background modal dismiss flag + cancellable conversation trigger", () => {
   assert.ok(s.includes("uiErrorDismissed"));
   assert.ok(s.includes("MSG.TRIGGER_CONVERSATION"));
   assert.ok(s.includes("cancelActiveOperations"));
+  assert.ok(s.includes("active.map((operation) => cancelBridgeOperation({ ...operation, reason }))"));
   assert.ok(s.includes("DISMISS_ERROR_MODAL"));
 });
 
@@ -73,6 +1151,55 @@ test("message protocol includes list control", () => {
   assert.ok(s.includes("ENSURE_JOB_LIST"));
   assert.ok(s.includes("RETURN_TO_LIST"));
   assert.ok(s.includes("CLOSE_CHAT"));
+});
+
+test("greeting control covers platform receipt, safe pause, account write and readback", () => {
+  const manifest = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
+  const hook = fs.readFileSync("extension/content/page-network-hook.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const planner = fs.readFileSync("extension/shared/message-planner.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  const mainEntry = manifest.content_scripts.find((entry) => entry.world === "MAIN");
+  assert.ok(mainEntry?.js?.includes("content/page-network-hook.js"));
+  assert.equal(mainEntry?.run_at, "document_start");
+  assert.ok(hook.includes("/wapi\\/zpgeek\\/friend\\/add"));
+  assert.ok(hook.includes("showGreeting"));
+  assert.ok(content.includes("/wapi/zpchat/greeting/getGreetingList"));
+  assert.ok(content.includes("/wapi/zpchat/greeting/updateGreetingV2"));
+  assert.ok(content.includes("/wapi/zpchat/greeting/custom/saveV2"));
+  assert.ok(content.includes('"zp_token"'));
+  assert.ok(content.includes("after.enabled !== enabled"));
+  assert.ok(background.includes("waitForFreshSelfMessages"));
+  assert.ok(background.includes("baselineMessages"));
+  assert.ok(planner.includes("NATIVE_GREETING_UNKNOWN"));
+  assert.ok(background.includes("已暂停以避免重复"));
+  assert.ok(panel.includes("confirmBossGreetingChange"));
+  assert.ok(panel.includes("MSG.SET_BOSS_GREETING"));
+  assert.ok(panel.includes("MSG.SAVE_BOSS_GREETING_TEXT"));
+  for (const id of [
+    "bossGreetingToggle",
+    "bossGreetingText",
+    "btnSaveBossGreetingText",
+    "bossGreetingConfirm",
+    "pluginTextEnabled",
+    "messageFlowPreview"
+  ]) assert.ok(html.includes(`id="${id}"`), `missing ${id}`);
+  assert.ok(html.includes("建议关闭 BOSS 自动招呼"));
+  assert.ok(html.includes('href="https://www.zhipin.com/web/geek/notify-set?type=greetSet"'));
+});
+
+test("real-time logs sort by timestamp and include dates", () => {
+  const storage = fs.readFileSync("extension/shared/storage.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const order = fs.readFileSync("extension/shared/log-order.js", "utf8");
+  assert.ok(storage.includes("logWriteChain"));
+  assert.ok(storage.includes("sortLogsNewestFirst"));
+  assert.ok(panel.includes("sortLogsNewestFirst(logs)"));
+  assert.ok(panel.includes("sortLogsOldestFirst(logs)"));
+  assert.ok(panel.includes("formatLogTimestamp"));
+  assert.ok(order.includes("includeDate = true"));
 });
 
 test("native greeting skip still works with multi segment", () => {
@@ -121,6 +1248,15 @@ test("non boss url blocked by helper", () => {
   assert.equal(isBossUrl("https://example.com/chat"), false);
 });
 
+test("popup only offers the floating panel on BOSS job list pages", () => {
+  const popup = fs.readFileSync("extension/popup/popup.js", "utf8");
+  assert.equal(isBossJobListUrl("https://www.zhipin.com/web/geek/jobs"), true);
+  assert.equal(isBossJobListUrl("https://www.zhipin.com/web/geek/chat"), false);
+  assert.equal(isBossJobListUrl("https://www.zhipin.com/job_detail/example.html"), false);
+  assert.ok(popup.includes("isBossJobListUrl(tab.url ||"));
+  assert.ok(popup.includes("请前往 BOSS 职位列表页使用插件"));
+});
+
 test("delivery hardening contracts", () => {
   const s = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const a = fs.readFileSync("extension/sidepanel/app.js", "utf8");
@@ -129,6 +1265,92 @@ test("delivery hardening contracts", () => {
   assert.ok(s.includes("error: 'ALREADY_RUNNING'"));
   assert.ok(a.includes("ensureConfigSavedBeforeDelivery"));
   assert.ok(c.includes("waitForImageSendConfirm"));
+});
+
+test("scheduled delivery pauses at queue boundaries and only auto-resumes schedule pauses", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const manifest = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
+  const panel = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const gateStart = background.indexOf("async function waitForRunnableQueueBoundary");
+  const gateEnd = background.indexOf("async function enforceDeliverySchedule", gateStart);
+  const gate = background.slice(gateStart, gateEnd);
+  const waitIndex = gate.indexOf("await waitWhilePaused()");
+  const recheckIndex = gate.indexOf("pauseAtDeliveryScheduleBoundary", waitIndex);
+  const loopStart = background.indexOf("async function runTaskLoop");
+  const loopEnd = background.indexOf("chrome.runtime.onMessage.addListener", loopStart);
+  const runLoop = background.slice(loopStart, loopEnd);
+  const queueGateEnd = runLoop.indexOf("// 持久化游标");
+  const queueGate = runLoop.slice(runLoop.indexOf("for (let qi"), queueGateEnd);
+  const schedulePauseHintIndex = panel.indexOf("else if (status === 'running' && task?.schedulePauseRequested)");
+  const intervalHintIndex = panel.indexOf("else if (waitingInterval)");
+  assert.ok(manifest.permissions.includes("alarms"));
+  assert.ok(gateStart >= 0 && gateEnd > gateStart);
+  assert.ok(waitIndex >= 0 && recheckIndex > waitIndex, "schedule must be rechecked after a pause wakes");
+  assert.ok(gate.includes("if (task.status === TASK_STATUS.PAUSED)"));
+  assert.ok(gate.includes("runner.pause = true"));
+  assert.ok(queueGate.includes("waitForRunnableQueueBoundary(taskId)"));
+  assert.ok(!queueGate.includes("task.status = TASK_STATUS.RUNNING"), "queue wake must not force PAUSED to RUNNING");
+  assert.ok(runLoop.includes("if (!task || await pauseAtDeliveryScheduleBoundary(task, config.settings || {}, new Date())) break;"));
+  assert.ok(background.includes("runner.abort || runner.pause || runner.schedulePauseRequested"));
+  assert.ok(background.includes("task.pauseSource !== 'schedule'"));
+  assert.ok(background.includes("isBossTab(tab) && isBossJobListUrl(tab.url || '')"));
+  assert.ok(background.includes("当前岗位完成后暂停"));
+  assert.ok(background.includes("已进入定时投递时段，自动恢复任务"));
+  assert.ok(background.includes("chrome.alarms?.onAlarm?.addListener"));
+  assert.ok(panel.includes("scheduledDeliveryEnabled"));
+  assert.ok(panel.includes("readScheduledDeliveryDays"));
+  assert.ok(schedulePauseHintIndex >= 0 && intervalHintIndex > schedulePauseHintIndex,
+    "schedule-ended status must take priority over the normal interval countdown");
+  assert.ok(panel.includes("投递间隔结束后自动暂停"));
+});
+
+test("preview UI falls back to reasonTexts and shows pass-rate warnings", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const engine = fs.readFileSync("extension/shared/filter-engine.js", "utf8");
+  assert.ok(engine.includes("export function previewReasonLines"));
+  assert.ok(app.includes("previewReasonLines(r)"));
+  assert.ok(app.includes("task.warnings.join"));
+  assert.ok(app.includes("通过率超过 80%") === false);
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(background.includes("通过率超过 80%，请检查筛选是否过宽"));
+});
+
+test("history/config controls and image-only resume stay on shipped paths", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const worker = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  const css = fs.readFileSync("extension/sidepanel/styles.css", "utf8");
+  assert.ok(app.includes("filterHistoryByDate(history, fromTs, toTs)"), "history date filter wired");
+  assert.ok(app.includes("filterHistoryRows(byDate, filter)"), "status filter applies after date filter");
+  assert.ok(app.includes("historyToday"), "today counter line present");
+  assert.ok(app.includes("今日已投"), "today counter label present");
+  assert.ok(app.includes("dailyMaxCommunicate"), "today counter uses daily limit");
+  assert.ok(app.includes("btnExportHistory"));
+  assert.ok(app.includes("JSON.stringify(exportData"));
+  assert.ok(app.includes("CLEAR_HISTORY"));
+  assert.ok(app.includes("$('btnImport')"));
+  assert.ok(html.includes('id="btnExport" class="btn"'));
+  assert.ok(html.includes('id="btnImport" class="btn"'));
+  assert.ok(css.includes(".btn-row.config-io .btn"));
+  assert.ok(!/\#btnExport[^{]*\{[^}]*min-width:\s*[3-9]\d/.test(css));
+  assert.ok(worker.includes("planResumeSend({ settings: config.settings, hasImages })"));
+  assert.ok(worker.includes("wantAutoImage"));
+  assert.ok(worker.includes("MSG.SEND_IMAGE"));
+  assert.ok(content.includes("sendImageFromDataUrl"));
+  assert.ok(!content.includes("sendPlatformResume"));
+  assert.ok(!content.includes("BHT_SEND_RESUME"));
+  assert.ok(!html.includes("autoSendAttachmentResume"));
+  assert.ok(!content.includes("uploadFile("));
+});
+
+test("panel accepts agent postMessage to skip tour and start preview", () => {
+  const onboarding = fs.readFileSync("extension/sidepanel/onboarding.js", "utf8");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  assert.ok(onboarding.includes("source !== 'bht-agent'"));
+  assert.ok(onboarding.includes("skip-onboarding"));
+  assert.ok(app.includes("source !== 'bht-agent'"));
+  assert.ok(app.includes("scan-preview"));
 });
 
 test("retry resumes after chat trigger without clicking the list twice", () => {
@@ -147,7 +1369,10 @@ test("retry resumes after chat trigger without clicking the list twice", () => {
   assert.ok(!content.includes("sleep(opTimeoutMs).then"), "completed operations must not emit a later false timeout");
 });
 
-if (!process.exitCode) console.log("flow contract tests ok");
+
+
+
+
 
 
 {
@@ -164,3 +1389,344 @@ if (!process.exitCode) console.log("flow contract tests ok");
   assert.ok(!html.includes("投递一份测试"));
   console.log("  PASS test delivery picks next untested job helper");
 }
+
+test("v1.7.19 worker tab reuse, inject budget and env auto-skip are wired", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const debugLog = fs.readFileSync("extension/shared/debug-log.js", "utf8");
+  const envFail = fs.readFileSync("extension/shared/environment-failures.js", "utf8");
+
+  // 执行页跨岗位复用：命中既有 workerTabId 时导航复用，而不是每岗新建+关闭
+  assert.ok(background.includes("autoDiscardable"), "worker tab must not be memory-recycled");
+  assert.ok(background.includes("await chrome.tabs.update(tab.id, { url: attempt.url, active: true })"), "reuse navigates existing worker tab and wakes it");
+  assert.ok(background.includes("let reused = Boolean(tab?.id)"), "reuse flag computed");
+  assert.ok(!background.includes("本岗位沟通触发结束"), "worker tab is no longer closed per job");
+
+  // 注入/加载硬预算：繁忙渲染进程不再造成 60-90s 黑洞
+  assert.ok(background.includes("injectWithBudget"), "inject budget helper present");
+  assert.ok(background.includes("临时沟通执行页内容脚本注入超时"), "inject timeout fails fast");
+
+  // 渲染就绪门 + 点击补偿 + 快速失败
+  assert.ok(content.includes("RENDER_GATE_MS"), "render gate present");
+  assert.ok(content.includes('error: "WORKER_PAGE_NOT_READY"'), "not-ready fast fail present");
+  assert.ok(content.includes('error: "WORKER_CHAT_CLICK_NO_EFFECT"'), "no-effect fast fail present");
+  assert.ok(content.includes("worker_detail_click_retry"), "click compensation retry present");
+  assert.ok(content.includes("isConversationNavigationStarted"), "navigation detection helper present");
+
+  // 调试日志限频 + 非阻塞
+  assert.ok(content.includes("debugTraceThrottles"), "content debug throttle map present");
+  assert.ok(debugLog.includes("FLUSH_INTERVAL_MS"), "coalesced flush interval present");
+  const floatHost = fs.readFileSync("extension/content/floating-host.js", "utf8");
+  assert.ok(floatHost.includes("自愈：面板打开状态因页面重载"), "float auto-reopens after page reload");
+  assert.ok(debugLog.includes("Promise.resolve(entry)"), "append never awaits storage flush");
+
+  // 环境失败分类共享模块接入后台
+  assert.ok(envFail.includes("ENV_AUTO_CONTINUE_ERRORS"), "env set exported");
+  assert.ok(background.includes("from '../shared/environment-failures.js'"), "background imports env classifier");
+  assert.ok(background.includes("CONTENT_INJECT_FAIL"), "inject timeout fails fast with env error");
+  assert.ok(background.includes("BOSS 页面脚本注入失败或超时"), "inject failure message present");
+  assert.ok(background.includes("envAutoSkip"), "queue stamps env skip flag");
+  assert.ok(background.includes("[自动跳过]"), "queue logs auto skip");
+  assert.ok(background.includes("row?.envAutoSkip === true"), "queue skips confirm loop for env failures");
+  assert.ok(background.includes("执行页加载或注入失败，丢弃冻结标签后再试"), "frozen worker tab is discarded before fallback");
+  assert.ok(!background.includes("活跃度只在左侧点一次卡片核对"), "old list-card activity path is removed");
+  assert.ok(background.includes("活跃度核对也必须留在临时详情页"), "activity inspect stays on the worker detail");
+  assert.ok(background.includes("{ requireComplete: true }"), "worker load waits for complete instead of returning a loading tab");
+  assert.ok(background.includes("isWorkerTriggerRetryable"), "retryable trigger errors are classified");
+  assert.ok(background.includes("WORKER_TRIGGER_RETRY"), "retry budget is imported");
+  assert.ok(background.includes("forceNew"), "retry reopens a fresh worker tab");
+  assert.ok(background.includes("关闭旧标签后重新打开并点击立即沟通"), "retry logs reopen + click");
+  assert.ok(!background.includes("canFallbackWorkerMode"), "formal delivery has no list-card fallback");
+  assert.ok(background.includes("for (let pingTry = 0; pingTry < 3"), "content ping is retried before discarding the tab");
+  assert.ok(background.includes("LIST_JOB_IDENTITY_MISMATCH"), "mismatched clone-list jobs are skipped not clicked");
+  assert.ok(envFail.includes("WORKER_LEFT_DETAIL"), "left-detail is environmental and not list-fallback");
+});
+
+
+
+
+
+test("v1.7.19 openConversationWorkerTab reuses one worker tab across jobs", async () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const source = extractFunctionSource(
+    background,
+    "async function closeConversationWorkerTab",
+    "function detailJobIdFromHref"
+  ) + "\n" + extractFunctionSource(
+    background,
+    "function detailJobIdFromHref",
+    "async function restoreTabsAfterWorker"
+  ) + "\n" + extractFunctionSource(
+    background,
+    "async function openConversationWorkerTab",
+    "async function triggerConversationInWorker"
+  );
+  let seq = 1;
+  const tabs = [];
+  const calls = { create: 0, update: [] };
+  const chromeStub = {
+    tabs: {
+      get: async (id) => {
+        const found = tabs.find((t) => t.id === id);
+        if (!found) throw new Error("No tab with id: " + id);
+        return found;
+      },
+      create: async (opts) => {
+        calls.create += 1;
+        const t = { id: 1000 + seq++, url: opts.url, windowId: 1, active: opts.active };
+        tabs.push(t);
+        return t;
+      },
+      update: async (id, props) => {
+        const t = tabs.find((x) => x.id === id);
+        if (!t) throw new Error("no tab " + id);
+        calls.update.push({ id, props });
+        Object.assign(t, props);
+        return t;
+      },
+      remove: async (id) => {
+        calls.remove = (calls.remove || 0) + 1;
+        const idx = tabs.findIndex((t) => t.id === id);
+        if (idx >= 0) tabs.splice(idx, 1);
+      },
+      sendMessage: async () => {
+        calls.ping = (calls.ping || 0) + 1;
+        return { ok: true, contentInstanceId: "content_test" };
+      }
+    }
+  };
+  const budgetLog = [];
+  const waitTabComplete = async (tabId, budgetMs) => {
+    budgetLog.push({ tabId, budgetMs });
+    // 模拟真实导航：返回最近一次 tabs.update 的目标 URL（无导航时回退到底站）
+    const lastNav = [...calls.update].reverse().find((u) => u.props.url);
+    const url = lastNav ? lastNav.props.url : "https://www.zhipin.com/job_detail/feedfacefeedfacefeed.html";
+    return { id: tabId, url, status: "complete" };
+  };
+  const forceInjectContent = async () => true;
+  const sleep = async () => {};
+  const publishTask = async () => {};
+  const factory = new Function(
+    "chrome",
+    "waitTabComplete",
+    "forceInjectContent",
+    "sleep",
+    "publishTask",
+    "isBossUrl",
+    source + "; return openConversationWorkerTab;"
+  );
+  const open = factory(chromeStub, waitTabComplete, forceInjectContent, sleep, publishTask, isBossUrl);
+  const task = { execution: {} };
+  const messageTab = { id: 7, windowId: 3 };
+  const job = { jobId: "j1", title: "T" };
+  const attempt = { mode: "detail", url: "https://www.zhipin.com/job_detail/feedfacefeedfacefeed.html" };
+
+  // 第 1 岗：无历史执行页 → 新建
+  const first = await open(task, attempt, messageTab, job);
+  assert.equal(calls.create, 1, "first job creates one tab");
+  assert.equal(first.id, task.execution.workerTabId, "execution tracks the created tab");
+  assert.equal(tabs[0].active, true, "worker tab is created active so Chrome loads job_detail");
+  assert.equal(calls.update[0].props.autoDiscardable, false, "created tab protected from memory recycle");
+  assert.deepEqual(budgetLog[0], { tabId: first.id, budgetMs: 30000 }, "first load uses default 30s budget");
+
+  // 第 2 岗：执行页存在 → 复用导航，不再新建
+  const secondAttempt = { ...attempt, url: "https://www.zhipin.com/job_detail/feedfacefeedfacefeed2.html" };
+  const second = await open(task, secondAttempt, messageTab, job);
+  assert.equal(calls.create, 1, "second job reuses instead of creating");
+  assert.equal(second.id, first.id, "reuse keeps the same tab id");
+  const navUpdate = calls.update.find((u) => u.props.url === secondAttempt.url);
+  assert.ok(navUpdate && navUpdate.id === first.id, "navigation goes to the same tab");
+  assert.deepEqual(budgetLog[1], { tabId: first.id, budgetMs: 45000 }, "reused navigation gets the longer 45s budget");
+
+  // 第 3 场：复用导航未提交（waitTabComplete 仍返回上一岗位详情）→ 防误点护栏拒绝
+  const staleOpen = factory(
+    chromeStub,
+    async (tabId) => ({ id: tabId, url: "https://www.zhipin.com/job_detail/OLDJOBOLDJOBOLDJOB.html", status: "complete" }),
+    forceInjectContent,
+    sleep,
+    publishTask,
+    isBossUrl
+  );
+  const staleTask = { execution: { workerTabId: first.id } };
+  let staleError = null;
+  try { await staleOpen(staleTask, secondAttempt, messageTab, job); } catch (e) { staleError = String((e && e.message) || e); }
+  assert.ok(staleError && staleError.includes('导航未生效'), "stale old detail page must be rejected, got " + staleError);
+
+  // 第 3 岗：执行页被外部关闭 → 重建
+  const closedId = first.id;
+  const idx = tabs.findIndex((t) => t.id === closedId);
+  tabs.splice(idx, 1);
+  // 保留 execution.workerTabId：模拟「执行页被外部关闭」而非执行字段被清空，
+  // 真正走 tabs.get 抛错 → 重建路径
+  // （delete task.execution.workerTabId;）
+  const third = await open(task, attempt, messageTab, job);
+  assert.equal(calls.create, 2, "closed worker tab is recreated");
+  assert.notEqual(third.id, closedId, "new tab id after recreate");
+  assert.deepEqual(budgetLog[2], { tabId: third.id, budgetMs: 30000 }, "recreated load uses default budget");
+
+  // 重试：forceNew 关闭旧执行页再新建，而不是导航复用
+  const retry = await open(task, attempt, messageTab, job, { forceNew: true });
+  assert.equal(calls.create, 3, "forceNew creates a fresh tab");
+  assert.equal(calls.remove, 1, "forceNew closes the previous worker tab");
+  assert.notEqual(retry.id, third.id, "retry tab is a new id");
+  assert.equal(task.execution.workerTabId, retry.id, "execution tracks the retry tab");
+});
+
+
+test("v1.7.20 history date filter, full config import and trigger dedup mark are wired", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  const storage = fs.readFileSync("extension/shared/storage.js", "utf8");
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const historyView = fs.readFileSync("extension/shared/history-view.js", "utf8");
+  // 日期筛选与今日计数
+  assert.ok(html.includes('id="historyFrom"') && html.includes('id="historyTo"'), "date inputs present");
+  assert.ok(html.includes('id="historyToday"'), "today counter line present");
+  assert.ok(app.includes("filterHistoryByDate(history, fromTs, toTs)"), "date filter applied");
+  assert.ok(app.includes("summarizeHistory(filtered)"), "stats reflect filtered rows");
+  assert.ok(historyView.includes("startOfLocalDay") && historyView.includes("endOfLocalDay"), "day boundary helpers");
+  // 全量导出/导入
+  assert.ok(storage.includes("dailyStats: STORAGE_KEYS.DAILY_STATS"), "dailyStats exported");
+  assert.ok(storage.includes("idempotency: STORAGE_KEYS.IDEMPOTENCY"), "idempotency exported");
+  assert.ok(storage.includes("task: STORAGE_KEYS.TASK"), "task exported");
+  assert.ok(storage.includes("sanitizeImportedTask"), "imported task sanitized");
+  // 触发即防重复
+  assert.ok(background.includes("markIdempotent(jobIdempotencyKey(job)") &&
+    background.includes("防重复：沟通一旦发起"), "job marked idempotent at trigger");
+  // P1: 触发/完成两条 job 级标记都必须携带 securityId（完成路径不得覆盖掉触发时的重发证据）
+  const jobMarks = background.match(/markIdempotent\(jobIdempotencyKey\(job\), \{[^}]*\}\)/g) || [];
+  assert.ok(jobMarks.length >= 2, "job-level idempotent marks exist at trigger and complete paths");
+  assert.ok(jobMarks.every((m) => m.includes("securityId")), "every job-level mark keeps securityId");
+});
+
+test("resume lightbox avoids session quota and surfaces set failure", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const preview = fs.readFileSync("extension/sidepanel/image-preview.js", "utf8");
+  // 已保存图片：弹窗按 profileId 直接读 storage.local，不再整包写 storage.session
+  assert.ok(app.includes("openImageLightbox({ profileId: profile.id, imageIndex"), "saved images open by profileId");
+  assert.ok(preview.includes("chrome.storage.local.get('bht_resumes')"), "popup reads saved images from local storage");
+  assert.match(preview, /stored\.profileId/, "popup supports profileId payload");
+  // 临时预览：先压缩再展示（原始大图会超 session 配额）
+  assert.ok(app.includes("fileToCompressedDataUrl(f)"), "tmp preview compressed before lightbox");
+  // 写入失败不再静默：给出错误提示且不再尝试开窗
+  assert.ok(app.includes("图片过大，无法打开预览"), "quota failure surfaces a toast");
+  assert.match(app, /catch \(e\) \{\s*console\.warn\('[^']*'?, e\)/, "set failure is caught");
+});
+
+test("history clear/export/date-guard UX", () => {
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  const historyView = fs.readFileSync("extension/shared/history-view.js", "utf8");
+  // 按钮文案
+  assert.ok(html.includes(">清除筛选</button>"), "reset button relabeled 清除筛选");
+  assert.ok(html.includes(">导出全部记录</button>"), "export button relabeled 导出全部记录");
+  assert.ok(html.includes(">清空全部记录</button>"), "clear button relabeled 清空全部记录");
+  // 清空二次确认
+  assert.ok(app.includes("window.confirm(") && app.includes("确定要清空全部投递记录吗"), "clear requires confirmation");
+  // 导出按筛选：筛选后导出筛选结果，未筛选导出全部
+  assert.ok(app.includes("const { rows, hasFilter } = visibleHistoryRows(history)"), "export uses visible rows");
+  assert.ok(app.includes("hasFilter ? rows : history"), "export respects active filter");
+  assert.ok(app.includes("已导出筛选后的") && app.includes("已导出全部"), "export toasts distinguish filtered/all");
+  // 日期防错：结束早于开始自动修正 + 提示
+  assert.ok(historyView.includes("normalizeHistoryDateRange"), "date guard helper exported");
+  assert.ok(app.includes("normalizeHistoryDateRange($('historyFrom')?.value"), "from listener guards range");
+  assert.ok(app.includes("normalizeHistoryDateRange($('historyFrom')?.value || '', $('historyTo')?.value || '')"), "to listener guards range");
+  assert.ok(app.includes("结束日期不能早于开始日期"), "guard surfaces a toast");
+});
+
+test("preview filters HR activity via network metadata and marks current delivery job", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const styles = fs.readFileSync("extension/sidepanel/styles.css", "utf8");
+  // 预览期用列表接口元数据核对活跃度（不点卡片），不满足的岗位在预览即排除
+  assert.ok(background.includes("matchActive(activeText, selected)"), "preview finalize applies matchActive");
+  assert.ok(background.includes("不点卡片"), "preview activity check is network-only");
+  assert.ok(background.includes("ENRICH_JOB_ACTIVITY"), "preview enriches via detail API message");
+  assert.ok(background.includes("applyPreviewActivityEnrichment(results, activities"), "enrichment results applied to preview");
+  assert.ok(background.includes("HR 活跃度核对（列表接口元数据"), "preview activity summary logged");
+  // 预览项带 jobId，供投递时高亮定位
+  assert.ok(app.includes("div.dataset.job = String(r.job.jobId || '')"), "preview item carries jobId");
+  // 当前投递岗：橙色描边 + 投递中徽标 + 只滚容器内的滚动条（主滚动条不动）
+  assert.ok(app.includes("markCurrentDeliveryJob()"), "panel polls current job marker");
+  assert.ok(app.includes("current-delivery") && app.includes("delivery-badge") && app.includes("投递中"), "highlight markers present");
+  assert.ok(app.includes("scroller.scrollTo({ top: y") && app.includes("lastDeliveryScrollJob"), "container-only scroll once per job");
+  assert.ok(app.includes("主页面/外层滚动条保持不动"), "outer scrollbar untouched by design");
+  assert.ok(styles.includes(".item.current-delivery") && styles.includes("#ff8c00"), "orange outline style present");
+});
+
+test("left-list anomaly protection pauses instead of cascade-skipping", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  // 列表页外部变化（刷新/风控）→ 恢复列表并暂停，而不是跳过
+  assert.ok(background.includes("trig.listPreserved === false") && background.includes("岗位与页面可能对不上"), "list change pauses with reason");
+  assert.ok(background.includes("await softReturnToList(task)") && background.includes("return 'limited'"), "restores list before pausing");
+  // 连续 N 岗活跃度未知 → 暂停
+  assert.ok(background.includes("runner.consecutiveUnknownActive") && background.includes("连续 ") && background.includes("无法读取 HR 活跃度"), "consecutive unknown pauses");
+  assert.ok(background.includes("runner.consecutiveUnknownActive = 0"), "counter resets on success and batch start");
+  // 锚点缺 city 时告警
+  assert.ok(background.includes("锚点 URL 缺少 city 参数"), "anchor missing city warns");
+  // 投递前锚点一致性预检：列表与预览不一致（切搜索词/筛选）→ 暂停并提示重新预览
+  assert.ok(background.includes("sameJobListUrl") && background.includes("投递前锚点核对"), "batch start prechecks anchor vs current list");
+  assert.ok(background.includes("岗位列表已变化") && background.includes("请重新扫描预览后再投递"), "anchor mismatch pause reason guides re-preview");
+  // 消息页防卡顿：连续 N 岗自动刷新消息 tab（长会话列表累积渲染卡顿 → 桥超时暂停）
+  assert.ok(background.includes("MESSAGE_TAB_REFRESH_INTERVAL") && background.includes("自动刷新消息页"), "message tab auto-refresh interval wired");
+  assert.ok(background.includes("jobsSinceMessageRefresh") && background.includes("chrome.tabs.reload(oldId)"), "refresh counter and reload path present");
+  // BOSS 平台级每日沟通上限：检测到弹窗 → 直接停止任务（不暂停/不重试）
+  assert.ok(content.includes("detectBossDailyLimitModal") && content.includes("您已达到沟通上限"), "boss daily limit modal detection present");
+  assert.ok(background.includes("BOSS_DAILY_LIMIT") && background.includes("已停止任务"), "boss daily limit stops task without retry");
+  // 预览 enrich 限频防风控（ego 实测结论已记录：~5 次即 code 37，按 v1.7.24 行为保留 12/900）
+  assert.ok(content.includes("maxChecks") && content.includes("await sleep(900)"), "enrich throttles per-job calls");
+  // 批次开始前同步列表页内容脚本版本：避免版本热更重注入被误判为「外部变化」而偶发暂停
+  assert.ok(background.includes("内容脚本版本已同步") && background.includes("forceInjectContent(task.execution.listTabId)"), "list tab content version synced at batch start");
+  assert.ok(content.includes("ACTIVITY_BUDGET"), "enrich caps checks per scan");
+  assert.ok(content.includes("parseBossActiveLabel") && content.includes("无法归一化时保留原文"), "enrich normalizes active label like click path");
+});
+
+test("worker delivery inspects activity on the temporary detail tab only", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const trigger = extractFunctionSource(
+    background,
+    "async function triggerConversationInWorker",
+    "async function sendToBoss"
+  );
+  const activityStart = trigger.indexOf("if (selectedActiveBuckets.length)");
+  const triggerStart = trigger.indexOf("MSG.TRIGGER_CONVERSATION");
+  assert.ok(activityStart >= 0 && triggerStart > activityStart, "worker activity inspection is inside the worker flow");
+  const activityBlock = trigger.slice(activityStart, triggerStart);
+  assert.ok(trigger.includes(".filter((attempt) => attempt.mode === CONVERSATION_WORKER_MODE.DETAIL)"), "delivery filters out list fallback attempts");
+  assert.ok(activityBlock.includes("tabId: workerTab.id"), "activity inspection targets the temporary detail tab");
+  assert.ok(!activityBlock.includes("tabId: listTabId"), "activity inspection never targets the left list tab");
+  assert.ok(!trigger.includes("canFallbackWorkerMode"), "delivery no longer falls back to clicking list cards");
+  assert.ok(!trigger.includes("[列表页] 已点卡片核对 HR 活跃度"), "old list-card activity path is removed");
+});
+
+test("skip does not wait job interval and waits are logged", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  // 未触发沟通的跳过项不等待投递间隔（已触发「立即沟通」的跳过仍保留间隔）
+  assert.ok(background.includes("outcome === 'skipped' && !hasChatCheckpoint(item)"), "untriggered skips skip the interval wait");
+  assert.ok(background.includes("无需等待投递间隔"), "skip no-wait log message present");
+  // 等待前把间隔写进日志
+  assert.ok(background.includes("等待投递间隔") && background.includes("秒后继续下一岗"), "interval wait is logged with seconds");
+  assert.ok(background.includes("waitDeliveryInterval"), "interval wait publishes a visible waiting phase");
+  // 批次最后一岗不再额外等待
+  assert.ok(background.includes("qi >= queue.length - 1"), "last queue item does not wait");
+});
+
+test("browser boundary audit covers every previously partial feature", () => {
+  const page = fs.readFileSync("tests/browser/boundary-audit.html", "utf8");
+  const harness = fs.readFileSync("scripts/panel-harness-server.mjs", "utf8");
+  const stub = fs.readFileSync("tests/browser/chrome-stub.js", "utf8");
+  for (const id of [
+    "TASK-04", "MSG-10", "RUN-06", "RUN-12", "RUN-13", "RUN-14", "RUN-15",
+    "LAY-03", "LAY-06", "LAY-07", "LAY-08", "DATA-13"
+  ]) {
+    assert.ok(page.includes(id), `${id} must have an independent browser check`);
+  }
+  assert.ok(harness.includes("/background/") && harness.includes("/content/"), "browser audit serves shipped background/content source");
+  assert.ok(stub.includes("function updateTaskStatus") && stub.includes("revision: Number(state.task.revision || 0) + 1"), "panel harness control responses advance task snapshots");
+});
+
+
+await runRegisteredTests();
+
+if (!process.exitCode) console.log("flow contract tests ok");

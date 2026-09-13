@@ -1,0 +1,128 @@
+root
+  container
+    container "弹窗遮罩" [ref=16, loc=unstable]
+    container
+      svg_root
+      container
+        container
+          text "登录后查看搜索结果"
+          image
+        container
+          image
+          container
+            text "可用"
+            container
+              svg_root
+              text "小红书"
+            text "或"
+            container
+              svg_root
+              text "微信"
+            text "扫码"
+        container
+          svg_root
+          text "小红书如何扫码"
+      container
+        text "手机号登录"
+        form
+          container
+            container
+              text "+86"
+              container
+            textbox [ref=8, loc=css:input[name="xhs-pc-web-phone"]]
+              text "输入手机号"
+              container
+          container
+          container
+            spinbutton [ref=9, loc=css:input[placeholder="输入验证码"]]
+              text "输入验证码"
+              container
+            text "获取验证码"
+          container
+          button [ref=66, loc=unstable]
+            text "登录"
+        container
+          container
+          container
+            text "我已阅读并同意"
+            anchor [ref=74, loc=href:https://agree.xiaohongshu.com/h5/terms/ZXXY20220331001/-1, url=https://agree.xiaohongshu.com/h5/terms/ZXXY20220331001/-1]
+              text "《用户协议》"
+            anchor [ref=77, loc=href:https://agree.xiaohongshu.com/h5/terms/ZXXY20220509001/-1, url=https://agree.xiaohongshu.com/h5/terms/ZXXY20220509001/-1]
+              text "《隐私政策》"
+            anchor [ref=80, loc=href:https://oa.xiaohongshu.com/h5/terms/ZXXY20220516001/-1, url=https://oa.xiaohongshu.com/h5/terms/ZXXY20220516001/-1]
+              text "《儿童/青少年个人信息保护规则》"
+        text "新用户可直接登录"
+  container
+    container
+      anchor [ref=87, loc=href:/explore?channel_type=web_search_result_notes, url=https://www.xiaohongshu.com/explore?channel_type=web_search_result_notes]
+        image
+      container
+        textbox [ref=3, loc=css:input[placeholder="登录探索更多内容"]]
+          text "开源工具"
+        container
+          svg_root
+          image
+      container
+        button [ref=100, loc=unstable]
+          text "创作中心"
+        button [ref=105, loc=unstable]
+          text "业务合作"
+    container
+      container
+        unordered_list [ref=111, loc=unstable]
+          container
+            list_item
+              anchor [ref=114, loc=href:/explore?channel_id=homefeed_recommend, url=https://www.xiaohongshu.com/explore?channel_id=homefeed_recommend]
+                svg_root
+                text "发现"
+            list_item
+              anchor [ref=122, loc=href:/red_video, url=https://www.xiaohongshu.com/red_video]
+                svg_root
+                text "RED"
+            list_item
+              anchor [ref=129, loc=href:/livelist?channel_id=0&channel_type=web_live_list, url=https://www.xiaohongshu.com/livelist?channel_id=0&channel_type=web_live_list]
+                svg_root
+                text "直播"
+            list_item
+              anchor [ref=135, loc=href:https://creator.xiaohongshu.com/publish/publish?source=official, url=https://creator.xiaohongshu.com/publish/publish?source=official]
+                svg_root
+                text "发布"
+            list_item
+              anchor [ref=142, loc=href:/search_result?keyword=%E5%BC%80%E6%BA%90%E5%B7%A5%E5%85%B7&type=51#, url=https://www.xiaohongshu.com/search_result?keyword=%E5%BC%80%E6%BA%90%E5%B7%A5%E5%85%B7&type=51#]
+                svg_root
+                text "通知"
+            button [ref=149, loc=unstable]
+              text "登录"
+        container
+          container
+            svg_root
+            text "更多"
+          container
+            svg_root
+            text "关于我们"
+      container
+        container
+          container
+            text "全部"
+            text "图文"
+            text "视频"
+            text "用户"
+          container
+            text "筛选"
+            svg_root
+        container
+          svg_root
+          svg_root
+          svg_root
+          svg_root
+          svg_root
+          svg_root
+          svg_root
+          svg_root
+          svg_root
+          svg_root
+          svg_root
+          svg_root
+          svg_root
+          svg_root
+          svg_root

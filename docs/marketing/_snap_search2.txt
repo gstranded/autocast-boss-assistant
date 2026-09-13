@@ -1,0 +1,286 @@
+root
+  container
+    container
+      anchor [ref=87, loc=href:/explore?channel_type=web_search_result_notes, url=https://www.xiaohongshu.com/explore?channel_type=web_search_result_notes]
+        image
+      container
+        textbox [ref=3, loc=css:input[placeholder="登录探索更多内容"]]
+          text "登录探索更多内容"
+          container
+        image
+      container
+        button [ref=100, loc=unstable]
+          text "创作中心"
+        button [ref=105, loc=unstable]
+          text "业务合作"
+    container
+      container
+        unordered_list [ref=111, loc=unstable]
+          container
+            list_item
+              anchor [ref=114, loc=href:/explore?channel_id=homefeed_recommend, url=https://www.xiaohongshu.com/explore?channel_id=homefeed_recommend]
+                svg_root
+                text "发现"
+            list_item
+              anchor [ref=122, loc=href:/red_video, url=https://www.xiaohongshu.com/red_video]
+                svg_root
+                text "RED"
+            list_item
+              anchor [ref=129, loc=href:/livelist?channel_id=0&channel_type=web_live_list, url=https://www.xiaohongshu.com/livelist?channel_id=0&channel_type=web_live_list]
+                svg_root
+                text "直播"
+            list_item
+              anchor [ref=135, loc=href:https://creator.xiaohongshu.com/publish/publish?source=official, url=https://creator.xiaohongshu.com/publish/publish?source=official]
+                svg_root
+                text "发布"
+            list_item
+              anchor [ref=142, loc=href:/explore?source=tourist_search#, url=https://www.xiaohongshu.com/explore?source=tourist_search#]
+                svg_root
+                text "通知"
+            button [ref=149, loc=unstable]
+              text "登录"
+        container
+          container
+            svg_root
+            text "更多"
+          container
+            svg_root
+            text "关于我们"
+      container
+        container
+          container [ref=437, loc=unstable]
+            text "推荐"
+          text "推荐"
+          container [ref=441, loc=unstable]
+            text "世界杯"
+          text "世界杯"
+          container [ref=445, loc=unstable]
+            text "穿搭"
+          text "穿搭"
+          container [ref=449, loc=unstable]
+            text "美食"
+          text "美食"
+          container [ref=453, loc=unstable]
+            text "彩妆"
+          text "彩妆"
+          container [ref=457, loc=unstable]
+            text "影视"
+          text "影视"
+          container [ref=461, loc=unstable]
+            text "职场"
+          text "职场"
+          container [ref=465, loc=unstable]
+            text "情感"
+          text "情感"
+          container [ref=469, loc=unstable]
+            text "家居"
+          text "家居"
+          container [ref=473, loc=unstable]
+            text "游戏"
+          text "游戏"
+          container [ref=477, loc=unstable]
+            text "旅行"
+          text "旅行"
+          container [ref=481, loc=unstable]
+            text "健身"
+          text "健身"
+          container [ref=485, loc=unstable]
+            text "视频"
+          text "视频"
+        container
+        svg_root
+        container
+        container
+          container
+            anchor [ref=495, loc=unstable, url=https://www.xiaohongshu.com/explore/6a50ce82000000002102304a?xsec_token=ABMryxIT_JIXTl3wGk-Po8xkmap94Qj7R6PlHK7126lDw=&xsec_source=]
+              container
+              image
+              container
+            container
+              anchor [ref=498, loc=unstable, url=https://www.xiaohongshu.com/explore/6a50ce82000000002102304a?xsec_token=ABMryxIT_JIXTl3wGk-Po8xkmap94Qj7R6PlHK7126lDw=&xsec_source=]
+                text "没抱啥期待，结果好像有点不一样 "
+              container
+                anchor [ref=502, loc=unstable, url=https://www.xiaohongshu.com/user/profile/67c4a093000000000d00b7c1?channel_type=explore_feed&parent_page_channel_type=web_profile_board&xsec_token=ABEB_aNbFPQw9KwktofKGCeelnv1arXeCN5jKXLC02ArE=&xsec_source=pc_feed]
+                  image
+                  text "透明神话"
+                container
+                  container
+                  svg_root
+                  text "858"
+          container
+            anchor [ref=514, loc=unstable, url=https://www.xiaohongshu.com/explore/6a4ef46e00000000210183ae?xsec_token=AB2gtl8G4V6HVj2bHNIiclkdz81yfhqk7nPeMSEJc1Foc=&xsec_source=]
+              container
+              image
+              container
+            container
+              anchor [ref=517, loc=unstable, url=https://www.xiaohongshu.com/explore/6a4ef46e00000000210183ae?xsec_token=AB2gtl8G4V6HVj2bHNIiclkdz81yfhqk7nPeMSEJc1Foc=&xsec_source=]
+                text "盒马，请问哪个是五指毛桃"
+              container
+                anchor [ref=521, loc=unstable, url=https://www.xiaohongshu.com/user/profile/587246546a6a692adbfab649?channel_type=explore_feed&parent_page_channel_type=web_profile_board&xsec_token=ABOO6LP5KEJtecbMClgkiNSWydms57jf6VxgJ5vZtEkFs=&xsec_source=pc_feed]
+                  image
+                  text "雪宝泡芙崽"
+                container
+                  container
+                  svg_root
+                  text "1.4万"
+          container
+            anchor [ref=533, loc=unstable, url=https://www.xiaohongshu.com/explore/6a56ec310000000021016ae4?xsec_token=ABbRXl7YddLw8kyWmhhur3BfgZmtDvblzzg9QdnFaaoIk=&xsec_source=]
+              container
+              image
+              container
+            container
+              anchor [ref=536, loc=unstable, url=https://www.xiaohongshu.com/explore/6a56ec310000000021016ae4?xsec_token=ABbRXl7YddLw8kyWmhhur3BfgZmtDvblzzg9QdnFaaoIk=&xsec_source=]
+                text "好奇papi酱多有钱啊？"
+              container
+                anchor [ref=540, loc=unstable, url=https://www.xiaohongshu.com/user/profile/69757fb20000000021009858?channel_type=explore_feed&parent_page_channel_type=web_profile_board&xsec_token=AB6K7LCoAXqIrKgq1oGnuhkkwLdDL6qOTrwy67Q24ebC4=&xsec_source=pc_feed]
+                  image
+                  text "蛋挞💕"
+                container
+                  container
+                  svg_root
+                  text "169"
+          container
+            anchor [ref=552, loc=unstable, url=https://www.xiaohongshu.com/explore/6a5833f3000000000f01dcec?xsec_token=ABaTwhurw8iJ9FKBOM4tZ3fU_uv-Yxmsw_vdncoY7AK2o=&xsec_source=]
+              container
+              image
+              container
+            container
+              anchor [ref=555, loc=unstable, url=https://www.xiaohongshu.com/explore/6a5833f3000000000f01dcec?xsec_token=ABaTwhurw8iJ9FKBOM4tZ3fU_uv-Yxmsw_vdncoY7AK2o=&xsec_source=]
+                text "引人不適，請謹慎觀看！珍惜生命，遠離毒品！"
+              container
+                anchor [ref=559, loc=unstable, url=https://www.xiaohongshu.com/user/profile/5f2bbcbf00000000010035e3?channel_type=explore_feed&parent_page_channel_type=web_profile_board&xsec_token=ABSOuh3wwBNI-m7iojIO3zc0vNplgK4GZ4baaV8WoKp_4=&xsec_source=pc_feed]
+                  image
+                  text "黃二千"
+                container
+                  container
+                  svg_root
+                  text "7070"
+          container
+            anchor [ref=571, loc=unstable, url=https://www.xiaohongshu.com/explore/6a599c5a000000000101fc2f?xsec_token=AB3cNYah0RPEBuIWtpCwJ4nQ6U12yWZpcc7UpJsn8-ars=&xsec_source=]
+              container
+              image
+              svg_root
+              container
+            container
+              anchor [ref=577, loc=unstable, url=https://www.xiaohongshu.com/explore/6a599c5a000000000101fc2f?xsec_token=AB3cNYah0RPEBuIWtpCwJ4nQ6U12yWZpcc7UpJsn8-ars=&xsec_source=]
+                text "JYP会不会后悔让WonderGirls去闯美"
+              container
+                anchor [ref=581, loc=unstable, url=https://www.xiaohongshu.com/user/profile/68d8fd95000000001a01cc1c?channel_type=explore_feed&parent_page_channel_type=web_profile_board&xsec_token=ABk7Y2zXLBDaXuM88R1xxqbXB3xsApUqseNyA9r5nVLaw=&xsec_source=pc_feed]
+                  image
+                  text "小眨酱Wink"
+                container
+                  container
+                  svg_root
+                  text "2685"
+          container
+            anchor [ref=593, loc=unstable, url=https://www.xiaohongshu.com/explore/6a6194f8000000001d022fc2?xsec_token=ABaD-EddIIOL981CpZeNo3pCn6fkGNfPQPj4S_eMgl5MU=&xsec_source=]
+              container
+              image
+              container
+            container
+              anchor [ref=596, loc=unstable, url=https://www.xiaohongshu.com/explore/6a6194f8000000001d022fc2?xsec_token=ABaD-EddIIOL981CpZeNo3pCn6fkGNfPQPj4S_eMgl5MU=&xsec_source=]
+                text "翻开叶子发现两只汤圆就这么萌萌地靠在一起"
+              container
+                anchor [ref=600, loc=unstable, url=https://www.xiaohongshu.com/user/profile/6988a206000000001d00064f?channel_type=explore_feed&parent_page_channel_type=web_profile_board&xsec_token=AB4M23CGi4snTHC3DjpJ6e7k-I0uYdk5EoH3KHDqtLZBk=&xsec_source=pc_feed]
+                  image
+                  text "罐梨啤士"
+                container
+                  container
+                  svg_root
+                  text "4763"
+          container
+            anchor [ref=612, loc=unstable, url=https://www.xiaohongshu.com/explore/6a5eb5e4000000001002b3b6?xsec_token=ABvI6FopylpxY8Ovg2lRi2K0wIbeB3BfBvENSPcXqTtCw=&xsec_source=]
+              container
+              image
+              container
+            container
+              anchor [ref=615, loc=unstable, url=https://www.xiaohongshu.com/explore/6a5eb5e4000000001002b3b6?xsec_token=ABvI6FopylpxY8Ovg2lRi2K0wIbeB3BfBvENSPcXqTtCw=&xsec_source=]
+                text "世界杯没了37万，赛事结束了，我的家也跟着散了赌博的危害 戒赌只有戒赌才能上岸"
+              container
+                anchor [ref=619, loc=unstable, url=https://www.xiaohongshu.com/user/profile/614b22fc000000000202382b?channel_type=explore_feed&parent_page_channel_type=web_profile_board&xsec_token=ABaMyAhP1ZzGBmi2U-N_aOTOsrZs_GA-FgY0Vjpj9E1aY=&xsec_source=pc_feed]
+                  image
+                  text "Zoe，"
+                container
+                  container
+                  svg_root
+                  text "9127"
+          container
+            anchor [ref=631, loc=unstable, url=https://www.xiaohongshu.com/explore/6a615e33000000001c011504?xsec_token=ABaD-EddIIOL981CpZeNo3pPo4vylU1_Nqm8wE1N8V7NY=&xsec_source=]
+              container
+              image
+              svg_root
+              container
+            container
+              anchor [ref=637, loc=unstable, url=https://www.xiaohongshu.com/explore/6a615e33000000001c011504?xsec_token=ABaD-EddIIOL981CpZeNo3pPo4vylU1_Nqm8wE1N8V7NY=&xsec_source=]
+                text "店员小哥，这……谁来洗锅🥹"
+              container
+                anchor [ref=641, loc=unstable, url=https://www.xiaohongshu.com/user/profile/63a2e3d300000000260052b0?channel_type=explore_feed&parent_page_channel_type=web_profile_board&xsec_token=ABv188yvZffDtHwT9Ye1kMqyUY2LgijMi3ezsOtooV4r8=&xsec_source=pc_feed]
+                  image
+                  text "饭饼饼儿"
+                container
+                  container
+                  svg_root
+                  text "2806"
+          container
+            anchor [ref=653, loc=unstable, url=https://www.xiaohongshu.com/explore/6a515538000000000c033c00?xsec_token=ABuspH7Aj5PaWw_p4tMDLbrbjXlpWu5vQXj4KVLWEfLvU=&xsec_source=]
+              container
+              image
+              container
+            container
+              anchor [ref=656, loc=unstable, url=https://www.xiaohongshu.com/explore/6a515538000000000c033c00?xsec_token=ABuspH7Aj5PaWw_p4tMDLbrbjXlpWu5vQXj4KVLWEfLvU=&xsec_source=]
+                text "一个五岁孩子的墓，过一段时间家里人就会给他增减玩具，添上鲜花。。。父母的爱和痛苦"
+              container
+                anchor [ref=660, loc=unstable, url=https://www.xiaohongshu.com/user/profile/6a51466a000000000d035c01?channel_type=explore_feed&parent_page_channel_type=web_profile_board&xsec_token=ABuspH7Aj5PaWw_p4tMDLbrYecSSo1pj_Om-wcKt1ONpk=&xsec_source=pc_feed]
+                  image
+                  text "凡烦烦凡。。。"
+                container
+                  container
+                  svg_root
+                  text "1.7万"
+          container
+            anchor [ref=672, loc=unstable, url=https://www.xiaohongshu.com/explore/6a55abf6000000001c027574?xsec_token=ABNlDAV6xHBMUuOq5qPWUW7irA8XyZe-ohKLRtSCq6HN4=&xsec_source=]
+              container
+              image
+              container
+            container
+              anchor [ref=675, loc=unstable, url=https://www.xiaohongshu.com/explore/6a55abf6000000001c027574?xsec_token=ABNlDAV6xHBMUuOq5qPWUW7irA8XyZe-ohKLRtSCq6HN4=&xsec_source=]
+                text "拼豆可以美到什么程度"
+              container
+                anchor [ref=679, loc=unstable, url=https://www.xiaohongshu.com/user/profile/6a30a66f000000000f038002?channel_type=explore_feed&parent_page_channel_type=web_profile_board&xsec_token=AB8FHLWwu4E3E5BSmJTPjyfIvEIwvBfuw-bBA0lHwfOso=&xsec_source=pc_feed]
+                  image
+                  text "今天想睡觉"
+                container
+                  container
+                  svg_root
+                  text "3299"
+          container
+            anchor [ref=691, loc=unstable, url=https://www.xiaohongshu.com/explore/6a5c3547000000001101c1a1?xsec_token=AB3KNaRohQE3bixg-QoDwqeJyqXKBnO5EsNGSf-q2_9kI=&xsec_source=]
+              container
+              image
+              container
+          container
+            anchor [ref=702, loc=unstable, url=https://www.xiaohongshu.com/explore/6a5fe693000000000f01ef58?xsec_token=ABsHrcIlmjJGqEhjdghlj9huIom0VsguwWDZRycUSAe2o=&xsec_source=]
+              container
+              image
+              svg_root
+              container
+          container
+            anchor [ref=716, loc=unstable, url=https://www.xiaohongshu.com/explore/6a59ff8c0000000011005e42?xsec_token=AB3cNYah0RPEBuIWtpCwJ4neR-0T9C3qxv1zBtpcPPqMo=&xsec_source=]
+              container
+              image
+              svg_root
+              container
+          container
+            anchor [ref=730, loc=unstable, url=https://www.xiaohongshu.com/explore/6a5146f100000000070263d6?xsec_token=ABuspH7Aj5PaWw_p4tMDLbrUewT5MfDG-DUle9Qv59whQ=&xsec_source=]
+              container
+              image
+              container
+          container
+            anchor [ref=741, loc=unstable, url=https://www.xiaohongshu.com/explore/6a5da51c000000000f03098d?xsec_token=ABPiQmlXedlRweS37QfPlFkSubN3RDBi8_e50yl_5hgRw=&xsec_source=]
+              container
+              image
+              svg_root
+              container
+          container
+            svg_root
+            svg_root

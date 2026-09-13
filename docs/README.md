@@ -6,6 +6,10 @@
 
 | 文档 | 说明 |
 |------|------|
+| [Agent 必读（仓库根 AGENTS.md）](../AGENTS.md) | 分支、双目录、Chrome/ego 加载约定；改代码前必读 |
+| [开发与发版工作流](./DEV_WORKFLOW.md) | `dev` 开发、合入 `main`、再发版；Chrome 稳定 / ego 开发 |
+| [安装与更新图文教程](./INSTALL.md) | Release ZIP、Git、浏览器商店三种安装方式，以及配置保留说明 |
+| [功能对照与产品路线图](./FEATURE_ROADMAP.md) | 对照同类项目，记录适合 AutoCast 的功能优先级与边界 |
 | [产品需求文档（PRD）](./requirements/PRD.md) | 产品定位、目标用户、功能范围、优先级、验收标准 |
 | [功能需求规格](./requirements/FRS.md) | 可开发的功能点拆解、状态机、规则语义、数据实体 |
 | [非功能需求](./requirements/NFR.md) | 性能、安全、隐私、稳定性、兼容性 |
