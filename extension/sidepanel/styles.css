@@ -564,6 +564,9 @@ select:disabled { cursor: not-allowed; opacity: 0.46; }
 .check { display: flex; align-items: center; gap: 6px; color: var(--text); width: fit-content; }
 .check input { width: auto; flex: 0 0 auto; }
 .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.setting-number-row { display: flex; align-items: center; gap: 6px; }
+.setting-number-row input { min-width: 0; flex: 1 1 auto; }
+.setting-number-row span { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
 .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
 .thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .thumbs img { width: 64px; height: 64px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); cursor: zoom-in; transition: border-color 0.15s ease, transform 0.15s ease; }

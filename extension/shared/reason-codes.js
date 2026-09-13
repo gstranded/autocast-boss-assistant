@@ -78,7 +78,7 @@ const REASON_TEXT = {
   EXEC_CLICK_FAIL: '点击立即沟通失败',
   EXEC_SEND_TEXT_FAIL: '文本消息发送失败',
   EXEC_SEND_IMAGE_FAIL: '图片简历发送失败',
-  EXEC_VAR_RENDER_FAIL: '模板变量渲染失败，已阻止发送',
+  EXEC_VAR_RENDER_FAIL: '模板变量填写错误，请检查，已阻止发送',
   EXEC_RESUME_MISSING: '绑定简历缺失文件',
   EXEC_USER_SKIP: '用户跳过当前岗位',
   EXEC_USER_PAUSE: '用户暂停任务',

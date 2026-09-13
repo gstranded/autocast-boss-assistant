@@ -37,7 +37,10 @@ import {
 import { pickResumeProfile } from '../shared/template.js';
 import { planResumeSend } from '../shared/resume-policy.js';
 import { REASON, reasonText } from '../shared/reason-codes.js';
-import { TASK_STATUS } from '../shared/constants.js';
+import {
+  TASK_STATUS,
+  normalizeTargetNoNewRetryLimit
+} from '../shared/constants.js';
 import { isBossUrl, isBossTab, bossUrlGuardMessage, BOSS_MATCH_PATTERNS } from '../shared/boss-url.js';
 import { didContentDocumentChange, isBossJobListUrl, resolveBossJobListUrl, sameJobListUrl } from '../shared/job-list-navigation.js';
 import { normalizeMatchText, normalizeText, randomBetween, sleep, uid } from '../shared/text-utils.js';
@@ -2916,7 +2919,6 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
     const collectionResultReceivedAt = Date.now();
     const collectionFinishedAt = Number(scan.scanMeta?.collectionFinishedAt || 0) ||
       Math.min(collectionResultReceivedAt, deadlineAt);
-    runner.previewScanFinishedAt = Math.min(collectionFinishedAt, deadlineAt);
     // 扫描结束回顶：投递从队列开头开始，把职位列表滚回顶部方便用户直接核对队首岗位
     await sendToBoss(MSG.SCROLL_LIST_TOP, {}, {
       tabId: sourcePreviewTab?.id || previewTab?.id || null,
@@ -2993,6 +2995,11 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
       });
     }
     if (stop.reason === PREVIEW_SCAN_STOP.BATCH_ERROR) warnings.push('继续加载异常：' + continuationError);
+    // 面板上的扫描计时覆盖完整流程：滚动采集、筛选以及 HR 活跃度核对。
+    // collectionFinishedAt / scrollElapsedMs 只用于诊断滚动阶段，不应让 UI
+    // 在进入 filtering 后提前停止计时。
+    const previewFinishedAt = Date.now();
+    runner.previewScanFinishedAt = previewFinishedAt;
     const scanMeta = {
       ...(scan.scanMeta || {}),
       uniqueCount: collectedJobs.size,
@@ -3003,7 +3010,7 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
       scanTabId: sourcePreviewTab.id,
       stopReason: stop.reason,
       stopMessage: stop.message,
-      elapsedMs: Date.now() - previewStartedAt,
+      elapsedMs: previewFinishedAt - previewStartedAt,
       scrollElapsedMs: collectionFinishedAt - scanStartedAt,
       collectionFinishedAt,
       collectionResultReceivedAt,
@@ -3127,12 +3134,18 @@ function mergeRefreshedTask(previousTask, freshTask, refreshMeta = {}) {
     previousTask?.queue || [],
     previousTask?.testedJobIds || []
   );
-  const queue = rebuildDeliveryQueue(
+  const rebuiltQueue = rebuildDeliveryQueue(
     mergedResults.results,
     previousTask?.queue || [],
     Array.from(doneIds)
   );
-  const queueCursor = Math.max(0, queue.findIndex((item) => item.status === 'pending'));
+  // results/items 保留完整历史，用于去重、累计成功数和展示统计；但刷新后的
+  // 当前投递队列只保留可运行岗位。这样上一批已经 done/skipped/failed 的岗位
+  // 不会再次占据新批次的队列序号，新的批次从第 1 个待投岗位开始。
+  const queue = rebuiltQueue
+    .filter((item) => item.status === 'pending')
+    .map((item, index) => ({ ...item, index }));
+  const queueCursor = 0;
   const previousRefreshes = Array.isArray(previousTask?.refreshHistory)
     ? previousTask.refreshHistory
     : [];
@@ -3341,7 +3354,9 @@ async function recordTargetModeHalt(task, message, level = 'warn') {
     taskId: task.id,
     targetCount: Number(task.targetCount || 0),
     success: Number(task.counters?.success || 0),
-    refreshCount: Number(task.targetRefreshCount || 0)
+    refreshCount: Number(task.targetRefreshCount || 0),
+    noNewRounds: Number(task.targetNoNewRounds || 0),
+    noNewRetryLimit: Number(task.targetNoNewRetryLimit || 0)
   });
 }
 
@@ -3426,8 +3441,31 @@ async function runTargetDeliveryLoop(taskId, taskRunId = uid('run')) {
       }
       const pending = (refreshed.task.queue || []).some((item) => item.status === 'pending');
       if (!pending) {
-        await recordTargetModeHalt(refreshed.task, `第 ${refreshCount} 轮扫描没有新增可投递岗位，目标未达成；成功 ${refreshed.task.counters?.success || 0}/${refreshed.task.targetCount}`);
-        return { ok: false, error: 'TARGET_NO_NEW_JOBS', task: refreshed.task };
+        const noNewRounds = Number(refreshed.task.targetNoNewRounds || 0) + 1;
+        const noNewRetryLimit = normalizeTargetNoNewRetryLimit(
+          refreshed.task.targetNoNewRetryLimit,
+          all.settings?.targetNoNewRetryLimit
+        );
+        refreshed.task.targetNoNewRounds = noNewRounds;
+        refreshed.task.targetNoNewRetryLimit = noNewRetryLimit;
+        await publishTask(refreshed.task);
+        await log('warn', `[目标模式] 第 ${refreshCount} 轮扫描没有新增可投递岗位；连续无新增重试 ${noNewRounds}/${noNewRetryLimit}，成功 ${refreshed.task.counters?.success || 0}/${refreshed.task.targetCount}`, {
+          taskId,
+          noNewRounds,
+          noNewRetryLimit,
+          refreshCount
+        });
+        if (noNewRounds >= noNewRetryLimit) {
+          await recordTargetModeHalt(refreshed.task, `连续 ${noNewRounds} 轮扫描没有新增可投递岗位，目标未达成；已达到无新增重试上限 ${noNewRetryLimit} 轮，自动停止。成功 ${refreshed.task.counters?.success || 0}/${refreshed.task.targetCount}`);
+          return { ok: false, error: 'TARGET_NO_NEW_JOBS_LIMIT', task: refreshed.task };
+        }
+        // 没有新岗位时继续刷新；下一轮仍会从持久化任务恢复，不需要用户再次点击。
+        continue;
+      }
+      if (Number(refreshed.task.targetNoNewRounds || 0) > 0) {
+        refreshed.task.targetNoNewRounds = 0;
+        refreshed.task.targetLastError = '';
+        await publishTask(refreshed.task);
       }
       // refreshAndContinue leaves the merged task in awaiting_confirm. The next
       // loop consumes its pending queue without requiring another button click.
@@ -4343,18 +4381,21 @@ async function runTaskLoop(taskId, taskRunId = uid('run')) {
     task.updatedAt = Date.now();
     await publishTask(task);
 
-    // 队列以预览快照为准（不是回页后再猜）
-    // 始终按 selected 重建 pending 视图，并去重
+    // 队列以预览快照为准（不是回页后再猜）。确认启动时已经按当前
+    // 选择构建了队列；刷新并继续时更要保留“当前刷新批次”，不能从
+    // 合并后的历史 results 重新把上一批岗位放回队列。
     {
-      const rebuilt = buildDeliveryQueue(task.results || [], { selectedOnly: true });
-      // 保留已完成状态
-      task.queue = rebuilt.map((q) => {
-        const old = (task.queue || []).find((candidate) => jobsShareMergeIdentity(candidate, q));
-        if (old && (old.status === 'done' || old.status === 'skipped' || old.status === 'failed')) {
-          return { ...q, status: old.status, outcome: old.outcome, finishedAt: old.finishedAt };
-        }
-        return q;
-      });
+      const persistedQueue = Array.isArray(task.queue) ? task.queue : null;
+      const rebuilt = persistedQueue
+        ? persistedQueue.map((q, index) => ({
+            ...q,
+            index,
+            status: ['pending', 'done', 'skipped', 'failed'].includes(q.status)
+              ? q.status
+              : 'pending'
+          }))
+        : buildDeliveryQueue(task.results || [], { selectedOnly: true });
+      task.queue = rebuilt;
       if (task.queueCursor == null) task.queueCursor = 0;
       await publishTask(task);
     }
@@ -4986,6 +5027,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const targetCount = Number.isFinite(requestedTargetCount)
           ? Math.max(1, Math.min(500, Math.floor(requestedTargetCount)))
           : 0;
+        const targetNoNewRetryLimit = normalizeTargetNoNewRetryLimit(
+          payload?.targetNoNewRetryLimit,
+          all.settings?.targetNoNewRetryLimit
+        );
         if (targetMode && !targetCount) {
           return { ok: false, error: 'TARGET_COUNT_INVALID', message: '目标模式需要设置 1-500 份成功投递目标' };
         }
@@ -4994,6 +5039,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         task.targetMode = targetMode;
         task.targetCount = targetMode ? targetCount : 0;
+        task.targetNoNewRetryLimit = targetMode ? targetNoNewRetryLimit : 0;
+        task.targetNoNewRounds = 0;
         task.targetLastError = '';
         if (targetMode && isTargetDeliveryReached(task)) {
           task.status = TASK_STATUS.COMPLETED;
@@ -5019,6 +5066,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!targetMode) {
           delete task.targetStartedAt;
           delete task.targetRefreshCount;
+          delete task.targetNoNewRetryLimit;
+          delete task.targetNoNewRounds;
         }
 
         // 单份投完后 status 可能是 completed/stopped：允许直接进入批量
@@ -5151,7 +5200,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           scheduled: scheduledStart.waiting,
           nextStartAt: task.scheduleNextStartAt || null,
           targetMode,
-          targetCount: targetMode ? targetCount : 0
+          targetCount: targetMode ? targetCount : 0,
+          targetNoNewRetryLimit: targetMode ? targetNoNewRetryLimit : 0
         };
         });
       }

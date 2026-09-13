@@ -9,7 +9,13 @@ import {
 } from "../extension/shared/filter-engine.js";
 import { includesKeyword, isSimilar, normalizeMatchText, parseSalaryRange, normalizeText, parseKeywords } from "../extension/shared/text-utils.js";
 import { planMessageSegments } from "../extension/shared/message-planner.js";
-import { MESSAGE_MODES, MESSAGE_SEGMENT_KINDS, STORAGE_KEYS } from "../extension/shared/constants.js";
+import {
+  DEFAULT_TARGET_NO_NEW_RETRY_LIMIT,
+  MESSAGE_MODES,
+  MESSAGE_SEGMENT_KINDS,
+  STORAGE_KEYS,
+  normalizeTargetNoNewRetryLimit
+} from "../extension/shared/constants.js";
 import {
   NATIVE_GREETING_STATES,
   normalizeMessageSegmentKind,
@@ -413,6 +419,25 @@ test("render template ok", () => {
 });
 test("render template missing fails", () => {
   assert.equal(renderTemplate("你好{职位名称}", {}).ok, false);
+});
+test("render template names invalid variable and correction", () => {
+  const rt = renderTemplate("你好{职位信息}", { title: "后端" });
+  assert.equal(rt.ok, false);
+  assert.ok(rt.reasonTexts[0].includes("模板变量填写错误，请检查，已阻止发送"));
+  assert.ok(rt.reasonTexts[0].includes("{职位信息}"));
+  assert.ok(rt.reasonTexts[0].includes("{职位名称}"));
+  assert.ok(rt.reasonTexts[0].includes("消息"));
+  const custom = renderTemplate("你好{职位}", { title: "后端" });
+  assert.equal(custom.ok, false);
+  assert.ok(custom.reasonTexts[0].includes("变量「{职位}」"));
+  assert.ok(!custom.reasonTexts[0].includes("变量「{职位信息}」"));
+});
+test("target no-new retry limit has a safe default and clamp", () => {
+  assert.equal(DEFAULT_TARGET_NO_NEW_RETRY_LIMIT, 5);
+  assert.equal(normalizeTargetNoNewRetryLimit(undefined), 5);
+  assert.equal(normalizeTargetNoNewRetryLimit(0), 1);
+  assert.equal(normalizeTargetNoNewRetryLimit(999), 50);
+  assert.equal(normalizeTargetNoNewRetryLimit("7"), 7);
 });
 test("pickResumeProfile priority", () => {
   const resumes = {
@@ -2081,6 +2106,11 @@ test("refresh merge keeps previous jobs and removes new-batch duplicates", () =>
   assert.equal(merged.added, 1);
   const queue = rebuildDeliveryQueue(merged.results, [{ jobId: "a", status: "done" }], ["a"]);
   assert.deepEqual(queue.map((item) => [item.jobId, item.status]), [["a", "done"], ["c", "pending"]]);
+  const currentRefreshBatch = queue
+    .filter((item) => item.status === "pending")
+    .map((item, index) => ({ ...item, index }));
+  assert.deepEqual(currentRefreshBatch.map((item) => [item.jobId, item.status, item.index]), [["c", "pending", 0]],
+    "a refresh batch starts at queue position 1 while historical done jobs remain available for dedupe");
   const refreshed = rebuildDeliveryQueue(
     [
       { decision: "pass", selected: true, job: { jobId: "failed", title: "失败岗", company: "A" } },

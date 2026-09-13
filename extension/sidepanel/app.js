@@ -2,7 +2,12 @@ import { MSG } from '../shared/messaging.js';
 import { parseKeywords, uid } from '../shared/text-utils.js';
 import { reasonText } from '../shared/reason-codes.js';
 import { previewReasonLines, normalizeActiveWithin } from '../shared/filter-engine.js';
-import { MESSAGE_SEGMENT_KINDS, STORAGE_KEYS } from '../shared/constants.js';
+import {
+  DEFAULT_TARGET_NO_NEW_RETRY_LIMIT,
+  MESSAGE_SEGMENT_KINDS,
+  STORAGE_KEYS,
+  normalizeTargetNoNewRetryLimit
+} from '../shared/constants.js';
 import { mergeResumeImages } from '../shared/resume-images.js';
 import { normalizeMessageSegmentKind } from '../shared/greeting-policy.js';
 import {
@@ -523,7 +528,7 @@ function setBossMode(isBoss, reason = '') {
   state.isBoss = effectiveBoss;
   state.bossBlockReason = effectiveBoss ? '' : (reason || '');
   if (!effectiveBoss) {
-    ['btnPreview', 'btnDiagnose', 'btnStart', 'btnTestOne', 'btnTargetMode', 'targetDeliveryCount', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
+    ['btnPreview', 'btnDiagnose', 'btnStart', 'btnTestOne', 'btnTargetMode', 'targetDeliveryCount', 'targetNoNewRetryLimit', 'btnPause', 'btnResume', 'btnSkip', 'btnStop'].forEach((id) => {
       const el = $(id);
       if (!el) return;
       el.disabled = true;
@@ -673,6 +678,10 @@ function fillSettings(settings) {
   $('companyDailyMax').value = settings.companyDailyMax;
   $('bossCooldownDays').value = settings.bossCooldownDays;
   $('consecutiveFailPause').value = settings.consecutiveFailPause;
+  $('targetNoNewRetryLimit').value = normalizeTargetNoNewRetryLimit(
+    settings.targetNoNewRetryLimit,
+    DEFAULT_TARGET_NO_NEW_RETRY_LIMIT
+  );
   $('jobIntervalSec').value = intervalBaseFromMs(settings.jobIntervalMs);
   $('neverRepeatJob').checked = settings.neverRepeatJob !== false;
   $('splitViewEnabled').checked = settings.splitViewEnabled !== false;
@@ -956,6 +965,7 @@ function readSettingsPatch(base) {
     companyDailyMax: Number($('companyDailyMax').value || 3),
     bossCooldownDays: Number($('bossCooldownDays').value || 30),
     consecutiveFailPause: Number($('consecutiveFailPause').value || 3),
+    targetNoNewRetryLimit: normalizeTargetNoNewRetryLimit($('targetNoNewRetryLimit').value),
     jobIntervalMs: intervalMsFromBase(Number($('jobIntervalSec').value || 5)),
     neverRepeatJob: $('neverRepeatJob').checked,
     splitViewEnabled: $('splitViewEnabled').checked,
@@ -1618,7 +1628,13 @@ function describeTaskPhase(task, status) {
       return `投递间隔等待中 · 还剩 ${remain} 秒`;
     }
     const target = task?.targetMode && task?.targetCount
-      ? `目标 ${task.counters?.success || 0}/${task.targetCount}`
+      ? `成功投递 ${task.counters?.success || 0}/${task.targetCount}` +
+        (Number(task.targetRefreshCount || 0) > 0
+          ? ` · 刷新轮次 ${task.targetRefreshCount}`
+          : '') +
+        (Number(task.targetNoNewRounds || 0) > 0
+          ? ` · 无新增重试 ${task.targetNoNewRounds}/${normalizeTargetNoNewRetryLimit(task.targetNoNewRetryLimit)}`
+          : '')
       : '';
     const prog = qLen ? `第 ${Math.min(qCur || 1, qLen)}/${qLen} 岗` : (pass ? `进度 ${done}/${pass}` : '运行中');
     return [target, prog, curTitle ? `当前：${curTitle}` : ''].filter(Boolean).join(' · ');
@@ -1717,12 +1733,14 @@ function updateTaskUI(task, runner = {}) {
     }
     else if (waitingInterval) hint = `上一岗已处理完，正在等待投递间隔（还剩 ${waitRemain} 秒），随后继续下一岗。可暂停或停止。`;
     else if (status === 'running') hint = task?.targetMode
-      ? `目标模式运行中：成功 ${task.counters?.success || 0}/${task.targetCount}，当前批次不足时会自动刷新并恢复筛选。`
+      ? `目标模式运行中：成功投递 ${task.counters?.success || 0}/${task.targetCount}` +
+        (Number(task.targetRefreshCount || 0) > 0 ? `；刷新轮次 ${task.targetRefreshCount}` : '') +
+        `；没有新岗位时最多连续重试 ${normalizeTargetNoNewRetryLimit(task.targetNoNewRetryLimit)} 轮。`
       : '运行中：可「暂停 / 跳过 / 停止」。停止后可再批量投递剩余岗位。';
     else if (status === 'paused' && task?.pauseSource === 'schedule') hint = `${task.pauseReason || '等待下一个投递时段'}；进入时段后自动继续。`;
     else if (status === 'paused') hint = '已暂停：点「继续」恢复当前队列；或「停止」后重新批量投递。';
     else if (status === 'awaiting_confirm') hint = state.targetModeEnabled
-      ? `目标模式已${task?.targetMode ? '保存' : '开启'}：设置成功目标后点「批量投递」，不足时会自动刷新列表。`
+      ? `目标模式已${task?.targetMode ? '保存' : '开启'}：设置成功投递目标和无新增重试上限后点「批量投递」。`
       : '预览已就绪：可「投递一份」试投，或「批量投递」勾选岗位。';
     else if (status === 'completed' || status === 'stopped') {
       hint = pending > 0
@@ -1795,7 +1813,7 @@ function updateTaskUI(task, runner = {}) {
     $('btnStart').disabled = !canBatch;
     $('btnStart').classList.toggle('is-armed', canBatch && (status === 'awaiting_confirm' || status === 'completed' || status === 'stopped'));
     $('btnStart').title = canBatch
-      ? (targetEnabled ? `目标模式：投递至 ${$('targetDeliveryCount')?.value || task?.targetCount || 10} 份成功` : (hasPending ? '批量投递当前勾选/剩余通过岗位' : '批量投递勾选岗位'))
+      ? (targetEnabled ? `目标模式：成功投递 ${$('targetDeliveryCount')?.value || task?.targetCount || 10} 份` : (hasPending ? '批量投递当前勾选/剩余通过岗位' : '批量投递勾选岗位'))
       : (isRunning ? '任务运行中，请先停止' : isPaused ? '任务已暂停，请点继续或先停止' : '请先扫描预览');
   }
   if ($('btnTestOne')) {
@@ -1811,7 +1829,9 @@ function updateTaskUI(task, runner = {}) {
     $('btnTargetMode').classList.toggle('is-armed', active);
     $('btnTargetMode').setAttribute('aria-pressed', active ? 'true' : 'false');
     $('btnTargetMode').textContent = active ? '目标模式：开启' : '目标模式：关闭';
-    $('btnTargetMode').title = active ? '批量投递将持续刷新列表，直到成功达到目标份数' : '开启后批量投递会自动刷新列表，直到成功达到目标份数';
+    $('btnTargetMode').title = active
+      ? `批量投递将持续刷新列表，直到成功达到目标份数；连续无新增达到 ${normalizeTargetNoNewRetryLimit($('targetNoNewRetryLimit')?.value)} 轮后停止`
+      : '开启后批量投递会自动刷新列表，直到成功达到目标份数';
   }
   if ($('targetDeliveryCount')) {
     const targetInput = $('targetDeliveryCount');
@@ -1821,6 +1841,16 @@ function updateTaskUI(task, runner = {}) {
       targetInput.value = targetCountValue;
     }
     targetInput.disabled = !onBoss || executionBusy || !targetEnabled;
+  }
+  if ($('targetNoNewRetryLimit')) {
+    const retryInput = $('targetNoNewRetryLimit');
+    const retryValue = task?.targetMode && Number(task.targetNoNewRetryLimit) > 0
+      ? String(task.targetNoNewRetryLimit)
+      : String(retryInput.value || DEFAULT_TARGET_NO_NEW_RETRY_LIMIT);
+    if (retryValue && document.activeElement !== retryInput) retryInput.value = retryValue;
+    // 这是设置项，不依赖目标模式开关；用户可以先在「设置」里配置，
+    // 开启目标模式后直接使用。运行中的任务仍锁定，避免修改当前任务快照。
+    retryInput.disabled = !onBoss || executionBusy;
   }
   if ($('btnPreview')) $('btnPreview').disabled = !(onBoss && !executionBusy && status !== 'running');
   if ($('btnDiagnose')) $('btnDiagnose').disabled = !onBoss;
@@ -3128,6 +3158,7 @@ function bindEvents() {
           testOne: { disabled: !!$('btnTestOne')?.disabled, title: $('btnTestOne')?.title || '' },
           targetMode: { enabled: state.targetModeEnabled === true, disabled: !!$('btnTargetMode')?.disabled, title: $('btnTargetMode')?.title || '' },
           targetCount: $('targetDeliveryCount')?.value || '',
+          targetNoNewRetryLimit: $('targetNoNewRetryLimit')?.value || '',
           start: { disabled: !!$('btnStart')?.disabled }
         },
         runner: state.config?.runner || null,
@@ -3202,6 +3233,8 @@ function bindEvents() {
           targetMode: state.config?.task?.targetMode === true,
           targetCount: state.config?.task?.targetCount || 0,
           targetRefreshCount: state.config?.task?.targetRefreshCount || 0,
+          targetNoNewRounds: state.config?.task?.targetNoNewRounds || 0,
+          targetNoNewRetryLimit: state.config?.task?.targetNoNewRetryLimit || 0,
           targetLastError: state.config?.task?.targetLastError || '',
           testedJobIds: state.config?.task?.testedJobIds || [],
           items: (state.config?.task?.items || []).slice(-3).map((it) => ({
@@ -3277,6 +3310,9 @@ function bindEvents() {
     if (state.targetModeEnabled && !$('targetDeliveryCount')?.value) {
       $('targetDeliveryCount').value = '10';
     }
+    if (state.targetModeEnabled && !$('targetNoNewRetryLimit')?.value) {
+      $('targetNoNewRetryLimit').value = String(DEFAULT_TARGET_NO_NEW_RETRY_LIMIT);
+    }
     if (state.targetModeEnabled && !state.targetCountDraft) {
       state.targetCountDraft = String($('targetDeliveryCount')?.value || '10');
     }
@@ -3293,6 +3329,11 @@ function bindEvents() {
     const value = Math.max(1, Math.min(500, Math.floor(Number(input.value) || 1)));
     input.value = String(value);
     state.targetCountDraft = String(value);
+  });
+
+  $('targetNoNewRetryLimit')?.addEventListener('change', () => {
+    const input = $('targetNoNewRetryLimit');
+    input.value = String(normalizeTargetNoNewRetryLimit(input.value));
   });
 
   $('btnDiagnose')?.addEventListener('click', async () => {
@@ -3322,6 +3363,7 @@ function bindEvents() {
     const task = state.config?.task;
     const targetMode = state.targetModeEnabled === true;
     const targetCount = Math.max(1, Math.min(500, Math.floor(Number($('targetDeliveryCount')?.value || 0))));
+    const targetNoNewRetryLimit = normalizeTargetNoNewRetryLimit($('targetNoNewRetryLimit')?.value);
     const doneIds = collectDoneJobIds(task?.items, task?.queue, task?.testedJobIds);
     // 若没勾选，或勾选的都已投完：自动改选剩余未投通过岗
     const pendingPassIds = (task?.results || [])
@@ -3353,7 +3395,8 @@ function bindEvents() {
       selectedJobIds,
       mode: 'batch',
       targetMode,
-      targetCount
+      targetCount,
+      targetNoNewRetryLimit
     });
     if (!res?.ok) {
       toast(res?.message || res?.error || '启动失败', 'error', 3500);
@@ -3361,7 +3404,7 @@ function bindEvents() {
     } else {
       state.targetCountDraft = '';
       const message = res.targetMode
-        ? `目标模式已开始：成功目标 ${res.targetCount} 份，不足时会自动刷新列表`
+        ? `目标模式已开始：成功投递目标 ${res.targetCount} 份，无新增最多连续重试 ${res.targetNoNewRetryLimit || targetNoNewRetryLimit} 轮`
         : res.scheduled
         ? '已加入定时队列，将在下一个投递时段自动开始'
         : res.splitView?.ok

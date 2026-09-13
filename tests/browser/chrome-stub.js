@@ -13,6 +13,8 @@
   const listeners = [];
   const calls = [];
   const duplicateResumeFixture = new URLSearchParams(location.search).get("duplicateResume") === "1";
+  const runnerFixture = new URLSearchParams(location.search).get("runner") || "";
+  const runnerFixtureStartedAt = Date.now() - 5200;
   const resumeFixtureImage = {
     name: "resume.png",
     size: 68,
@@ -101,7 +103,15 @@
     task: null,
     logs: [{ id: "log_1", ts: Date.now(), level: "info", message: "测试容器已连接" }],
     dailyStats: {},
-    runner: {}
+    runner: runnerFixture === "filtering"
+      ? {
+          previewing: true,
+          previewStartedAt: runnerFixtureStartedAt,
+          previewScanStartedAt: runnerFixtureStartedAt,
+          previewScanFinishedAt: 0,
+          previewPhase: "filtering"
+        }
+      : {}
   };
   state.settings = { ...state.settings, ...(storage.bht_settings || {}) };
 

@@ -11,6 +11,18 @@ const VAR_MAP = {
   工作城市: (ctx) => ctx.city || ctx.location || ''
 };
 
+const TEMPLATE_VARIABLES = Object.freeze(Object.keys(VAR_MAP));
+
+function describeMissingVariable(key) {
+  if (!VAR_MAP[key]) {
+    if (key === '职位信息') {
+      return '消息模板中的变量「{职位信息}」不受支持，请到「消息」页改为「{职位名称}」';
+    }
+    return `消息模板中的变量「{${key}}」不受支持，请到「消息」页修改；可用变量：${TEMPLATE_VARIABLES.map((name) => `{${name}}`).join('、')}`;
+  }
+  return `消息模板中的变量「{${key}}」当前没有可替换内容，请到「消息」页检查`;
+}
+
 export function renderTemplate(text, ctx = {}, { failOnMissing = true } = {}) {
   let missing = [];
   const rendered = String(text || '').replace(VAR_RE, (_, rawKey) => {
@@ -29,12 +41,13 @@ export function renderTemplate(text, ctx = {}, { failOnMissing = true } = {}) {
   });
 
   if (failOnMissing && (missing.length || /\{[^}]+\}/.test(rendered))) {
+    const details = Array.from(new Set(missing.map(describeMissingVariable)));
     return {
       ok: false,
       text: rendered,
       missing,
       reasonCodes: [REASON.EXEC_VAR_RENDER_FAIL],
-      reasonTexts: [reasonText(REASON.EXEC_VAR_RENDER_FAIL, missing.join(','))]
+      reasonTexts: [reasonText(REASON.EXEC_VAR_RENDER_FAIL, details.join('；'))]
     };
   }
   return { ok: true, text: rendered, missing: [], reasonCodes: [], reasonTexts: [] };

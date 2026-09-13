@@ -39,7 +39,7 @@
         <!-- TASK -->
         <section class="panel active" id="tab-task">
           <div class="card">
-            <div class="card-title" data-help-title="任务控制" data-help="先扫描当前职位列表并核对预览，再批量投递。任务启动后会把职位列表与消息中心排成左右两个窗口，方便同时观察。">任务控制</div>
+            <div class="card-title" data-help-title="任务控制" data-help="先扫描当前职位列表并核对预览，再批量投递。目标模式会持续刷新补充岗位；若连续多轮没有新增可投岗位，会在达到你设置的重试上限后自动停止。">任务控制</div>
             <div class="task-actions">
               <div class="task-primary-actions">
                 <button id="btnPreview" class="btn primary command-btn">扫描预览</button>
@@ -48,7 +48,7 @@
               <div class="target-mode-controls">
                 <button id="btnTargetMode" class="btn command-btn" type="button" aria-pressed="false">目标模式：关闭</button>
                 <label class="target-count-field" for="targetDeliveryCount">
-                  <span>成功目标</span>
+                  <span>成功投递目标</span>
                   <input id="targetDeliveryCount" type="number" min="1" max="500" value="10" inputmode="numeric" />
                   <span>份</span>
                 </label>
@@ -461,6 +461,13 @@
               <div>
                 <label data-help-title="连续失败暂停" data-help="连续失败达到这个次数后自动暂停，避免页面变化时继续误操作。">连续失败暂停</label>
                 <input id="consecutiveFailPause" type="number" min="1" />
+              </div>
+              <div>
+                <label for="targetNoNewRetryLimit" data-help-title="目标模式无新增岗位时重试" data-help="目标模式每次刷新后，如果没有发现新的可投递岗位，就继续刷新并重试。达到这里设置的轮数后才自动停止；普通批量投递不受影响。">目标模式无新增岗位时重试</label>
+                <div class="setting-number-row">
+                  <input id="targetNoNewRetryLimit" type="number" min="1" max="50" value="5" inputmode="numeric" />
+                  <span>轮后停止</span>
+                </div>
               </div>
             </div>
             <label class="check" data-help-title="同一职位永不重复" data-help="开启后，历史中已经沟通过的职位不会再次进入投递队列。"><input type="checkbox" id="neverRepeatJob" />同一职位永不重复</label>

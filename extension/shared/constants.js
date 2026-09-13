@@ -35,6 +35,20 @@ export const TASK_STATUS = {
   FAILED: 'failed'
 };
 
+export const DEFAULT_TARGET_NO_NEW_RETRY_LIMIT = 5;
+export const MIN_TARGET_NO_NEW_RETRY_LIMIT = 1;
+export const MAX_TARGET_NO_NEW_RETRY_LIMIT = 50;
+
+export function normalizeTargetNoNewRetryLimit(value, fallback = DEFAULT_TARGET_NO_NEW_RETRY_LIMIT) {
+  const fallbackValue = Number.isFinite(Number(fallback))
+    ? Math.max(MIN_TARGET_NO_NEW_RETRY_LIMIT, Math.min(MAX_TARGET_NO_NEW_RETRY_LIMIT, Math.floor(Number(fallback))))
+    : DEFAULT_TARGET_NO_NEW_RETRY_LIMIT;
+  const numeric = Number(value);
+  return Number.isFinite(numeric)
+    ? Math.max(MIN_TARGET_NO_NEW_RETRY_LIMIT, Math.min(MAX_TARGET_NO_NEW_RETRY_LIMIT, Math.floor(numeric)))
+    : fallbackValue;
+}
+
 export const ITEM_STATE = {
   NOT_STARTED: 'NOT_STARTED',
   COMMUNICATION_CREATED: 'COMMUNICATION_CREATED',
@@ -63,6 +77,7 @@ export const DEFAULT_SETTINGS = {
   neverRepeatJob: true,
   allowRepublishedJob: false,
   consecutiveFailPause: 3,
+  targetNoNewRetryLimit: DEFAULT_TARGET_NO_NEW_RETRY_LIMIT,
   autoSendImageResume: true,
   resumeSendTiming: 'after_text', // after_text | manual
   splitViewEnabled: true,

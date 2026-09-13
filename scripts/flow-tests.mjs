@@ -289,10 +289,16 @@ test("target mode refreshes in the background and preserves stop/duplicate guard
   const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
   assert.ok(html.includes('id="btnTargetMode"'));
   assert.ok(html.includes('id="targetDeliveryCount"'));
+  assert.ok(html.includes('id="targetNoNewRetryLimit"'));
+  assert.ok(html.includes('成功投递目标'));
+  assert.ok(html.includes('目标模式无新增岗位时重试'));
+  assert.ok(!html.includes('连续无新增重试上限'));
   assert.ok(!html.includes('id="btnRefreshContinue"'));
   assert.ok(panel.includes("targetMode"));
   assert.ok(panel.includes("targetCount"));
   assert.ok(panel.includes("targetCountDraft"));
+  assert.ok(panel.includes("targetNoNewRetryLimit"));
+  assert.ok(panel.includes("retryInput.disabled = !onBoss || executionBusy"));
   assert.ok(panel.includes("targetModeUserChanged"));
   assert.ok(panel.includes("const targetTaskActive = status === 'running' || status === 'paused' || runner.targetLoop === true"));
   assert.ok(panel.includes("!state.targetModeUserChanged && task?.targetMode === true && targetTaskActive"));
@@ -316,7 +322,9 @@ test("target mode refreshes in the background and preserves stop/duplicate guard
   assert.ok(background.includes("withRunnerAdmission('previewing'"));
   assert.ok(background.includes("refreshAndContinue({"));
   assert.ok(background.includes("TARGET_REFRESH_LIMIT"));
-  assert.ok(background.includes("TARGET_NO_NEW_JOBS"));
+  assert.ok(background.includes("TARGET_NO_NEW_JOBS_LIMIT"));
+  assert.ok(background.includes("连续无新增重试"));
+  assert.ok(background.includes("if (noNewRounds >= noNewRetryLimit)"));
   assert.ok(background.includes("if (task.targetMode === true) runTargetDeliveryLoop"));
   assert.ok(background.includes("alreadyCompleted: true"));
   assert.ok(background.includes("[目标模式] 目标已达到，忽略重复启动"));
@@ -338,6 +346,12 @@ test("target mode refreshes in the background and preserves stop/duplicate guard
     "refresh merge must retain the existing execution context while updating list context");
   assert.ok(refreshMerge.includes("messageTabId: previousExecution.messageTabId"),
     "refresh merge must retain the reusable message tab");
+  assert.ok(refreshMerge.includes(".filter((item) => item.status === 'pending')"),
+    "refresh merge must keep only the current pending delivery batch");
+  assert.ok(refreshMerge.includes("const queueCursor = 0"),
+    "a refreshed delivery batch must restart its queue cursor");
+  assert.ok(background.includes("const persistedQueue = Array.isArray(task.queue) ? task.queue : null"),
+    "delivery loop must consume the persisted current-batch queue instead of historical results");
   assert.ok(background.includes("qMeta.status === 'failed'"),
     "resume must skip failed queue entries unless an explicit retry reset them to pending");
   assert.ok(background.includes("jobsShareMergeIdentity(x, row.job || {})"),
@@ -628,6 +642,13 @@ test("preview accumulates virtualized jobs until bottom or the 60 second deadlin
   assert.ok(panel.includes("elapsedSeconds"));
   assert.ok(panel.includes("previewScanFinishedAt"));
   assert.ok(panel.includes("正在加载岗位…"));
+  const previewStart = background.indexOf("async function runPreview");
+  const previewEnd = background.indexOf("function isRefreshableJobSourceContext", previewStart);
+  const preview = background.slice(previewStart, previewEnd);
+  assert.ok(preview.indexOf("setPreviewPhase('filtering'") < preview.indexOf("const previewFinishedAt = Date.now()"),
+    "preview timer must finish after filtering begins");
+  assert.ok(preview.includes("runner.previewScanFinishedAt = previewFinishedAt"),
+    "preview timer must finish after filtering and activity checks");
   assert.ok(!panel.includes("滚动已达到 60 秒上限"));
   assert.ok(!panel.includes("已加载 ${runner.previewScanned} 岗"));
 });
