@@ -116,7 +116,7 @@
   state.settings = { ...state.settings, ...(storage.bht_settings || {}) };
 
   function stateResponse() {
-    return { ok: true, runtimeVersion: "1.7.36", ...clone(state) };
+    return { ok: true, runtimeVersion: "1.7.37", ...clone(state) };
   }
 
   function updateTaskStatus(status, patch = {}) {
@@ -194,7 +194,7 @@
 
     if (type === "BHT_GET_STATE") return stateResponse();
     if (type === "BHT_GET_RUNNER_STATE") {
-      return { ok: true, runtimeVersion: "1.7.36", now: Date.now(), runner: clone(state.runner) };
+      return { ok: true, runtimeVersion: "1.7.37", now: Date.now(), runner: clone(state.runner) };
     }
     if (type === "BHT_GET_BOSS_GREETING") return clone(state.bossGreeting);
     if (type === "BHT_SET_BOSS_GREETING") {
