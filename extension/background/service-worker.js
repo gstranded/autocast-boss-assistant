@@ -3101,7 +3101,8 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
 
 function isRefreshableJobSourceContext(context = {}) {
   return context?.sourceType === JOB_SOURCE_TYPES.RECOMMEND ||
-    (context?.sourceType === JOB_SOURCE_TYPES.EXPECTATION && Boolean(String(context?.expectationKey || '').trim()));
+    (context?.sourceType === JOB_SOURCE_TYPES.EXPECTATION && Boolean(String(context?.expectationKey || '').trim())) ||
+    (context?.sourceType === JOB_SOURCE_TYPES.SEARCH && Boolean(String(context?.searchKey || '').trim()));
 }
 
 function mergeRefreshedTask(previousTask, freshTask, refreshMeta = {}) {
@@ -3238,7 +3239,7 @@ async function refreshAndContinue(payload = {}, sourceTab, previewRunId = '') {
     return { ok: false, error: 'TASK_NOT_FINISHED', message: '请先完成或停止当前投递任务，再刷新并继续' };
   }
   if (!isRefreshableJobSourceContext(previousTask.sourceContext)) {
-    return { ok: false, error: 'JOB_SOURCE_NOT_RESTORABLE', message: '这批预览没有记录可恢复的求职期望来源，请重新扫描后再使用' };
+    return { ok: false, error: 'JOB_SOURCE_NOT_RESTORABLE', message: '这批预览没有记录可恢复的岗位列表来源（推荐、求职期望或搜索列表），请重新扫描后再使用' };
   }
   const tabOpt = { tabId: sourceTab.id, forceInject: true, previewRunId };
   // “刷新并继续”恢复的是已完成任务的快照。BOSS 刷新时可能先把当前页
@@ -5035,7 +5036,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return { ok: false, error: 'TARGET_COUNT_INVALID', message: '目标模式需要设置 1-500 份成功投递目标' };
         }
         if (targetMode && !isRefreshableJobSourceContext(task.sourceContext)) {
-          return { ok: false, error: 'JOB_SOURCE_NOT_RESTORABLE', message: '目标模式需要先扫描一批带有效求职期望来源的岗位' };
+          return { ok: false, error: 'JOB_SOURCE_NOT_RESTORABLE', message: '目标模式需要先扫描一批带可恢复来源的岗位列表（推荐、求职期望或搜索列表）' };
         }
         task.targetMode = targetMode;
         task.targetCount = targetMode ? targetCount : 0;

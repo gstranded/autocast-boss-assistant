@@ -469,6 +469,33 @@
     });
   }
 
+  function normalizeSearchSourceKey(href = location.href) {
+    try {
+      const parsed = new URL(String(href || ""), location.origin);
+      const volatile = new Set(["_", "_security_check", "ka", "page", "pageSize", "from", "timestamp", "t"]);
+      const params = [];
+      for (const [key, value] of parsed.searchParams) {
+        if (volatile.has(key)) continue;
+        params.push(`${key}=${value}`);
+      }
+      return `${parsed.pathname}?${params.sort().join("&")}`;
+    } catch (_) {
+      return String(href || "").split("#")[0];
+    }
+  }
+
+  function isSearchListContext(request = {}) {
+    if (!isListLikePage()) return false;
+    const requestHref = String(request.href || "");
+    if (/\/search\/joblist\.json/i.test(requestHref)) return true;
+    try {
+      const parsed = new URL(location.href, location.origin);
+      return /\/web\/geek\/jobs/i.test(parsed.pathname) && parsed.searchParams.has("query");
+    } catch (_) {
+      return false;
+    }
+  }
+
   function readEffectiveFilterRequest(request = readLastJobListRequest()) {
     return buildLiveFilterSignature(request).request;
   }
@@ -503,6 +530,9 @@
     const tabs = getJobExpectTabs();
     const activeTabs = tabs.filter(isActiveJobExpectTab);
     const request = readLastJobListRequest();
+    const onList = isListLikePage();
+    const listHref = onList ? location.href : getSavedListHref();
+    const searchKey = onList ? normalizeSearchSourceKey(listHref) : "";
     const base = {
       sourceType: "unknown",
       expectationKey: "",
@@ -516,9 +546,44 @@
         requestHref: request.href || "",
         requestAt: request.at || 0
       },
+      listHref,
+      searchKey,
       capturedAt: Date.now()
     };
+    const requestKey = String(request.encryptExpectId || "").trim();
+    // 搜索接口/搜索 URL 是更可靠的来源证据；即使页面同时渲染了一个
+    // 默认期望 tab，也不能把搜索结果误判成期望列表，刷新时会被切回另一批岗位。
+    if (!requestKey && isSearchListContext(request) && searchKey) {
+      return { ok: true, context: { ...base, sourceType: "search" } };
+    }
     if (activeTabs.length !== 1) {
+      // BOSS 在滚动/刷新过程中可能暂时移除期望 tab 的 active class，
+      // 但最近一次岗位请求仍带有唯一 encryptExpectId。请求证据足够时，
+      // 用它恢复来源，不能把一个短暂的 DOM 空窗降级成 unknown。
+      if (requestKey) {
+        const items = await readJobExpectations({ force: refreshExpectations });
+        const matches = items.filter((item) => expectationKey(item) === requestKey);
+        if (matches.length === 1) {
+          const item = matches[0];
+          return {
+            ok: true,
+            context: {
+              ...base,
+              sourceType: "expectation",
+              expectationKey: requestKey,
+              expectationId: item.id,
+              expectationLabel: item.label,
+              selectedLabel: item.label,
+              selectionEvidence: {
+                ...base.selectionEvidence,
+                expectedEncryptExpectId: requestKey,
+                requestMatches: true
+              }
+            }
+          };
+        }
+      }
+      // 搜索列表没有可恢复的期望 ID，但可以安全地按原搜索 URL 和筛选恢复。
       return { ok: true, context: { ...base, error: activeTabs.length ? "EXPECTATION_SELECTION_AMBIGUOUS" : "EXPECTATION_SELECTION_NOT_FOUND" } };
     }
     const active = activeTabs[0];
@@ -701,25 +766,27 @@
   async function restoreJobSourceContext(payload = {}) {
     const expected = payload?.sourceContext || payload || {};
     const sourceType = String(expected.sourceType || "unknown");
-    if (sourceType !== "recommend" && sourceType !== "expectation") {
+    if (sourceType !== "recommend" && sourceType !== "expectation" && sourceType !== "search") {
       return { ok: false, error: "JOB_SOURCE_UNKNOWN", message: "扫描时没有记录可恢复的求职期望来源" };
     }
     const deadline = Date.now() + Math.max(3000, Number(payload?.timeoutMs || 12000));
-    const waitForTabs = async () => {
+    const waitForSourceReady = async () => {
       while (Date.now() < deadline) {
-        if (getJobExpectTabs().length) return true;
+        if (sourceType === "search" ? isListLikePage() : getJobExpectTabs().length) return true;
         await sleep(250);
       }
       return false;
     };
-    if (!await waitForTabs()) {
+    if (!await waitForSourceReady()) {
       return { ok: false, error: "EXPECTATION_UI_NOT_READY", message: "BOSS 求职期望区域未加载完成" };
     }
     const clickTab = (tab) => {
       clickLikeHuman(tab);
       return true;
     };
-    if (sourceType === "recommend") {
+    if (sourceType === "search") {
+      // 搜索列表由原 URL 恢复，不点击任何求职期望 tab，避免误切换到推荐列表。
+    } else if (sourceType === "recommend") {
       const recommend = getJobExpectTabs().find((el) => {
         const cls = String(el.className || "");
         return /(^|\s)synthesis(\s|$)/.test(cls) || textOf(el).replace(/\s+/g, " ").trim() === "推荐";
@@ -755,12 +822,16 @@
     while (Date.now() < deadline) {
       const context = await getJobSourceContext({ refreshExpectations: false });
       const current = context.context || {};
-      const sourceMatches = sourceType === "recommend"
-        ? current.sourceType === "recommend"
-        : current.sourceType === "expectation" && current.expectationKey === String(expected.expectationKey || "");
-      const requestMatches = sourceType === "recommend"
+      const sourceMatches = sourceType === "search"
+        ? current.sourceType === "search" && current.searchKey === String(expected.searchKey || "")
+        : sourceType === "recommend"
+          ? current.sourceType === "recommend"
+          : current.sourceType === "expectation" && current.expectationKey === String(expected.expectationKey || "");
+      const requestMatches = sourceType === "search"
         ? current.selectionEvidence?.requestEncryptExpectId === ""
-        : current.selectionEvidence?.requestEncryptExpectId === String(expected.expectationKey || "");
+        : sourceType === "recommend"
+          ? current.selectionEvidence?.requestEncryptExpectId === ""
+          : current.selectionEvidence?.requestEncryptExpectId === String(expected.expectationKey || "");
       if (sourceMatches && requestMatches) {
         const filters = await restoreFilterRequest(expected.filterSignature || {}, deadline);
         if (!filters.ok) {
@@ -774,12 +845,16 @@
         }
         const verified = await getJobSourceContext({ refreshExpectations: false });
         const verifiedContext = verified.context || {};
-        const verifiedSource = sourceType === "recommend"
-          ? verifiedContext.sourceType === "recommend"
-          : verifiedContext.sourceType === "expectation" && verifiedContext.expectationKey === String(expected.expectationKey || "");
-        const verifiedRequest = sourceType === "recommend"
+        const verifiedSource = sourceType === "search"
+          ? verifiedContext.sourceType === "search" && verifiedContext.searchKey === String(expected.searchKey || "")
+          : sourceType === "recommend"
+            ? verifiedContext.sourceType === "recommend"
+            : verifiedContext.sourceType === "expectation" && verifiedContext.expectationKey === String(expected.expectationKey || "");
+        const verifiedRequest = sourceType === "search"
           ? verifiedContext.selectionEvidence?.requestEncryptExpectId === ""
-          : verifiedContext.selectionEvidence?.requestEncryptExpectId === String(expected.expectationKey || "");
+          : sourceType === "recommend"
+            ? verifiedContext.selectionEvidence?.requestEncryptExpectId === ""
+            : verifiedContext.selectionEvidence?.requestEncryptExpectId === String(expected.expectationKey || "");
         const expectedFilters = normalizeFilterSignature(expected.filterSignature || {});
         const expectedRequestObserved = expectedFilters.observed === true || Boolean(
           expected.selectionEvidence?.requestHref || expected.selectionEvidence?.requestEncryptExpectId

@@ -1791,7 +1791,8 @@ function updateTaskUI(task, runner = {}) {
   const hasPending = countPendingPassJobs(task) > 0 || Array.from(state.selected || []).length > 0;
   // 批量投递：不限 awaiting_confirm；单份投完(completed/stopped)后也应可点
   const sourceReady = task?.sourceContext?.sourceType === 'recommend' ||
-    (task?.sourceContext?.sourceType === 'expectation' && String(task?.sourceContext?.expectationKey || '').trim());
+    (task?.sourceContext?.sourceType === 'expectation' && String(task?.sourceContext?.expectationKey || '').trim()) ||
+    (task?.sourceContext?.sourceType === 'search' && String(task?.sourceContext?.searchKey || '').trim());
   // Restore an active target task on first load, but keep an explicit user
   // toggle and completed historical tasks from being overwritten by refresh.
   const targetTaskActive = status === 'running' || status === 'paused' || runner.targetLoop === true;

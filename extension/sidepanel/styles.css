@@ -636,13 +636,7 @@ html.float-mode main { overflow: auto; max-height: calc(100vh - 112px); }
 .bht-toast.error { background: var(--danger); border-color: var(--danger); color: #ffffff; }
 .bht-toast.warn { background: var(--warn); border-color: var(--warn); color: #ffffff; }
 
-.bht-modal { position: fixed; top: 96px; left: 0; right: 0; bottom: 0; z-index: 10000; background: rgba(0, 0, 0, 0.56); display: grid; place-items: center; padding: 16px; }
-.controls,
-.task-actions,
-#btnPause,
-#btnResume,
-#btnSkip,
-#btnStop { position: relative; z-index: 10001; }
+.bht-modal { position: fixed; top: 96px; left: 0; right: 0; bottom: 0; z-index: 130000; background: rgba(0, 0, 0, 0.56); display: grid; place-items: center; padding: 16px; }
 .bht-modal[hidden] { display: none !important; }
 .bht-modal-card { width: min(340px, 100%); background: var(--panel); border: 1px solid var(--line-strong); border-radius: 8px; padding: 14px; color: var(--text); box-shadow: var(--shadow); }
 .bht-modal-title { font-size: 15px; font-weight: 800; margin-bottom: 8px; }

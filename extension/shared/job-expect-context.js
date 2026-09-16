@@ -10,6 +10,7 @@ const FILTER_SIGNATURE_KEYS = Object.freeze([
 export const JOB_SOURCE_TYPES = Object.freeze({
   RECOMMEND: 'recommend',
   EXPECTATION: 'expectation',
+  SEARCH: 'search',
   UNKNOWN: 'unknown'
 });
 
@@ -110,6 +111,11 @@ export function sameJobSourceContext(left = {}, right = {}) {
   if (aType === JOB_SOURCE_TYPES.EXPECTATION) {
     const aKey = String(left?.expectationKey || '').trim();
     const bKey = String(right?.expectationKey || '').trim();
+    return Boolean(aKey && bKey && aKey === bKey);
+  }
+  if (aType === JOB_SOURCE_TYPES.SEARCH) {
+    const aKey = String(left?.searchKey || '').trim();
+    const bKey = String(right?.searchKey || '').trim();
     return Boolean(aKey && bKey && aKey === bKey);
   }
   return aType === JOB_SOURCE_TYPES.RECOMMEND;

@@ -305,6 +305,8 @@ test("target mode refreshes in the background and preserves stop/duplicate guard
   assert.ok(panel.includes("state.targetModeUserChanged = true"));
   assert.ok(panel.includes("state.targetCountDraft = String($('targetDeliveryCount').value || '')"));
   assert.ok(panel.includes("const targetCountValue = state.targetCountDraft ||"));
+  assert.ok(panel.includes("task?.sourceContext?.sourceType === 'search'"),
+    "panel target-mode readiness must recognize refreshable search lists");
   assert.ok(background.includes("async function runTargetDeliveryLoop"));
   assert.ok(background.includes("async function runTargetDeliveryLoop(taskId, taskRunId = uid('run'))"),
     "target loop must accept the caller generation");
@@ -332,6 +334,14 @@ test("target mode refreshes in the background and preserves stop/duplicate guard
   assert.ok(content.includes("detectActiveFilterRequest"));
   assert.ok(content.includes("[ka^=\"${prefix}\"]"));
   assert.ok(content.includes("selected option in the hidden dropdown"));
+  assert.ok(content.includes("normalizeSearchSourceKey"), "search lists must have a stable refresh identity");
+  assert.ok(content.includes("const requestKey = String(request.encryptExpectId || \"\").trim()"),
+    "a temporarily missing active expectation tab may fall back to request evidence");
+  assert.ok(content.includes('sourceType: "search"'), "target mode must support refreshable search lists");
+  assert.ok(content.includes('sourceType === "search" ? isListLikePage() : getJobExpectTabs().length'),
+    "search source restore must not wait for an expectation tab");
+  assert.ok(background.includes("JOB_SOURCE_TYPES.SEARCH") && background.includes("searchKey"),
+    "background target guard must accept a stable search source");
   assert.ok(background.includes("jobMergeKey") && background.includes("mergeRefreshedTask"));
   assert.ok(content.includes("locationText") && content.includes("securityId") && content.includes("lid"),
     "synthetic job identities must include stable location/identity evidence");

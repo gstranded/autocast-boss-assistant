@@ -2071,6 +2071,22 @@ test("job expectation context uses stable ids instead of display labels", () => 
     { sourceType: JOB_SOURCE_TYPES.RECOMMEND },
     { sourceType: JOB_SOURCE_TYPES.RECOMMEND }
   ), true);
+  assert.equal(JOB_SOURCE_TYPES.SEARCH, "search");
+  assert.equal(sameJobSourceContext(
+    { sourceType: JOB_SOURCE_TYPES.SEARCH, searchKey: "/web/geek/jobs?query=ai" },
+    { sourceType: JOB_SOURCE_TYPES.SEARCH, searchKey: "/web/geek/jobs?query=ai" }
+  ), true);
+  assert.equal(sameJobSourceContext(
+    { sourceType: JOB_SOURCE_TYPES.SEARCH, searchKey: "/web/geek/jobs?query=ai" },
+    { sourceType: JOB_SOURCE_TYPES.SEARCH, searchKey: "/web/geek/jobs?query=java" }
+  ), false);
+});
+
+test("pause modal stays above task controls", () => {
+  const styles = fs.readFileSync("extension/sidepanel/styles.css", "utf8");
+  const modal = styles.match(/\.bht-modal\s*\{[^}]*\}/)?.[0] || "";
+  assert.match(modal, /z-index:\s*130000/);
+  assert.ok(!styles.includes("#btnStop { position: relative; z-index: 10001; }"));
 });
 
 test("filter context comparison is conservative when request evidence exists", () => {
