@@ -65,7 +65,9 @@ export function checkDedup(job, ctx) {
 
   if (bossId && settings.bossCooldownDays > 0) {
     const hit = history.find(
-      (h) => h.bossId === bossId && h.status === 'success' && daysBetween(h.ts) < settings.bossCooldownDays
+      (h) => h.bossId === bossId &&
+        (h.status === 'success' || h.reason === 'BOSS_JOB_SWITCH_REQUIRED') &&
+        daysBetween(h.ts) < settings.bossCooldownDays
     );
     if (hit) {
       return {

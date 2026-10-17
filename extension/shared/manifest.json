@@ -1,0 +1,92 @@
+{
+  "manifest_version": 3,
+  "name": "__MSG_extName__",
+  "description": "__MSG_extDesc__",
+  "version": "1.7.39",
+  "default_locale": "zh_CN",
+  "icons": {
+    "16": "assets/icons/icon16.png",
+    "32": "assets/icons/icon32.png",
+    "48": "assets/icons/icon48.png",
+    "128": "assets/icons/icon128.png"
+  },
+  "action": {
+    "default_title": "AutoCast-Boss海投助手",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "assets/icons/icon16.png",
+      "32": "assets/icons/icon32.png",
+      "48": "assets/icons/icon48.png"
+    }
+  },
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "permissions": [
+    "storage",
+    "alarms",
+    "tabs",
+    "scripting",
+    "unlimitedStorage",
+    "windows"
+  ],
+  "host_permissions": [
+    "*://*.zhipin.com/*",
+    "*://zhipin.com/*",
+    "*://*.bosszhipin.com/*",
+    "*://bosszhipin.com/*",
+    "https://github.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.zhipin.com/*",
+        "*://zhipin.com/*",
+        "*://*.bosszhipin.com/*",
+        "*://bosszhipin.com/*"
+      ],
+      "js": [
+        "content/page-network-hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.zhipin.com/*",
+        "*://zhipin.com/*",
+        "*://*.bosszhipin.com/*",
+        "*://bosszhipin.com/*"
+      ],
+      "js": [
+        "shared/trigger-navigation-recovery.js",
+        "shared/conversation-match.js",
+        "shared/page-clock.js",
+        "shared/operation-dispatch-gate.js",
+        "content/content-main.js",
+        "content/floating-host.js"
+      ],
+      "css": [
+        "content/floating-host.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "sidepanel/*",
+        "shared/*",
+        "assets/icons/*",
+        "content/floating-host.css"
+      ],
+      "matches": [
+        "*://*.zhipin.com/*",
+        "*://zhipin.com/*",
+        "*://*.bosszhipin.com/*",
+        "*://bosszhipin.com/*"
+      ]
+    }
+  ]
+}
