@@ -732,6 +732,25 @@ test("session exists dedup", () => {
     false
   );
 });
+test("confirmed platform job-switch dialog prevents another job for that HR during cooldown", () => {
+  const job = { jobId: "new-job", bossId: "same-hr", company: "C", title: "T" };
+  const context = {
+    settings: { neverRepeatJob: true, bossCooldownDays: 30, companyDailyMax: 3 },
+    history: [{
+      jobId: "other-job", bossId: "same-hr", status: "skipped_list",
+      reason: "BOSS_JOB_SWITCH_REQUIRED", ts: Date.now()
+    }]
+  };
+  assert.deepEqual(checkDedup(job, context).reasonCodes, [REASON.DEDUP_BOSS]);
+  assert.equal(checkDedup({ ...job, bossId: "different-hr" }, context).ok, true);
+  assert.equal(checkDedup(job, { ...context, history: [{ ...context.history[0], reason: "NON_CHAT_JOB" }] }).ok, true);
+  assert.equal(checkDedup(job, {
+    ...context, history: [{ ...context.history[0], ts: Date.now() - 31 * 86400000 }]
+  }).ok, true);
+  assert.equal(checkDedup(job, {
+    ...context, settings: { ...context.settings, bossCooldownDays: 0 }
+  }).ok, true);
+});
 test("idempotency key stable", () => {
   const k = segmentIdempotencyKey({ jobId: "j1", bossId: "b1" }, 1, 0);
   assert.ok(k.includes("j1"));
@@ -1315,9 +1334,10 @@ test("manifest version + hosts", () => {
   assert.ok(mainHook?.js?.includes("content/page-network-hook.js"));
   assert.equal(isolated?.js?.[0], "shared/trigger-navigation-recovery.js");
   assert.equal(isolated?.js?.[1], "shared/conversation-match.js");
-  assert.equal(isolated?.js?.[2], "shared/operation-dispatch-gate.js");
+  assert.equal(isolated?.js?.[2], "shared/page-clock.js");
+  assert.equal(isolated?.js?.[3], "shared/operation-dispatch-gate.js");
   assert.ok(!isolated.js.includes("shared/job-identity.js"), "esm identity module must not be injected as a classic content script");
-  assert.equal(isolated?.js?.[3], "content/content-main.js");
+  assert.equal(isolated?.js?.[4], "content/content-main.js");
   assert.ok(m.host_permissions.includes("https://github.com/*"), "update check needs github.com host permission");
   const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
   assert.ok(app.includes("btnCheckUpdate"), "update check UI wired");
@@ -1551,6 +1571,17 @@ test("input clearing alone cannot confirm a send", () => {
 test("new rendered own message confirms a send", () => {
   assert.equal(
     confirmRenderedOwnMessage(["历史消息"], ["历史消息", "新的测试消息"], "新的测试消息"),
+    true
+  );
+});
+
+test("BOSS text-content own message confirms a send", () => {
+  assert.equal(
+    confirmRenderedOwnMessage(
+      ["历史消息"],
+      ["历史消息", "我对机房运维工程师很感兴趣，希望能进一步沟通。"],
+      "我对机房运维工程师很感兴趣，希望能进一步沟通。"
+    ),
     true
   );
 });
@@ -1900,6 +1931,15 @@ test("batch delivery not limited to awaiting_confirm", () => {
   assert.ok(sw.includes("NO_PENDING") || sw.includes("没有可批量投递"), "CONFIRM_AND_START handles empty pending");
   assert.ok(sw.includes("批量投递启动"), "batch start log present");
   assert.ok(sw.includes("自动勾选剩余未投通过岗") || sw.includes("testDelivery"), "restore selection after single delivery");
+});
+
+test("target mode starts a new run after a terminal task", () => {
+  const sw = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(sw.includes("function createFreshTargetTask"), "terminal target runs get a fresh task snapshot");
+  assert.ok(sw.includes("const freshTargetRun = targetMode"), "fresh-task path is limited to terminal target runs");
+  assert.ok(sw.includes("task = createFreshTargetTask(task)"), "new target run replaces the old task");
+  assert.ok(sw.includes("counters: { processed: 0, success: 0, skipped: 0, failed: 0 }"), "new target run resets counters");
+  assert.ok(!sw.includes("baselineSuccess + targetCount"), "new target count is independent of the previous run");
 });
 
 console.log("12) test-delivery next job");
