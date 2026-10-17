@@ -68,7 +68,10 @@ import {
   sameFilterSignature,
   sameJobSourceContext
 } from '../shared/job-expect-context.js';
+import { resolveTargetSearchContinuation } from '../shared/target-search-scan.js';
 import { createOperationRegistry } from './operation-registry.js';
+import { attachPageClock } from './page-clock.js';
+import { activateBackgroundTab, backgroundWorkspaceProblem, navigateBackgroundTab, prepareBackgroundWorkspace } from './execution-workspace.js';
 import {
   appendSessionDebugLog,
   getSessionDebugLogs,
@@ -100,6 +103,10 @@ const DELIVERY_SCHEDULE_ALARM = 'bht_delivery_schedule';
 // 防卡顿：连续投递多少岗后自动刷新一次消息页（BOSS 聊天页在长会话列表下会渲染卡顿）
 const MESSAGE_TAB_REFRESH_INTERVAL = 10;
 const BHT_RUNTIME_VERSION = String(chrome.runtime.getManifest?.().version || 'unknown');
+let backgroundExecution = null;
+chrome.runtime.onConnect?.addListener((port) => attachPageClock(port, {
+  allowSender: (sender) => sender?.frameId === 0 && isBossTab(sender?.tab)
+}));
 const VERSION_GUARDED_MESSAGES = new Set([
   MSG.RUN_PREVIEW,
   MSG.CONFIRM_AND_START,
@@ -113,6 +120,20 @@ const JOB_PHASE = Object.freeze({
   CONVERSATION_OPENED: 'CONVERSATION_OPENED',
   CONVERSATION_OPENED_EDITOR_PENDING: 'CONVERSATION_OPENED_EDITOR_PENDING'
 });
+
+// A bridge can return an operation receipt with ok=true while carrying a
+// transport/window error in its error field. These errors must never be
+// treated as a legitimate "HR activity unknown" result.
+const ACTIVITY_INFRASTRUCTURE_ERRORS = new Set([
+  'BACKGROUND_TAB_MOVED',
+  'BACKGROUND_TAB_CLOSED',
+  'BACKGROUND_WINDOW_CLOSED',
+  'BACKGROUND_WORKSPACE_INVALID',
+  'CONTENT_INJECT_FAIL',
+  'CONTENT_VERSION_MISMATCH',
+  'OP_BRIDGE_TIMEOUT',
+  'OP_DEADLINE_EXCEEDED'
+]);
 
 function hasChatCheckpoint(item) {
   return [
@@ -620,6 +641,11 @@ async function waitForRunnableQueueBoundary(taskId) {
       runner.pause = true;
       continue;
     }
+    const workspaceProblem = await backgroundWorkspaceProblem(task);
+    if (workspaceProblem) {
+      await pauseForWorkspaceProblem(task, workspaceProblem);
+      return { ok: false, workspace: true, config: all, task };
+    }
     return { ok: true, config: all, task };
   }
   return { ok: false, error: 'ABORTED' };
@@ -712,7 +738,11 @@ async function enforceDeliverySchedule(source = 'alarm', now = new Date()) {
     runner.taskRunId = resumedTaskRunId;
     runner.taskRunTaskId = task.id;
     task.execution = { ...(task.execution || {}), taskRunId: resumedTaskRunId };
-    split = await prepareSplitWorkspace(task, settings);
+    split = await prepareDeliveryWorkspace(task, settings);
+    if (split.background && !split.ok) {
+      await pauseForWorkspaceProblem(task, split);
+      return split;
+    }
   }
   const published = await publishTask(task);
   if (!published || runner.stopping || runner.abort || task.status === TASK_STATUS.STOPPED ||
@@ -942,6 +972,7 @@ async function forceInjectContent(tabId, { deadlineAt = 0 } = {}) {
     files: [
       "shared/trigger-navigation-recovery.js",
       "shared/conversation-match.js",
+      "shared/page-clock.js",
       "shared/operation-dispatch-gate.js",
       "content/content-main.js"
     ],
@@ -1069,6 +1100,42 @@ async function raiseSplitWindows(listWindowId, messageWindowId) {
     await chrome.windows.update(listWindowId, { state: 'normal' }).catch(() => {});
     await chrome.windows.update(listWindowId, { focused: true }).catch(() => {});
   }
+}
+
+async function pauseForWorkspaceProblem(task, problem) {
+  runner.pause = true;
+  task.status = TASK_STATUS.PAUSED;
+  task.pauseSource = 'workspace';
+  task.awaitingUserRetry = true;
+  task.pauseReason = problem.message;
+  await publishTask(task);
+  await log('warn', problem.message, { taskId: task.id, error: problem.error });
+}
+
+async function prepareDeliveryWorkspace(task, settings = {}) {
+  backgroundExecution = null;
+  // Delivery always uses the isolated two-window workspace.  The user may
+  // leave it visible, switch to another app, or minimize either window; the
+  // runner keeps operating without requiring a foreground window.
+  if (task.execution?.workerTabId && !task.execution.backgroundDeliveryActive) {
+    await closeConversationWorkerTab(task, task.execution.workerTabId);
+  }
+  const result = await prepareBackgroundWorkspace(task);
+  if (result.ok) backgroundExecution = { taskId: task.id, windowId: result.windowId, messageWindowId: task.execution?.messageWindowId || null };
+  return { ...result, background: true };
+}
+
+async function activateDeliveryTab(task, tabId) {
+  if (task?.execution?.backgroundDeliveryActive) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    const windowId = tab?.windowId || task.execution.backgroundWindowId;
+    const allowed = [task.execution.backgroundWindowId, task.execution.messageWindowId]
+      .filter((id, index, all) => id != null && all.indexOf(id) === index);
+    const result = await activateBackgroundTab(windowId, tabId, chrome, allowed);
+    if (!result.ok) throw new Error(result.message);
+    return;
+  }
+  await chrome.tabs.update(tabId, { active: true });
 }
 
 export async function prepareSplitWorkspace(task, settings = {}) {
@@ -1263,13 +1330,27 @@ async function ensureMessageTab(task) {
     try {
       const t = await chrome.tabs.get(oldId);
       if (t && isBossUrl(t.url || t.pendingUrl || "")) {
+        if (task.execution.backgroundDeliveryActive && ![
+          task.execution.backgroundWindowId,
+          task.execution.messageWindowId
+        ].includes(t.windowId)) {
+          throw new Error('消息标签已离开后台工作窗口');
+        }
         // 确保在消息中心
         if (!/\/chat/i.test(t.url || "")) {
-          await chrome.tabs.update(oldId, { url: "https://www.zhipin.com/web/geek/chat", active: true });
+          if (task.execution.backgroundDeliveryActive) {
+            const nav = await navigateBackgroundTab(oldId, 'https://www.zhipin.com/web/geek/chat', chrome, [
+              task.execution.backgroundWindowId,
+              task.execution.messageWindowId
+            ].filter((id, index, all) => id != null && all.indexOf(id) === index));
+            if (!nav.ok) throw new Error(nav.message);
+          } else {
+            await chrome.tabs.update(oldId, { url: "https://www.zhipin.com/web/geek/chat", active: true });
+          }
           await waitTabComplete(oldId, 25000);
           await forceInjectContent(oldId);
         } else {
-          try { await chrome.tabs.update(oldId, { active: true }); } catch (_) {}
+          await activateDeliveryTab(task, oldId);
         }
         if (task.execution.splitViewActive) await setSplitTabZoom(oldId);
         // 防卡顿：连续投递 N 岗后自动刷新消息页，避免大会话列表累积导致渲染卡顿
@@ -1305,10 +1386,28 @@ async function ensureMessageTab(task) {
   // 新建消息 tab 时重置刷新计数
   task.execution.jobsSinceMessageRefresh = 0;
   let tab;
-  if (task.execution.splitViewActive && task.execution.splitBounds?.right) {
+  if (task.execution.backgroundDeliveryActive) {
+    const problem = await backgroundWorkspaceProblem(task);
+    if (problem) throw new Error(problem.message);
+    const splitRight = task.execution.splitBounds?.right || {};
+    const messageWindow = await chrome.windows.create({
+      url: 'https://www.zhipin.com/web/geek/chat',
+      // A normal Chrome window has a platform minimum width and can overlap
+      // the left half on narrow displays. Background workspaces use popup
+      // windows so the saved split bounds are honored exactly.
+      type: 'popup',
+      focused: false,
+      ...splitRight
+    });
+    tab = messageWindow?.tabs?.[0] || (await chrome.tabs.query({ windowId: messageWindow.id }))[0];
+    if (!tab?.id) throw new Error('后台消息窗口已创建，但未获得标签页');
+    task.execution.messageWindowId = messageWindow.id;
+    if (backgroundExecution) backgroundExecution.messageWindowId = messageWindow.id;
+    await chrome.tabs.update(tab.id, { autoDiscardable: false });
+  } else if (task.execution.splitViewActive && task.execution.splitBounds?.right) {
     const win = await chrome.windows.create({
       url: "https://www.zhipin.com/web/geek/chat",
-      type: 'normal',
+      type: 'popup',
       focused: true,
       ...task.execution.splitBounds.right
     });
@@ -1416,16 +1515,21 @@ async function ensureListTab(task) {
   if (task.execution.listTabId) {
     try {
       const t = await chrome.tabs.get(task.execution.listTabId);
-      if (t && isBossUrl(t.url || "")) return t;
+      if (t && isBossUrl(t.url || t.pendingUrl || '') && isBossJobListUrl(t.url || t.pendingUrl || '')) return t;
     } catch (_) {}
   }
+  // Never adopt the currently active BOSS tab as a replacement. During
+  // background delivery that tab can be the chat window, and taking it over
+  // turns a transient navigation/failure into a destructive window switch.
+  if (task.execution.backgroundDeliveryActive) return null;
   const t = await getActiveBossTab({ allowInactiveBossTab: true });
-  if (t?.id) {
+  if (t?.id && isBossJobListUrl(t.url || t.pendingUrl || '')) {
     task.execution.listTabId = t.id;
     task.execution.listWindowId = t.windowId;
     await publishTask(task);
+    return t;
   }
-  return t;
+  return null;
 }
 
 async function getListTabFingerprint(tabId) {
@@ -1447,13 +1551,24 @@ async function getListTabFingerprint(tabId) {
 
 async function closeConversationWorkerTab(task, tabId, { reason = '', publish = true } = {}) {
   const workerTabId = tabId || task?.execution?.workerTabId || null;
-  if (workerTabId) {
+  // Chromium/macOS may ignore tabs.create({windowId}) for popup windows and
+  // place the new tab in the last focused normal window. In background mode
+  // we then reuse the right-side chat tab as the temporary detail tab. That
+  // tab belongs to the message workspace and must never be removed while
+  // retrying or cleaning up a worker attempt.
+  const sharedMessageTab = Boolean(
+    task?.execution?.workerTabShared &&
+    workerTabId != null &&
+    workerTabId === task?.execution?.messageTabId
+  );
+  if (workerTabId && !sharedMessageTab) {
     try { await chrome.tabs.remove(workerTabId); } catch (_) {}
   }
   if (task?.execution && (!workerTabId || task.execution.workerTabId === workerTabId)) {
     delete task.execution.workerTabId;
     delete task.execution.workerMode;
     delete task.execution.workerUrl;
+    delete task.execution.workerTabShared;
     task.updatedAt = Date.now();
     if (publish) await publishTask(task);
   }
@@ -1479,6 +1594,7 @@ function detailJobIdFromHref(href) {
 }
 
 async function restoreTabsAfterWorker(messageTab, listTabId, workerTab, task = null) {
+  if (task?.execution?.backgroundDeliveryActive) return;
   const workerId = workerTab?.id || null;
   if (messageTab?.id && messageTab.id !== workerId) {
     try { await chrome.tabs.update(messageTab.id, { active: true }); } catch (_) {}
@@ -1500,9 +1616,33 @@ async function restoreTabsAfterWorker(messageTab, listTabId, workerTab, task = n
   } catch (_) {}
 }
 
+async function restoreSharedWorkerMessageTab(task, messageTab, workerTab) {
+  if (!task?.execution?.backgroundDeliveryActive ||
+      !task?.execution?.workerTabShared ||
+      !messageTab?.id ||
+      !workerTab?.id ||
+      messageTab.id !== workerTab.id) return;
+  const allowed = [task.execution.backgroundWindowId, task.execution.messageWindowId]
+    .filter((id, index, all) => id != null && all.indexOf(id) === index);
+  const live = await chrome.tabs.get(messageTab.id).catch(() => null);
+  if (!live || !allowed.includes(live.windowId)) return;
+  if (/\/chat(?:\/|$)/i.test(String(live.url || live.pendingUrl || ''))) {
+    return;
+  }
+  const nav = await navigateBackgroundTab(
+    messageTab.id,
+    'https://www.zhipin.com/web/geek/chat',
+    chrome,
+    allowed
+  );
+  if (!nav.ok) return;
+  await waitTabComplete(messageTab.id, 25000).catch(() => {});
+  await forceInjectContent(messageTab.id).catch(() => {});
+}
+
 async function openConversationWorkerTab(task, attempt, messageTab, job, { forceNew = false } = {}) {
   if (!task.execution) task.execution = {};
-  if (forceNew && task.execution.workerTabId) {
+  if (forceNew && task.execution.workerTabId && !task.execution.workerTabShared) {
     await closeConversationWorkerTab(task, task.execution.workerTabId, {
       reason: '重试立即沟通，关闭旧执行页后重新打开',
       publish: true
@@ -1515,27 +1655,78 @@ async function openConversationWorkerTab(task, attempt, messageTab, job, { force
   if (previousTabId != null) {
     try { tab = await chrome.tabs.get(previousTabId); } catch (_) { tab = null; }
   }
+  if (task.execution.backgroundDeliveryActive && ![
+    task.execution.backgroundWindowId,
+    task.execution.messageWindowId
+  ].includes(tab?.windowId)) tab = null;
   let reused = Boolean(tab?.id);
   if (reused) {
     try {
-      // 必须 active:true：Chrome 会节流后台标签，job_detail 可能一直 loading，executeScript 卡到预算耗尽。
-      await chrome.tabs.update(tab.id, { url: attempt.url, active: true });
+      // Keep a minimized workspace minimized. A normal background window may
+      // activate its worker tab to avoid Chromium throttling, while a
+      // minimized window must be navigated without restoring or raising it.
+      if (task.execution.backgroundDeliveryActive) {
+        const nav = await navigateBackgroundTab(tab.id, attempt.url, chrome, [
+          task.execution.backgroundWindowId,
+          task.execution.messageWindowId
+        ].filter((id, index, all) => id != null && all.indexOf(id) === index));
+        if (!nav.ok) throw new Error(nav.message);
+      } else {
+        await chrome.tabs.update(tab.id, { url: attempt.url, active: true });
+      }
     } catch (_) {
       tab = null;
       reused = false;
     }
   }
   if (!reused) {
+    // In Chromium/macOS, tabs.create({windowId}) can occasionally place a
+    // background tab in the last focused normal window when the destination
+    // is an unfocused popup. Pin the worker to the delivery-owned message
+    // window and verify/move it immediately, otherwise the next bridge call
+    // is rejected as BACKGROUND_TAB_MOVED and the job is falsely classified
+    // as an HR-activity miss.
+    const targetWindowId = task.execution.backgroundDeliveryActive
+      ? (task.execution.messageWindowId || messageTab?.windowId || task.execution.backgroundWindowId || null)
+      : (messageTab?.windowId || task.execution.messageWindowId || null);
     const createOptions = {
       url: attempt.url,
-      active: true
+      active: task.execution.backgroundDeliveryActive ? false : true
     };
-    const targetWindowId = messageTab?.windowId || task.execution.messageWindowId || null;
     if (targetWindowId != null) createOptions.windowId = targetWindowId;
     if (messageTab?.id) createOptions.openerTabId = messageTab.id;
     tab = await chrome.tabs.create(createOptions);
     if (!tab?.id) throw new Error('临时沟通执行页创建失败');
+    if (task.execution.backgroundDeliveryActive && targetWindowId != null && tab.windowId !== targetWindowId) {
+      try {
+        await chrome.tabs.move(tab.id, { windowId: targetWindowId, index: -1 });
+        tab = await chrome.tabs.get(tab.id);
+      } catch (_) {}
+    }
+    if (task.execution.backgroundDeliveryActive && targetWindowId != null && tab.windowId !== targetWindowId) {
+      await chrome.tabs.remove(tab.id).catch(() => {});
+      // `tabs.create({windowId})` is ignored for popup windows by the
+      // Chromium build used by ego/macOS. Reuse the right-side chat tab as a
+      // temporary detail tab instead of leaking work into the user's normal
+      // window or failing every background delivery.
+      const shared = messageTab?.id != null
+        ? await chrome.tabs.get(messageTab.id).catch(() => null)
+        : null;
+      if (!shared || shared.windowId !== targetWindowId) {
+        throw new Error('临时沟通执行页未能进入后台消息窗口，已跳过该岗位');
+      }
+      tab = shared;
+      reused = true;
+      task.execution.workerTabShared = true;
+      const nav = await navigateBackgroundTab(tab.id, attempt.url, chrome, [targetWindowId]);
+      if (!nav.ok) throw new Error(nav.message);
+    }
   }
+  // The shared-tab marker describes the current attempt only. Clear it when
+  // a later navigation successfully gets a distinct worker tab; retaining a
+  // stale true value makes cleanup/restoration reason about the wrong tab.
+  if (tab?.id === messageTab?.id) task.execution.workerTabShared = true;
+  else delete task.execution.workerTabShared;
   // autoDiscardable 仅支持 tabs.update：创建后统一设置为不可被内存优化回收
   try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (_) {}
   task.execution.workerTabId = tab.id;
@@ -1612,7 +1803,8 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
   let activityAccepted = null;
 
   for (let index = 0; index < attempts.length; index++) {
-    if (result?.ok || result?.filtered || operationAborted(result)) break;
+    if (result?.ok || result?.filtered || result?.error === 'NON_CHAT_JOB' ||
+      isEnvironmentalFailure(result) || operationAborted(result)) break;
     const attempt = attempts[index];
     const maxTries = Math.max(1, Number(WORKER_TRIGGER_RETRY.maxTries || 3));
     const retryDelayMs = Math.max(0, Number(WORKER_TRIGGER_RETRY.delayMs || 0));
@@ -1658,10 +1850,26 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
           );
           if (operationAborted(activityInspection)) {
             result = activityInspection;
+          } else if (activityInspection?.error === 'NON_CHAT_JOB') {
+            result = activityInspection;
           } else if (isEnvironmentalFailure(activityInspection)) {
             result = activityInspection;
           } else {
             const activeText = String(activityInspection?.activeText || '').trim();
+            const activityError = String(activityInspection?.error || '').trim();
+            if (ACTIVITY_INFRASTRUCTURE_ERRORS.has(activityError)) {
+              result = {
+                ok: false,
+                error: activityError,
+                environmental: true,
+                message: activityInspection?.message || '临时详情页未能保持在后台投递窗口'
+              };
+              await log('warn', `[执行页] 后台详情页环境异常：${activityError}，跳过当前岗位并继续`, {
+                jobId: job.jobId,
+                workerTabId: workerTab.id,
+                activityError
+              });
+            }
             job.activeText = activeText;
             activityAccepted = Boolean(
               activityInspection?.ok &&
@@ -1675,7 +1883,7 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
               activityAccepted,
               inspectError: activityInspection?.error || ''
             });
-            if (!activityAccepted) {
+            if (!result && !activityAccepted) {
               result = {
                 ok: false,
                 error: REASON.FILTER_ACTIVE,
@@ -1688,7 +1896,8 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
           }
         }
 
-        if (!(result?.ok || result?.filtered || operationAborted(result))) {
+        if (!(result?.ok || result?.filtered || result?.error === 'NON_CHAT_JOB' ||
+          isEnvironmentalFailure(result) || operationAborted(result))) {
           triggerStarted = true;
           result = await sendToBoss(
             MSG.TRIGGER_CONVERSATION || 'BHT_TRIGGER_CONVERSATION',
@@ -1698,6 +1907,18 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
             },
             { tabId: workerTab.id, forceInject: true }
           );
+          // 点击后可能整页跳到消息页；在新的文档里核验同 HR 换岗弹窗，
+          // 避免把旧岗位会话当成当前岗位已成功建聊。
+          if (result?.ok && (result.already || result.navigated)) {
+            const switchCheck = await sendToBoss(
+              MSG.CHECK_JOB_SWITCH,
+              { timeoutMs: 1000 },
+              { tabId: workerTab.id, forceInject: true }
+            );
+            if (switchCheck?.error === 'BOSS_JOB_SWITCH_REQUIRED' || operationAborted(switchCheck)) {
+              result = switchCheck;
+            }
+          }
         }
       } catch (error) {
         result = {
@@ -1706,6 +1927,9 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
           message: '临时沟通执行页失败：' + String(error?.message || error)
         };
       } finally {
+        if (typeof restoreSharedWorkerMessageTab === 'function') {
+          await restoreSharedWorkerMessageTab(task, messageTab, workerTab);
+        }
         await restoreTabsAfterWorker(messageTab, listTabId, workerTab, task);
       }
 
@@ -1715,16 +1939,19 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
         tryIndex: tryIndex + 1,
         ok: Boolean(result?.ok),
         error: result?.error || '',
+        activityError: activityInspection?.error || '',
         activeText: activityInspection?.activeText || '',
         activityAccepted,
         navigated: Boolean(result?.navigated)
       });
 
-      if (result?.ok || result?.filtered || operationAborted(result)) break;
-
-      const canRetry = isWorkerTriggerRetryable(result) && tryIndex < maxTries - 1 && !runner.abort;
+      // Retry known pre-click worker failures before applying the broader
+      // environment auto-skip classification. These failures are
+      // recoverable by replacing the stale detail tab.
+      const retryable = isWorkerTriggerRetryable(result);
+      const canRetry = retryable && tryIndex < maxTries - 1 && !runner.abort;
       const failedTabId = workerTab?.id || task?.execution?.workerTabId;
-      if (failedTabId && isWorkerTriggerRetryable(result)) {
+      if (failedTabId && retryable) {
         await closeConversationWorkerTab(task, failedTabId, {
           reason: canRetry
             ? '立即沟通未成功，关闭执行页后重试'
@@ -1732,17 +1959,25 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
           publish: true
         });
       }
-      if (!canRetry) break;
-      await log('warn', `[执行页] 打开岗位或未找到立即沟通（${result?.message || result?.error || '未知'}），将重新打开标签重试（${tryIndex + 1}/${maxTries}）`, {
-        jobId: job.jobId,
-        error: result?.error || '',
-        tryIndex: tryIndex + 1,
-        maxTries
-      });
-      if (retryDelayMs) await sleep(retryDelayMs);
+      if (canRetry) {
+        await log('warn', `[执行页] 打开岗位或未找到立即沟通（${result?.message || result?.error || '未知'}），将重新打开标签重试（${tryIndex + 1}/${maxTries}）`, {
+          jobId: job.jobId,
+          error: result?.error || '',
+          tryIndex: tryIndex + 1,
+          maxTries
+        });
+        if (retryDelayMs) await sleep(retryDelayMs);
+        continue;
+      }
+      if (result?.ok || result?.filtered || result?.error === 'NON_CHAT_JOB' ||
+        isEnvironmentalFailure(result) || operationAborted(result)) break;
+      // Non-environmental failures retain the existing stop-and-protect
+      // behavior; only the explicit retryable set can continue the loop.
+      break;
     }
 
-    if (result?.ok || result?.filtered || operationAborted(result)) break;
+    if (result?.ok || result?.filtered || result?.error === 'NON_CHAT_JOB' ||
+      isEnvironmentalFailure(result) || operationAborted(result)) break;
   }
 
   const listAfter = await getListTabFingerprint(listTabId);
@@ -1767,6 +2002,7 @@ async function triggerConversationInWorker(task, job, messageTab, listTabId, act
     ...(result || { ok: false, error: 'WORKER_TRIGGER_EMPTY', message: '临时沟通执行页没有返回结果' }),
     workerMode: attemptResults[attemptResults.length - 1]?.mode || '',
     workerTabClosed: false,
+    activityError: attemptResults[attemptResults.length - 1]?.activityError || '',
     // 环境类异常（页面未就绪/点击无效果/执行页失败/超时）：队列自动继续，不阻塞等待用户
     environmental: isEnvironmentalFailure(result),
     listPreserved,
@@ -1826,6 +2062,17 @@ async function sendToBoss(type, payload = {}, { retries = 2, forceInject = false
       error: "NOT_BOSS_URL",
       message: bossUrlGuardMessage(tab.url || "")
     };
+  }
+  // Select only tabs owned by the current background workspace. Never activate the user's other window.
+  if (backgroundExecution && (runKind === 'task' || runner.targetLoop)) {
+    const activation = await activateBackgroundTab(
+      tab.windowId || backgroundExecution.windowId,
+      tab.id,
+      chrome,
+      [backgroundExecution.windowId, backgroundExecution.messageWindowId].filter((id, index, all) => id != null && all.indexOf(id) === index)
+    );
+    if (!activation.ok) return activation;
+    if (isCancelled()) return cancelledResult();
   }
 
   const critical = [
@@ -2752,7 +2999,8 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
   const config = await getAllConfig();
   if (!isActive()) return cancelled();
   runner.previewPreviousTask = cloneTaskSnapshot(config.task);
-  const scanSessionId = uid('scan');
+  const continuingScan = Boolean(payload.continueScanSessionId);
+  const scanSessionId = String(payload.continueScanSessionId || uid('scan'));
   const requestedMaxScanMs = Number(payload.maxScanMs);
   const maxElapsedMs = Number.isFinite(requestedMaxScanMs) && requestedMaxScanMs > 0
     ? Math.max(1000, Math.min(OPERATION_TIMEOUTS.PREVIEW_SCROLL_MS, requestedMaxScanMs))
@@ -2803,7 +3051,8 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
     const scanResult = await scanPreviewJobs({
       ...payload,
       scanSessionId,
-      resetSession: true,
+      resetSession: !continuingScan,
+      deltaOnly: continuingScan,
       deadlineAt,
       continuous: true,
       maxRounds: Math.max(64, Math.min(512, Number(payload.maxRounds || 512))),
@@ -3055,7 +3304,11 @@ async function runPreview(payload = {}, previewTab = null, previewRunId = runner
   };
 
   
-  task.listHref = previewListHref || '';
+    // Keep the complete source URL when it is available.  On search pages BOSS
+    // may expose a shortened SPA URL (city + keyword) even though the active
+    // experience/degree filters are carried by the request and source context.
+    // The source context is the stronger snapshot for later list validation.
+    task.listHref = finalSourceContext?.listHref || previewListHref || '';
   if (previewListExpect) {
     task.listExpectLabel = previewListExpect;
   }
@@ -3103,6 +3356,89 @@ function isRefreshableJobSourceContext(context = {}) {
   return context?.sourceType === JOB_SOURCE_TYPES.RECOMMEND ||
     (context?.sourceType === JOB_SOURCE_TYPES.EXPECTATION && Boolean(String(context?.expectationKey || '').trim())) ||
     (context?.sourceType === JOB_SOURCE_TYPES.SEARCH && Boolean(String(context?.searchKey || '').trim()));
+}
+
+function normalizeSearchSourceIdentity(href = '') {
+  try {
+    const parsed = new URL(String(href || ''), 'https://www.zhipin.com');
+    const ignored = new Set([
+      '_', '_security_check', 'ka', 'page', 'pageSize', 'from', 'timestamp', 't',
+      'jobType', 'salary', 'experience', 'degree', 'industry', 'scale'
+    ]);
+    const params = [];
+    for (const [key, value] of parsed.searchParams) {
+      if (ignored.has(key)) continue;
+      params.push(`${key}=${value}`);
+    }
+    return `${parsed.pathname}?${params.sort().join('&')}`;
+  } catch (_) {
+    return String(href || '').split('#')[0];
+  }
+}
+
+// A terminal target run is historical. When the user clicks “批量投递” again
+// in target mode, start a fresh run with a new task id and zeroed counters.
+// Keep per-job terminal states and the saved source so the next run starts at
+// the remaining jobs. Global idempotency remains the final duplicate guard.
+function createFreshTargetTask(previousTask) {
+  const snapshot = cloneTaskSnapshot(previousTask) || {};
+  const now = Date.now();
+  const doneIds = collectDoneJobIds(snapshot.items, snapshot.queue, snapshot.testedJobIds);
+  const results = (snapshot.results || []).map((row) => ({
+    ...row,
+    selected: row?.decision === 'pass' && !doneIds.has(String(row?.job?.jobId || ''))
+  }));
+  const previousQueue = new Map((snapshot.queue || []).map((entry) => [String(entry?.jobId || ''), entry]));
+  const queue = buildDeliveryQueue(results, { selectedOnly: false }).map((entry, index) => {
+    const old = previousQueue.get(String(entry.jobId || ''));
+    if (old && ['done', 'skipped', 'failed'].includes(old.status)) {
+      return { ...entry, index, status: old.status, outcome: old.outcome, finishedAt: old.finishedAt };
+    }
+    if (doneIds.has(String(entry.jobId || ''))) return { ...entry, index, status: 'done' };
+    return { ...entry, index, status: 'pending' };
+  });
+  const execution = { ...(snapshot.execution || {}), taskRunId: '' };
+  delete execution.workerTabId;
+  delete execution.phase;
+  delete execution.jobsSinceMessageRefresh;
+  return {
+    ...snapshot,
+    listHref: snapshot.sourceContext?.listHref || snapshot.listHref || '',
+    id: uid('task'),
+    status: TASK_STATUS.AWAITING_CONFIRM,
+    createdAt: now,
+    updatedAt: now,
+    revision: 0,
+    counters: { processed: 0, success: 0, skipped: 0, failed: 0 },
+    results,
+    items: Array.isArray(snapshot.items) ? snapshot.items : [],
+    queue,
+    queueCursor: 0,
+    currentJobId: null,
+    nextJobId: null,
+    completionSignal: null,
+    pauseReason: '',
+    pauseSource: '',
+    awaitingUserRetry: false,
+    uiErrorDismissed: true,
+    retryCurrent: false,
+    errorKey: '',
+    lastErrorDetail: '',
+    consecutiveFails: 0,
+    testDelivery: false,
+    testJobId: null,
+    targetMode: false,
+    targetCount: 0,
+    targetNoNewRetryLimit: 0,
+    targetNoNewRounds: 0,
+    targetRefreshCount: 0,
+    targetLastError: '',
+    targetStartedAt: 0,
+    refreshHistory: [],
+    refreshCount: 0,
+    testedJobIds: [],
+    execution
+  };
 }
 
 function mergeRefreshedTask(previousTask, freshTask, refreshMeta = {}) {
@@ -3245,6 +3581,9 @@ async function refreshAndContinue(payload = {}, sourceTab, previewRunId = '') {
   // “刷新并继续”恢复的是已完成任务的快照。BOSS 刷新时可能先把当前页
   // 临时切回“推荐”，因此刷新前的页面状态只能用于诊断，不能作为拦截条件。
   const before = await sendToBoss(MSG.GET_JOB_SOURCE_CONTEXT, { refreshExpectations: true }, tabOpt).catch(() => null);
+  const continuation = payload.targetMode === true && before?.ok
+    ? resolveTargetSearchContinuation(previousTask, before.context, sourceTab.id)
+    : null;
   const sourceChangedBeforeRefresh = Boolean(
     before?.context && !sameJobSourceContext(previousTask.sourceContext, before.context)
   );
@@ -3264,13 +3603,31 @@ async function refreshAndContinue(payload = {}, sourceTab, previewRunId = '') {
     expectationLabel: previousTask.sourceContext.expectationLabel || '推荐'
   });
   try {
-    await chrome.tabs.reload(sourceTab.id);
-    const readyTab = await waitTabComplete(sourceTab.id, 45000, { requireComplete: true });
+    let readyTab = sourceTab;
+    if (continuation) {
+      await log('info', '[目标模式] 搜索列表尚未扫描到底，继续加载未扫描岗位', {
+        tabId: sourceTab.id,
+        scrollTop: continuation.scrollTop,
+        scanSessionId: continuation.scanSessionId
+      });
+    } else {
+      // 搜索页的关键词、城市等来自原 URL；外部切换来源后也必须先恢复该 URL。
+      const expectedHref = previousTask.sourceContext?.listHref || previousTask.listHref;
+      if (previousTask.sourceContext.sourceType === JOB_SOURCE_TYPES.SEARCH &&
+          !sameJobListUrl(sourceTab.url || sourceTab.pendingUrl || '', expectedHref)) {
+        await chrome.tabs.update(sourceTab.id, { url: expectedHref });
+      } else {
+        await chrome.tabs.reload(sourceTab.id);
+      }
+      readyTab = await waitTabComplete(sourceTab.id, 45000, { requireComplete: true });
+    }
     if (!readyTab || !isBossJobListUrl(readyTab.url || readyTab.pendingUrl || '')) {
       return { ok: false, error: 'LIST_RELOAD_FAILED', message: '职位列表刷新失败，旧任务已保留' };
     }
-    await forceInjectContent(sourceTab.id);
-    await sleep(650);
+    if (!continuation) {
+      await forceInjectContent(sourceTab.id);
+      await sleep(650);
+    }
     const restored = await sendToBoss(
       MSG.RESTORE_JOB_SOURCE_CONTEXT,
       { sourceContext: previousTask.sourceContext, timeoutMs: 15000 },
@@ -3312,6 +3669,10 @@ async function refreshAndContinue(payload = {}, sourceTab, previewRunId = '') {
     setPreviewPhase('collecting', previewRunId);
     const fresh = await runPreview({
       ...payload,
+      ...(continuation ? {
+        continueScanSessionId: continuation.scanSessionId,
+        resumeScrollTop: continuation.scrollTop
+      } : {}),
       captureSourceContext: true,
       // A refresh is one logical task. Keep the temporary scan out of
       // storage/events until it has been merged back into the original task.
@@ -3547,6 +3908,20 @@ async function processOneJob(task, resultRow, config) {
   const job = { ...resultRow.job };
   if (!job.listHref && task.listHref) job.listHref = task.listHref;
   const item = ensureItem(task, job);
+  const skipExistingBossJob = async (result) => {
+    item.state = 'SKIPPED';
+    item.phase = '';
+    item.reasons = [result.message || '已与该 BOSS 沟通过其他岗位，已跳过'];
+    task.counters.skipped += 1;
+    runner.consecutiveUnknownActive = 0;
+    await bumpDailyStat('skip');
+    await appendHistory({
+      jobId: job.jobId, bossId: job.bossId, title: job.title, company: job.company,
+      status: 'skipped_list', reason: 'BOSS_JOB_SWITCH_REQUIRED', taskId: task.id
+    });
+    await log('info', '[任务] ' + item.reasons[0], { jobId: job.jobId, cancelled: result.cancelled });
+    return 'skipped';
+  };
   const resumedFromChat = hasChatCheckpoint(item);
   if (resumedFromChat && item.triggerIdentity) Object.assign(job, item.triggerIdentity);
   resultRow.job = job;
@@ -3707,12 +4082,13 @@ async function processOneJob(task, resultRow, config) {
     );
     if (operationAborted(trig)) return 'aborted';
     await log(
-      trig?.ok ? 'success' : (trig?.filtered ? 'info' : 'error'),      trig?.ok
+      trig?.ok ? 'success' : (trig?.filtered || trig?.skipped || trig?.error === 'NON_CHAT_JOB' ? 'info' : 'error'),
+      trig?.ok
         ? ('[执行页] 已触发沟通 btn=' + (trig.buttonText || '') +
           (trig.navigated ? ' · BOSS 跳转在临时页完成' : (trig.stayed ? ' · 已点留在此页' : ' · 无需留在此页弹窗')) +
           (trig.listPreserved ? ' · 左侧筛选保持' : ' · 左侧页面需检查') +
           (trig.already ? ' · 继续沟通' : ''))
-        : (trig?.filtered
+        : (trig?.filtered || trig?.skipped || trig?.error === 'NON_CHAT_JOB'
           ? ('已跳过：' + (trig?.message || 'HR 活跃时间不满足'))
           : ('[执行页] 触发沟通失败：' + (trig?.message || trig?.error || ''))),
       {
@@ -3724,8 +4100,9 @@ async function processOneJob(task, resultRow, config) {
         workerAttempts: trig?.workerAttempts
       }
     );
-    if (trig?.ok) runner.consecutiveUnknownActive = 0;
+    if (trig?.ok || trig?.error === 'NON_CHAT_JOB') runner.consecutiveUnknownActive = 0;
     if (!trig?.ok) {
+      if (trig?.error === 'BOSS_JOB_SWITCH_REQUIRED') return await skipExistingBossJob(trig);
       if (trig?.filtered === true && trig?.error === REASON.FILTER_ACTIVE) {
         job.activeText = String(trig.activeText || '');
         // 预览行同步为「投递跳过」：该岗位在投递时因 HR 活跃不匹配被跳过，不被计入投递
@@ -3753,10 +4130,25 @@ async function processOneJob(task, resultRow, config) {
           await publishTask(task);
           return 'limited';
         }
-        // 防级联②：连续 N 岗读不到 HR 活跃度（未知）→ 左侧列表大概率已失效，
-        // 暂停而不是继续空转跳过。
-        if (job.activeText) {
+        // 详情页已确认是目标岗位、但 BOSS 没有返回 HR 活跃标签时，
+        // 这是一个正常的“未知”业务结果，应安全跳过该岗并继续队列。
+        // 只有详情页身份本身无法确认（或左侧列表指纹已变化）才说明
+        // 页面状态可能失效，连续出现时暂停保护，避免把错岗当成未知活跃度。
+        const activityError = String(
+          trig.activityInspection?.error ||
+          trig.activityError ||
+          trig.workerAttempts?.[trig.workerAttempts.length - 1]?.error ||
+          ''
+        );
+        const detailIdentityUnknown = activityError === 'DETAIL_IDENTITY_MISMATCH';
+        if (job.activeText || !detailIdentityUnknown) {
           runner.consecutiveUnknownActive = 0;
+          if (!job.activeText) {
+            await log('info', '[列表页] 详情页身份已确认，但 HR 活跃度未公开；安全跳过并继续队列', {
+              jobId: job.jobId,
+              activityError: activityError || 'DETAIL_ACTIVE_UNKNOWN'
+            });
+          }
         } else {
           runner.consecutiveUnknownActive = (runner.consecutiveUnknownActive || 0) + 1;
           if (runner.consecutiveUnknownActive >= 3) {
@@ -3764,13 +4156,14 @@ async function processOneJob(task, resultRow, config) {
             runner.pause = true;
             task.status = TASK_STATUS.PAUSED;
             task.awaitingUserRetry = true;
-            task.pauseReason = `连续 ${runner.consecutiveUnknownActive} 岗无法读取 HR 活跃度，左侧列表可能已失效（刷新/筛选变化）；请检查左侧列表后继续`;
-            await log('warn', task.pauseReason, { jobId: job.jobId, activeText: job.activeText || '' });
+            task.pauseReason = `连续 ${runner.consecutiveUnknownActive} 岗无法读取 HR 活跃度且无法确认详情页身份，左侧列表可能已失效（刷新/筛选变化）；请检查左侧列表后继续`;
+            await log('warn', task.pauseReason, { jobId: job.jobId, activeText: job.activeText || '', activityError });
             await publishTask(task);
             return 'limited';
           }
-          await log('warn', `[列表页] HR 活跃度未读取到（${runner.consecutiveUnknownActive}/3），将先回列表恢复状态再核对下一岗`, {
-            jobId: job.jobId
+          await log('warn', `[列表页] 详情页身份未确认（${runner.consecutiveUnknownActive}/3），将先回列表恢复状态再核对下一岗`, {
+            jobId: job.jobId,
+            activityError
           });
         }
         item.state = 'SKIPPED';
@@ -3801,6 +4194,7 @@ async function processOneJob(task, resultRow, config) {
       item.reasons = [trig?.message || trig?.error || '列表页触发沟通失败'];
       if (item.state === 'SKIPPED') {
         task.counters.skipped += 1;
+        if (trig?.error === 'NON_CHAT_JOB') await bumpDailyStat('skip');
         await appendHistory({ jobId: job.jobId, title: job.title, company: job.company, status: 'skipped_list', taskId: task.id });
         return 'skipped';
       }
@@ -3884,7 +4278,7 @@ async function processOneJob(task, resultRow, config) {
 
   // 消息页阶段一：解析并打开会话（不含输入框门禁）
   if (runner.abort) return 'aborted';
-  try { await chrome.tabs.update(msgTabId, { active: true }); } catch (_) {}
+  try { await activateDeliveryTab(task, msgTabId); } catch (_) {}
   await sleep(400);
   if (runner.abort) return 'aborted';
   await log('info', '[消息页] 等待并匹配会话…', { jobId: job.jobId, company: job.company, title: job.title });
@@ -3894,6 +4288,7 @@ async function processOneJob(task, resultRow, config) {
     msgOpt
   );
   if (operationAborted(conv)) return 'aborted';
+  if (conv?.error === 'BOSS_JOB_SWITCH_REQUIRED') return await skipExistingBossJob(conv);
   if (!conv?.ok && conv?.error === 'CONVERSATION_NOT_FOUND') {
     await log('info', '[消息页] 首次刷新后暂未出现新会话，正在执行第二次刷新…', {
       jobId: job.jobId,
@@ -3907,13 +4302,14 @@ async function processOneJob(task, resultRow, config) {
       resumed: false
     });
     if (operationAborted(secondRefresh)) return 'aborted';
-    try { await chrome.tabs.update(msgTabId, { active: true }); } catch (_) {}
+    try { await activateDeliveryTab(task, msgTabId); } catch (_) {}
     conv = await sendToBoss(
       MSG.WAIT_OPEN_CONVERSATION || 'BHT_WAIT_OPEN_CONVERSATION',
       { job, beforeKeys: beforeSnap?.keys || [], timeoutMs: 14000 },
       msgOpt
     );
     if (operationAborted(conv)) return 'aborted';
+    if (conv?.error === 'BOSS_JOB_SWITCH_REQUIRED') return await skipExistingBossJob(conv);
   }
   await log(
     conv?.ok ? 'success' : 'error',
@@ -3960,13 +4356,14 @@ async function processOneJob(task, resultRow, config) {
 
   // 消息页阶段二：等待输入框（失败=暂停，绝不当成未找到会话）
   await log('info', '[消息页] 等待聊天输入框…', { jobId: job.jobId });
-  try { await chrome.tabs.update(msgTabId, { active: true }); } catch (_) {}
+  try { await activateDeliveryTab(task, msgTabId); } catch (_) {}
   let editor = await sendToBoss(
     MSG.WAIT_CHAT_EDITOR || 'BHT_WAIT_CHAT_EDITOR',
     { timeoutMs: 30000 },
     msgOpt
   );
   if (operationAborted(editor)) return 'aborted';
+  if (editor?.error === 'BOSS_JOB_SWITCH_REQUIRED') return await skipExistingBossJob(editor);
   await log(
     editor?.ok ? 'success' : 'error',
     editor?.ok
@@ -3979,6 +4376,22 @@ async function processOneJob(task, resultRow, config) {
     item.reasons = [editor?.message || 'CHAT_EDITOR_NOT_READY'];
     item.phase = JOB_PHASE.CONVERSATION_OPENED_EDITOR_PENDING;
     task.counters.failed += 1;
+    // 编辑器仍在加载、被 BOSS 订阅弹层遮挡或处于 disabled 状态时，尚未发生发送副作用：
+    // 标记为环境失败，让队列顺延；只有已点击发送后仍缺少自己的消息回执才进入人工暂停。
+    const editorEnvironmentFailure = editor?.error === 'CHAT_EDITOR_NOT_READY' ||
+      editor?.nativeDialog === 'subscribe' || editor?.diagnostic?.nativeDialog === 'subscribe';
+    if (editorEnvironmentFailure) {
+      resultRow.envAutoSkip = true;
+      task.consecutiveFails += 1;
+      task.lastErrorDetail = JSON.stringify(editor?.diagnostic || {}, null, 0).slice(0, 800);
+      await bumpDailyStat('fail');
+      await log('warn', '[消息页] 编辑器未就绪，跳过当前岗位并顺延队列', {
+        jobId: job.jobId,
+        diagnostic: editor?.diagnostic,
+        nativeDialog: editor?.nativeDialog || editor?.diagnostic?.nativeDialog || ''
+      });
+      return 'failed';
+    }
     task.pauseReason = '会话已打开，但消息输入框未识别，请检查消息页后点重试';
     task.awaitingUserRetry = true;
     task.lastErrorDetail = JSON.stringify(editor?.diagnostic || {}, null, 0).slice(0, 800);
@@ -4187,11 +4600,17 @@ async function processOneJob(task, resultRow, config) {
       let sendCode = REASON.EXEC_SEND_TEXT_FAIL;
       if (sendRes?.error === 'LOGIN_REQUIRED') sendCode = REASON.LIMIT_PLATFORM;
       if (sendRes?.error === 'CHAT_TIMEOUT' || sendRes?.error === 'INPUT_NOT_FOUND') sendCode = REASON.EXEC_CHAT_TIMEOUT;
+      if (sendRes?.error === 'CHAT_EDITOR_NOT_READY') sendCode = REASON.EXEC_CHAT_TIMEOUT;
       item.reasons = [reasonText(sendCode, sendRes?.message || sendRes?.error || '')];
       task.pauseReason = item.reasons[0];
       task.lastErrorDetail = '岗位：' + (job.title || '') + ' @ ' + (job.company || '') + '\n发送内容：' + String(step.text || '').slice(0, 80);
       task.counters.failed += 1;
       task.consecutiveFails += 1;
+      const sendEnvironmentFailure = sendRes?.error === 'CHAT_EDITOR_NOT_READY' ||
+        sendRes?.nativeDialog === 'subscribe' || sendRes?.diagnostic?.nativeDialog === 'subscribe';
+      if (sendEnvironmentFailure) {
+        resultRow.envAutoSkip = true;
+      }
       await bumpDailyStat('fail');
       await log('error', '发送失败：' + (job.title || '') + ' - ' + item.reasons[0], { jobId: job.jobId });
       if (sendRes?.error === 'LOGIN_REQUIRED') {
@@ -4432,9 +4851,37 @@ async function runTaskLoop(taskId, taskRunId = uid('run')) {
     // 明确提示用户「岗位列表已变化，请重新预览」。
     if (task.listHref && task.execution?.listTabId) {
       try {
-        const anchor = resolveBossJobListUrl({ candidate: task.listHref });
         const fp = await getListTabFingerprint(task.execution.listTabId);
-        const same = sameJobListUrl(anchor, String(fp.url || ''));
+        const sourceContext = task.sourceContext || {};
+        const currentUrl = String(fp.url || '');
+        const isSearchSource = sourceContext.sourceType === JOB_SOURCE_TYPES.SEARCH;
+        const anchor = resolveBossJobListUrl({ candidate: task.listHref });
+        let currentSourceContext = null;
+        if (isSearchSource) {
+          // Search filters can live in the SPA request/DOM rather than the URL.
+          // Read the source context from the saved list tab before comparing the
+          // anchor so a changed degree/experience filter cannot silently reuse
+          // the old preview queue.
+          const sourceRead = await sendToBoss(
+            MSG.GET_JOB_SOURCE_CONTEXT,
+            { refreshExpectations: false },
+            { tabId: task.execution.listTabId, forceInject: false }
+          ).catch(() => null);
+          if (sourceRead?.ok && sourceRead.context) currentSourceContext = sourceRead.context;
+        }
+        const sourceMatches = !currentSourceContext || (
+          sameJobSourceContext(sourceContext, currentSourceContext) &&
+          sameFilterSignature(sourceContext.filterSignature, currentSourceContext.filterSignature)
+        );
+        // Search filters are represented in the saved filter signature and can
+        // be absent from BOSS's shortened SPA URL. Prefer the live source
+        // context when available; the stable URL identity remains a fallback
+        // for older content scripts that cannot report it.
+        const same = isSearchSource
+          ? (currentSourceContext
+            ? sourceMatches
+            : normalizeSearchSourceIdentity(anchor) === normalizeSearchSourceIdentity(currentUrl))
+          : sameJobListUrl(anchor, currentUrl);
         if (same === false) {
           try { await softReturnToList(task); } catch (_) {}
           runner.pause = true;
@@ -4443,15 +4890,20 @@ async function runTaskLoop(taskId, taskRunId = uid('run')) {
           task.pauseReason = `岗位列表已变化（当前列表与预览时不一致，可能切换了搜索/筛选），请重新扫描预览后再投递`;
           await log('warn', '[列表页] ' + task.pauseReason, {
             anchor: String(anchor).slice(0, 160),
-            currentUrl: String(fp.url || '').slice(0, 160)
+            currentUrl: currentUrl.slice(0, 160),
+            sourceType: sourceContext.sourceType || '',
+            currentSourceContext,
+            sourceMatches
           });
           await publishTask(task);
           return 'limited';
         }
         await log('info', '[列表页] 投递前锚点核对：当前列表与预览一致（岗位集合未变化）', {
           anchor: String(anchor).slice(0, 120),
-          currentUrl: String(fp.url || '').slice(0, 120),
-          same: String(same)
+          currentUrl: currentUrl.slice(0, 120),
+          sourceType: sourceContext.sourceType || '',
+          same: String(same),
+          sourceMatches
         });
       } catch (_) {
         // 预检失败不阻塞：逐岗核对与防级联保护仍兜底
@@ -4966,7 +5418,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await enforceDeliverySchedule('settings_changed');
         await debugLog('background.settings', 'saved', {
           debugLoggingEnabled,
-          splitViewEnabled: savedSettings.splitViewEnabled !== false,
+          splitViewEnabled: true,
+          backgroundDeliveryEnabled: true,
           scheduledDeliveryEnabled: savedSettings.scheduledDeliveryEnabled === true
         });
         return { ok: true };
@@ -5037,6 +5490,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         if (targetMode && !isRefreshableJobSourceContext(task.sourceContext)) {
           return { ok: false, error: 'JOB_SOURCE_NOT_RESTORABLE', message: '目标模式需要先扫描一批带可恢复来源的岗位列表（推荐、求职期望或搜索列表）' };
+        }
+        const previousTaskId = task.id;
+        const freshTargetRun = targetMode &&
+          [TASK_STATUS.COMPLETED, TASK_STATUS.STOPPED, TASK_STATUS.FAILED].includes(task.status);
+        if (freshTargetRun) {
+          task = createFreshTargetTask(task);
+          await log('info', `[目标模式] 已结束任务 ${previousTaskId}，创建新一轮目标任务`, {
+            previousTaskId,
+            taskId: task.id,
+            requestedTargetCount: targetCount
+          });
         }
         task.targetMode = targetMode;
         task.targetCount = targetMode ? targetCount : 0;
@@ -5166,13 +5630,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const scheduledStart = stageTaskForDeliverySchedule(task, all.settings || {}, new Date());
         const split = scheduledStart.waiting
           ? { ok: false, skipped: true, reason: 'waiting_for_schedule' }
-          : await prepareSplitWorkspace(task, all.settings || {});
+          : await prepareDeliveryWorkspace(task, all.settings || {});
+        if (split.background && !split.ok) {
+          await pauseForWorkspaceProblem(task, split);
+          return split;
+        }
         await publishTask(task);
         if (runner.abort || task.status === TASK_STATUS.STOPPED) {
           return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，未开始投递' };
         }
         if (split.ok) {
-          await log('success', '[分屏] 职位列表在左侧，消息中心在右侧', {
+          await log('success', '[投递工作区] 职位列表在左侧，消息中心在右侧；可切换应用或最小化窗口，投递继续运行', {
             listTabId: split.listTabId,
             messageTabId: split.messageTabId
           });
@@ -5196,6 +5664,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return {
           ok: true,
           taskId: task.id,
+          freshTargetRun,
+          previousTaskId: freshTargetRun ? previousTaskId : null,
           splitView: split,
           pending: selectedIds.length,
           scheduled: scheduledStart.waiting,
@@ -5209,27 +5679,59 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MSG.RUN_TEST_DELIVERY:
       case 'BHT_RUN_TEST_DELIVERY': {
         return await withRunnerAdmission('starting', async () => {
+        let guard = null;
         {
           await log('info', '[投递一份] 收到启动请求', {
             senderTab: sender?.tab ? { id: sender.tab.id, url: sender.tab.url || '' } : null
           });
-          const guard = await assertBossContext(sender);
+          guard = await assertBossContext(sender);
           if (!guard.ok) {
             await log('warn', guard.message);
             return guard;
-          }
-          if (guard.tab?.id) {
-            payload = {
-              ...(payload || {}),
-              listTabId: guard.tab.id,
-              listWindowId: guard.tab.windowId
-            };
           }
         }
         const all = await getAllConfig();
         let task = all.task;
         if (!task || !(task.results || []).length) {
           return { ok: false, error: 'NO_PREVIEW', message: '请先扫描预览，再使用「投递一份」' };
+        }
+
+        // The floating panel can remain open on an older/duplicate BOSS list
+        // tab after a previous delivery created its isolated workspace. Do not
+        // replace the saved delivery list with that sender tab: doing so makes
+        // the next workspace check report BACKGROUND_LIST_MOVED and pauses
+        // before any job is attempted. Prefer the task's still-valid list tab;
+        // use the sender tab only when the task has no usable saved source.
+        const savedListTab = task.execution?.listTabId != null
+          ? await chrome.tabs.get(task.execution.listTabId).catch(() => null)
+          : null;
+        const savedListUrl = savedListTab?.url || savedListTab?.pendingUrl || '';
+        const senderListUrl = guard.tab?.url || guard.tab?.pendingUrl || '';
+        const workspaceActive = task.execution?.backgroundDeliveryActive === true;
+        const savedIsList = Boolean(savedListTab && isBossJobListUrl(savedListUrl));
+        const senderIsList = Boolean(guard.tab && isBossJobListUrl(senderListUrl));
+        // When a delivery workspace is active, only a saved tab that is
+        // already inside that workspace is authoritative. A duplicate tab in
+        // the user's normal window must be left alone; prepareBackgroundWorkspace
+        // will recover the live list tab from the popup. For a fresh task with
+        // no active workspace, the tab that owns the panel is the natural
+        // source, while an old saved list is only a fallback.
+        const preferredListTab = workspaceActive
+          ? (savedIsList && savedListTab.windowId === task.execution.backgroundWindowId ? savedListTab : null)
+          : (senderIsList ? guard.tab : (savedIsList ? savedListTab : null));
+        if (preferredListTab?.id) {
+          payload = {
+            ...(payload || {}),
+            listTabId: preferredListTab.id,
+            listWindowId: preferredListTab.windowId
+          };
+          if (savedListTab?.id === preferredListTab.id && guard.tab?.id !== preferredListTab.id) {
+            await log('info', '[投递一份] 面板所在页不是当前后台工作页，沿用任务保存的职位列表 tab', {
+              senderTabId: guard.tab?.id || null,
+              savedListTabId: preferredListTab.id,
+              savedListWindowId: preferredListTab.windowId
+            });
+          }
         }
         const wantId = payload?.jobId || (payload?.selectedJobIds && payload.selectedJobIds[0]) || null;
         // 单岗队列每次重建会丢掉旧 queue done，靠 testedJobIds / items 推进到下一岗
@@ -5325,13 +5827,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const scheduledStart = stageTaskForDeliverySchedule(task, all.settings || {}, new Date());
         const split = scheduledStart.waiting
           ? { ok: false, skipped: true, reason: 'waiting_for_schedule' }
-          : await prepareSplitWorkspace(task, all.settings || {});
+          : await prepareDeliveryWorkspace(task, all.settings || {});
+        if (split.background && !split.ok) {
+          await pauseForWorkspaceProblem(task, split);
+          return split;
+        }
         await publishTask(task);
         if (runner.abort || task.status === TASK_STATUS.STOPPED) {
           return { ok: false, error: 'OP_CANCELLED', message: '任务已停止，未开始投递' };
         }
         if (split.ok) {
-          await log('success', '[分屏] 投递一份已打开左右工作区', {
+          await log('success', '[投递工作区] 已打开左右窗口；可切换应用或最小化窗口，投递继续运行', {
             listTabId: split.listTabId,
             messageTabId: split.messageTabId
           });
@@ -5497,6 +6003,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           runner.taskRunId = resumeTaskRunId;
           runner.taskRunTaskId = all.task.id;
           all.task.execution = { ...(all.task.execution || {}), taskRunId: resumeTaskRunId };
+          const workspace = await prepareDeliveryWorkspace(all.task, all.settings || {});
+          if (workspace.background && !workspace.ok) {
+            await pauseForWorkspaceProblem(all.task, workspace);
+            return workspace;
+          }
         }
         all.task.status = TASK_STATUS.RUNNING;
         all.task.pauseReason = '';
@@ -5709,7 +6220,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               runner: sanitizeDebugValue({ ...runner, activeOperations: operations.size }),
               settings: sanitizeDebugValue({
                 debugLoggingEnabled: config.settings?.debugLoggingEnabled === true,
-                splitViewEnabled: config.settings?.splitViewEnabled !== false,
+                splitViewEnabled: true,
+                backgroundDeliveryEnabled: true,
                 messageMode: config.settings?.messageMode || '',
                 consecutiveFailPause: config.settings?.consecutiveFailPause
               }),
