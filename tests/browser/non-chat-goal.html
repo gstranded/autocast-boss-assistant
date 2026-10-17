@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>网申跳过与目标预览回归</title>
+<style>
+body { margin: 28px; font: 16px/1.6 system-ui; color: #172337; background: #f6f8fb; }
+h1 { font-size: 24px; } button, a { display: inline-block; padding: 10px 18px; }
+#fixture, #previewList { padding: 18px; background: white; border: 1px solid #dce3ed; }
+.pass { color: #167544; } .fail { color: #b32929; } .hidden { display: none; }
+</style>
+<h1>网申跳过与目标预览回归</h1>
+<p>使用当前源码的真实 DOM 检测和预览渲染函数；不连接账号、不发送消息。</p>
+<ol id="results"></ol>
+<div id="fixture"></div>
+<pre id="summaryBox"></pre>
+<div id="previewList"></div>
+<script type="module">
+import { collectDoneJobIds } from "/extension/shared/task-model.js";
+import { previewReasonLines } from "/extension/shared/filter-engine.js";
+const content = await (await fetch("/extension/content/content-main.js")).text();
+const panel = await (await fetch("/extension/sidepanel/app.js")).text();
+function extract(source, start, end) {
+  const at = source.indexOf(start);
+  const to = source.indexOf(end, at);
+  if (at < 0 || to < 0) throw new Error(`missing source: ${start}`);
+  return source.slice(at, to).trim();
+}
+function bind(source, start, end, values) {
+  return new Function(...Object.keys(values), `return (${extract(source, start, end)});`)(...Object.values(values));
+}
+function check(value, message) { if (!value) throw new Error(message); }
+const fixture = document.querySelector("#fixture");
+const textOf = (node) => node?.textContent?.trim() || "";
+const bindings = { document, getComputedStyle, textOf };
+bindings.findNonChatApplyButton = bind(content, "function findNonChatApplyButton", "function findConversationActionButton", bindings);
+bindings.findConversationActionButton = bind(content, "function findConversationActionButton", "function detectNonChatJob", bindings);
+bindings.location = { pathname: "/job_detail/job-a.html", href: "https://www.zhipin.com/job_detail/job-a.html" };
+bindings.BHT_CONTENT_VERSION = "1.7.39";
+bindings.detectNonChatJob = bind(content, "function detectNonChatJob", "async function clickChatButton", bindings);
+Object.assign(bindings, {
+  SELECTORS: { title: [".job-name"], detailRoot: [".job-detail-box"] },
+  firstEl: (selectors, root = document) => root.querySelector(selectors.join(",")),
+  normalizeText: (text) => String(text || "").trim(),
+  extractJobIdFromHref: () => "job-a",
+  extractDetailActiveText: () => "",
+  extractDetailCompany: () => "示例企业",
+  extractDetailHrName: () => "",
+  debugTrace: () => {},
+  dismissCommonDialogs: () => {},
+  detectLoginModal: () => ({ ok: false }),
+  pageInfo: () => ({}),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+});
+bindings.clickLikeHuman = (el) => { el.click(); return true; };
+bindings.findExistingBossJobSwitchDialog = bind(content,
+  "function findExistingBossJobSwitchDialog", "function skipExistingBossJobSwitch", bindings);
+bindings.skipExistingBossJobSwitch = bind(content,
+  "function skipExistingBossJobSwitch", "async function checkExistingBossJobSwitch", bindings);
+const inspect = bind(content, "async function inspectWorkerJobDetail", "// 岗位详情页内点击", bindings);
+const trigger = bind(content, "async function triggerConversationOnWorkerDetail", "async function triggerConversationOnList", bindings);
+const rows = [];
+async function test(name, run) {
+  const li = document.createElement("li");
+  try {
+    await run();
+    li.textContent = `通过：${name}`; li.className = "pass"; rows.push({ name, ok: true });
+  } catch (error) {
+    li.textContent = `失败：${name} — ${error.message}`; li.className = "fail";
+    rows.push({ name, ok: false, error: error.message });
+  }
+  document.querySelector("#results").append(li);
+}
+await test("详情页立即网申直接跳过，不点击按钮", async () => {
+  fixture.innerHTML = '<div class="job-detail-box"><h1 class="job-name">国企运维工程师</h1><div class="job-detail-op"><a href="#">立即网申</a></div></div>';
+  let clicks = 0;
+  fixture.querySelector("a").addEventListener("click", () => { clicks += 1; });
+  const start = performance.now();
+  for (const fn of [inspect, trigger]) {
+    const result = await fn({ jobId: "job-a" });
+    check(result.error === "NON_CHAT_JOB" && result.skipped, "没有按网申岗位跳过");
+  }
+  check(clicks === 0, "网申按钮被点击");
+  check(performance.now() - start < 1000, "仍在等待不存在的 HR 或沟通入口");
+});
+await test("隐藏网申按钮和无关说明不导致误跳过", async () => {
+  fixture.innerHTML = '<div class="job-detail-box"><p>本公司支持网申</p><a class="hidden">立即网申</a><a>查看职位</a></div>';
+  check(bindings.detectNonChatJob(fixture) === null, "把隐藏按钮或说明文字误判成网申入口");
+});
+await test("有立即沟通时不把投递简历入口误判成网申", async () => {
+  fixture.innerHTML = '<div class="job-detail-box"><button>立即沟通</button><button>投递简历</button></div>';
+  check(bindings.detectNonChatJob(fixture) === null, "有站内沟通仍被误跳过");
+});
+await test("同 HR 换岗弹窗只取消切换，不通知 BOSS", async () => {
+  fixture.innerHTML = '<div class="change-job-tip-dialog" style="width:360px;height:200px">您与该Boss已沟通过，是否就新职位运维继续沟通？注：更换沟通职位将通知Boss<div class="cancel">取消</div><div class="confirm">沟通新职位</div></div>';
+  let cancelled = 0;
+  let confirmed = 0;
+  fixture.querySelector(".cancel").addEventListener("click", () => { cancelled += 1; });
+  fixture.querySelector(".confirm").addEventListener("click", () => { confirmed += 1; });
+  const result = bindings.skipExistingBossJobSwitch();
+  check(result?.error === "BOSS_JOB_SWITCH_REQUIRED" && result.cancelled, "未识别或取消真实布局的换岗提示");
+  check(cancelled === 1 && confirmed === 0, "误确认沟通新职位");
+});
+await test("隐藏换岗提示不阻止正常投递", async () => {
+  fixture.innerHTML = '<div class="change-job-tip-dialog" style="display:none">您与该Boss已沟通过，是否就新职位运维继续沟通？<button>沟通新职位</button></div>';
+  check(bindings.skipExistingBossJobSwitch() === null, "误把隐藏弹窗当作当前换岗提示");
+});
+await test("目标预览只勾选新岗位，已处理岗位显示结果", async () => {
+  fixture.innerHTML = "";
+  const state = { config: { settings: {} } };
+  const render = bind(panel, "function renderPreview", "// 批量投递时标记", {
+    document, state, $: (id) => document.getElementById(id), collectDoneJobIds, previewReasonLines,
+    formatPreviewReasonLine: () => "", escapeHtml: (text) => String(text || "").replaceAll("&", "&amp;").replaceAll("<", "&lt;"),
+    markCurrentDeliveryJob: () => {}
+  });
+  render({ id: "task-a", revision: 1, results: ["done", "skip", "failed", "new"].map((jobId) => ({
+    job: { jobId, title: jobId }, decision: "pass", selected: true
+  })), items: [
+    { jobId: "done", state: "COMPLETED" }, { jobId: "skip", state: "SKIPPED" },
+    { jobId: "failed", state: "FAILED" }, { jobId: "new", state: "NOT_STARTED" }
+  ], queue: [], summary: { scanned: 4, pass: 4, reject: 0 } });
+  check(state.selected.size === 1 && state.selected.has("new"), "历史岗位仍被勾选");
+  const inputs = [...document.querySelectorAll("#previewList input")];
+  check(inputs.length === 1 && inputs[0].dataset.job === "new", "已处理岗位仍可重复勾选");
+  check(document.querySelector("#previewList").textContent.includes("已投递成功"), "没有展示成功状态");
+});
+window.__BHT_REGRESSION_RESULTS__ = rows;
+document.title = `${rows.filter((row) => row.ok).length}/${rows.length} 通过 · 网申与目标预览`;
+</script>
+</html>

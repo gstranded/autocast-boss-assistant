@@ -81,6 +81,7 @@ export const DEFAULT_SETTINGS = {
   autoSendImageResume: true,
   resumeSendTiming: 'after_text', // after_text | manual
   splitViewEnabled: true,
+  backgroundDeliveryEnabled: true,
   debugLoggingEnabled: false,
   scheduledDeliveryEnabled: false,
   scheduledDeliveryDays: [1, 2, 3, 4, 5],

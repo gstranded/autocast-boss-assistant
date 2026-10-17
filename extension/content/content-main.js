@@ -21,6 +21,7 @@
     RETURN_TO_LIST: "BHT_RETURN_TO_LIST",
     SCROLL_LIST_TOP: "BHT_SCROLL_LIST_TOP",
     CLOSE_CHAT: "BHT_CLOSE_CHAT",
+    CHECK_JOB_SWITCH: "BHT_CHECK_JOB_SWITCH",
     DIAGNOSE: "BHT_DIAGNOSE",
     GET_JOB_SOURCE_CONTEXT: "BHT_GET_JOB_SOURCE_CONTEXT",
     RESTORE_JOB_SOURCE_CONTEXT: "BHT_RESTORE_JOB_SOURCE_CONTEXT",
@@ -29,7 +30,7 @@
     DEBUG_EVENT: "BHT_DEBUG_EVENT"
   };
 
-  const BHT_CONTENT_VERSION = "1.7.38";
+  const BHT_CONTENT_VERSION = "1.7.39";
   // 版本化热更新：扩展重载后可重新注入，不卡在旧脚本
   if (
     window.__BHT_CONTENT_VERSION__ === BHT_CONTENT_VERSION &&
@@ -51,6 +52,13 @@
   window.__BHT_ACTIVE_OP_TYPE__ = null;
   window.__BHT_CONTENT_LOADED__ = true;
   window.__BHT_LAST_TRIGGER_CLICK__ = null;
+  window.__BHT_PAGE_CLOCK__?.dispose();
+  const pageClock = globalThis.BHTPageClock.createPageClock({
+    connect: (name) => chrome.runtime.connect({ name }),
+    isHidden: () => document.visibilityState === "hidden",
+    isCancelled: (opId) => Boolean(opId && window.__BHT_OP_CANCELLED__?.[opId])
+  });
+  window.__BHT_PAGE_CLOCK__ = pageClock;
   // 岗位身份模块是 ES module（供后台/单元测试复用），不能用经典脚本注入；
   // 内容脚本隔离世界里通过动态 import 加载后挂到全局供本文件使用。
   const bhtIdentityReady = (() => {
@@ -71,6 +79,7 @@
   const nativeGreetingReceipts = [];
   const jobNetworkMetadata = new Map();
   let latestJobListRequest = null;
+  const jobListPagination = { hasMore: null, loading: false };
 
   function rememberJobNetworkMetadata(raw = {}) {
     const jobId = String(raw.jobId || '').trim();
@@ -106,6 +115,7 @@
     const data = event.data;
     if (!data || data.source !== "bht-page-network-hook") return;
     if (data.type === "job-list-context") {
+      jobListPagination.loading = true;
       latestJobListRequest = {
         href: String(data.href || ""),
         encryptExpectId: String(data.encryptExpectId || "").trim(),
@@ -117,6 +127,12 @@
       return;
     }
     if (data.type === "job-metadata") {
+      if (data.endpoint === "list") {
+        jobListPagination.hasMore = typeof data.hasMore === "boolean" ? data.hasMore : null;
+        jobListPagination.loading = false;
+      } else if (data.endpoint === "cache" && !jobListPagination.loading && typeof data.hasMore === "boolean") {
+        jobListPagination.hasMore = data.hasMore;
+      }
       for (const job of Array.isArray(data.jobs) ? data.jobs : []) rememberJobNetworkMetadata(job);
       return;
     }
@@ -456,10 +472,43 @@
     return { request, hints, observed: signature?.observed === true };
   }
 
+  // Search pages encode the visible ordinary filters in the page URL.  The
+  // search API does not always repeat those values in its request (after a
+  // reload it may briefly emit only `?_=`), so relying on the latest network
+  // request alone makes a valid search snapshot look like it changed.  Use
+  // URL values as a fallback for the same filter keys while keeping explicit
+  // DOM/request evidence authoritative.
+  function readUrlFilterRequest(href = location.href) {
+    const result = {};
+    try {
+      const parsed = new URL(String(href || ''), location.origin);
+      for (const key of FILTER_REQUEST_KEYS) {
+        result[key] = String(parsed.searchParams.get(key) || '').trim();
+      }
+    } catch (_) {}
+    return result;
+  }
+
+  function augmentFilterSignatureFromUrl(signature = {}, href = location.href) {
+    const normalized = normalizeFilterSignature(signature);
+    const urlRequest = readUrlFilterRequest(href);
+    const request = { ...normalized.request };
+    let urlObserved = false;
+    for (const key of FILTER_REQUEST_KEYS) {
+      if (urlRequest[key]) urlObserved = true;
+      if (!request[key] && urlRequest[key]) request[key] = urlRequest[key];
+    }
+    return {
+      ...normalized,
+      request,
+      observed: normalized.observed || urlObserved
+    };
+  }
+
   function buildLiveFilterSignature(request = readLastJobListRequest()) {
     const domRequest = detectActiveFilterRequest();
     const requestFromPage = request?.filterParams || {};
-    return normalizeFilterSignature({
+    return augmentFilterSignatureFromUrl({
       request: Object.fromEntries(FILTER_REQUEST_KEYS.map((key) => [
         key,
         String(domRequest[key] || requestFromPage[key] || '').trim()
@@ -780,6 +829,13 @@
     if (!await waitForSourceReady()) {
       return { ok: false, error: "EXPECTATION_UI_NOT_READY", message: "BOSS 求职期望区域未加载完成" };
     }
+    // Older tasks may have been captured before URL filter fallback existed.
+    // Reconstruct missing search filter request fields from the saved search
+    // URL before restoring/validating, so continuing a target run does not
+    // stop merely because the first post-reload API request omitted them.
+    const expectedFilterSignature = sourceType === "search"
+      ? augmentFilterSignatureFromUrl(expected.filterSignature || {}, expected.listHref || location.href)
+      : normalizeFilterSignature(expected.filterSignature || {});
     const clickTab = (tab) => {
       clickLikeHuman(tab);
       return true;
@@ -833,7 +889,7 @@
           ? current.selectionEvidence?.requestEncryptExpectId === ""
           : current.selectionEvidence?.requestEncryptExpectId === String(expected.expectationKey || "");
       if (sourceMatches && requestMatches) {
-        const filters = await restoreFilterRequest(expected.filterSignature || {}, deadline);
+        const filters = await restoreFilterRequest(expectedFilterSignature, deadline);
         if (!filters.ok) {
           return {
             ok: false,
@@ -855,7 +911,7 @@
           : sourceType === "recommend"
             ? verifiedContext.selectionEvidence?.requestEncryptExpectId === ""
             : verifiedContext.selectionEvidence?.requestEncryptExpectId === String(expected.expectationKey || "");
-        const expectedFilters = normalizeFilterSignature(expected.filterSignature || {});
+        const expectedFilters = expectedFilterSignature;
         const expectedRequestObserved = expectedFilters.observed === true || Boolean(
           expected.selectionEvidence?.requestHref || expected.selectionEvidence?.requestEncryptExpectId
         );
@@ -1176,6 +1232,12 @@ const SELECTORS = {
     ],
     sendBtn: [".submit-button", ".send-message", ".btn-send", "[class*='send-btn']", "button.send-btn"],
     selfMsg: [
+      // Current BOSS chat markup renders the message body in
+      // `.message-item.item-myself .text-content`. Keep this ahead of the
+      // outer `.text` wrapper so a delayed/virtualized message is observed as
+      // soon as its body node is inserted.
+      ".message-item.item-myself .text-content",
+      ".message-item.item-myself p .text-content",
       ".message-item.item-myself .text",
       ".message-item.myself .text",
       ".item-myself .message-content",
@@ -1217,13 +1279,10 @@ const SELECTORS = {
 
   function sleep(ms) {
     const opId = window.__BHT_ACTIVE_OP_ID__;
-    if (opId && window.__BHT_OP_CANCELLED__?.[opId]) {
-      return Promise.reject(operationCancelledError(opId));
-    }
-    return new Promise((resolve, reject) => setTimeout(() => {
-      if (opId && window.__BHT_OP_CANCELLED__?.[opId]) reject(operationCancelledError(opId));
-      else resolve();
-    }, ms));
+    return pageClock.sleep(ms, opId).catch((error) => {
+      if (error?.code === "OP_CANCELLED") throw operationCancelledError(opId);
+      throw error;
+    });
   }
 
   async function bossGreetingApi(path, options = {}) {
@@ -1887,6 +1946,19 @@ function firstEl(selectors, root = document) {
     const opts = { bubbles: true, cancelable: true, view: window };
     const dispatched = [];
     let fallback = false;
+    const href = String(el.getAttribute?.("href") || "").trim();
+    const suppressJavascriptDefault = /^javascript:/i.test(href);
+    const preventJavascriptDefault = (event) => {
+      try { event.preventDefault(); } catch (_) {}
+    };
+    // BOSS action anchors commonly use `href="javascript:;"`. Synthetic
+    // clicks otherwise make Chromium evaluate that URL after the framework's
+    // handler runs, producing a CSP error in the extension error page. Keep
+    // the click event (Vue/React handlers still receive it) but suppress only
+    // the anchor's default JavaScript URL.
+    if (suppressJavascriptDefault) {
+      try { el.addEventListener("click", preventJavascriptDefault, true); } catch (_) {}
+    }
     try {
       for (const type of ["mouseover", "mousedown", "mouseup", "click"]) {
         const accepted = el.dispatchEvent(new MouseEvent(type, opts));
@@ -1904,6 +1976,10 @@ function firstEl(selectors, root = document) {
           element: describeDebugElement(el)
         }, "error");
         return false;
+      }
+    } finally {
+      if (suppressJavascriptDefault) {
+        try { el.removeEventListener("click", preventJavascriptDefault, true); } catch (_) {}
       }
     }
     debugTrace("click_dispatched", {
@@ -2468,7 +2544,17 @@ function firstEl(selectors, root = document) {
     // Preserve the current virtual window before returning to the top. BOSS
     // currently appends cards, but this also covers a future recycled list.
     collectWindow();
-    if (payload.resetSession === true && initialSnapshot.top > 8) {
+    const resumeScrollTop = Number(payload.resumeScrollTop);
+    if (payload.resumeScrollTop != null && Number.isFinite(resumeScrollTop) && resumeScrollTop >= 0) {
+      session.reachedEnd = false;
+      session.stableRounds = 0;
+      session.bottomStableRounds = 0;
+      session.startedAt = Date.now();
+      session.scanStartTop = null;
+      setAdaptiveScrollTop(scroller, resumeScrollTop);
+      await sleepUntilScanStop(80);
+      collectWindow();
+    } else if (payload.resetSession === true && initialSnapshot.top > 8) {
       try {
         setAdaptiveScrollTop(scroller, 0);
         let topStableRounds = 0;
@@ -2547,8 +2633,12 @@ function firstEl(selectors, root = document) {
       if (after.atBottom && collected.visibleCount > 0 && collected.added <= 0 && !visibleChanged) session.bottomStableRounds += 1;
       else session.bottomStableRounds = 0;
       const explicitEnd = after.atBottom && hasExplicitJobListEnd(scroller);
+      // 触底会加载下一页；后台标签页或慢请求可能超过三秒才渲染新卡片。
+      // 平台仍有下一页或请求未完成时，不能仅凭短暂不增长宣布扫描到底。
+      const paginationSettled = !jobListPagination.loading && jobListPagination.hasMore !== true;
       if (
         !timedOut &&
+        paginationSettled &&
         (
           explicitEnd ||
           (session.bottomStableRounds >= 8 && Date.now() - session.lastGrowthAt >= 3000)
@@ -2590,6 +2680,8 @@ function firstEl(selectors, root = document) {
         atBottom: snapshot.atBottom,
         stableRounds: session.stableRounds,
         bottomStableRounds: session.bottomStableRounds,
+        hasMore: jobListPagination.hasMore,
+        loadingMore: jobListPagination.loading,
         growthEvents: session.growthEvents,
         initialScrollTop: session.initialScrollTop,
         initialScrollHeight: session.initialScrollHeight,
@@ -2955,6 +3047,71 @@ function firstEl(selectors, root = document) {
     return firstEl(SELECTORS.chatRoot);
   }
 
+  function isDisabledChatControl(el) {
+    if (!el) return true;
+    try {
+      if (el.disabled === true || el.readOnly === true) return true;
+      if (el.getAttribute?.('disabled') != null || el.getAttribute?.('readonly') != null) return true;
+      if (el.getAttribute?.('aria-disabled') === 'true') return true;
+      if (String(el.getAttribute?.('contenteditable') || '').toLowerCase() === 'false') return true;
+      if (/(^|\s)(disabled|is-disabled|disable)(\s|$)/i.test(String(el.className || ''))) return true;
+      const style = getComputedStyle(el);
+      if (style.pointerEvents === 'none') return true;
+    } catch (_) {}
+    return false;
+  }
+
+  function findNativeSubscribeDialog() {
+    try {
+      const roots = Array.from(document.querySelectorAll(
+        '.startchat-dialog, .dialog-chat, .dialog-wrap, .dialog-container, [role="dialog"], [class*="dialog"], [class*="modal"]'
+      ));
+      for (const el of roots) {
+        const style = getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        if (style.display === 'none' || style.visibility === 'hidden' || rect.width < 120 || rect.height < 120) continue;
+        const text = String(el.innerText || el.textContent || '').replace(/\s+/g, ' ');
+        const hasSubscribe = /订阅回复消息|微信扫码订阅|实时收到他的回复/.test(text);
+        const hasQr = Boolean(el.querySelector('img[src*="qrcode"], img[src*="qr"], canvas, [class*="qrcode"], [class*="qr-code"]'));
+        if (hasSubscribe && hasQr) {
+          return {
+            ok: true,
+            element: el,
+            message: 'BOSS 的订阅回复弹窗正在遮挡聊天编辑器，请先关闭弹窗后再继续'
+          };
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function detectNativeSubscribeDialog() {
+    const hit = findNativeSubscribeDialog();
+    return hit ? { ok: true, message: hit.message } : { ok: false };
+  }
+
+  // 点击「立即沟通」后，BOSS 有时会先打开“订阅回复消息”二维码弹窗。
+  // 这个弹窗不需要用户参与，关闭后 BOSS 会把已创建的会话保留在消息页；
+  // 只关闭明确识别出的订阅弹窗，避免误关登录、验证或其它业务弹窗。
+  function closeNativeSubscribeDialog() {
+    const hit = findNativeSubscribeDialog();
+    if (!hit?.element) return { ok: false };
+    const root = hit.element;
+    const close = root.querySelector(
+      '.dialog-title .close, a.close, button.close, [aria-label*="关闭"], [title*="关闭"], .icon-close'
+    );
+    if (!close) {
+      return { ok: false, error: 'SUBSCRIBE_DIALOG_CLOSE_NOT_FOUND', message: hit.message };
+    }
+    const clicked = clickLikeHuman(close);
+    return {
+      ok: clicked !== false,
+      closed: true,
+      message: hit.message,
+      button: describeDebugElement(close)
+    };
+  }
+
   function getChatInput() {
     // 优先可见且像聊天输入的节点
     for (const sel of SELECTORS.chatInput) {
@@ -2966,6 +3123,7 @@ function firstEl(selectors, root = document) {
             if (st.display === "none" || st.visibility === "hidden") continue;
             const r = el.getBoundingClientRect();
             if (r.width < 20 || r.height < 10) continue;
+            if (isDisabledChatControl(el)) continue;
             const ph = el.getAttribute("data-placeholder") || el.getAttribute("placeholder") || el.getAttribute("aria-label") || "";
             const nearChat = el.closest?.(".chat-conversation, .chat-box, .conversation-box, .chat-container, .dialog-chat, .chat-input, .message-input, #bht-mock-chat");
             if (nearChat || /发送|Enter|消息|沟通|聊/.test(ph) || /chat-input|#chat-input/.test(sel)) return el;
@@ -2973,7 +3131,8 @@ function firstEl(selectors, root = document) {
         }
       } catch (_) {}
     }
-    return firstEl(SELECTORS.chatInput);
+    const fallback = firstEl(SELECTORS.chatInput);
+    return isDisabledChatControl(fallback) ? null : fallback;
   }
 
   
@@ -3077,6 +3236,24 @@ function firstEl(selectors, root = document) {
     return candidates[0]?.element || null;
   }
 
+  function detectNonChatJob(scope = document, detailTitle = "") {
+    // 同时存在站内沟通时仍走沟通流程；不能把普通「投递简历」入口误判成网申岗。
+    if (findConversationActionButton(scope)) return null;
+    const button = findNonChatApplyButton(scope);
+    if (!button) return null;
+    const buttonText = textOf(button).replace(/\s+/g, " ").trim();
+    return {
+      ok: false,
+      error: "NON_CHAT_JOB",
+      skipped: true,
+      message: `该岗位为「${buttonText}」流程，不支持站内沟通，已自动跳过`,
+      detailTitle,
+      buttonText,
+      href: location.href,
+      contentVersion: BHT_CONTENT_VERSION
+    };
+  }
+
   async function clickChatButton() {
     const btn = findConversationActionButton(document);
 
@@ -3165,7 +3342,54 @@ function firstEl(selectors, root = document) {
     return { ok: false };
   }
 
+  function findExistingBossJobSwitchDialog() {
+    const roots = document.querySelectorAll(
+      ".change-job-tip-dialog, .dialog-wrap, .boss-dialog, [role='dialog'], [class*='modal']"
+    );
+    return Array.from(roots).find((el) => {
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      if (rect.width < 80 || rect.height < 60 || style.display === "none" || style.visibility === "hidden") return false;
+      const text = textOf(el).replace(/\s+/g, "");
+      return /您与该boss已沟通过/i.test(text) &&
+        /是否就新职位|更换沟通职位|沟通新职位/.test(text);
+    }) || null;
+  }
+
+  function skipExistingBossJobSwitch() {
+    const dialog = findExistingBossJobSwitchDialog();
+    if (!dialog) return null;
+    // BOSS 明确提示更换岗位会通知 HR；批量任务保持原会话，不自动确认切换。
+    const cancel = Array.from(dialog.querySelectorAll("button,a,[role='button'],.btn,span,div"))
+      .find((el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return textOf(el).trim() === "取消" && rect.width > 0 && rect.height > 0 &&
+          style.display !== "none" && style.visibility !== "hidden";
+      });
+    const cancelled = Boolean(cancel && clickLikeHuman(cancel));
+    return {
+      ok: false,
+      error: "BOSS_JOB_SWITCH_REQUIRED",
+      skipped: true,
+      cancelled,
+      message: "已与该 BOSS 沟通过其他岗位，已跳过新岗位并保留原会话",
+      contentVersion: BHT_CONTENT_VERSION
+    };
+  }
+
+  async function checkExistingBossJobSwitch(payload = {}) {
+    const deadline = Date.now() + Math.max(0, Math.min(1200, Number(payload.timeoutMs) || 0));
+    for (;;) {
+      const blocked = skipExistingBossJobSwitch();
+      if (blocked) return blocked;
+      if (Date.now() >= deadline) return { ok: true, contentVersion: BHT_CONTENT_VERSION };
+      await sleep(50);
+    }
+  }
+
 function dismissCommonDialogs() {
+    if (findExistingBossJobSwitchDialog()) return false;
     const labels = /确定|继续|我知道了|开启|同意|稍后|允许|关闭|取消/;
     // 优先点确认类，避免误点取消
     const preferred = Array.from(document.querySelectorAll("button,a,.btn")).filter((el) =>
@@ -3188,11 +3412,13 @@ function dismissCommonDialogs() {
   }
 
   function hasUsableChatInput() {
+    if (detectNativeSubscribeDialog().ok) return false;
     const input = getChatInput();
     if (!input) return false;
     // 排除隐藏节点
     const style = window.getComputedStyle(input);
     if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity || "1") === 0) return false;
+    if (isDisabledChatControl(input)) return false;
     const rect = input.getBoundingClientRect();
     if (!(rect.width > 20 && rect.height > 10)) return false;
     // 防止职位列表页误命中其它 contenteditable
@@ -4164,6 +4390,7 @@ async function startChat(job, opts = {}) {
       try {
         const st = getComputedStyle(el);
         if (st.display === "none" || st.visibility === "hidden" || st.opacity === "0") return false;
+        if (isDisabledChatControl(el)) return false;
         const r = el.getBoundingClientRect();
         return r.width > 8 && r.height > 8;
       } catch (_) {
@@ -4179,8 +4406,34 @@ async function startChat(job, opts = {}) {
     const exact = visible.find((el) => textOf(el) === "发送" || textOf(el) === "发送消息");
     if (exact && (chatRoot ? chatRoot.contains(exact) || !document.body.contains(chatRoot) : true)) return exact;
     const byClass = firstEl(SELECTORS.sendBtn, chatRoot || document);
-    if (byClass) return byClass;
+    if (byClass && !isDisabledChatControl(byClass)) return byClass;
     return visible.find(isSend) || null;
+  }
+
+  function hasDisabledSendButton() {
+    const input = getChatInput();
+    const roots = [
+      input?.closest?.(".editor-container, .chat-conversation, .chat-box, .conversation-box, .chat-container, .dialog-chat, .chat-input, .message-input"),
+      input?.parentElement,
+      getChatRoot()
+    ].filter(Boolean);
+    const seen = new Set();
+    return roots.some((root) => Array.from(root.querySelectorAll("button, a, div[role='button'], span.btn, .submit-button, .btn-send"))
+      .some((el) => {
+        if (seen.has(el)) return false;
+        seen.add(el);
+        return /^(发送|发送消息|Send)$/i.test(textOf(el)) && isDisabledChatControl(el);
+      }));
+  }
+
+  async function waitForSendButtonReady(timeoutMs = 2200) {
+    const started = Date.now();
+    let button = findSendButton();
+    while (!button && Date.now() - started < timeoutMs) {
+      await sleep(100);
+      button = findSendButton();
+    }
+    return button;
   }
 
   async function setInputText(input, text) {
@@ -4236,13 +4489,32 @@ async function startChat(job, opts = {}) {
   async function sendText(text, context = {}) {
     if (!text || !String(text).trim()) return { ok: false, error: "EMPTY_TEXT" };
     dismissCommonDialogs();
+    const subscribeDialog = detectNativeSubscribeDialog();
+    if (subscribeDialog.ok) {
+      const closed = closeNativeSubscribeDialog();
+      if (!closed.ok) {
+        return { ok: false, error: "CHAT_EDITOR_NOT_READY", message: subscribeDialog.message, nativeDialog: "subscribe" };
+      }
+      await sleep(300);
+    }
     let ready = await waitForChat(10000);
     if (!ready) {
       dismissCommonDialogs();
       await sleep(300);
       ready = await waitForChat(6000);
     }
-    if (!ready) return { ok: false, error: "CHAT_TIMEOUT", message: "聊天输入框未就绪" };
+    if (!ready) {
+      const lateSubscribeDialog = detectNativeSubscribeDialog();
+      if (lateSubscribeDialog.ok) {
+        return {
+          ok: false,
+          error: "CHAT_EDITOR_NOT_READY",
+          message: lateSubscribeDialog.message,
+          nativeDialog: "subscribe"
+        };
+      }
+      return { ok: false, error: "CHAT_TIMEOUT", message: "聊天输入框未就绪" };
+    }
     const input = getChatInput();
     if (!input || !hasUsableChatInput()) {
       return { ok: false, error: "INPUT_NOT_FOUND", message: "未找到可用聊天输入框" };
@@ -4259,11 +4531,19 @@ async function startChat(job, opts = {}) {
       await sleep(220);
     }
 
-    // 优先点「发送」；BOSS 聊天页默认 Enter 发送
-    const sendBtn = findSendButton();
+    // 优先点「发送」。BOSS 的 Vue 编辑器会在 input 事件后异步移除
+    // `.btn-send.disabled`（实测约 0.7 秒）；等待按钮进入可用状态，避免
+    // 后台投递过早退回 Enter，而 Enter 在该页面不会触发发送。
+    const sendBtn = await waitForSendButtonReady(2200);
     if (sendBtn) {
+      if (isDisabledChatControl(sendBtn)) {
+        return { ok: false, error: "CHAT_EDITOR_NOT_READY", message: "聊天发送按钮当前不可用，请等待会话加载完成后重试" };
+      }
       clickLikeHuman(sendBtn);
     } else {
+      if (hasDisabledSendButton()) {
+        return { ok: false, error: "CHAT_EDITOR_NOT_READY", message: "聊天发送按钮当前不可用，请等待会话加载完成后重试" };
+      }
       try { input.focus(); } catch (_) {}
       const fireKey = (opts) => {
         input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...opts }));
@@ -4276,8 +4556,12 @@ async function startChat(job, opts = {}) {
     const needle = needleFull;
     let confirmed = false;
     let selfTail = [];
-    for (let i = 0; i < 25; i++) {
-      await sleep(220);
+    // BOSS may acknowledge the send and paint the own-message bubble several
+    // seconds later when the chat tab is backgrounded or minimized. Keep the
+    // confirmation window bounded, but long enough to avoid treating a real
+    // sent message as a failure that pauses the whole queue.
+    for (let i = 0; i < 48; i++) {
+      await sleep(250);
       if (typeof detectLoginModal === "function") {
         const loginHit = detectLoginModal();
         if (loginHit.ok) return { ok: false, error: "LOGIN_REQUIRED", message: loginHit.message };
@@ -4575,6 +4859,81 @@ async function startChat(job, opts = {}) {
     return { ok: false };
   }
 
+  async function closeSubscribeDialogIfPresent({ waitMs = 0, stopWhen = null } = {}) {
+    const started = Date.now();
+    do {
+      // A successful click can navigate away from the detail page before the
+      // optional subscription layer is painted. Do not hold up the normal
+      // navigation path while waiting for a dialog that can no longer matter.
+      if (typeof stopWhen === "function" && stopWhen()) {
+        return { ok: false, stopped: true };
+      }
+      const closed = closeNativeSubscribeDialog();
+      if (closed.ok) {
+        // BOSS updates the detail action to「继续沟通」asynchronously after the
+        // close click. Give the page a short chance to commit that state before
+        // the caller checks the network receipt or navigates to chat.
+        await sleep(120);
+        return closed;
+      }
+      if (!waitMs || Date.now() - started >= waitMs) break;
+      await sleep(50);
+    } while (Date.now() - started < waitMs);
+    return { ok: false };
+  }
+
+  async function closeSubscribeDialogAndConfirmConversation(scope = document, timeoutMs = 2200) {
+    // BOSS can render the QR layer well after the click (observed around
+    // 1.8s). Keep polling long enough to catch it, but stop immediately when
+    // the click has already navigated away from the detail page. The list
+    // layout keeps the URL at /web/geek/jobs, so only use the detail URL gate
+    // for the temporary worker page; on the list page, stop once BOSS enters
+    // the chat route.
+    const startedOnWorkerDetail = /\/job_detail\//i.test(location.pathname);
+    const closed = await closeSubscribeDialogIfPresent({
+      waitMs: 2800,
+      stopWhen: () => startedOnWorkerDetail
+        ? !/\/job_detail\//i.test(location.pathname)
+        : /\/chat(?:\/|$)/i.test(location.pathname)
+    });
+    if (!closed.ok) return null;
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (!/\/job_detail\//i.test(location.pathname)) {
+        return {
+          available: true,
+          showGreeting: null,
+          text: '',
+          source: 'subscribe-dialog-navigation',
+          closed: true
+        };
+      }
+      const action = findConversationActionButton(scope || document) || findConversationActionButton(document);
+      if (/继续沟通/.test(textOf(action))) {
+        return {
+          available: true,
+          showGreeting: null,
+          text: '',
+          source: 'subscribe-dialog-closed',
+          closed: true,
+          actionText: textOf(action)
+        };
+      }
+      await sleep(100);
+    }
+    // Closing the QR layer itself is a post-click signal. The message page
+    // will still verify the exact conversation identity, so do not click the
+    // original action a second time just because the detail label is slow to
+    // update.
+    return {
+      available: true,
+      showGreeting: null,
+      text: '',
+      source: 'subscribe-dialog-closed',
+      closed: true
+    };
+  }
+
   function extractDetailHrName(scope) {
     const root =
       scope ||
@@ -4761,6 +5120,12 @@ async function startChat(job, opts = {}) {
       );
       last = { root, detailHref, actualJobId, detailTitle, identityMatches };
       if (identityMatches) {
+        // 网申岗通常没有 HR 信息，先识别投递方式，避免落入连续活跃度未知保护。
+        const nonChat = detectNonChatJob(root, detailTitle);
+        if (nonChat) {
+          debugTrace("worker_detail_non_chat_job", nonChat, "info");
+          return nonChat;
+        }
         const activeText = extractDetailActiveText(root);
         if (activeText) {
           const result = {
@@ -4809,6 +5174,8 @@ async function startChat(job, opts = {}) {
       },
       page: pageInfo()
     });
+    const existingBoss = skipExistingBossJobSwitch();
+    if (existingBoss) return existingBoss;
     dismissCommonDialogs();
     if (typeof detectLoginModal === "function") {
       const loginHit = detectLoginModal();
@@ -4848,6 +5215,11 @@ async function startChat(job, opts = {}) {
           textOf(document.querySelector(".job-detail .job-name, .job-detail-box .job-name, h1.job-name")) ||
           "";
         gateBtn = findConversationActionButton(scope);
+        const nonChat = !gateBtn ? detectNonChatJob(scope, title) : null;
+        if (nonChat) {
+          debugTrace("worker_detail_non_chat_job", nonChat, "info");
+          return nonChat;
+        }
         if (gateBtn && !btnFirstSeenAt) btnFirstSeenAt = nowMs;
         const loginHit = typeof detectLoginModal === "function" ? detectLoginModal() : null;
         if (loginHit?.ok) {
@@ -4972,13 +5344,27 @@ async function startChat(job, opts = {}) {
     // 自动招呼开启时仍可能出现“留在此页”；执行页停留或跳转都不会影响左侧真实列表。
     let stay = { ok: false };
     for (let i = 0; i < 18 && !stay.ok; i++) {
+      const existingBoss = skipExistingBossJobSwitch();
+      if (existingBoss) return existingBoss;
       stay = clickStayOnListDialog();
       if (!stay.ok) await sleep(50);
+    }
+    // BOSS may show the subscription QR dialog after the click. It is a
+    // post-click informational layer: close it and use the resulting
+    // 「继续沟通」state as a provisional trigger receipt. The message page
+    // still performs the final conversation identity check before any text is
+    // sent.
+    const subscribeReceipt = await closeSubscribeDialogAndConfirmConversation(scopeRoot, 2200);
+    if (subscribeReceipt?.closed) {
+      debugTrace("worker_detail_subscribe_dialog_closed", subscribeReceipt, subscribeReceipt.available ? "info" : "warn");
     }
     dismissCommonDialogs();
     let nativeGreeting = clicked.already
       ? { available: false, showGreeting: null, text: "", source: "already-contacted" }
       : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 3200);
+    if (!clicked.already && !nativeGreeting.available && subscribeReceipt?.available) {
+      nativeGreeting = subscribeReceipt;
+    }
 
     if (!clicked.already && !nativeGreeting.available) {
       // 无回执且页面既未跳转也未弹窗：BOSS 事件绑定可能晚于 DOM 出现，补点一次后仍无效果才快速失败
@@ -5036,6 +5422,8 @@ async function startChat(job, opts = {}) {
         return unconfirmed;
       }
     }
+    const blockedSwitch = skipExistingBossJobSwitch();
+    if (blockedSwitch) return blockedSwitch;
     const result = {
       ok: true,
       phase: "CHAT_TRIGGERED",
@@ -5269,15 +5657,24 @@ async function startChat(job, opts = {}) {
       // 弹层有时只出现 100~300ms，BOSS 随后就会整页进入聊天；高频短轮询避免固定等待 450ms 错过它。
       let stay = { ok: false };
       for (let i = 0; i < 18 && !stay.ok; i++) {
+        const existingBoss = skipExistingBossJobSwitch();
+        if (existingBoss) return existingBoss;
         stay = clickStayOnListDialog();
         if (!stay.ok) await sleep(50);
       }
       debugTrace("trigger_stay_on_list_dialog", { result: stay, page: pageInfo() }, stay.ok ? "debug" : "warn");
+      const subscribeReceipt = await closeSubscribeDialogAndConfirmConversation(document, 2200);
+      if (subscribeReceipt?.closed) {
+        debugTrace("trigger_subscribe_dialog_closed", subscribeReceipt, subscribeReceipt.available ? "info" : "warn");
+      }
       // 再关一次常见弹层
       dismissCommonDialogs();
-      const nativeGreeting = clicked.already
+      let nativeGreeting = clicked.already
         ? { available: false, showGreeting: null, text: "", source: "already-contacted" }
         : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 3200);
+      if (!clicked.already && !nativeGreeting.available && subscribeReceipt?.available) {
+        nativeGreeting = subscribeReceipt;
+      }
       if (!clicked.already && !nativeGreeting.available) {
         return {
           ok: false,
@@ -5593,6 +5990,8 @@ async function startChat(job, opts = {}) {
     });
 
     while (Date.now() < deadline) {
+      const existingBoss = skipExistingBossJobSwitch();
+      if (existingBoss) return existingBoss;
       dismissCommonDialogs();
       lastSnap = getConversationSnapshot();
       const items = lastSnap.items || [];
@@ -5881,7 +6280,25 @@ async function startChat(job, opts = {}) {
     const start = Date.now();
     let lastDiagnostic = null;
     while (Date.now() - start < timeoutMs) {
+      const existingBoss = skipExistingBossJobSwitch();
+      if (existingBoss) return existingBoss;
       dismissCommonDialogs();
+      const subscribeDialog = detectNativeSubscribeDialog();
+      if (subscribeDialog.ok) {
+        const closed = closeNativeSubscribeDialog();
+        lastDiagnostic = {
+          ...collectEditorDiagnostic(),
+          nativeDialog: "subscribe",
+          message: subscribeDialog.message,
+          dialogClosed: closed.ok
+        };
+        if (closed.ok) {
+          await sleep(300);
+          continue;
+        }
+        await sleep(450);
+        continue;
+      }
       if (hasUsableChatInput()) {
         return {
           ok: true,
@@ -5902,6 +6319,7 @@ async function startChat(job, opts = {}) {
       ok: false,
       error: "CHAT_EDITOR_NOT_READY",
       message: "会话已打开，但未识别到消息输入框",
+      nativeDialog: lastDiagnostic?.nativeDialog || "",
       diagnostic: lastDiagnostic,
       contentVersion: BHT_CONTENT_VERSION
     };
@@ -5917,6 +6335,10 @@ async function runOpByType(type, payload = {}) {
       window.__BHT_OP_LOCK__ = lockKey;
     }
     try {
+    if (/TRIGGER_CONVERSATION|WAIT_OPEN_CONVERSATION|WAIT_CHAT_EDITOR|SEND_TEXT|SEND_IMAGE/.test(lockKey)) {
+      const existingBoss = skipExistingBossJobSwitch();
+      if (existingBoss) return existingBoss;
+    }
     switch (type) {
       case MSG.PING:
         return {
@@ -5927,6 +6349,8 @@ async function runOpByType(type, payload = {}) {
         };
       case MSG.DIAGNOSE:
         return { ok: true, ...diagnose(), contentVersion: BHT_CONTENT_VERSION };
+      case MSG.CHECK_JOB_SWITCH:
+        return await checkExistingBossJobSwitch(payload || {});
       case MSG.GET_JOB_SOURCE_CONTEXT:
         return { ...(await getJobSourceContext({ refreshExpectations: payload?.refreshExpectations === true })), contentVersion: BHT_CONTENT_VERSION };
       case MSG.RESTORE_JOB_SOURCE_CONTEXT:
@@ -5996,6 +6420,7 @@ async function runOpByType(type, payload = {}) {
         return true;
       }
       window.__BHT_OP_CANCELLED__[opId] = true;
+      pageClock.cancel(opId);
       if (opId && window.__BHT_OP_INFLIGHT__?.[opId]) {
         window.__BHT_OP_INFLIGHT__[opId].cancelled = true;
       }
@@ -6048,6 +6473,7 @@ async function runOpByType(type, payload = {}) {
           return;
         }
         const permit = await dispatchGate({
+          yieldTurn: () => pageClock.sleep(0, opId),
           isCancelled: isOperationCancelled,
           readOperationState: async () => {
             if (!opId) return null;
@@ -6056,12 +6482,28 @@ async function runOpByType(type, payload = {}) {
           },
           settleCancellation: async (reason) => {
             if (opId) window.__BHT_OP_CANCELLED__[opId] = true;
+            pageClock.cancel(opId);
             await markSettledCancellation(reason);
           },
           finishCompleted: async (row) => {
             log("RUN_OP skip already done", opId, row?.result?.error || row?.result?.ok);
             if (opId) delete inflight[opId];
           }
+        }).catch(async (error) => {
+          if (isOperationCancelled()) {
+            await markSettledCancellation();
+          } else {
+            if (opId) delete inflight[opId];
+            try {
+              await chrome.storage.local.set({
+                ["bht_op_" + opId]: {
+                  status: "done", opType, at: Date.now(),
+                  result: { ok: false, error: error?.code || "PAGE_CLOCK_FAILED", message: "后台计时连接中断，页面操作未开始，请重试" }
+                }
+              });
+            } catch (_) {}
+          }
+          return { ok: false, reason: "clock_failed" };
         });
         if (!permit.ok) return;
 
@@ -6107,6 +6549,7 @@ async function runOpByType(type, payload = {}) {
             innerTimeoutId = setTimeout(() => {
               timedOut = true;
               if (opId) window.__BHT_OP_CANCELLED__[opId] = true;
+              pageClock.cancel(opId);
               if (opId) window.__BHT_OP_TIMED_OUT__[opId] = true;
               debugTrace("operation_inner_timeout", { opId, opType, timeoutMs: opTimeoutMs }, "error");
               resolve({

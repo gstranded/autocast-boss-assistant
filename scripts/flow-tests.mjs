@@ -4,6 +4,28 @@ import { isBossUrl } from "../extension/shared/boss-url.js";
 import { isBossJobListUrl } from "../extension/shared/job-list-navigation.js";
 import { planMessageSegments } from "../extension/shared/message-planner.js";
 import { MESSAGE_MODES } from "../extension/shared/constants.js";
+import { normalizeActiveWithin, matchActive, summarizePreview } from "../extension/shared/filter-engine.js";
+import {
+  buildConversationWorkerAttempts,
+  CONVERSATION_WORKER_MODE,
+  isListDocumentPreserved
+} from "../extension/shared/conversation-worker.js";
+import {
+  isEnvironmentalFailure,
+  isWorkerTriggerRetryable,
+  WORKER_TRIGGER_RETRY
+} from "../extension/shared/environment-failures.js";
+import {
+  collectDoneJobIds,
+  jobsShareMergeIdentity,
+  mergeTaskResults,
+  rebuildDeliveryQueue,
+  buildDeliveryQueue,
+  isTargetDeliveryReached,
+  targetDeliveryRemaining
+} from "../extension/shared/task-model.js";
+import { resolveTargetSearchContinuation } from "../extension/shared/target-search-scan.js";
+import { normalizeTargetNoNewRetryLimit, TASK_STATUS } from "../extension/shared/constants.js";
 
 console.log("8) delivery flow contracts");
 const registeredTests = [];
@@ -33,7 +55,9 @@ function createVirtualScanHarness({
   replaceScrollerAfterSleeps = 0,
   initialLoadedJobs = totalJobs,
   appendBatchSize = 0,
-  cancelAfterSleeps = 0
+  cancelAfterSleeps = 0,
+  appendDelayMs = 0,
+  pagination = { hasMore: null, loading: false }
 } = {}) {
   const content = fs.readFileSync("extension/content/content-main.js", "utf8");
   const functionSource = extractFunctionSource(
@@ -53,6 +77,7 @@ function createVirtualScanHarness({
   let clock = 0;
   let sleepCount = 0;
   let scrollerGeneration = 1;
+  let loadRequestedAt = null;
 
   function makeScroller(top, generation) {
     let scrollTop = Math.max(0, Math.min(currentHeight() - viewport, top));
@@ -142,8 +167,14 @@ function createVirtualScanHarness({
     sleepCount += 1;
     const wasAtBottom = activeScroller.scrollTop + viewport >= activeScroller.scrollHeight - 48;
     if (appendBatchSize > 0 && wasAtBottom && loadedJobs < totalJobs) {
-      loadedJobs = Math.min(totalJobs, loadedJobs + appendBatchSize);
-      events.push({ type: "load", at: clock, loadedJobs });
+      if (loadRequestedAt == null) loadRequestedAt = clock;
+      if (clock - loadRequestedAt >= appendDelayMs) {
+        loadedJobs = Math.min(totalJobs, loadedJobs + appendBatchSize);
+        if (typeof pagination.hasMore === "boolean") pagination.hasMore = loadedJobs < totalJobs;
+        pagination.loading = false;
+        loadRequestedAt = null;
+        events.push({ type: "load", at: clock, loadedJobs });
+      }
     }
     if (replaceScrollerAfterSleeps > 0 && sleepCount === replaceScrollerAfterSleeps) {
       const previous = activeScroller;
@@ -181,6 +212,7 @@ function createVirtualScanHarness({
     "nextAdaptiveScrollTop",
     "pulseAdaptiveScrollBottom",
     "hasExplicitJobListEnd",
+    "jobListPagination",
     `return (${functionSource});`
   )(
     window,
@@ -195,7 +227,8 @@ function createVirtualScanHarness({
     scrollHelpers.setAdaptiveScrollTop,
     scrollHelpers.nextAdaptiveScrollTop,
     scrollHelpers.pulseAdaptiveScrollBottom,
-    scrollHelpers.hasExplicitJobListEnd
+    scrollHelpers.hasExplicitJobListEnd,
+    pagination
   );
 
   return {
@@ -300,8 +333,8 @@ test("target mode refreshes in the background and preserves stop/duplicate guard
   assert.ok(panel.includes("targetNoNewRetryLimit"));
   assert.ok(panel.includes("retryInput.disabled = !onBoss || executionBusy"));
   assert.ok(panel.includes("targetModeUserChanged"));
-  assert.ok(panel.includes("const targetTaskActive = status === 'running' || status === 'paused' || runner.targetLoop === true"));
-  assert.ok(panel.includes("!state.targetModeUserChanged && task?.targetMode === true && targetTaskActive"));
+  assert.ok(panel.includes("const targetTaskKnown = Boolean(task?.targetMode === true && status && status !== 'idle')"));
+  assert.ok(panel.includes("!state.targetModeUserChanged && targetTaskKnown"));
   assert.ok(panel.includes("state.targetModeUserChanged = true"));
   assert.ok(panel.includes("state.targetCountDraft = String($('targetDeliveryCount').value || '')"));
   assert.ok(panel.includes("const targetCountValue = state.targetCountDraft ||"));
@@ -387,6 +420,83 @@ test("target mode refreshes in the background and preserves stop/duplicate guard
   assert.ok(refresh.includes("if (!isPreviewRunActive(previewRunId)) return previewCancelledResult()"));
 });
 
+test("a second target batch is a fresh task run", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  assert.ok(background.includes("function createFreshTargetTask"));
+  assert.ok(background.includes("const freshTargetRun = targetMode"));
+  assert.ok(background.includes("task = createFreshTargetTask(task)"));
+  assert.ok(background.includes("id: uid('task')"));
+  assert.ok(background.includes("counters: { processed: 0, success: 0, skipped: 0, failed: 0 }"));
+  assert.ok(background.includes("const doneIds = collectDoneJobIds(snapshot.items, snapshot.queue, snapshot.testedJobIds)"));
+  assert.ok(!background.includes("baselineSuccess + targetCount"));
+});
+
+test("delivery workspace is always split and remains background-safe", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const workspace = fs.readFileSync("extension/background/execution-workspace.js", "utf8");
+  const panel = fs.readFileSync("extension/sidepanel/index.html", "utf8");
+  const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
+  const prepareStart = background.indexOf("async function prepareDeliveryWorkspace");
+  const prepareEnd = background.indexOf("export async function prepareSplitWorkspace", prepareStart);
+  const prepare = background.slice(prepareStart, prepareEnd);
+  assert.ok(prepare.includes("prepareBackgroundWorkspace(task)"));
+  assert.ok(!prepare.includes("backgroundDeliveryEnabled === false"));
+  assert.ok(workspace.includes("win.state === 'minimized' || win.focused === false"), "minimized or unfocused windows need a non-focusing activation path");
+  assert.ok(workspace.includes("minimized: win.state === 'minimized'"));
+  assert.ok(!panel.includes('id="backgroundDeliveryEnabled"'));
+  assert.ok(!panel.includes('id="splitViewEnabled"'));
+  assert.ok(app.includes("splitViewEnabled: true"));
+  assert.ok(app.includes("backgroundDeliveryEnabled: true"));
+});
+
+test("fresh target task resets run state but keeps the saved source and workspace", () => {
+  const source = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const createFreshTargetTask = bindFunction(source, "function createFreshTargetTask", "function mergeRefreshedTask", {
+    cloneTaskSnapshot: (task) => JSON.parse(JSON.stringify(task)),
+    uid: (prefix) => `${prefix}-new`,
+    TASK_STATUS,
+    buildDeliveryQueue,
+    collectDoneJobIds
+  });
+  const previous = {
+    id: "task-old",
+    status: TASK_STATUS.COMPLETED,
+    createdAt: 1,
+    counters: { processed: 3, success: 2, skipped: 1, failed: 0 },
+    targetMode: true,
+    targetCount: 2,
+    sourceContext: { sourceType: "search", searchKey: "query=运维" },
+    execution: { listTabId: 10, listWindowId: 1, messageWindowId: 2, workerTabId: 99 },
+    results: [
+      { decision: "pass", selected: false, job: { jobId: "old-a", title: "A", company: "C" } },
+      { decision: "reject", selected: false, reasonTexts: ["不匹配"], job: { jobId: "old-r", title: "R", company: "C" } }
+    ],
+    items: [
+      { jobId: "old-a", state: "COMPLETED", phase: "CHAT_TRIGGERED" },
+      { jobId: "old-r", state: "SKIPPED" }
+    ],
+    queue: [{ jobId: "old-a", status: "done" }],
+    testedJobIds: ["old-a"],
+    refreshHistory: [{ at: 1 }]
+  };
+  const fresh = createFreshTargetTask(previous);
+  assert.equal(fresh.id, "task-new");
+  assert.equal(fresh.status, TASK_STATUS.AWAITING_CONFIRM);
+  assert.deepEqual(fresh.counters, { processed: 0, success: 0, skipped: 0, failed: 0 });
+  assert.equal(fresh.targetMode, false);
+  assert.equal(fresh.targetCount, 0);
+  assert.equal(fresh.sourceContext.searchKey, "query=运维");
+  assert.equal(fresh.execution.listTabId, 10);
+  assert.equal(fresh.execution.messageWindowId, 2);
+  assert.equal(fresh.execution.workerTabId, undefined);
+  assert.equal(fresh.items.find((item) => item.jobId === "old-a").state, "COMPLETED");
+  assert.equal(fresh.items.find((item) => item.jobId === "old-a").phase, "CHAT_TRIGGERED");
+  assert.deepEqual(fresh.testedJobIds, []);
+  assert.deepEqual(fresh.refreshHistory, []);
+  assert.equal(fresh.queue.length, 1);
+  assert.equal(fresh.queue[0].status, "done");
+});
+
 test("single delivery counts the successful job before leaving the loop", () => {
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const marker = "if (task.testDelivery && outcome === 'success')";
@@ -418,6 +528,52 @@ test("background uses the two-page trigger flow and returns safely after failure
   assert.ok(s.includes("while (outcome === 'failed')"));
 });
 
+test("chat send gates disabled editors and native subscribe dialogs before side effects", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const sendStart = content.indexOf("async function sendText");
+  const sendEnd = content.indexOf("async function sendImage", sendStart);
+  const send = content.slice(sendStart, sendEnd);
+  assert.ok(send.includes("detectNativeSubscribeDialog"), "sendText must inspect the native subscribe layer");
+  assert.ok(content.includes(".message-item.item-myself .text-content"), "sendText must recognize current BOSS own-message body nodes");
+  assert.ok(send.includes("for (let i = 0; i < 48; i++)"), "sendText confirmation must tolerate delayed background chat rendering");
+  assert.ok(send.includes('error: \"CHAT_EDITOR_NOT_READY\"'), "blocked editor must return an environment error");
+  assert.ok(send.includes("isDisabledChatControl(sendBtn)"), "disabled send buttons must not be clicked");
+  assert.ok(content.includes("async function waitForSendButtonReady(timeoutMs = 2200)"), "BOSS send button readiness must be polled after input events");
+  assert.ok(send.includes("const sendBtn = await waitForSendButtonReady(2200)"), "sendText must wait for the real send button before dispatching Enter fallback");
+  assert.ok(content.includes("nativeDialog: lastDiagnostic?.nativeDialog || \"\""), "editor timeout must expose native dialog diagnostics");
+  assert.ok(send.includes("const closed = closeNativeSubscribeDialog()"), "sendText must close a visible subscription dialog before waiting for the editor");
+});
+
+test("subscription QR dialog is closed after a conversation click and confirmed by the follow-up action", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  assert.ok(content.includes("function findNativeSubscribeDialog"));
+  assert.ok(content.includes(".startchat-dialog"));
+  assert.ok(content.includes(".dialog-title .close"));
+  assert.ok(content.includes("async function closeSubscribeDialogAndConfirmConversation"));
+  assert.ok(content.includes("source: 'subscribe-dialog-closed'"));
+  assert.ok(content.includes("closeSubscribeDialogAndConfirmConversation(document, 2200)"));
+  assert.ok(content.includes("const startedOnWorkerDetail = /\\/job_detail\\//i.test(location.pathname)"));
+  assert.ok(content.includes("/\\/chat(?:\\/|$)/i.test(location.pathname)"));
+  assert.ok(content.includes("if (!clicked.already && !nativeGreeting.available && subscribeReceipt?.available)"));
+  assert.ok(content.includes("dialogClosed: closed.ok"), "message editor waits must record and close subscription dialogs");
+});
+
+test("native editor failures auto-skip while unconfirmed sends keep manual pause protection", () => {
+  const worker = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const editorStart = worker.indexOf("// 消息页阶段二：等待输入框");
+  const editorEnd = worker.indexOf("const chatRes = {", editorStart);
+  const editor = worker.slice(editorStart, editorEnd);
+  assert.ok(editor.includes("editorEnvironmentFailure"));
+  assert.ok(editor.includes("resultRow.envAutoSkip = true"));
+  assert.ok(editor.includes("return 'failed'"));
+  const envBranch = editor.slice(editor.indexOf("if (editorEnvironmentFailure)"), editor.indexOf("task.pauseReason =", editor.indexOf("if (editorEnvironmentFailure)")));
+  assert.ok(!envBranch.includes("runner.pause = true"), "blocked editor must not open the manual pause modal");
+  const sendFail = worker.slice(worker.indexOf("if (!sendRes?.ok)"), worker.indexOf("await markIdempotent", worker.indexOf("if (!sendRes?.ok)")));
+  assert.ok(sendFail.includes("sendEnvironmentFailure"));
+  assert.ok(sendFail.includes("resultRow.envAutoSkip = true"));
+  assert.ok(worker.includes("error: REASON.EXEC_CONSECUTIVE_FAIL") || worker.includes("REASON.EXEC_CONSECUTIVE_FAIL"));
+});
+
 test("successful conversation creation survives a forced list-to-chat navigation", () => {
   const content = fs.readFileSync("extension/content/content-main.js", "utf8");
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
@@ -447,8 +603,11 @@ test("conversation trigger uses a temporary worker tab and never navigates the l
   assert.ok(worker.includes("isListDocumentPreserved"));
   assert.ok(background.includes("triggerConversationInWorker"));
   assert.ok(background.includes("openConversationWorkerTab"));
-  assert.ok(background.includes("await chrome.tabs.update(tab.id, { url: attempt.url, active: true })"), "worker tab is activated so Chrome does not freeze job_detail");
-  assert.ok(background.includes("url: attempt.url,\n      active: true"), "new worker tab is created active");
+  assert.ok(background.includes("await chrome.tabs.update(tab.id, { url: attempt.url, active: true })"), "normal foreground worker tabs remain active for reliable page loading");
+  assert.ok(background.includes("navigateBackgroundTab(tab.id, attempt.url"), "background worker navigation avoids restoring a minimized window");
+  assert.ok(background.includes("const createOptions = {") && background.includes("active: task.execution.backgroundDeliveryActive ? false : true"), "new worker tabs stay background-safe during delivery");
+  assert.ok(background.includes("tabs.move(tab.id, { windowId: targetWindowId"), "new worker tabs are pinned to the delivery window");
+  assert.ok(background.includes("navigateBackgroundTab(tab.id, attempt.url"), "worker navigation stays background-safe after a window loses focus");
   assert.ok(background.includes("restoreTabsAfterWorker"), "focus returns to chat/list after worker load");
   assert.ok(background.includes("workerDetail: attempt.mode === CONVERSATION_WORKER_MODE.DETAIL"));
   assert.ok(background.includes("closeConversationWorkerTab"));
@@ -489,7 +648,10 @@ test("HR activity is inspected on the temporary detail before any conversation c
   assert.ok(worker.includes("活跃度核对也必须留在临时详情页"), "activity checked on the temporary detail page");
   assert.ok(worker.includes("tabId: workerTab.id"), "activity inspection targets the worker tab");
   assert.ok(!worker.includes("tabId: listTabId"), "activity inspection never targets the left list tab");
-  assert.ok(worker.includes("if (result?.ok || result?.filtered || operationAborted(result)) break;"));
+  assert.ok(
+    worker.includes("if (result?.ok || result?.filtered || result?.error === 'NON_CHAT_JOB' || operationAborted(result)) break;") ||
+    worker.includes("if (!(result?.ok || result?.filtered || result?.error === 'NON_CHAT_JOB' ||\n          isEnvironmentalFailure(result) || operationAborted(result))) {")
+  );
   assert.ok(worker.includes("filtered: true"));
   assert.ok(worker.includes("result?.filtered"));
   assert.ok(worker.includes("执行页加载或注入失败，丢弃冻结标签后再试"));
@@ -774,6 +936,37 @@ test("append-only preview loads 15 to 50 jobs at the fast cadence", async () => 
   assert.ok(harness.clock <= 7000, `fast lazy loading took ${harness.clock}ms in the fake clock`);
 });
 
+test("search waits for a slow next page instead of declaring the first page exhausted", async () => {
+  const harness = createVirtualScanHarness({
+    totalJobs: 30, visibleJobs: 5, initialLoadedJobs: 15, appendBatchSize: 15,
+    appendDelayMs: 5000, pagination: { hasMore: true, loading: false }
+  });
+  const result = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "slow-search-page", resetSession: true, continuous: true,
+    maxRounds: 100, deadlineAt: 15000
+  });
+  assert.equal(result.count, 30, "must collect the second page even after five seconds without growth");
+  assert.equal(result.scanMeta.hasMore, false);
+  assert.equal(result.scanMeta.reachedEnd, true);
+  assert.equal(result.scanMeta.timedOut, false);
+  assert.ok(harness.events.some((event) => event.type === "load" && event.at >= 5000));
+});
+
+test("known next pages and pending list requests remain unfinished at the scan deadline", async () => {
+  for (const pagination of [{ hasMore: true, loading: false }, { hasMore: false, loading: true }]) {
+    const harness = createVirtualScanHarness({ totalJobs: 15, visibleJobs: 5, pagination });
+    const result = await harness.scanAdaptiveJobBatch({
+      scanSessionId: "pending-search-page", resetSession: true, continuous: true,
+      maxRounds: 100, deadlineAt: 6000
+    });
+    assert.equal(result.count, 15);
+    assert.equal(result.scanMeta.reachedEnd, false);
+    assert.equal(result.scanMeta.timedOut, true);
+    assert.equal(result.scanMeta.hasMore, pagination.hasMore);
+    assert.equal(result.scanMeta.loadingMore, pagination.loading);
+  }
+});
+
 test("preview keeps already collected jobs when a wait is cancelled", async () => {
   const harness = createVirtualScanHarness({
     totalJobs: 90,
@@ -938,7 +1131,8 @@ test("page operations consume the background budget and keep timeout terminal st
   assert.ok(content.includes("原操作可能还在收尾；保留取消墓碑"));
   assert.ok(!content.includes("if (window.__BHT_DEBUG_ENABLED__ !== true || !window.__BHT_ACTIVE_OP_ID__) return;"));
   assert.ok(content.includes('error: "OP_DEADLINE_EXCEEDED"'));
-  assert.ok(content.includes("if (opId && window.__BHT_OP_CANCELLED__?.[opId])"));
+  assert.ok(content.includes("isCancelled: (opId) => Boolean(opId && window.__BHT_OP_CANCELLED__?.[opId])"));
+  assert.ok(content.includes("return pageClock.sleep(ms, opId)"));
   assert.ok(content.includes("!timedOut && opId"));
   assert.ok(content.includes("markSettledCancellation"));
   const gateStart = content.indexOf("const dispatchGate");
@@ -1408,7 +1602,11 @@ test("v1.7.19 worker tab reuse, inject budget and env auto-skip are wired", () =
 
   // 执行页跨岗位复用：命中既有 workerTabId 时导航复用，而不是每岗新建+关闭
   assert.ok(background.includes("autoDiscardable"), "worker tab must not be memory-recycled");
-  assert.ok(background.includes("await chrome.tabs.update(tab.id, { url: attempt.url, active: true })"), "reuse navigates existing worker tab and wakes it");
+  assert.ok(
+    background.includes("navigateBackgroundTab(tab.id, attempt.url") ||
+      background.includes("await chrome.tabs.update(tab.id, { url: attempt.url, active: true })"),
+    "reuse navigates existing worker tab without leaving the delivery workspace"
+  );
   assert.ok(background.includes("let reused = Boolean(tab?.id)"), "reuse flag computed");
   assert.ok(!background.includes("本岗位沟通触发结束"), "worker tab is no longer closed per job");
 
@@ -1736,6 +1934,501 @@ test("browser boundary audit covers every previously partial feature", () => {
   assert.ok(stub.includes("function updateTaskStatus") && stub.includes("revision: Number(state.task.revision || 0) + 1"), "panel harness control responses advance task snapshots");
 });
 
+
+function bindFunction(source, start, end, bindings) {
+  return new Function(...Object.keys(bindings),
+    `return (${extractFunctionSource(source, start, end)});`
+  )(...Object.values(bindings));
+}
+
+function createNonChatDetailHarness({ chat = false, activeText = "", delayMs = 0 } = {}) {
+  const source = fs.readFileSync("extension/content/content-main.js", "utf8");
+  let clock = 100;
+  let sleeps = 0;
+  const title = { textContent: "国企运维工程师" };
+  const root = {};
+  const button = { textContent: "立即网申" };
+  const location = { pathname: "/job_detail/job-a.html", href: "https://www.zhipin.com/job_detail/job-a.html" };
+  const bindings = {
+    document: { readyState: "complete", querySelector: () => null },
+    location,
+    SELECTORS: { title: ["title"], detailRoot: ["root"] },
+    firstEl: (selectors) => selectors[0] === "title" ? title : root,
+    textOf: (node) => node?.textContent || "",
+    normalizeText: (text) => String(text || "").trim(),
+    extractJobIdFromHref: () => "job-a",
+    findConversationActionButton: () => chat ? {} : null,
+    findNonChatApplyButton: () => clock >= 100 + delayMs ? button : null,
+    extractDetailActiveText: () => activeText,
+    extractDetailCompany: () => "示例国企",
+    extractDetailHrName: () => "",
+    BHT_CONTENT_VERSION: "1.7.39",
+    debugTrace: () => {},
+    dismissCommonDialogs: () => {},
+    skipExistingBossJobSwitch: () => null,
+    pageInfo: () => ({ href: location.href }),
+    detectLoginModal: () => ({ ok: false }),
+    Date: { now: () => clock },
+    sleep: async (ms) => { clock += ms; sleeps += 1; }
+  };
+  bindings.detectNonChatJob = bindFunction(source, "function detectNonChatJob", "async function clickChatButton", bindings);
+  return {
+    inspect: bindFunction(source, "async function inspectWorkerJobDetail", "// 岗位详情页内点击", bindings),
+    trigger: bindFunction(source, "async function triggerConversationOnWorkerDetail", "async function triggerConversationOnList", bindings),
+    get elapsed() { return clock - 100; },
+    get sleeps() { return sleeps; }
+  };
+}
+
+test("worker detail skips web application before HR or chat waits", async () => {
+  for (const method of ["inspect", "trigger"]) {
+    const harness = createNonChatDetailHarness({ delayMs: 500 });
+    const result = await harness[method]({ jobId: "job-a", title: "国企运维工程师" });
+    assert.equal(result.error, "NON_CHAT_JOB");
+    assert.equal(result.skipped, true);
+    assert.equal(result.buttonText, "立即网申");
+    assert.ok(harness.elapsed <= 750, "must not wait for missing HR information or exhaust render retries");
+  }
+});
+
+test("ordinary chat jobs with an apply entry still pass HR inspection", async () => {
+  const harness = createNonChatDetailHarness({ chat: true, activeText: "今日活跃" });
+  const result = await harness.inspect({ jobId: "job-a" });
+  assert.equal(result.ok, true);
+  assert.equal(result.activeText, "今日活跃");
+});
+
+test("existing-HR dialog cancels only the scoped switch and ignores hidden or unrelated text", () => {
+  const source = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const clicks = [];
+  const cancel = { text: "取消", getBoundingClientRect: () => ({ width: 80, height: 30 }) };
+  const confirm = { text: "沟通新职位", getBoundingClientRect: () => ({ width: 80, height: 30 }) };
+  const dialog = {
+    text: "您与该Boss已沟通过，是否就新职位榆中支行继续沟通？注：更换沟通职位将通知Boss",
+    display: "block",
+    getBoundingClientRect: () => ({ width: 360, height: 220 }),
+    querySelectorAll: () => [confirm, cancel]
+  };
+  const bindings = {
+    document: { querySelectorAll: () => [dialog] },
+    getComputedStyle: (node) => ({ display: node.display || "block", visibility: "visible" }),
+    textOf: (node) => node.text,
+    clickLikeHuman: (node) => { clicks.push(node.text); return true; },
+    BHT_CONTENT_VERSION: "1.7.39"
+  };
+  bindings.findExistingBossJobSwitchDialog = bindFunction(source,
+    "function findExistingBossJobSwitchDialog", "function skipExistingBossJobSwitch", bindings);
+  const skip = bindFunction(source, "function skipExistingBossJobSwitch", "async function checkExistingBossJobSwitch", bindings);
+  const result = skip();
+  assert.equal(result.error, "BOSS_JOB_SWITCH_REQUIRED");
+  assert.equal(result.cancelled, true);
+  assert.deepEqual(clicks, ["取消"]);
+  dialog.display = "none";
+  assert.equal(skip(), null);
+  dialog.display = "block";
+  dialog.text = "岗位说明：您与该Boss已沟通过";
+  assert.equal(skip(), null);
+  assert.deepEqual(clicks, ["取消"]);
+  dialog.text = "您与该Boss已沟通过，是否就新职位继续沟通？";
+  dialog.querySelectorAll = () => [confirm];
+  assert.equal(skip().cancelled, false);
+  assert.deepEqual(clicks, ["取消"], "a missing cancel must never fall back to notifying the HR");
+});
+
+test("worker detects the switch prompt in the new document after BOSS navigation without retrying", async () => {
+  const source = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const operations = [];
+  let opens = 0;
+  const worker = bindFunction(source, "async function triggerConversationInWorker", "async function sendToBoss", {
+    getListTabFingerprint: async () => ({ url: "https://www.zhipin.com/web/geek/jobs", contentInstanceId: "same" }),
+    normalizeActiveWithin, buildConversationWorkerAttempts, CONVERSATION_WORKER_MODE, WORKER_TRIGGER_RETRY,
+    runner: { abort: false },
+    operationAborted: (result) => result?.error === "OP_CANCELLED",
+    openConversationWorkerTab: async () => { opens += 1; return { id: 2 }; },
+    sendToBoss: async (type) => {
+      operations.push(type);
+      return type === "trigger"
+        ? { ok: true, navigated: true }
+        : { ok: false, error: "BOSS_JOB_SWITCH_REQUIRED", skipped: true, cancelled: true };
+    },
+    restoreTabsAfterWorker: async () => {},
+    isEnvironmentalFailure, isWorkerTriggerRetryable, isListDocumentPreserved, matchActive,
+    log: async () => {}, debugLog: async () => {},
+    MSG: { TRIGGER_CONVERSATION: "trigger", CHECK_JOB_SWITCH: "check-switch" }
+  });
+  const result = await worker({ listHref: "https://www.zhipin.com/web/geek/jobs" },
+    { jobId: "job-a", href: "https://www.zhipin.com/job_detail/job-a.html" }, { id: 3 }, 1);
+  assert.equal(result.error, "BOSS_JOB_SWITCH_REQUIRED");
+  assert.equal(result.environmental, false);
+  assert.equal(opens, 1);
+  assert.deepEqual(operations, ["trigger", "check-switch"]);
+});
+
+test("worker retries a pre-click environmental failure before auto-skipping", async () => {
+  const source = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const operations = [];
+  let opens = 0;
+  const worker = bindFunction(source, "async function triggerConversationInWorker", "async function sendToBoss", {
+    getListTabFingerprint: async () => ({ url: "https://www.zhipin.com/web/geek/jobs", contentInstanceId: "same" }),
+    normalizeActiveWithin, buildConversationWorkerAttempts, CONVERSATION_WORKER_MODE, WORKER_TRIGGER_RETRY,
+    runner: { abort: false },
+    operationAborted: () => false,
+    openConversationWorkerTab: async () => { opens += 1; return { id: opens + 1 }; },
+    sendToBoss: async (type) => {
+      operations.push(type);
+      return operations.length === 1
+        ? { ok: false, error: "WORKER_CHAT_BUTTON_NOT_FOUND", environmental: true }
+        : { ok: true, navigated: true };
+    },
+    closeConversationWorkerTab: async () => ({ ok: true }),
+    restoreTabsAfterWorker: async () => {},
+    isEnvironmentalFailure, isWorkerTriggerRetryable, isListDocumentPreserved, matchActive,
+    log: async () => {}, debugLog: async () => {},
+    MSG: { TRIGGER_CONVERSATION: "trigger", CHECK_JOB_SWITCH: "check-switch" },
+    sleep: async () => {}
+  });
+  const result = await worker({ listHref: "https://www.zhipin.com/web/geek/jobs" },
+    { jobId: "job-a", href: "https://www.zhipin.com/job_detail/job-a.html" }, { id: 3 }, 1);
+  assert.equal(result.ok, true);
+  assert.equal(opens, 2, "a recoverable pre-click error reopens the detail tab");
+  assert.deepEqual(operations, ["trigger", "trigger", "check-switch"]);
+});
+
+test("message dispatch refuses text and images while an existing-HR switch is pending", async () => {
+  const source = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const pageWindow = {};
+  const dispatch = bindFunction(source, "async function runOpByType", "const onBhtMessage", {
+    window: pageWindow,
+    MSG: {
+      CHECK_JOB_SWITCH: "BHT_CHECK_JOB_SWITCH",
+      SEND_TEXT: "BHT_SEND_TEXT",
+      SEND_IMAGE: "BHT_SEND_IMAGE"
+    },
+    checkExistingBossJobSwitch: async () => ({ ok: false, error: "BOSS_JOB_SWITCH_REQUIRED", cancelled: true }),
+    skipExistingBossJobSwitch: () => ({ ok: false, error: "BOSS_JOB_SWITCH_REQUIRED", cancelled: false }),
+    sendText: () => { throw Error("must not send into the old job conversation"); },
+    sendImageFromDataUrl: () => { throw Error("must not send into the old job conversation"); }
+  });
+  for (const type of ["BHT_SEND_TEXT", "BHT_SEND_IMAGE"]) {
+    assert.equal((await dispatch(type, {})).error, "BOSS_JOB_SWITCH_REQUIRED");
+    assert.equal(pageWindow.__BHT_OP_LOCK__, null);
+  }
+  const switchResult = await dispatch("BHT_CHECK_JOB_SWITCH", {});
+  assert.equal(switchResult.error, "BOSS_JOB_SWITCH_REQUIRED");
+  assert.equal(switchResult.cancelled, true);
+});
+
+test("job-switch conflicts at trigger, conversation or editor count as skips and never send", async () => {
+  const source = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  for (const stage of ["trigger", "conversation", "editor"]) {
+    const runner = { abort: false, pause: false, consecutiveUnknownActive: 2 };
+    const task = {
+      id: "task-a", status: TASK_STATUS.RUNNING, items: [], results: [],
+      listHref: "https://www.zhipin.com/web/geek/jobs", execution: { listTabId: 1 },
+      counters: { success: 0, skipped: 0, failed: 0 }
+    };
+    const history = [];
+    const stats = [];
+    const blocked = { ok: false, error: "BOSS_JOB_SWITCH_REQUIRED", cancelled: true, message: "保留原会话，跳过" };
+    const process = bindFunction(source, "async function processOneJob", "async function runTaskLoop", {
+      runner, TASK_STATUS, REASON: { FILTER_ACTIVE: "FILTER_ACTIVE" },
+      JOB_PHASE: { CHAT_TRIGGERED: "CHAT_TRIGGERED", CONVERSATION_OPENED: "CONVERSATION_OPENED" },
+      ensureItem: (task, job) => { const item = { jobId: job.jobId, state: "NOT_STARTED" }; task.items.push(item); return item; },
+      hasChatCheckpoint: () => false, publishTask: async () => {},
+      getTodayStats: async () => ({}), checkLimits: () => ({ ok: true }),
+      getHistory: async () => history, getIdempotencyMap: async () => ({}), checkDedup: () => ({ ok: true }),
+      ensureListTab: async () => ({ id: 1, url: task.listHref }), isBossJobListUrl,
+      ensureMessageTab: async () => ({ id: 2 }), syncTaskBossGreeting: async () => {},
+      MSG: { GET_CONVERSATION_SNAPSHOT: "snapshot", WAIT_OPEN_CONVERSATION: "conversation", WAIT_CHAT_EDITOR: "editor" },
+      sendToBoss: async (type) => {
+        if (type === "snapshot") return { ok: true, keys: [], count: 0 };
+        if (type === stage) return blocked;
+        if (type === "conversation") return { ok: true };
+        throw Error("unexpected operation after a switch conflict: " + type);
+      },
+      triggerConversationInWorker: async () => stage === "trigger" ? blocked : { ok: true, listPreserved: true },
+      refreshMessageTabOnce: async () => ({ ok: true }), operationAborted: () => false,
+      chrome: { tabs: { update: async () => {} } }, sleep: async () => {},
+      log: async () => {}, debugLog: async () => {}, markIdempotent: async () => {}, jobIdempotencyKey: () => "job:a",
+      bumpDailyStat: async (kind) => stats.push(kind), appendHistory: async (row) => history.push(row)
+    });
+    const row = { job: { jobId: "new-job", bossId: "same-hr", title: "新岗位", company: "C" } };
+    task.results.push(row);
+    assert.equal(await process(task, row, { settings: {}, filters: {} }), "skipped", stage);
+    assert.deepEqual(task.counters, { success: 0, skipped: 1, failed: 0 });
+    assert.equal(task.items[0].phase, "");
+    assert.equal(runner.pause, false);
+    assert.equal(runner.consecutiveUnknownActive, 0);
+    assert.deepEqual(stats, ["skip"]);
+    assert.equal(history[0].reason, "BOSS_JOB_SWITCH_REQUIRED");
+    assert.equal(history[0].bossId, "same-hr");
+  }
+});
+
+test("worker does not retry or trigger chat after recognizing a non-chat job", async () => {
+  const source = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  for (const activeWithin of [[], ["week"]]) {
+    let opens = 0;
+    const operations = [];
+    const worker = bindFunction(source, "async function triggerConversationInWorker", "async function sendToBoss", {
+      getListTabFingerprint: async () => ({ url: "https://www.zhipin.com/web/geek/jobs", contentInstanceId: "same" }),
+      normalizeActiveWithin,
+      buildConversationWorkerAttempts,
+      CONVERSATION_WORKER_MODE,
+      WORKER_TRIGGER_RETRY,
+      runner: { abort: false },
+      operationAborted: (result) => result?.error === "OP_CANCELLED",
+      openConversationWorkerTab: async () => { opens += 1; return { id: 2 }; },
+      sendToBoss: async (type) => {
+        operations.push(type);
+        return { ok: false, error: "NON_CHAT_JOB", skipped: true, buttonText: "立即网申" };
+      },
+      restoreTabsAfterWorker: async () => {},
+      isEnvironmentalFailure,
+      isWorkerTriggerRetryable,
+      isListDocumentPreserved,
+      matchActive,
+      log: async () => {},
+      debugLog: async () => {},
+      MSG: { INSPECT_JOB_DETAIL: "inspect", TRIGGER_CONVERSATION: "trigger" }
+    });
+    const result = await worker({ listHref: "https://www.zhipin.com/web/geek/jobs" },
+      { jobId: "job-a", href: "https://www.zhipin.com/job_detail/job-a.html" }, { id: 3 }, 1, activeWithin);
+    assert.equal(result.error, "NON_CHAT_JOB");
+    assert.equal(result.environmental, false);
+    assert.equal(opens, 1);
+    assert.deepEqual(operations, [activeWithin.length ? "inspect" : "trigger"]);
+  }
+});
+
+test("four web-application jobs count as skips without pausing for unknown HR activity", async () => {
+  const source = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const runner = { abort: false, pause: false, consecutiveUnknownActive: 2 };
+  const task = { id: "task-a", status: TASK_STATUS.RUNNING, items: [], results: [],
+    listHref: "https://www.zhipin.com/web/geek/jobs?query=运维",
+    execution: { listTabId: 1 }, counters: { success: 0, skipped: 0, failed: 0 } };
+  const history = [];
+  const stats = [];
+  const process = bindFunction(source, "async function processOneJob", "async function runTaskLoop", {
+    runner, TASK_STATUS, REASON: { FILTER_ACTIVE: "FILTER_ACTIVE" },
+    ensureItem: (task, job) => {
+      const item = { jobId: job.jobId, state: "NOT_STARTED" };
+      task.items.push(item);
+      return item;
+    },
+    hasChatCheckpoint: () => false,
+    publishTask: async () => {},
+    getTodayStats: async () => ({}), checkLimits: () => ({ ok: true }),
+    getHistory: async () => history, getIdempotencyMap: async () => ({}),
+    checkDedup: () => ({ ok: true }),
+    ensureListTab: async () => ({ id: 1, url: task.listHref }), isBossJobListUrl,
+    ensureMessageTab: async () => ({ id: 2 }), syncTaskBossGreeting: async () => {},
+    MSG: { GET_CONVERSATION_SNAPSHOT: "snapshot" },
+    sendToBoss: async (type) => {
+      assert.equal(type, "snapshot", "non-chat jobs must never reach the message-sending path");
+      return { ok: true, keys: [], count: 0 };
+    },
+    triggerConversationInWorker: async () => ({
+      ok: false, error: "NON_CHAT_JOB", skipped: true, message: "立即网申，不支持站内沟通"
+    }),
+    operationAborted: () => false, log: async () => {},
+    bumpDailyStat: async (kind) => stats.push(kind),
+    appendHistory: async (row) => history.push(row)
+  });
+  for (let index = 0; index < 4; index++) {
+    const row = { job: { jobId: `web-${index}`, title: "国企岗位", company: "C" } };
+    task.results.push(row);
+    assert.equal(await process(task, row, { settings: {}, filters: { activeWithin: ["week"] } }), "skipped");
+  }
+  assert.equal(runner.pause, false);
+  assert.equal(runner.consecutiveUnknownActive, 0);
+  assert.equal(task.status, TASK_STATUS.RUNNING);
+  assert.deepEqual(task.counters, { success: 0, skipped: 4, failed: 0 });
+  assert.ok(task.items.every((item) => item.state === "SKIPPED"));
+  assert.deepEqual(stats, ["skip", "skip", "skip", "skip"]);
+  assert.equal(history.length, 4);
+});
+
+test("detail-page activity unknown skips safely without list-failure pause", async () => {
+  const source = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const runner = { abort: false, pause: false, consecutiveUnknownActive: 0 };
+  const task = { id: "task-detail-unknown", status: TASK_STATUS.RUNNING, items: [], results: [],
+    listHref: "https://www.zhipin.com/web/geek/jobs?query=运维",
+    execution: { listTabId: 1 }, counters: { success: 0, skipped: 0, failed: 0 } };
+  const history = [];
+  const stats = [];
+  const process = bindFunction(source, "async function processOneJob", "async function runTaskLoop", {
+    runner, TASK_STATUS, REASON: { FILTER_ACTIVE: "FILTER_ACTIVE" },
+    ensureItem: (task, job) => {
+      const item = { jobId: job.jobId, state: "NOT_STARTED" };
+      task.items.push(item);
+      return item;
+    },
+    hasChatCheckpoint: () => false,
+    publishTask: async () => {},
+    getTodayStats: async () => ({}), checkLimits: () => ({ ok: true }),
+    getHistory: async () => history, getIdempotencyMap: async () => ({}),
+    checkDedup: () => ({ ok: true }),
+    ensureListTab: async () => ({ id: 1, url: task.listHref }), isBossJobListUrl,
+    ensureMessageTab: async () => ({ id: 2 }), syncTaskBossGreeting: async () => {},
+    MSG: { GET_CONVERSATION_SNAPSHOT: "snapshot" },
+    sendToBoss: async (type) => {
+      assert.equal(type, "snapshot");
+      return { ok: true, keys: [], count: 0 };
+    },
+    triggerConversationInWorker: async () => ({
+      ok: false,
+      filtered: true,
+      error: "FILTER_ACTIVE",
+      activeText: "",
+      activityError: "DETAIL_ACTIVE_UNKNOWN",
+      listPreserved: true,
+      workerAttempts: [{ error: "DETAIL_ACTIVE_UNKNOWN" }],
+      message: "投递跳过：HR 活跃度未知"
+    }),
+    operationAborted: () => false, log: async () => {},
+    bumpDailyStat: async (kind) => stats.push(kind),
+    appendHistory: async () => {}
+  });
+  for (let index = 0; index < 3; index++) {
+    const row = { job: { jobId: `unknown-${index}`, title: "运维岗位", company: "C" } };
+    task.results.push(row);
+    assert.equal(await process(task, row, { settings: {}, filters: { activeWithin: ["week"] } }), "skipped");
+  }
+  assert.equal(runner.pause, false);
+  assert.equal(runner.consecutiveUnknownActive, 0);
+  assert.equal(task.status, TASK_STATUS.RUNNING);
+  assert.deepEqual(task.counters, { success: 0, skipped: 3, failed: 0 });
+  assert.ok(task.items.every((item) => item.state === "SKIPPED"));
+});
+
+test("background activity bridge errors are environmental, never HR-unknown", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const env = fs.readFileSync("extension/shared/environment-failures.js", "utf8");
+  assert.ok(background.includes("ACTIVITY_INFRASTRUCTURE_ERRORS.has(activityError)"));
+  assert.ok(background.includes("后台详情页环境异常"));
+  assert.ok(env.includes("'BACKGROUND_TAB_MOVED'"));
+});
+
+test("search continuation requires unchanged source, filters and an unfinished scan", () => {
+  const context = { sourceType: "search", searchKey: "/web/geek/jobs?query=运维", filterSignature: { observed: true, request: { degree: "203" } } };
+  const task = { targetMode: true, sourceContext: context, scanMeta: { sessionId: "scan-a", timedOut: true, reachedEnd: false, scanTabId: 1, scrollTop: 840 } };
+  assert.deepEqual(resolveTargetSearchContinuation(task, context, 1), { scanSessionId: "scan-a", scrollTop: 840 });
+  assert.equal(resolveTargetSearchContinuation(task, { ...context, searchKey: "another" }, 1), null);
+  assert.equal(resolveTargetSearchContinuation(task, { ...context, filterSignature: { observed: true, request: { degree: "202" } } }, 1), null);
+  assert.equal(resolveTargetSearchContinuation(task, context, 2), null);
+  assert.equal(resolveTargetSearchContinuation({ ...task, targetMode: false }, context, 1), null);
+  assert.equal(resolveTargetSearchContinuation({ ...task, scanMeta: { ...task.scanMeta, reachedEnd: true } }, context, 1), null);
+});
+
+test("search scan resumes beyond a timed-out batch and returns only newly found jobs", async () => {
+  const harness = createVirtualScanHarness({ totalJobs: 60, visibleJobs: 3 });
+  const first = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "search-a", resetSession: true, continuous: true, deadlineAt: 500
+  });
+  assert.equal(first.scanMeta.timedOut, true);
+  assert.ok(first.jobs.length < 60);
+  harness.activeScroller.scrollTop = 0; // UI returns to top after displaying the first batch.
+  const second = await harness.scanAdaptiveJobBatch({
+    scanSessionId: "search-a", resetSession: false, deltaOnly: true,
+    continuous: true, resumeScrollTop: first.scanMeta.scrollTop, deadlineAt: harness.clock + 15000
+  });
+  const firstIds = new Set(first.jobs.map((job) => job.jobId));
+  assert.ok(second.jobs.length > 0);
+  assert.ok(second.jobs.every((job) => !firstIds.has(job.jobId)));
+  assert.equal(new Set([...first.jobs, ...second.jobs].map((job) => job.jobId)).size, 60);
+  assert.equal(second.scanMeta.reachedEnd, true);
+  assert.equal(second.scanMeta.scanStartTop, first.scanMeta.scrollTop);
+});
+
+function createTargetLoopHarness(batches, targetCount = 4) {
+  const source = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const row = (id) => ({ job: { jobId: id, title: id, company: "C", href: `https://www.zhipin.com/job_detail/${id}.html` }, decision: "pass", selected: true });
+  const freshTask = (ids) => {
+    const results = ids.map(row);
+    return { results, items: ids.map((jobId) => ({ jobId, title: jobId, company: "C", state: "NOT_STARTED" })),
+      queue: buildDeliveryQueue(results), summary: summarizePreview(results),
+      sourceContext: { sourceType: "search", searchKey: "query=运维" } };
+  };
+  let config = { settings: { targetNoNewRetryLimit: 2 }, task: {
+    ...freshTask(batches.shift()), id: "task-a", targetMode: true, targetCount,
+    status: TASK_STATUS.RUNNING, counters: { success: 0, skipped: 0, failed: 0, processed: 0 },
+    execution: { listTabId: 1 }, testedJobIds: []
+  } };
+  const attempts = [];
+  let refreshes = 0;
+  const runner = { abort: false };
+  const clone = (value) => JSON.parse(JSON.stringify(value));
+  const publishTask = async (task) => { config.task = clone(task); };
+  const merge = bindFunction(source, "function mergeRefreshedTask", "async function refreshAndContinue", {
+    jobsShareMergeIdentity, mergeTaskResults, collectDoneJobIds, rebuildDeliveryQueue, summarizePreview, TASK_STATUS
+  });
+  const loop = bindFunction(source, "async function runTargetDeliveryLoop", "function itemErrorHint", {
+    runner, uid: () => "run-a", isTaskRunCurrent: () => true, TASK_STATUS,
+    getAllConfig: async () => clone(config), publishTask,
+    isTargetDeliveryReached, targetDeliveryRemaining, normalizeTargetNoNewRetryLimit,
+    log: async () => {}, setTaskTerminalSignal: () => {},
+    chrome: { tabs: { get: async () => ({ id: 1, url: "https://www.zhipin.com/web/geek/jobs?query=运维" }) } },
+    isBossJobListUrl,
+    withRunnerAdmission: async (_kind, fn) => fn("preview-a"),
+    refreshAndContinue: async () => {
+      refreshes += 1;
+      assert.ok(refreshes <= 5, "target loop must terminate");
+      const incoming = freshTask(batches.shift() || []);
+      const merged = merge(config.task, incoming, config.task.sourceContext);
+      await publishTask(merged.task);
+      return { ok: true, task: clone(config.task) };
+    },
+    recordTargetModeHalt: async (task, message) => {
+      task.status = TASK_STATUS.STOPPED;
+      task.targetLastError = message;
+      await publishTask(task);
+    },
+    runTaskLoop: async () => {
+      const task = config.task;
+      for (const entry of task.queue.filter((item) => item.status === "pending")) {
+        assert.ok(!attempts.includes(entry.jobId), `repeated delivery: ${entry.jobId}`);
+        attempts.push(entry.jobId);
+        const skipped = entry.jobId.startsWith("skip");
+        entry.status = skipped ? "skipped" : "done";
+        task.items.find((item) => item.jobId === entry.jobId).state = skipped ? "SKIPPED" : "COMPLETED";
+        task.testedJobIds.push(entry.jobId);
+        task.counters[skipped ? "skipped" : "success"] += 1;
+        task.counters.processed += 1;
+        if (isTargetDeliveryReached(task)) break;
+      }
+      task.status = TASK_STATUS.COMPLETED;
+      await publishTask(task);
+      return { ok: true };
+    }
+  });
+  return { loop, attempts, get task() { return config.task; }, get refreshes() { return refreshes; } };
+}
+
+test("search target loop ignores repeated batches and reaches the goal with new successful jobs", async () => {
+  const harness = createTargetLoopHarness([
+    ["skip-web-apply", "a"], ["skip-web-apply", "a", "b"],
+    ["a", "b"], ["a", "b", "skip-other", "c", "d", "e"]
+  ]);
+  const result = await harness.loop("task-a");
+  assert.equal(result.ok, true);
+  assert.equal(harness.task.counters.success, 4);
+  assert.equal(harness.task.counters.skipped, 2);
+  assert.equal(harness.task.status, TASK_STATUS.COMPLETED);
+  assert.equal(harness.refreshes, 3);
+  assert.deepEqual(harness.attempts, ["skip-web-apply", "a", "b", "skip-other", "c", "d"]);
+  assert.equal(harness.task.queue.find((entry) => entry.jobId === "e").status, "pending");
+});
+
+test("an exhausted search stops without repeating old jobs or claiming the goal was reached", async () => {
+  const harness = createTargetLoopHarness([["a"], ["a"], ["a"]]);
+  const result = await harness.loop("task-a");
+  assert.equal(result.error, "TARGET_NO_NEW_JOBS_LIMIT");
+  assert.equal(harness.task.counters.success, 1);
+  assert.equal(harness.task.status, TASK_STATUS.STOPPED);
+  assert.equal(harness.refreshes, 2);
+  assert.deepEqual(harness.attempts, ["a"]);
+});
 
 await runRegisteredTests();
 
