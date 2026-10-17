@@ -36,7 +36,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
-const BHT_UI_VERSION = "1.7.38";
+const BHT_UI_VERSION = "1.7.39";
 const VERSION_GUARDED_API_MESSAGES = new Set([
   MSG.RUN_PREVIEW,
   MSG.CONFIRM_AND_START,
@@ -684,7 +684,10 @@ function fillSettings(settings) {
   );
   $('jobIntervalSec').value = intervalBaseFromMs(settings.jobIntervalMs);
   $('neverRepeatJob').checked = settings.neverRepeatJob !== false;
-  $('splitViewEnabled').checked = settings.splitViewEnabled !== false;
+  // Delivery always opens the normal left-list/right-chat workspace and keeps
+  // running when the user switches apps or minimizes either window. These
+  // legacy settings remain readable for imported configs but are no longer
+  // exposed as competing runtime switches.
   $('debugLoggingEnabled').checked = settings.debugLoggingEnabled === true;
   $('scheduledDeliveryEnabled').checked = settings.scheduledDeliveryEnabled === true;
   const scheduledDays = new Set(normalizeDeliveryScheduleDays(settings.scheduledDeliveryDays));
@@ -968,7 +971,8 @@ function readSettingsPatch(base) {
     targetNoNewRetryLimit: normalizeTargetNoNewRetryLimit($('targetNoNewRetryLimit').value),
     jobIntervalMs: intervalMsFromBase(Number($('jobIntervalSec').value || 5)),
     neverRepeatJob: $('neverRepeatJob').checked,
-    splitViewEnabled: $('splitViewEnabled').checked,
+    splitViewEnabled: true,
+    backgroundDeliveryEnabled: true,
     debugLoggingEnabled: $('debugLoggingEnabled').checked,
     scheduledDeliveryEnabled: $('scheduledDeliveryEnabled').checked,
     scheduledDeliveryDays: readScheduledDeliveryDays(),
@@ -1793,10 +1797,13 @@ function updateTaskUI(task, runner = {}) {
   const sourceReady = task?.sourceContext?.sourceType === 'recommend' ||
     (task?.sourceContext?.sourceType === 'expectation' && String(task?.sourceContext?.expectationKey || '').trim()) ||
     (task?.sourceContext?.sourceType === 'search' && String(task?.sourceContext?.searchKey || '').trim());
-  // Restore an active target task on first load, but keep an explicit user
-  // toggle and completed historical tasks from being overwritten by refresh.
-  const targetTaskActive = status === 'running' || status === 'paused' || runner.targetLoop === true;
-  if (!state.targetModeUserChanged && task?.targetMode === true && targetTaskActive) {
+  // Restore the target-mode control for the task that owns the current
+  // preview, including a completed/stopped target run. A terminal target run
+  // is still the source for the next click: CONFIRM_AND_START creates a fresh
+  // task id and skips the already-processed jobs. Keep an explicit user toggle
+  // authoritative so turning the mode off is not undone by a refresh.
+  const targetTaskKnown = Boolean(task?.targetMode === true && status && status !== 'idle');
+  if (!state.targetModeUserChanged && targetTaskKnown) {
     state.targetModeEnabled = true;
   }
   const targetEnabled = state.targetModeEnabled === true;
@@ -1953,8 +1960,12 @@ function renderPreview(task) {
 
 const list = $('previewList');
   list.innerHTML = '';
+  const doneIds = collectDoneJobIds(task.items, task.queue, task.testedJobIds);
+  const itemStates = new Map((task.items || []).map((item) => [String(item.jobId), item.state]));
   state.selected = new Set(
-    (task.results || []).filter((r) => r.selected && r.decision === 'pass').map((r) => r.job.jobId)
+    (task.results || []).filter((r) =>
+      r.selected && r.decision === 'pass' && !doneIds.has(String(r.job.jobId))
+    ).map((r) => r.job.jobId)
   );
 
   const fragment = document.createDocumentFragment();
@@ -1962,7 +1973,13 @@ const list = $('previewList');
     const div = document.createElement('div');
     div.className = `item ${r.decision}`;
     div.dataset.job = String(r.job.jobId || '');
-    const canSelect = r.decision === 'pass';
+    const alreadyProcessed = r.decision === 'pass' && doneIds.has(String(r.job.jobId));
+    const canSelect = r.decision === 'pass' && !alreadyProcessed;
+    const outcomeText = {
+      COMPLETED: '已投递成功',
+      SKIPPED: '已跳过',
+      FAILED: '已处理失败'
+    }[itemStates.get(String(r.job.jobId))] || '已处理';
     div.innerHTML = `
       <div class="row">
         <div class="t">${escapeHtml(r.job.title || '未命名职位')}</div>
@@ -1977,7 +1994,9 @@ const list = $('previewList');
       <div class="m">${escapeHtml(r.job.company || '')} · ${escapeHtml(r.job.location || '')} · ${escapeHtml(
       r.job.salary || ''
     )}</div>
-      <div class="r">${escapeHtml(previewReasonLines(r).join('；'))}</div>
+      <div class="r">${escapeHtml(alreadyProcessed
+        ? `${outcomeText}，本任务不会重复投递`
+        : previewReasonLines(r).join('；'))}</div>
     `;
     fragment.appendChild(div);
   });
@@ -3405,12 +3424,12 @@ function bindEvents() {
     } else {
       state.targetCountDraft = '';
       const message = res.targetMode
-        ? `目标模式已开始：成功投递目标 ${res.targetCount} 份，无新增最多连续重试 ${res.targetNoNewRetryLimit || targetNoNewRetryLimit} 轮`
+        ? `${res.freshTargetRun ? '新一轮目标任务已开始' : '目标模式已开始'}：成功投递目标 ${res.targetCount} 份，无新增最多连续重试 ${res.targetNoNewRetryLimit || targetNoNewRetryLimit} 轮`
         : res.scheduled
         ? '已加入定时队列，将在下一个投递时段自动开始'
         : res.splitView?.ok
-          ? '已开始投递 · 已打开左右分屏'
-          : '已开始投递 · 消息页使用普通标签';
+          ? '已开始投递 · 已自动左右分屏，可切屏或最小化窗口继续运行'
+          : '已开始投递 · 正在准备投递工作区';
       toast(message, res.scheduled || !res.splitView?.ok ? 'warn' : 'success', res.scheduled ? 4200 : 2600);
     }
     await refresh({ soft: true });
@@ -3476,7 +3495,7 @@ function bindEvents() {
     } else {
       const suffix = res.scheduled
         ? ' · 已加入定时队列'
-        : res.splitView?.ok ? ' · 已左右分屏' : ' · 普通标签模式';
+        : res.splitView?.ok ? ' · 已左右分屏，可切屏或最小化窗口继续运行' : ' · 正在准备工作区';
       const remainTxt = typeof res.remain === 'number' ? (' · 还剩 ' + res.remain + ' 个未投') : '';
       toast('投递一份已开始：' + (res.job?.title || selectedJobIds[0]) + suffix + remainTxt, res.splitView?.ok ? 'success' : 'warn', 3200);
     }
