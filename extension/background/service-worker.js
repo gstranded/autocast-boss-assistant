@@ -5234,8 +5234,8 @@ async function runTaskLoop(taskId, taskRunId = uid('run')) {
       } else if (outcome === 'skipped' && !hasChatCheckpoint(item)) {
         await log('info', '[队列] 跳过（未投递），无需等待投递间隔，继续下一岗…');
       } else {
-        let iv = config.settings.jobIntervalMs || [4000, 6000];
-        if (Array.isArray(iv) && iv[0] < 1000) iv = [4000, 6000];
+        let iv = config.settings.jobIntervalMs || [29000, 31000];
+        if (Array.isArray(iv) && iv[0] < 1000) iv = [29000, 31000];
         const waitMs = randomBetween(iv);
         await log('info', `[队列] 等待投递间隔 ${Math.max(1, Math.round(waitMs / 1000))} 秒后继续下一岗…`);
         await waitDeliveryInterval(task, waitMs);

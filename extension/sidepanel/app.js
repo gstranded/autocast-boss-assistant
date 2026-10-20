@@ -558,11 +558,11 @@ function intervalBaseFromMs(ms) {
   if (Array.isArray(ms) && ms.length >= 2 && Number.isFinite(ms[1]) && ms[1] > 0) {
     return Math.max(1, Math.round(ms[1] / 1000 - 1));
   }
-  return 5;
+  return 30;
 }
 
 function intervalMsFromBase(baseSec) {
-  const n = Math.min(60, Math.max(1, Math.round(Number(baseSec) || 5)));
+  const n = Math.min(60, Math.max(1, Math.round(Number(baseSec) || 30)));
   return [Math.max(1000, (n - 1) * 1000), (n + 1) * 1000];
 }
 
@@ -969,7 +969,7 @@ function readSettingsPatch(base) {
     bossCooldownDays: Number($('bossCooldownDays').value || 30),
     consecutiveFailPause: Number($('consecutiveFailPause').value || 3),
     targetNoNewRetryLimit: normalizeTargetNoNewRetryLimit($('targetNoNewRetryLimit').value),
-    jobIntervalMs: intervalMsFromBase(Number($('jobIntervalSec').value || 5)),
+    jobIntervalMs: intervalMsFromBase(Number($('jobIntervalSec').value || 30)),
     neverRepeatJob: $('neverRepeatJob').checked,
     splitViewEnabled: true,
     backgroundDeliveryEnabled: true,

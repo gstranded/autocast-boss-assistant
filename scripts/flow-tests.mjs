@@ -1920,6 +1920,14 @@ test("skip does not wait job interval and waits are logged", () => {
   assert.ok(background.includes("qi >= queue.length - 1"), "last queue item does not wait");
 });
 
+test("delivery interval fallback is about 30 seconds", () => {
+  const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
+  const constants = fs.readFileSync("extension/shared/constants.js", "utf8");
+  assert.ok(background.includes("jobIntervalMs || [29000, 31000]"));
+  assert.ok(background.includes("iv = [29000, 31000]"));
+  assert.ok(constants.includes("jobIntervalMs: [29000, 31000]"));
+});
+
 test("browser boundary audit covers every previously partial feature", () => {
   const page = fs.readFileSync("tests/browser/boundary-audit.html", "utf8");
   const harness = fs.readFileSync("scripts/panel-harness-server.mjs", "utf8");

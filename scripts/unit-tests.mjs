@@ -1067,6 +1067,10 @@ test("delivery schedule settings normalize imported day values", () => {
   assert.equal(nextDeliveryScheduleStart(noDays, new Date(2026, 8, 7, 10, 0, 0, 0)), null);
   assert.ok(formatDeliveryScheduleStatus(noDays).includes("未选择运行日"));
 });
+test("default delivery interval is about 30 seconds", () => {
+  const settings = normalizeSettings({});
+  assert.deepEqual(settings.jobIntervalMs, [29000, 31000]);
+});
 test("delivery schedule honors custom windows", () => {
   const custom = { ...scheduledWeekdays, scheduledDeliveryWindows: [{ start: '10:00', end: '14:00' }] };
   const monday = (hour, minute) => new Date(2026, 8, 7, hour, minute, 0, 0);

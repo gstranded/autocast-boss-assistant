@@ -69,7 +69,7 @@ export const DEFAULT_SETTINGS = {
   nativeGreetingWaitMs: 2600,
   similarityThreshold: 0.85,
   segmentIntervalMs: [1800, 3200],
-  jobIntervalMs: [4000, 6000], // 投递间隔：基准 5 秒 → 4~6 秒随机
+  jobIntervalMs: [29000, 31000], // 投递间隔：基准 30 秒 → 29~31 秒随机
   taskMaxCommunicate: 30,
   dailyMaxCommunicate: 80,
   companyDailyMax: 3,
