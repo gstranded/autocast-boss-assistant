@@ -321,6 +321,7 @@
             <input id="profileName" placeholder="例如：广州 AI 岗" />
             <label data-help-title="图片简历" data-help="可一次选择多张，按预览顺序发送。单张源文件不能超过 8 MB，导入后会自动压缩。">图片简历（源文件单张 ≤ 8 MB，导入后自动压缩）</label>
             <input id="imageFiles" type="file" accept="image/*" multiple />
+            <div class="hint risk-hint">上传前尽量移除或遮盖邮箱、电话号码等联系方式，避免触发 BOSS 的检测或风控。</div>
             <div id="imagePreview" class="thumbs"></div>
             <button id="btnClearImages" class="btn tiny">清空图片</button>
             <div class="btn-row" style="margin-top:10px">
@@ -455,8 +456,9 @@
                 <input id="bossCooldownDays" type="number" min="0" />
               </div>
               <div>
-                <label data-help-title="投递间隔（秒）" data-help="每投完一份后等待的基准时间。实际等待会在设置值 ±1 秒内随机，例如设为 30 时实际等待 29~31 秒，降低机械节奏。">投递间隔（秒）</label>
-                <input id="jobIntervalSec" type="number" min="1" max="60" />
+                <label data-help-title="投递间隔（秒）" data-help="默认基准为 30 秒，实际等待 29~31 秒；修改后按设置值 ±1 秒随机等待。间隔过短、频率过快可能触发平台风控。">投递间隔（秒）</label>
+                <input id="jobIntervalSec" type="number" min="1" max="60" value="30" />
+                <div class="hint risk-hint">默认 30 秒；间隔过短容易触发风控。</div>
               </div>
               <div>
                 <label data-help-title="连续失败暂停" data-help="连续失败达到这个次数后自动暂停，避免页面变化时继续误操作。">连续失败暂停</label>
@@ -493,6 +495,7 @@
               <li>可随时暂停 / 停止；刷新后可继续未完成任务</li>
             </ol>
             <button id="btnReplayTour" class="btn block" style="margin-top:10px">重看新手引导</button>
+            <button type="button" id="btnUsageNotice" class="btn block" style="margin-top:8px">查看注意事项与免责声明</button>
           </div>
         </section>
       </main>
@@ -513,6 +516,38 @@
       <div id="bht-help-title" class="help-popover-title"></div>
       <div id="bht-help-body" class="help-popover-body"></div>
     </div>
+    <dialog id="usage-notice" class="usage-notice" aria-labelledby="usageNoticeTitle" aria-describedby="usageNoticeIntro">
+      <header class="usage-notice-head">
+        <div class="usage-notice-kicker">使用前请留意</div>
+        <h2 id="usageNoticeTitle" tabindex="-1">注意事项与免责声明</h2>
+        <p id="usageNoticeIntro">合理控制频率，核对投递内容，留意账号状态。</p>
+      </header>
+      <div class="usage-notice-body" tabindex="0" aria-label="注意事项正文">
+        <section class="usage-notice-section">
+          <h3>1. 投递间隔不要太短</h3>
+          <p>默认投递间隔基准为 <strong>30 秒</strong>，实际等待为 29–31 秒。间隔过短、频率过快，容易被平台检测并触发风控。请谨慎调整；任何间隔都不能保证账号不会受到限制。</p>
+        </section>
+        <section class="usage-notice-section">
+          <h3>2. 简历图片尽量不带联系方式</h3>
+          <p>上传前，尽量移除或遮盖图片中的<strong>邮箱、电话号码等联系方式</strong>。BOSS 可能检测这类内容，触发拦截或风控；请先检查图片再发送。</p>
+        </section>
+        <section class="usage-notice-section">
+          <h3>3. 开源工具，辅助重复操作</h3>
+          <p>AutoCast 是开源项目，与 BOSS 直聘官方无隶属关系。它帮助你减少手动重复的工作，不能完全代替本人筛选岗位、核对简历、判断投递对象和进行沟通。</p>
+          <a href="https://github.com/gstranded/autocast-boss-assistant" target="_blank" rel="noopener noreferrer">开源地址：github.com/gstranded/autocast-boss-assistant ↗</a>
+        </section>
+        <section class="usage-notice-section">
+          <h3>4. 免责声明</h3>
+          <p>本工具按开源许可“按现状”提供，不保证投递效果或账号安全。请遵守平台规则与适用法律，使用真实、合法的求职材料，并自行决定和承担使用风险。如出现验证码、限制或其他异常，请暂停操作并自行处理。法律允许范围内，项目作者及贡献者不对使用本工具造成的损失承担责任。</p>
+        </section>
+      </div>
+      <footer class="usage-notice-foot">
+        <label class="check"><input id="usageNoticeDismissed" type="checkbox" />不再提示</label>
+        <button type="button" id="btnCloseUsageNotice" class="btn primary">我已了解</button>
+        <p class="usage-notice-foot-hint">可在「设置」中重新查看或恢复提醒。</p>
+        <p id="usageNoticeStatus" class="usage-notice-foot-hint risk-hint" role="status" hidden></p>
+      </footer>
+    </dialog>
     <script type="module" src="./app.js"></script>
     <script type="module" src="./onboarding.js"></script>
   </body>

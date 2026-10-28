@@ -12,7 +12,8 @@ export const STORAGE_KEYS = {
   TASK: 'bht_current_task',
   LOGS: 'bht_logs',
   DAILY_STATS: 'bht_daily_stats',
-  ONBOARDING: 'bht_onboarding'
+  ONBOARDING: 'bht_onboarding',
+  USAGE_NOTICE: 'bht_usage_notice'
 };
 
 export const MESSAGE_MODES = {

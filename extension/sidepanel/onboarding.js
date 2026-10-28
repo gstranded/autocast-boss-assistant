@@ -2,6 +2,7 @@
 // Auto-shows a small spotlight popover the first time the side panel opens.
 // Steps highlight real parts of the panel (tabs / cards / buttons).
 import { STORAGE_KEYS } from '../shared/constants.js';
+import { waitForUsageNotice } from './usage-notice.js';
 
 const KEY = STORAGE_KEYS.ONBOARDING;
 
@@ -214,6 +215,7 @@ function go(delta) {
 
 function onKey(e) {
   if (!active) return;
+  if (document.getElementById('usage-notice')?.open) return;
   if (e.key === 'Escape') { e.preventDefault(); finish(false); }
   else if (e.key === 'ArrowRight') { e.preventDefault(); if (idx >= STEPS.length - 1) finish(true); else go(1); }
   else if (e.key === 'ArrowLeft') { e.preventDefault(); go(-1); }
@@ -250,8 +252,12 @@ async function init() {
     if (data.source !== 'bht-agent') return;
     if (data.cmd === 'skip-onboarding') finish(false);
   });
+  await waitForUsageNotice();
   if (await isDone()) return;
-  setTimeout(start, 250);
+  setTimeout(async () => {
+    await waitForUsageNotice();
+    start();
+  }, 250);
 }
 
 init();

@@ -9,6 +9,7 @@ import {
   normalizeTargetNoNewRetryLimit
 } from '../shared/constants.js';
 import { mergeResumeImages } from '../shared/resume-images.js';
+import { initUsageNotice } from './usage-notice.js';
 import { normalizeMessageSegmentKind } from '../shared/greeting-policy.js';
 import {
   collectDoneJobIds,
@@ -3824,7 +3825,9 @@ document.addEventListener('click', (e) => {
 }, true);
 
 applyTheme('dark');
-loadInitialTheme();
+loadInitialTheme().then(() => {
+  initUsageNotice({ onError: (message) => toast(message, 'warn', 5000) });
+});
 enhanceHelpTips();
 wireThemeSwitch();
 wireFilterToggles();

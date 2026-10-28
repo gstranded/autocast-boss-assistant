@@ -644,6 +644,38 @@ html.float-mode main { overflow: auto; max-height: calc(100vh - 112px); }
 .bht-modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .bht-modal-actions .btn { min-width: 72px; }
 
+.risk-hint { color: var(--warn); }
+.usage-notice {
+  width: min(460px, calc(100vw - 24px));
+  max-width: none;
+  max-height: calc(100dvh - 24px);
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.usage-notice[open] { display: flex; flex-direction: column; }
+.usage-notice::backdrop { background: rgba(0, 0, 0, 0.64); }
+.usage-notice-head { flex: 0 0 auto; padding: 18px 18px 12px; border-bottom: 1px solid var(--line); }
+.usage-notice-kicker { font-size: 11px; font-weight: 700; color: var(--warn); }
+.usage-notice h2 { margin: 4px 0 6px; font-size: 18px; line-height: 1.4; }
+.usage-notice h2:focus { outline: none; }
+.usage-notice-head p { margin: 0; color: var(--muted); font-size: 12px; }
+.usage-notice-body { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 4px 18px 16px; line-height: 1.7; }
+.usage-notice-section { padding-top: 14px; }
+.usage-notice h3 { margin: 0 0 6px; font-size: 13px; font-weight: 750; }
+.usage-notice-section p { margin: 0; color: var(--muted); }
+.usage-notice-section strong { color: var(--text); }
+.usage-notice a { display: inline-block; margin-top: 7px; color: var(--primary); overflow-wrap: anywhere; }
+.usage-notice a:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.usage-notice-foot { flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--line); background: var(--surface); }
+.usage-notice-foot .check { margin: 0; }
+.usage-notice-foot-hint { flex: 0 0 100%; margin: 0; color: var(--muted); font-size: 11px; }
+.usage-notice-foot-hint.risk-hint { color: var(--warn); }
+
 @media (max-width: 340px) {
   .header { align-items: flex-start; }
   .tagline { white-space: normal; }
