@@ -47,9 +47,9 @@ Scan first, confirm second, deliver last. Every job shows pass/skip reasons. Sta
 
 ![Task panel](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/screenshots/01-task.png)
 
-### 2) Filters: explainable AND / OR / NOT rules
+### 2) Filters: explainable OR / NOT rules
 
-Separate fields for title, company, JD, and location. Each keyword rule has its own enable switch, so a rule can be paused without deleting its contents. Combined text rules run in `NOT → OR → AND` order.
+Separate fields for title, company, JD, and location. Each keyword rule has its own enable switch, so a rule can be paused without deleting its contents. Text rules run in `NOT → OR` order: reject any exclusion match, then require at least one inclusion match when OR is nonempty. Every enabled field must pass. Legacy AND conditions are removed from saved and imported configurations.
 
 ![Filter panel](https://raw.githubusercontent.com/gstranded/autocast-boss-assistant/main/docs/assets/screenshots/02-filter.png)
 

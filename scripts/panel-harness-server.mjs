@@ -53,6 +53,14 @@ async function readJsonBody(request) {
 const server = http.createServer(async (request, response) => {
   try {
     const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
+    if (requestUrl.pathname === "/__harness/frame") {
+      const width = Math.max(300, Math.min(800, Number(requestUrl.searchParams.get("width")) || 420));
+      response.writeHead(200, { "Cache-Control": "no-store", "Content-Type": contentTypes[".html"] });
+      response.end(`<!doctype html><html><head><meta charset="utf-8"><title>面板尺寸验证</title></head>
+        <body style="margin:0;background:#e8e8e8"><iframe title="AutoCast 开发面板" width="${width}" height="1000"
+        style="display:block;border:0" src="/sidepanel/index.html?mode=float&harness=1"></iframe></body></html>`);
+      return;
+    }
     if (requestUrl.pathname === "/__harness/calls") {
       if (request.method === "DELETE") {
         harnessCalls.length = 0;

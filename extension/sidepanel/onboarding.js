@@ -31,7 +31,7 @@ const STEPS = [
   },
   {
     tab: 'resume',
-    sel: '#tab-resume .card',
+    sel: '#resumePlanCard',
     title: '④ 准备简历',
     body: '上传图片简历并按岗位方向建立方案。发送时机建议选择文本完成后立即发送。'
   },

@@ -26,7 +26,7 @@ import { checkDedup, checkLimits, segmentIdempotencyKey, jobIdempotencyKey } fro
 import { renderTemplate, pickResumeProfile } from "../extension/shared/template.js";
 import { filterHistoryRows, filterHistoryByDate, summarizeHistory, startOfLocalDay, endOfLocalDay, normalizeHistoryDateRange } from "../extension/shared/history-view.js";
 import { planResumeSend } from "../extension/shared/resume-policy.js";
-import { buildExportPayload, importConfigPatch, IMPORT_CONFIG_KEYS, sanitizeImportedTask, normalizeSettings, saveSettings } from "../extension/shared/storage.js";
+import { buildExportPayload, importConfigPatch, IMPORT_CONFIG_KEYS, sanitizeImportedTask, normalizeSettings, saveSettings, normalizeFilters, saveFilters, getAllConfig } from "../extension/shared/storage.js";
 import { isBossUrl, isBossHostname, isBossTab, bossUrlGuardMessage } from "../extension/shared/boss-url.js";
 import {
   didContentDocumentChange,
@@ -195,9 +195,9 @@ test("parseKeywords multi separators", () => {
 
 console.log("2) filter-engine");
 const filters = {
-  title: { or: ["Java", "后端"], and: ["Agent"], not: ["外包"] },
-  company: { or: [], and: [], not: [] },
-  jd: { or: [], and: [], not: ["驻场"] },
+  title: { or: ["Java", "后端"], not: ["外包"] },
+  company: { or: [], not: [] },
+  jd: { or: [], not: ["驻场"] },
   location: { include: ["广州"], exclude: [], mode: "contains" },
   salaryMin: 10000,
   salaryMax: null,
@@ -228,13 +228,13 @@ test("summary counts", () => {
 });
 test("disabled OR keeps keywords but ignores the rule", () => {
   const disabled = structuredClone(filters);
-  disabled.title.enabled = { or: false, and: true, not: true };
+  disabled.title.enabled = { or: false, not: true };
   const r = evaluateJob({ ...passJob, title: "Python Agent 开发" }, disabled, {}, {});
   assert.equal(r.decision, "pass");
 });
 test("disabled NOT allows a stored exclusion keyword", () => {
   const disabled = structuredClone(filters);
-  disabled.title.enabled = { or: true, and: true, not: false };
+  disabled.title.enabled = { or: true, not: false };
   disabled.excludeOutsource = false;
   const r = evaluateJob({ ...passJob, title: "Java Agent 外包开发" }, disabled, {}, {});
   assert.equal(r.decision, "pass");
@@ -250,24 +250,32 @@ test("daily yuan salary is compared as monthly, not as inflated K", () => {
   assert.equal(r.decision, "reject");
   assert.ok(r.reasonCodes.includes(REASON.FILTER_SALARY_LOW));
 });
-test("title AND miss / company OR miss / company NOT / JD OR miss", () => {
-  const titleAnd = evaluateJob({ ...passJob, title: "Java 开发" }, filters, {}, {});
-  assert.equal(titleAnd.decision, "reject");
-  assert.ok(titleAnd.reasonCodes.includes(REASON.FILTER_TITLE_AND_MISS));
+test("legacy AND never affects evaluation, OR and NOT still apply", () => {
+  const legacy = structuredClone(filters);
+  for (const field of ["title", "company", "jd"]) {
+    legacy[field].and = ["不会出现的必需词"];
+    legacy[field].enabled = { or: true, not: true, and: true };
+  }
+  const result = evaluateJob({ ...passJob, title: "Java 开发" }, legacy, {}, {});
+  assert.equal(result.decision, "pass");
+  assert.ok(!result.passReasons.some((text) => text.includes("必需词")));
+  assert.equal(evaluateJob({ ...passJob, title: "Python 开发" }, legacy, {}, {}).decision, "reject");
+  const excluded = evaluateJob({ ...passJob, title: "Java 外包开发" }, legacy, {}, {});
+  assert.ok(excluded.reasonCodes.includes(REASON.FILTER_TITLE_NOT_HIT));
+  assert.equal(evaluateJob(passJob, { ...filters, title: { or: [], not: [] } }, {}, {}).decision, "pass");
+});
+test("company OR miss / company NOT / JD OR miss", () => {
   const companyOr = evaluateJob(passJob, { ...filters, company: { or: ["字节"], not: [] } }, {}, {});
   assert.equal(companyOr.decision, "reject");
   assert.ok(companyOr.reasonCodes.includes(REASON.FILTER_COMPANY_OR_MISS));
   const companyNot = evaluateJob(passJob, { ...filters, company: { or: [], not: ["科技"] } }, {}, {});
   assert.equal(companyNot.decision, "reject");
   assert.ok(companyNot.reasonCodes.includes(REASON.FILTER_COMPANY_NOT_HIT));
-  const jdOr = evaluateJob(passJob, { ...filters, jd: { or: ["Golang"], and: [], not: [] } }, {}, {});
+  const jdOr = evaluateJob(passJob, { ...filters, jd: { or: ["Golang"], not: [] } }, {}, {});
   assert.equal(jdOr.decision, "reject");
   assert.ok(jdOr.reasonCodes.includes(REASON.FILTER_JD_OR_MISS));
 });
-test("JD AND miss / location exclude / exact location / salary high", () => {
-  const jdAnd = evaluateJob(passJob, { ...filters, jd: { or: [], and: ["分布式", "高并发"], not: [] } }, {}, {});
-  assert.equal(jdAnd.decision, "reject");
-  assert.ok(jdAnd.reasonCodes.includes(REASON.FILTER_JD_AND_MISS));
+test("location exclude / exact location / salary high", () => {
   const locEx = evaluateJob(passJob, { ...filters, location: { include: [], exclude: ["天河"], mode: "contains" } }, {}, {});
   assert.equal(locEx.decision, "reject");
   assert.ok(locEx.reasonCodes.includes(REASON.FILTER_LOCATION_EXCLUDED));
@@ -871,6 +879,49 @@ test("settings patches serialize and preserve concurrent keys", async () => {
   }
 });
 
+test("legacy filters migrate on read, save, import and export without changing OR/NOT", async () => {
+  const legacy = structuredClone(filters);
+  for (const field of ["title", "company", "jd"]) {
+    legacy[field].and = ["旧的必需词"];
+    legacy[field].enabled = { or: false, not: true, and: true };
+  }
+  const original = structuredClone(legacy);
+  const normalized = normalizeFilters(legacy);
+  const check = (value) => {
+    for (const field of ["title", "company", "jd"]) {
+      assert.ok(!("and" in value[field]));
+      assert.ok(!("and" in value[field].enabled));
+      assert.deepEqual(value[field].or, original[field].or);
+      assert.deepEqual(value[field].not, original[field].not);
+      assert.equal(value[field].enabled.or, false);
+      assert.equal(value[field].enabled.not, true);
+    }
+    assert.deepEqual(value.location, original.location);
+    assert.equal(value.salaryMin, original.salaryMin);
+  };
+  check(normalized);
+  check(importConfigPatch({ filters: legacy })[STORAGE_KEYS.FILTERS]);
+  check(buildExportPayload({ filters: legacy }).filters);
+  assert.deepEqual(legacy, original, "migration must not mutate the input");
+  const previousChrome = globalThis.chrome;
+  const stored = { [STORAGE_KEYS.FILTERS]: structuredClone(legacy) };
+  globalThis.chrome = { storage: { local: {
+    get: async (keys) => Object.fromEntries((Array.isArray(keys) ? keys : [keys])
+      .map((key) => [key, structuredClone(stored[key])])),
+    set: async (patch) => {
+      for (const [key, value] of Object.entries(patch)) stored[key] = structuredClone(value);
+    }
+  } } };
+  try {
+    check((await getAllConfig()).filters);
+    check(stored[STORAGE_KEYS.FILTERS]);
+    await saveFilters(legacy);
+    check(stored[STORAGE_KEYS.FILTERS]);
+  } finally {
+    globalThis.chrome = previousChrome;
+  }
+});
+
 test("export carries daily stats, idempotency and task; import sanitizes task", () => {
   const all = {
     settings: { dailyMaxCommunicate: 150, taskMaxCommunicate: 1 },
@@ -1356,16 +1407,15 @@ test("UI exposes themes, help tips and filter switches", () => {
   assert.equal((html.match(/data-schedule-day=/g) || []).length, 7);
   for (const id of [
     "titleOrEnabled",
-    "titleAndEnabled",
     "titleNotEnabled",
     "companyOrEnabled",
     "companyNotEnabled",
     "jdOrEnabled",
-    "jdAndEnabled",
     "jdNotEnabled",
     "locIncludeEnabled",
     "locExcludeEnabled"
   ]) assert.ok(html.includes(`id="${id}"`), `missing ${id}`);
+  assert.ok(!html.includes("AND"));
   for (const chip of [
     'data-active="online"',
     'data-active="just"',

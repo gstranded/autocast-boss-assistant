@@ -14,6 +14,22 @@ import { normalizeDeliveryScheduleDays, normalizeDeliveryScheduleWindows, format
 let logWriteChain = Promise.resolve();
 let settingsWriteChain = Promise.resolve();
 
+export function normalizeFilters(filters = {}) {
+  const normalized = { ...deepClone(DEFAULT_FILTERS), ...deepClone(filters || {}) };
+  for (const field of ['title', 'company', 'jd']) {
+    const rules = normalized[field] || {};
+    normalized[field] = {
+      ...deepClone(DEFAULT_FILTERS[field]),
+      ...rules,
+      enabled: { ...DEFAULT_FILTERS[field].enabled, ...rules.enabled }
+    };
+    // AND 已移除：旧配置与导入文件中的条件也必须停用，不能在后台隐藏生效。
+    delete normalized[field].and;
+    delete normalized[field].enabled.and;
+  }
+  return normalized;
+}
+
 export function normalizeSettings(settings = {}) {
   const normalized = { ...deepClone(DEFAULT_SETTINGS), ...(settings || {}) };
   // v1.7.11：BOSS「发简历」受双向回复门禁限制，平台简历自动发送功能已移除。
@@ -73,6 +89,11 @@ export async function getAllConfig() {
   if (JSON.stringify(settings) !== JSON.stringify(storedSettings)) {
     await set({ [STORAGE_KEYS.SETTINGS]: settings });
   }
+  const storedFilters = data[STORAGE_KEYS.FILTERS] || {};
+  const filters = normalizeFilters(storedFilters);
+  if (JSON.stringify(filters) !== JSON.stringify(storedFilters)) {
+    await set({ [STORAGE_KEYS.FILTERS]: filters });
+  }
   const resumes = normalizeResumes(data[STORAGE_KEYS.RESUMES]);
   if (countResumeImages(resumes) < countResumeImages(data[STORAGE_KEYS.RESUMES])) {
     await set({ [STORAGE_KEYS.RESUMES]: resumes });
@@ -85,7 +106,7 @@ export async function getAllConfig() {
   }
   return {
     settings,
-    filters: data[STORAGE_KEYS.FILTERS],
+    filters,
     messageTemplate,
     resumes,
     bindings: data[STORAGE_KEYS.BINDINGS],
@@ -109,7 +130,7 @@ export function saveSettings(settings) {
 }
 
 export async function saveFilters(filters) {
-  await set({ [STORAGE_KEYS.FILTERS]: filters });
+  await set({ [STORAGE_KEYS.FILTERS]: normalizeFilters(filters) });
 }
 
 export async function saveMessageTemplate(template) {
@@ -277,6 +298,7 @@ export function buildExportPayload(all = {}, now = new Date()) {
     version: 1,
     ...all,
     settings: normalizeSettings(all.settings || {}),
+    filters: normalizeFilters(all.filters || {}),
     logs: (all.logs || []).slice(0, 100)
   };
 }
@@ -288,6 +310,8 @@ export function importConfigPatch(payload) {
     if (payload[key] == null) continue;
     if (key === 'settings') {
       put[storageKey] = normalizeSettings(payload[key]);
+    } else if (key === 'filters') {
+      put[storageKey] = normalizeFilters(payload[key]);
     } else if (key === 'task') {
       const sanitized = sanitizeImportedTask(payload[key]);
       if (sanitized) put[storageKey] = sanitized;

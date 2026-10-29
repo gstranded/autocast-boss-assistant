@@ -314,6 +314,27 @@ select:disabled { cursor: not-allowed; opacity: 0.46; }
 .field-row .field-label { display: flex; align-items: center; gap: 5px; margin: 0; color: var(--text); font-weight: 630; }
 .filter-field.is-disabled .field-label { color: var(--muted); }
 
+.filter-card > .card-title + .filter-field { border-top: 0; padding-top: 0; }
+.filter-card .field-row .label-help-row { flex: 1; min-width: 0; }
+.company-lists { margin-top: 10px; border-top: 1px solid var(--line); }
+.company-lists summary { padding: 12px 0 2px; list-style: none; cursor: pointer; }
+.company-lists summary::-webkit-details-marker { display: none; }
+.company-lists summary:focus-visible { outline: none; border-radius: 6px; box-shadow: var(--focus); }
+.company-lists-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 650; }
+.company-lists-action { flex: none; color: var(--primary); font-size: 12px; font-weight: 500; }
+.company-lists-action::after { content: '展开 ▾'; }
+.company-lists[open] .company-lists-action::after { content: '收起 ▴'; }
+.company-lists-summary { display: block; margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.company-lists-content { padding-top: 10px; }
+.company-list-field + .company-list-field { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.company-list-field > .label-help-row:first-child { margin-top: 0; }
+.filter-field-meta { flex: none; color: var(--muted); font-size: 12px; }
+.whitelist-policy { margin-top: 8px; }
+.filter-condition-group + .filter-condition-group { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.filter-group-title { margin-bottom: 6px; font-weight: 650; color: var(--text); }
+.filter-save-footer { padding: 0 2px 8px; }
+.filter-save-footer .hint { margin-bottom: 8px; }
+
 .logic-tag {
   display: inline-flex;
   align-items: center;
@@ -327,7 +348,6 @@ select:disabled { cursor: not-allowed; opacity: 0.46; }
   background: var(--chip);
 }
 .logic-tag.or { color: var(--primary); background: var(--primary-soft); }
-.logic-tag.and { color: var(--success); background: var(--success-soft); }
 .logic-tag.not { color: var(--danger); background: var(--danger-soft); }
 
 .switch { position: relative; display: inline-flex; flex: 0 0 auto; width: 36px; height: 20px; margin: 0; cursor: pointer; }
@@ -596,15 +616,20 @@ select:disabled { cursor: not-allowed; opacity: 0.46; }
 }
 .chip:active { transform: scale(0.96); }
 
-.profile-list,
 .binding-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
-.profile-item,
 .binding-item { border: 1px solid var(--line); background: var(--surface); border-radius: 7px; padding: 8px; }
-.profile-item.active { border-color: var(--primary); box-shadow: 0 0 0 1px var(--primary-soft); }
-.profile-item .name { font-weight: 650; }
-.profile-item .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
-.profile-item .actions,
 .binding-item .actions { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.profile-picker { display: flex; align-items: center; gap: 8px; }
+.profile-picker select { flex: 1; width: 0; min-width: 0; margin: 0; }
+.profile-picker .btn { flex: none; }
+.profile-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.profile-meta .pill { margin-left: 0; }
+.profile-more { position: relative; flex: none; font-weight: 400; }
+.profile-more summary { list-style: none; }
+.profile-more summary::-webkit-details-marker { display: none; }
+.profile-more-actions { position: absolute; z-index: 20; top: calc(100% + 6px); right: 0; display: flex; flex-direction: column; gap: 6px; width: 158px; padding: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); }
+.profile-more-actions .btn { width: 100%; text-align: left; }
+.resume-plan-card #btnSaveResume { margin-top: 12px; }
 .pill { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 999px; background: var(--primary-soft); color: var(--primary); margin-left: 6px; }
 .pill.default { background: var(--success-soft); color: var(--success); }
 .binding-item input,

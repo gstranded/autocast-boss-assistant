@@ -741,7 +741,10 @@ test("autosave protects IME composition and never rebuilds message inputs", () =
   assert.ok(app.includes("await saveSettings({ refresh: false });"), "theme saves must use the config queue");
   assert.ok(app.includes("enqueueConfigSave(() => api(MSG.IMPORT_CONFIG"), "imports must wait for pending saves");
   const profileActions = app.slice(app.indexOf("$('btnAddProfile')"), app.indexOf("$('btnAddBinding')"));
-  assert.ok(profileActions.includes("enqueueConfigSave"), "resume management writes must use the config queue");
+  assert.ok(profileActions.includes("manageResume"), "resume management writes must use the guarded config queue");
+  const management = app.slice(app.indexOf("async function manageResume"), app.indexOf("function renderResumeEditor"));
+  assert.ok(management.includes("enqueueConfigSave"));
+  assert.ok(management.includes("hasPendingResumeFiles"));
   assert.ok(!app.includes("rememberPersistedConfig();\n  return true;"));
 });
 

@@ -3,6 +3,7 @@ import { parseKeywords, uid } from '../shared/text-utils.js';
 import { reasonText } from '../shared/reason-codes.js';
 import { previewReasonLines, normalizeActiveWithin } from '../shared/filter-engine.js';
 import {
+  DEFAULT_SETTINGS,
   DEFAULT_TARGET_NO_NEW_RETRY_LIMIT,
   MESSAGE_SEGMENT_KINDS,
   STORAGE_KEYS,
@@ -48,12 +49,10 @@ const VERSION_GUARDED_API_MESSAGES = new Set([
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024;
 const FILTER_TOGGLE_FIELDS = {
   titleOr: 'titleOrEnabled',
-  titleAnd: 'titleAndEnabled',
   titleNot: 'titleNotEnabled',
   companyOr: 'companyOrEnabled',
   companyNot: 'companyNotEnabled',
   jdOr: 'jdOrEnabled',
-  jdAnd: 'jdAndEnabled',
   jdNot: 'jdNotEnabled',
   locInclude: 'locIncludeEnabled',
   locExclude: 'locExcludeEnabled'
@@ -585,14 +584,23 @@ function readActiveChips() {
   return [val];
 }
 
+function updateCompanyListsSummary() {
+  const summary = $('companyListsSummary');
+  if (!summary) return;
+  const blackCount = parseKeywords($('blacklist')?.value || '').length;
+  const whiteCount = parseKeywords($('whitelist')?.value || '').length;
+  const restriction = !$('whitelistOnly')?.checked
+    ? '白名单限制关闭'
+    : whiteCount ? '白名单限制开启' : '白名单为空，暂不限制';
+  summary.textContent = `黑名单 ${blackCount} 项 · 白名单 ${whiteCount} 项 · ${restriction}`;
+}
+
 function fillFilters(filters, lists, settings) {
   $('titleOr').value = kwJoin(filters.title?.or);
-  $('titleAnd').value = kwJoin(filters.title?.and);
   $('titleNot').value = kwJoin(filters.title?.not);
   $('companyOr').value = kwJoin(filters.company?.or);
   $('companyNot').value = kwJoin(filters.company?.not);
   $('jdOr').value = kwJoin(filters.jd?.or);
-  $('jdAnd').value = kwJoin(filters.jd?.and);
   $('jdNot').value = kwJoin(filters.jd?.not);
   $('locInclude').value = kwJoin(filters.location?.include);
   $('locExclude').value = kwJoin(filters.location?.exclude);
@@ -606,46 +614,39 @@ function fillFilters(filters, lists, settings) {
   $('whitelist').value = (lists.companyWhitelist || []).join('\n');
   $('whitelistOnly').checked = Boolean(settings.whitelistOnly);
   setFilterToggle('titleOr', filters.title?.enabled?.or !== false);
-  setFilterToggle('titleAnd', filters.title?.enabled?.and !== false);
   setFilterToggle('titleNot', filters.title?.enabled?.not !== false);
   setFilterToggle('companyOr', filters.company?.enabled?.or !== false);
   setFilterToggle('companyNot', filters.company?.enabled?.not !== false);
   setFilterToggle('jdOr', filters.jd?.enabled?.or !== false);
-  setFilterToggle('jdAnd', filters.jd?.enabled?.and !== false);
   setFilterToggle('jdNot', filters.jd?.enabled?.not !== false);
   setFilterToggle('locInclude', filters.location?.enabled?.include !== false);
   setFilterToggle('locExclude', filters.location?.enabled?.exclude !== false);
+  updateCompanyListsSummary();
 }
 
 function readFilters() {
   return {
     title: {
       or: parseKeywords($('titleOr').value),
-      and: parseKeywords($('titleAnd').value),
       not: parseKeywords($('titleNot').value),
       enabled: {
         or: $('titleOrEnabled').checked,
-        and: $('titleAndEnabled').checked,
         not: $('titleNotEnabled').checked
       }
     },
     company: {
       or: parseKeywords($('companyOr').value),
-      and: [],
       not: parseKeywords($('companyNot').value),
       enabled: {
         or: $('companyOrEnabled').checked,
-        and: true,
         not: $('companyNotEnabled').checked
       }
     },
     jd: {
       or: parseKeywords($('jdOr').value),
-      and: parseKeywords($('jdAnd').value),
       not: parseKeywords($('jdNot').value),
       enabled: {
         or: $('jdOrEnabled').checked,
-        and: $('jdAndEnabled').checked,
         not: $('jdNotEnabled').checked
       }
     },
@@ -964,8 +965,8 @@ function readSettingsPatch(base) {
     nativeGreetingWaitMs: Number(base.nativeGreetingWaitMs || 2600),
     autoSendImageResume: $('autoSendImageResume').checked,
     resumeSendTiming: $('resumeSendTiming').value,
-    taskMaxCommunicate: Number($('taskMaxCommunicate').value || 30),
-    dailyMaxCommunicate: Number($('dailyMaxCommunicate').value || 80),
+    taskMaxCommunicate: Number($('taskMaxCommunicate').value || DEFAULT_SETTINGS.taskMaxCommunicate),
+    dailyMaxCommunicate: Number($('dailyMaxCommunicate').value || DEFAULT_SETTINGS.dailyMaxCommunicate),
     companyDailyMax: Number($('companyDailyMax').value || 3),
     bossCooldownDays: Number($('bossCooldownDays').value || 30),
     consecutiveFailPause: Number($('consecutiveFailPause').value || 3),
@@ -1405,56 +1406,83 @@ function getActiveProfile() {
 
 function renderProfileList() {
   const resumes = state.config?.resumes || { profiles: [], defaultProfileId: '' };
-  const box = $('profileList');
-  if (!box) return;
-  box.innerHTML = '';
-  const activeId = state.activeProfileId || resumes.defaultProfileId;
+  const select = $('profileSelect');
+  const profile = getActiveProfile();
+  if (!select || !profile) return;
+  state.activeProfileId = profile.id;
+  select.replaceChildren(...(resumes.profiles || []).map((p) => {
+    const option = document.createElement('option');
+    option.value = p.id;
+    option.textContent = `${p.name || '未命名方案'}${p.id === resumes.defaultProfileId ? '（默认）' : ''}`;
+    return option;
+  }));
+  select.value = profile.id;
+  document.querySelectorAll('#bindingList select[data-bind-profile] option').forEach((option) => {
+    const boundProfile = resumes.profiles.find((p) => p.id === option.value);
+    if (boundProfile) option.textContent = boundProfile.name || boundProfile.id;
+  });
+  const meta = $('profileMeta');
+  if (meta) {
+    meta.innerHTML = '<span class="pill">正在编辑</span>' +
+      (profile.id === resumes.defaultProfileId ? '<span class="pill default">默认方案</span>' : '') +
+      `<span>已保存图片 ${(profile.images || []).length} 张</span>`;
+    if (profile.id !== resumes.defaultProfileId) {
+      const label = document.createElement('span');
+      const defaultProfile = resumes.profiles.find((p) => p.id === resumes.defaultProfileId);
+      label.textContent = `默认：${defaultProfile?.name || '未命名方案'}`;
+      meta.appendChild(label);
+    }
+  }
+  updateResumeControls();
+}
 
-  (resumes.profiles || []).forEach((p) => {
-    const div = document.createElement('div');
-    const isActive = p.id === activeId;
-    const isDefault = p.id === resumes.defaultProfileId;
-    div.className = `profile-item${isActive ? ' active' : ''}`;
-    div.innerHTML = `
-      <div class="name">
-        ${escapeHtml(p.name || '未命名方案')}
-        ${isDefault ? '<span class="pill default">默认</span>' : ''}
-        ${isActive ? '<span class="pill">编辑中</span>' : ''}
-      </div>
-      <div class="meta">图片 ${(p.images || []).length} 张</div>
-      <div class="actions">
-        <button class="btn tiny" data-switch="${p.id}">切换编辑</button>
-        <button class="btn tiny" data-default="${p.id}">设默认</button>
-      </div>
-    `;
-    box.appendChild(div);
-  });
+let resumeControlLocks = 0;
+let resumeNameLocks = 0;
 
-  box.querySelectorAll('[data-switch]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      // flush current form into memory first
-      flushActiveProfileForm();
-      state.resumeRevision += 1;
-      state.activeProfileId = btn.getAttribute('data-switch');
-      renderResumeEditor();
-      renderProfileList();
-    });
-  });
-  box.querySelectorAll('[data-default]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      await enqueueConfigSave(async () => {
-        const dirtyBefore = state.formDirty || state.messageDirty;
-        flushActiveProfileForm();
-        state.config.resumes.defaultProfileId = btn.getAttribute('data-default');
-        state.resumeRevision += 1;
-        const revisionAtStart = draftRevisionSnapshot();
-        await api(MSG.SAVE_RESUMES, state.config.resumes);
-        settleManagementDirty(revisionAtStart, dirtyBefore);
-        await refresh({ soft: false });
-        toast('已更新默认方案', 'success');
-      });
-    });
-  });
+function updateResumeControls() {
+  const resumes = state.config?.resumes;
+  for (const id of ['profileSelect', 'btnAddProfile', 'btnSaveResume', 'imageFiles', 'btnClearImages', 'btnClearPendingImages']) {
+    if ($(id)) $(id).disabled = resumeControlLocks > 0;
+  }
+  if ($('btnClearPendingImages')) $('btnClearPendingImages').hidden = !hasPendingResumeFiles();
+  if ($('profileName')) $('profileName').disabled = resumeNameLocks > 0;
+  if ($('btnSetDefaultProfile')) {
+    $('btnSetDefaultProfile').disabled = resumeControlLocks > 0 || state.activeProfileId === resumes?.defaultProfileId;
+  }
+  if ($('btnDeleteProfile')) {
+    $('btnDeleteProfile').disabled = resumeControlLocks > 0 || (resumes?.profiles?.length || 0) <= 1;
+    $('btnDeleteProfile').title = (resumes?.profiles?.length || 0) <= 1 ? '至少保留一个方案' : '';
+  }
+}
+
+async function withResumeControlsLocked(work, { lockName = false } = {}) {
+  resumeControlLocks += 1;
+  if (lockName) resumeNameLocks += 1;
+  updateResumeControls();
+  try {
+    return await work();
+  } finally {
+    resumeControlLocks -= 1;
+    if (lockName) resumeNameLocks -= 1;
+    updateResumeControls();
+  }
+}
+
+async function manageResume(work, { changeProfile = false } = {}) {
+  if (resumeControlLocks > 0) return;
+  if (changeProfile && hasPendingResumeFiles()) {
+    if ($('profileMore')) $('profileMore').open = false;
+    if ($('profileSelect')) $('profileSelect').value = getActiveProfile()?.id || '';
+    toast('请先保存当前方案的待上传图片，或清除本次选择，再切换、新建或删除方案', 'warn', 4200);
+    return;
+  }
+  if ($('profileMore')) $('profileMore').open = false;
+  try {
+    await withResumeControlsLocked(() => enqueueConfigSave(work), { lockName: true });
+  } catch (error) {
+    renderProfileList();
+    toast(String(error?.message || error || '方案保存失败'), 'error', 4200);
+  }
 }
 
 function renderResumeEditor() {
@@ -1462,7 +1490,13 @@ function renderResumeEditor() {
   if (!profile) return;
   state.activeProfileId = profile.id;
   $('profileName').value = profile.name || '';
+  renderResumeImages(profile);
+}
+
+function renderResumeImages(profile = getActiveProfile()) {
+  if (!profile) return;
   const thumbs = $('imagePreview');
+  thumbs.querySelectorAll('img[data-tmp="1"]').forEach((img) => URL.revokeObjectURL(img.src));
   thumbs.innerHTML = '';
   (profile.images || []).forEach((img, idx) => {
     const el = document.createElement('img');
@@ -2475,7 +2509,10 @@ async function fileToCompressedDataUrl(file, maxEdge = 1280, quality = 0.72) {
 let resumeSaveChain = Promise.resolve();
 
 function saveResume(opts = {}) {
-  const run = resumeSaveChain.then(() => enqueueConfigSave(() => saveResumeNow(opts)));
+  const run = withResumeControlsLocked(
+    () => resumeSaveChain.then(() => enqueueConfigSave(() => saveResumeNow(opts))),
+    { lockName: opts.includePendingFiles !== false }
+  );
   resumeSaveChain = run.catch(() => {});
   return run;
 }
@@ -2757,6 +2794,8 @@ function wireResumeFilePreview() {
     const box = $('imagePreview');
     if (!box) return;
     const files = Array.from(input.files || []);
+    renderResumeImages();
+    updateResumeControls();
     if (!files.length) return;
     // 临时预览本次选择（不覆盖已保存图，追加显示）
     const frag = document.createDocumentFragment();
@@ -2782,7 +2821,8 @@ function shouldAutosaveTarget(target) {
   return Boolean(
     target?.matches?.('input, textarea, select') &&
     String(target.type || '').toLowerCase() !== 'file' &&
-    target?.id !== 'bossGreetingText'
+    target?.id !== 'bossGreetingText' &&
+    target?.id !== 'profileSelect'
   );
 }
 function wireAutosave() {
@@ -2931,6 +2971,10 @@ function bindEvents() {
       toast(String(e.message || e), 'error', /扩展上下文|F5|失效/.test(String(e.message || e)) ? 6000 : 3500);
     }
   });
+  for (const id of ['blacklist', 'whitelist', 'whitelistOnly']) {
+    $(id)?.addEventListener('input', updateCompanyListsSummary);
+    $(id)?.addEventListener('change', updateCompanyListsSummary);
+  }
   $('btnSaveMessage').addEventListener('click', async () => {
     try {
       await saveMessage();
@@ -2998,26 +3042,63 @@ function bindEvents() {
     try { scheduleAutosave(); } catch (_) {}
   });
 
+  $('profileSelect')?.addEventListener('change', async () => {
+    const nextId = $('profileSelect').value;
+    if (nextId === getActiveProfile()?.id) return;
+    await manageResume(async () => {
+      const dirtyBefore = state.formDirty || state.messageDirty;
+      flushActiveProfileForm();
+      const resumes = structuredClone(state.config.resumes);
+      if (!resumes.profiles.some((p) => p.id === nextId)) return;
+      state.resumeRevision += 1;
+      const revisionAtStart = draftRevisionSnapshot();
+      await api(MSG.SAVE_RESUMES, resumes);
+      state.config.resumes = resumes;
+      rememberPersistedConfigSection('resumes', resumes);
+      state.activeProfileId = nextId;
+      settleManagementDirty(revisionAtStart, dirtyBefore);
+      renderResumeEditor();
+      renderProfileList();
+    }, { changeProfile: true });
+  });
+
+  $('profileName')?.addEventListener('input', () => {
+    flushActiveProfileForm();
+    renderProfileList();
+  });
+  document.addEventListener('click', (event) => {
+    if (!$('profileMore')?.contains(event.target)) $('profileMore')?.removeAttribute('open');
+  });
+  $('profileMore')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') $('profileMore').open = false;
+  });
+
   $('btnAddProfile')?.addEventListener('click', async () => {
-    await enqueueConfigSave(async () => {
+    await manageResume(async () => {
       const dirtyBefore = state.formDirty || state.messageDirty;
       flushActiveProfileForm();
       const resumes = structuredClone(state.config.resumes);
       const id = uid('profile');
       resumes.profiles.push({ id, name: `方案 ${resumes.profiles.length + 1}`, images: [] });
       if (!resumes.defaultProfileId) resumes.defaultProfileId = id;
-      state.activeProfileId = id;
       state.resumeRevision += 1;
       const revisionAtStart = draftRevisionSnapshot();
       await api(MSG.SAVE_RESUMES, resumes);
+      state.config.resumes = resumes;
+      state.activeProfileId = id;
+      rememberPersistedConfigSection('resumes', resumes);
       settleManagementDirty(revisionAtStart, dirtyBefore);
       await refresh({ soft: false });
+      renderResumeEditor();
+      renderProfileList();
+      state.draftBindings = readBindingsFromDom();
+      renderBindings();
       toast('已新建方案', 'success');
-    });
+    }, { changeProfile: true });
   });
 
   $('btnSetDefaultProfile')?.addEventListener('click', async () => {
-    await enqueueConfigSave(async () => {
+    await manageResume(async () => {
       const dirtyBefore = state.formDirty || state.messageDirty;
       flushActiveProfileForm();
       const resumes = structuredClone(state.config.resumes);
@@ -3025,14 +3106,16 @@ function bindEvents() {
       state.resumeRevision += 1;
       const revisionAtStart = draftRevisionSnapshot();
       await api(MSG.SAVE_RESUMES, resumes);
+      state.config.resumes = resumes;
+      rememberPersistedConfigSection('resumes', resumes);
       settleManagementDirty(revisionAtStart, dirtyBefore);
-      await refresh({ soft: false });
+      renderProfileList();
       toast('已设为默认方案', 'success');
     });
   });
 
   $('btnDeleteProfile')?.addEventListener('click', async () => {
-    await enqueueConfigSave(async () => {
+    await manageResume(async () => {
       const dirtyBefore = state.formDirty || state.messageDirty;
       const resumes = structuredClone(state.config.resumes);
       if ((resumes.profiles || []).length <= 1) {
@@ -3042,31 +3125,53 @@ function bindEvents() {
       const delId = state.activeProfileId;
       resumes.profiles = resumes.profiles.filter((p) => p.id !== delId);
       if (resumes.defaultProfileId === delId) resumes.defaultProfileId = resumes.profiles[0].id;
-      state.activeProfileId = resumes.defaultProfileId;
-      const bindings = { rules: (state.config.bindings?.rules || []).filter((r) => r.profileId !== delId) };
+      const rules = readBindingsFromDom().filter((r) => r.profileId !== delId);
+      const bindings = { rules: rules.filter((r) => (r.keywords || []).length && r.profileId) };
       state.resumeRevision += 1;
       const revisionAtStart = draftRevisionSnapshot();
       await api(MSG.SAVE_RESUMES, resumes);
       await api(MSG.SAVE_BINDINGS, bindings);
+      state.config.resumes = resumes;
+      state.config.bindings = bindings;
+      state.activeProfileId = resumes.defaultProfileId;
+      state.draftBindings = rules;
+      rememberPersistedConfigSection('resumes', resumes);
+      rememberPersistedConfigSection('bindings', bindings);
       settleManagementDirty(revisionAtStart, dirtyBefore);
-      await refresh({ soft: false });
+      renderResumeEditor();
+      renderProfileList();
+      renderBindings();
       toast('方案已删除', 'success');
-    });
+    }, { changeProfile: true });
   });
 
   $('btnClearImages')?.addEventListener('click', async () => {
-    await enqueueConfigSave(async () => {
+    await manageResume(async () => {
       const dirtyBefore = state.formDirty || state.messageDirty;
+      flushActiveProfileForm();
       const resumes = structuredClone(state.config.resumes);
       const profile = resumes.profiles.find((p) => p.id === state.activeProfileId);
       if (profile) profile.images = [];
       state.resumeRevision += 1;
       const revisionAtStart = draftRevisionSnapshot();
       await api(MSG.SAVE_RESUMES, resumes);
+      state.config.resumes = resumes;
+      $('imageFiles').value = '';
+      rememberPersistedConfigSection('resumes', resumes);
       settleManagementDirty(revisionAtStart, dirtyBefore);
-      await refresh({ soft: false });
+      renderResumeEditor();
+      renderProfileList();
       toast('已清空图片', 'success');
     });
+  });
+
+  $('btnClearPendingImages')?.addEventListener('click', () => {
+    $('imageFiles').value = '';
+    state.resumeRevision += 1;
+    renderResumeImages();
+    updateResumeControls();
+    scheduleAutosave();
+    toast('已清除本次选择，已保存图片保留', 'success');
   });
 
   $('btnAddBinding')?.addEventListener('click', () => {

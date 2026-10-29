@@ -32,8 +32,8 @@
       pluginTextEnabled: true,
       strictGreetingGuard: true,
       nativeGreetingWaitMs: 2600,
-      taskMaxCommunicate: 1,
-      dailyMaxCommunicate: 80,
+      taskMaxCommunicate: 150,
+      dailyMaxCommunicate: 150,
       companyDailyMax: 3,
       bossCooldownDays: 30,
       consecutiveFailPause: 3,
@@ -47,12 +47,11 @@
     filters: {
       title: {
         or: ["Agent", "大模型"],
-        and: [],
         not: ["外包"],
-        enabled: { or: true, and: true, not: true }
+        enabled: { or: true, not: true }
       },
-      company: { or: [], and: [], not: [], enabled: { or: true, and: true, not: true } },
-      jd: { or: [], and: [], not: ["培训"], enabled: { or: true, and: true, not: true } },
+      company: { or: [], not: [], enabled: { or: true, not: true } },
+      jd: { or: [], not: ["培训"], enabled: { or: true, not: true } },
       location: {
         include: ["广州"],
         exclude: [],
@@ -114,6 +113,14 @@
       : {}
   };
   state.settings = { ...state.settings, ...(storage.bht_settings || {}) };
+  for (const [field, key] of Object.entries({
+    filters: "bht_filters",
+    lists: "bht_black_white_lists",
+    resumes: "bht_resumes",
+    bindings: "bht_resume_bindings"
+  })) {
+    if (storage[key]) state[field] = clone(storage[key]);
+  }
 
   function stateResponse() {
     return { ok: true, runtimeVersion: "1.7.41", ...clone(state) };
@@ -240,10 +247,14 @@
     }
     if (type === "BHT_SAVE_FILTERS") {
       state.filters = clone(payload);
+      storage.bht_filters = clone(payload);
+      persistStorage();
       return { ok: true };
     }
     if (type === "BHT_SAVE_LISTS") {
       state.lists = clone(payload);
+      storage.bht_black_white_lists = clone(payload);
+      persistStorage();
       return { ok: true };
     }
     if (type === "BHT_SAVE_TEMPLATE") {
@@ -252,10 +263,14 @@
     }
     if (type === "BHT_SAVE_RESUMES") {
       state.resumes = clone(payload);
+      storage.bht_resumes = clone(payload);
+      persistStorage();
       return { ok: true };
     }
     if (type === "BHT_SAVE_BINDINGS") {
       state.bindings = clone(payload);
+      storage.bht_resume_bindings = clone(payload);
+      persistStorage();
       return { ok: true };
     }
     if (type === "BHT_RUN_PREVIEW") {

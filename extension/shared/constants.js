@@ -71,8 +71,8 @@ export const DEFAULT_SETTINGS = {
   similarityThreshold: 0.85,
   segmentIntervalMs: [1800, 3200],
   jobIntervalMs: [29000, 31000], // 投递间隔：基准 30 秒 → 29~31 秒随机
-  taskMaxCommunicate: 30,
-  dailyMaxCommunicate: 80,
+  taskMaxCommunicate: 150,
+  dailyMaxCommunicate: 150,
   companyDailyMax: 3,
   bossCooldownDays: 30,
   neverRepeatJob: true,
@@ -93,21 +93,18 @@ export const DEFAULT_SETTINGS = {
 export const DEFAULT_FILTERS = {
   title: {
     or: [],
-    and: [],
     not: ['外包', '驻场', '代招'],
-    enabled: { or: true, and: true, not: true }
+    enabled: { or: true, not: true }
   },
   company: {
     or: [],
-    and: [],
     not: [],
-    enabled: { or: true, and: true, not: true }
+    enabled: { or: true, not: true }
   },
   jd: {
     or: [],
-    and: [],
     not: ['外包', '驻场', '培训'],
-    enabled: { or: true, and: true, not: true }
+    enabled: { or: true, not: true }
   },
   location: {
     include: [],

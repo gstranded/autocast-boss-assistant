@@ -5,7 +5,6 @@ function evalTextRules(text, rules = {}, codes) {
   const value = text || '';
   const enabled = rules.enabled || {};
   const or = enabled.or === false ? [] : (rules.or || []);
-  const and = enabled.and === false ? [] : (rules.and || []);
   const not = enabled.not === false ? [] : (rules.not || []);
 
   for (const k of not) {
@@ -26,18 +25,6 @@ function evalTextRules(text, rules = {}, codes) {
         pass: false,
         reasonCodes: [codes.or],
         reasonTexts: [reasonText(codes.or, or.join('/'))],
-        hits: {}
-      };
-    }
-  }
-
-  if (and.length) {
-    const miss = and.find((k) => !includesKeyword(value, k));
-    if (miss) {
-      return {
-        pass: false,
-        reasonCodes: [codes.and],
-        reasonTexts: [reasonText(codes.and, miss)],
         hits: {}
       };
     }
@@ -209,17 +196,14 @@ export function evaluateJob(job, filters, lists = {}, settings = {}, options = {
   const checks = [
     evalTextRules(job.title, filters.title, {
       or: REASON.FILTER_TITLE_OR_MISS,
-      and: REASON.FILTER_TITLE_AND_MISS,
       not: REASON.FILTER_TITLE_NOT_HIT
     }),
     evalTextRules(company, filters.company, {
       or: REASON.FILTER_COMPANY_OR_MISS,
-      and: REASON.FILTER_COMPANY_OR_MISS,
       not: REASON.FILTER_COMPANY_NOT_HIT
     }),
     evalTextRules(job.jd, filters.jd, {
       or: REASON.FILTER_JD_OR_MISS,
-      and: REASON.FILTER_JD_AND_MISS,
       not: REASON.FILTER_JD_NOT_HIT
     }),
     evalLocation(job.location, filters.location)
@@ -237,7 +221,6 @@ export function evaluateJob(job, filters, lists = {}, settings = {}, options = {
   }
 
   if (filters.title?.enabled?.or !== false && filters.title?.or?.length) passReasons.push(`职位命中包含词`);
-  if (filters.title?.enabled?.and !== false && filters.title?.and?.length) passReasons.push(`职位满足必需词`);
   if (filters.location?.enabled?.include !== false && filters.location?.include?.length) {
     passReasons.push(`地点匹配：${job.location || ''}`);
   }
