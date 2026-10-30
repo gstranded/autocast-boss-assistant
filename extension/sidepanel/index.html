@@ -32,7 +32,7 @@
         <button data-tab="message">消息</button>
         <button data-tab="resume">简历</button>
         <button data-tab="history">记录</button>
-        <button data-tab="settings">设置</button>
+        <button data-tab="settings">设置<span id="settingsUpdateDot" class="update-dot" aria-label="有新版本" hidden></span></button>
       </nav>
 
       <main>
@@ -395,14 +395,15 @@
 
         <!-- SETTINGS -->
         <section class="panel" id="tab-settings">
-          <div class="card">
-            <div class="card-title" data-help-title="版本与更新" data-help="检查 GitHub 上是否有新版本；更新包下载后可覆盖安装（同目录升级不丢设置）。">版本与更新</div>
+          <div class="card" id="updateCard">
+            <div class="card-title" data-help-title="版本与更新" data-help="后台每 6 小时自动检查 GitHub 正式版本；发现更新时轻提醒一次，版本标记会保留到安装新版。也可以手动检查更新。">版本与更新</div>
             <div class="update-row">
               <div>
                 <div class="source-label">当前版本</div>
-                <div class="source-meta" id="updateCurrentVersion">v1.7.26</div>
+                <div class="source-meta" id="updateCurrentVersion">—</div>
               </div>
               <div class="update-actions">
+                <span id="updateVersionBadge" class="update-version-badge" role="status" hidden></span>
                 <button id="btnCheckUpdate" class="btn tiny" type="button">检查更新</button>
                 <button id="btnRepoHome" class="btn tiny" type="button">项目主页</button>
               </div>
@@ -464,8 +465,8 @@
                 <input id="taskMaxCommunicate" type="number" min="1" />
               </div>
               <div>
-                <label data-help-title="每日最多沟通" data-help="当天累计沟通上限，达到后任务暂停。">每日最多沟通</label>
-                <input id="dailyMaxCommunicate" type="number" min="1" />
+                <label data-help-title="每日最多沟通" data-help="当天累计沟通上限，达到后任务暂停。0 表示不设每日上限，留空使用默认值 150。">每日最多沟通</label>
+                <input id="dailyMaxCommunicate" type="number" min="0" />
               </div>
               <div>
                 <label data-help-title="同公司每天最多" data-help="限制同一天向同一公司沟通的岗位数量。">同公司每天最多</label>
@@ -522,6 +523,14 @@
     </div>
 
     <div id="bht-toast" class="bht-toast" hidden></div>
+    <aside id="updateReminder" class="update-reminder" role="status" aria-live="polite" hidden>
+      <div class="update-reminder-copy">
+        <strong>AutoCast 有新版本啦</strong>
+        <p id="updateReminderText"></p>
+        <button type="button" id="btnViewUpdate" class="update-reminder-link">查看更新 ›</button>
+      </div>
+      <button type="button" id="btnCloseUpdateReminder" class="update-reminder-close" aria-label="关闭更新提醒">×</button>
+    </aside>
     <div id="bht-modal" class="bht-modal" hidden>
       <div class="bht-modal-card">
         <div class="bht-modal-title" id="bht-modal-title">提示</div>

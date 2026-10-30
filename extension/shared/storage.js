@@ -3,13 +3,16 @@ import {
   DEFAULT_LISTS,
   DEFAULT_MESSAGE_TEMPLATE,
   DEFAULT_SETTINGS,
-  STORAGE_KEYS
+  STORAGE_KEYS,
+  normalizeCommunicationLimit,
+  validateCommunicationLimits
 } from './constants.js';
 import { deepClone, todayKey, uid } from './text-utils.js';
 import { countResumeImages, normalizeResumes } from './resume-images.js';
 import { normalizeMessageTemplateRoles } from './greeting-policy.js';
 import { mergeRuntimeLog, sortLogsNewestFirst } from './log-order.js';
 import { normalizeDeliveryScheduleDays, normalizeDeliveryScheduleWindows, formatClock } from './delivery-schedule.js';
+import { validateImportedConfig } from './config-validation.js';
 
 let logWriteChain = Promise.resolve();
 let settingsWriteChain = Promise.resolve();
@@ -17,7 +20,7 @@ let settingsWriteChain = Promise.resolve();
 export function normalizeFilters(filters = {}) {
   const normalized = { ...deepClone(DEFAULT_FILTERS), ...deepClone(filters || {}) };
   for (const field of ['title', 'company', 'jd']) {
-    const rules = normalized[field] || {};
+    const rules = normalized[field] && typeof normalized[field] === 'object' ? normalized[field] : {};
     normalized[field] = {
       ...deepClone(DEFAULT_FILTERS[field]),
       ...rules,
@@ -26,12 +29,31 @@ export function normalizeFilters(filters = {}) {
     // AND 已移除：旧配置与导入文件中的条件也必须停用，不能在后台隐藏生效。
     delete normalized[field].and;
     delete normalized[field].enabled.and;
+    for (const key of ['or', 'not']) {
+      normalized[field][key] = Array.isArray(rules[key])
+        ? rules[key].filter((word) => typeof word === 'string')
+        : deepClone(DEFAULT_FILTERS[field][key]);
+    }
+  }
+  const location = normalized.location && typeof normalized.location === 'object' ? normalized.location : {};
+  normalized.location = {
+    ...deepClone(DEFAULT_FILTERS.location),
+    ...location,
+    enabled: { ...DEFAULT_FILTERS.location.enabled, ...location.enabled }
+  };
+  for (const key of ['include', 'exclude']) {
+    normalized.location[key] = Array.isArray(location[key]) ? location[key].filter((word) => typeof word === 'string') : [];
+  }
+  for (const key of ['experience', 'degree']) {
+    normalized[key] = Array.isArray(normalized[key]) ? normalized[key].filter((word) => typeof word === 'string') : [];
   }
   return normalized;
 }
 
 export function normalizeSettings(settings = {}) {
   const normalized = { ...deepClone(DEFAULT_SETTINGS), ...(settings || {}) };
+  normalized.taskMaxCommunicate = normalizeCommunicationLimit(normalized.taskMaxCommunicate, DEFAULT_SETTINGS.taskMaxCommunicate);
+  normalized.dailyMaxCommunicate = normalizeCommunicationLimit(normalized.dailyMaxCommunicate, DEFAULT_SETTINGS.dailyMaxCommunicate, { allowZero: true });
   // v1.7.11：BOSS「发简历」受双向回复门禁限制，平台简历自动发送功能已移除。
   delete normalized.autoSendAttachmentResume;
   if (normalized.resumeSendTiming === 'on_request') normalized.resumeSendTiming = 'after_text';
@@ -121,6 +143,7 @@ export async function getAllConfig() {
 
 export function saveSettings(settings) {
   const write = async () => {
+    validateCommunicationLimits(settings || {});
     const data = await get(STORAGE_KEYS.SETTINGS);
     const current = data[STORAGE_KEYS.SETTINGS] || {};
     await set({ [STORAGE_KEYS.SETTINGS]: normalizeSettings({ ...current, ...(settings || {}) }) });
@@ -299,12 +322,14 @@ export function buildExportPayload(all = {}, now = new Date()) {
     ...all,
     settings: normalizeSettings(all.settings || {}),
     filters: normalizeFilters(all.filters || {}),
+    messageTemplate: normalizeMessageTemplateRoles(all.messageTemplate || DEFAULT_MESSAGE_TEMPLATE),
     logs: (all.logs || []).slice(0, 100)
   };
 }
 
 export function importConfigPatch(payload) {
-  if (!payload || typeof payload !== 'object') throw new Error('无效配置文件');
+  // 在任何落盘和默认值补写之前校验完整文件，拒绝时保留全部原配置。
+  validateImportedConfig(payload);
   const put = {};
   for (const [key, storageKey] of Object.entries(IMPORT_CONFIG_KEYS)) {
     if (payload[key] == null) continue;
@@ -319,6 +344,10 @@ export function importConfigPatch(payload) {
       put[storageKey] = Array.isArray(payload[key]) ? payload[key].slice(0, 5000) : [];
     } else if (key === 'idempotency' || key === 'dailyStats') {
       put[storageKey] = payload[key] && typeof payload[key] === 'object' && !Array.isArray(payload[key]) ? payload[key] : {};
+    } else if (key === 'messageTemplate') {
+      put[storageKey] = normalizeMessageTemplateRoles(payload[key]);
+    } else if (key === 'resumes') {
+      put[storageKey] = normalizeResumes(payload[key]);
     } else {
       put[storageKey] = payload[key];
     }

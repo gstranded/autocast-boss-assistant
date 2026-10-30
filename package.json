@@ -5,7 +5,7 @@
   "type": "module",
   "description": "AutoCast 海投助手 Chrome / Edge 扩展",
   "scripts": {
-    "test": "node scripts/unit-tests.mjs && node scripts/flow-tests.mjs && node scripts/background-delivery-tests.mjs",
+    "test": "node scripts/unit-tests.mjs && node scripts/flow-tests.mjs && node scripts/background-delivery-tests.mjs && node scripts/audit-regression-tests.mjs && node scripts/update-reminder-tests.mjs",
     "test:flow": "node scripts/flow-tests.mjs",
     "test:panel:serve": "node scripts/panel-harness-server.mjs",
     "smoke": "node scripts/smoke-test.mjs",

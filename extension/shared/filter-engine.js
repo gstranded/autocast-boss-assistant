@@ -101,7 +101,20 @@ export function classifyActive(activeText) {
   if (/刚刚活跃/.test(t)) return 'just';
   if (/今日活跃/.test(t)) return 'today';
   if (/3日内活跃/.test(t)) return '3d';
-  if (/\d+日前活跃/.test(t)) return '3d';
+  const daysAgo = t.match(/(\d+)\s*[日天]前活跃/);
+  if (daysAgo) {
+    const days = Number(daysAgo[1]);
+    if (days === 0) return 'today';
+    if (days <= 3) return '3d';
+    if (days <= 7) return 'week';
+    if (days <= 14) return '2w';
+    if (days <= 30) return 'month';
+    if (days <= 60) return '2m';
+    if (days <= 90) return '3m';
+    if (days <= 120) return '4m';
+    if (days <= 180) return 'half';
+    return 'year';
+  }
   if (/两周内活跃|(^|[^0-9])2周内活跃/.test(t)) return '2w';
   if (/本周活跃/.test(t)) return 'week';
   if (/本月活跃/.test(t)) return 'month';

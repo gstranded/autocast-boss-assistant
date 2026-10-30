@@ -1529,6 +1529,12 @@ const SELECTORS = {
     let quotaNotice = null;
     const handleQuotaWarning = options?.handleQuotaWarning === true;
     while (Date.now() - started < timeoutMs) {
+      if (options?.handleDailyLimit === true) {
+        const dailyLimit = detectBossDailyLimitModal();
+        if (dailyLimit.ok) {
+          return { available: false, showGreeting: null, text: "", source: "boss-daily-limit", dailyLimit, quotaNotice };
+        }
+      }
       const receipt = findNativeGreetingReceipt(job, afterTs);
       if (receipt) {
         return {
@@ -3323,7 +3329,7 @@ function firstEl(selectors, root = document) {
         const rect = element.getBoundingClientRect();
         if (style.display === "none" || style.visibility === "hidden" || rect.width < 80 || rect.height < 60) continue;
         const text = String(element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
-        if (!/今天已与\s*\d+\s*位BOSS沟通[\s\S]*还剩\s*\d+\s*次沟通机会/.test(text)) continue;
+        if (!/今天已与\s*\d+\s*位\s*BOSS\s*沟通[\s\S]*还剩\s*\d+\s*次沟通机会/i.test(text)) continue;
         const confirm = Array.from(element.querySelectorAll(
           ".btn-sure, button, a, [role='button'], .btn, span"
         )).find((candidate) => {
@@ -3479,21 +3485,24 @@ function firstEl(selectors, root = document) {
     }
   }
 
-function dismissCommonDialogs() {
-    if (findExistingBossJobSwitchDialog()) return false;
-    const labels = /确定|继续|我知道了|开启|同意|稍后|允许|关闭|取消/;
-    // 优先点确认类，避免误点取消
-    const preferred = Array.from(document.querySelectorAll("button,a,.btn")).filter((el) =>
-      /确定|继续|我知道了|开启|同意|允许/.test(textOf(el))
-    );
-    if (preferred[0]) {
-      clickLikeHuman(preferred[0]);
-      return true;
-    }
-    const any = Array.from(document.querySelectorAll("button,a,.btn")).find((el) => labels.test(textOf(el)));
-    if (any && /确定|继续|我知道了/.test(textOf(any))) {
-      clickLikeHuman(any);
-      return true;
+  function dismissCommonDialogs() {
+    // 业务弹窗由各自流程处理；硬上限必须保留，不能被清理掉后继续补点。
+    if (findExistingBossJobSwitchDialog() || detectBossDailyLimitModal().ok || detectLoginModal().ok) return false;
+    const visible = (el) => {
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" &&
+        Number(style.opacity || "1") !== 0 && rect.width > 0 && rect.height > 0;
+    };
+    const roots = Array.from(document.querySelectorAll(
+      ".dialog-wrap, .dialog-container, .boss-dialog, [role='dialog'], [aria-modal='true'], [class*='modal']"
+    )).filter(visible);
+    for (const root of roots) {
+      const button = Array.from(root.querySelectorAll("button,a,[role='button'],.btn")).find((el) =>
+        visible(el) && !el.disabled && el.getAttribute?.("aria-disabled") !== "true" &&
+        /^(确定|继续|我知道了|知道了|开启|同意|允许)$/.test(textOf(el))
+      );
+      if (button) return clickLikeHuman(button) !== false;
     }
     return false;
   }
@@ -5372,6 +5381,10 @@ async function startChat(job, opts = {}) {
         return leftDetail;
       }
     } else {
+      const limitHit = detectBossDailyLimitModal();
+      if (limitHit.ok) {
+        return { ok: false, error: "BOSS_DAILY_LIMIT", message: limitHit.message, contentVersion: BHT_CONTENT_VERSION };
+      }
       const btn = gateBtn || findConversationActionButton(scopeRoot);
       if (!btn) {
         const missing = {
@@ -5443,6 +5456,10 @@ async function startChat(job, opts = {}) {
     // 自动招呼开启时仍可能出现“留在此页”；执行页停留或跳转都不会影响左侧真实列表。
     let stay = { ok: false };
     for (let i = 0; i < 18 && !stay.ok; i++) {
+      const limitHit = detectBossDailyLimitModal();
+      if (limitHit.ok) {
+        return { ok: false, error: "BOSS_DAILY_LIMIT", message: limitHit.message, contentVersion: BHT_CONTENT_VERSION };
+      }
       const existingBoss = skipExistingBossJobSwitch();
       if (existingBoss) return existingBoss;
       stay = clickStayOnListDialog();
@@ -5466,7 +5483,11 @@ async function startChat(job, opts = {}) {
     dismissCommonDialogs();
     let nativeGreeting = clicked.already
       ? { available: false, showGreeting: null, text: "", source: "already-contacted" }
-      : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 3200, { handleQuotaWarning: true });
+      : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 3200, { handleQuotaWarning: true, handleDailyLimit: true });
+    // 先消费等待期间捕获的终止原因，不能被订阅弹窗等临时成功回执覆盖。
+    if (nativeGreeting.dailyLimit?.ok) {
+      return { ok: false, error: "BOSS_DAILY_LIMIT", message: nativeGreeting.dailyLimit.message, contentVersion: BHT_CONTENT_VERSION };
+    }
     if (nativeGreeting?.quotaNotice?.detected) quotaNotice = nativeGreeting.quotaNotice;
     if (!clicked.already && !nativeGreeting.available && subscribeReceipt?.available) {
       nativeGreeting = subscribeReceipt;
@@ -5481,7 +5502,7 @@ async function startChat(job, opts = {}) {
     // 上限提示通常在点击后异步出现；等过首轮回执窗口后再检查一次，
     // 将平台限流报告成明确的终止原因，避免落入连续“点击无效果”自动暂停。
     if (typeof detectBossDailyLimitModal === "function") {
-      const limitHit = detectBossDailyLimitModal();
+      const limitHit = nativeGreeting.dailyLimit || detectBossDailyLimitModal();
       if (limitHit.ok) {
         return { ok: false, error: "BOSS_DAILY_LIMIT", message: limitHit.message, contentVersion: BHT_CONTENT_VERSION };
       }
@@ -5523,8 +5544,12 @@ async function startChat(job, opts = {}) {
           job,
           nativeReceiptStartedAt + 2500,
           4200,
-          { handleQuotaWarning: true }
+          { handleQuotaWarning: true, handleDailyLimit: true }
         );
+        const retryLimit = retryGreeting.dailyLimit || detectBossDailyLimitModal();
+        if (retryLimit.ok) {
+          return { ok: false, error: "BOSS_DAILY_LIMIT", message: retryLimit.message, contentVersion: BHT_CONTENT_VERSION };
+        }
         if (retryGreeting?.quotaNotice?.detected) quotaNotice = retryGreeting.quotaNotice;
         if (retryGreeting?.quotaNotice?.detected && !retryGreeting.quotaNotice.closed) {
           const blocked = {

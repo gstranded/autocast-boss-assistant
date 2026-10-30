@@ -7,10 +7,12 @@ import {
   DEFAULT_TARGET_NO_NEW_RETRY_LIMIT,
   MESSAGE_SEGMENT_KINDS,
   STORAGE_KEYS,
-  normalizeTargetNoNewRetryLimit
+  normalizeTargetNoNewRetryLimit,
+  validateCommunicationLimits
 } from '../shared/constants.js';
 import { mergeResumeImages } from '../shared/resume-images.js';
 import { initUsageNotice } from './usage-notice.js';
+import { initUpdateReminder } from './update-reminder.js';
 import { normalizeMessageSegmentKind } from '../shared/greeting-policy.js';
 import {
   collectDoneJobIds,
@@ -39,6 +41,7 @@ const $ = (id) => document.getElementById(id);
 const FLOAT_MODE = new URLSearchParams(location.search).get("mode") === "float";
 if (FLOAT_MODE) document.documentElement.classList.add('float-mode');
 const BHT_UI_VERSION = "1.7.43";
+let updateReminder;
 const VERSION_GUARDED_API_MESSAGES = new Set([
   MSG.RUN_PREVIEW,
   MSG.CONFIRM_AND_START,
@@ -778,113 +781,6 @@ function renderScheduleWindowDiagnosis(enabled) {
   warnEl.textContent = problems.map((d) => `时段 ${d.index + 1}：${d.reason}`).join('；');
 }
 
-const UPDATE_CHECK_FEED = 'https://github.com/gstranded/autocast-boss-assistant/releases.atom';
-const UPDATE_CHECK_RELEASE_PAGE = 'https://github.com/gstranded/autocast-boss-assistant/releases';
-const UPDATE_CHECK_HOME_PAGE = 'https://github.com/gstranded/autocast-boss-assistant';
-
-function isNewerVersion(latest, current) {
-  const parse = (v) => String(v || '').replace(/^v/, '').split('.').map((n) => Number(n) || 0);
-  const a = parse(latest);
-  const b = parse(current);
-  for (let i = 0; i < Math.max(a.length, b.length); i++) {
-    const x = a[i] || 0;
-    const y = b[i] || 0;
-    if (x !== y) return x > y;
-  }
-  return false;
-}
-
-function openUpdateLink(url) {
-  return (e) => {
-    if (e) e.preventDefault();
-    try { chrome.tabs.create({ url, active: true }); } catch (_) {}
-  };
-}
-
-function formatUpdateDate(iso) {
-  try { return new Date(iso).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }); }
-  catch (_) { return ''; }
-}
-
-// 渲染检查结果：有新版 → 引导前往最新 Release；无新版 → 已是最新 + 项目主页入口
-function renderUpdateStatus(statusEl, { latest, current, release }) {
-  statusEl.innerHTML = '';
-  const line = document.createElement('div');
-  const dateText = release?.published_at ? ' · ' + formatUpdateDate(release.published_at) + ' 发布' : '';
-  if (latest && isNewerVersion(latest, current)) {
-    line.textContent = `发现新版本 v${latest}（当前 v${current}）${dateText}。`;
-    statusEl.appendChild(line);
-    const hint = document.createElement('div');
-    hint.textContent = `可前往最新版本下载页获取：${(release?.body || '').replace(/[#>*`\n-]/g, ' ').trim().slice(0, 80) || ''}`;
-    if (hint.textContent.trim().length > 5) statusEl.appendChild(hint);
-  } else {
-    line.textContent = `已是最新版本（v${current}）${dateText}。`;
-    statusEl.appendChild(line);
-  }
-  const links = document.createElement('div');
-  links.className = 'update-links';
-  const releaseLink = document.createElement('a');
-  releaseLink.href = (release && release.html_url) || UPDATE_CHECK_RELEASE_PAGE;
-  releaseLink.target = '_blank';
-  releaseLink.rel = 'noopener';
-  releaseLink.textContent = latest && isNewerVersion(latest, current) ? '前往下载 ›' : '更新日志 ›';
-  releaseLink.addEventListener('click', openUpdateLink(releaseLink.href));
-  const homeLink = document.createElement('a');
-  homeLink.href = UPDATE_CHECK_HOME_PAGE;
-  homeLink.target = '_blank';
-  homeLink.rel = 'noopener';
-  homeLink.textContent = '项目主页 ›';
-  homeLink.addEventListener('click', openUpdateLink(homeLink.href));
-  links.appendChild(releaseLink);
-  links.appendChild(homeLink);
-  statusEl.appendChild(links);
-}
-
-function wireUpdateCheck() {
-  const btn = $('btnCheckUpdate');
-  const statusEl = $('updateStatus');
-  const currentEl = $('updateCurrentVersion');
-  if (!btn || btn.__bhtWired) return;
-  btn.__bhtWired = true;
-  if (currentEl) currentEl.textContent = 'v' + BHT_UI_VERSION;
-  const homeBtn = $('btnRepoHome');
-  if (homeBtn && !homeBtn.__bhtWired) {
-    homeBtn.__bhtWired = true;
-    homeBtn.addEventListener('click', openUpdateLink(UPDATE_CHECK_HOME_PAGE));
-  }
-  btn.addEventListener('click', async () => {
-    if (btn.disabled) return;
-    btn.disabled = true;
-    if (statusEl) {
-      statusEl.hidden = false;
-      statusEl.textContent = '正在检查更新…';
-    }
-    try {
-      const res = await fetch(UPDATE_CHECK_FEED);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const xml = await res.text();
-      const parsed = new DOMParser().parseFromString(xml, 'application/xml');
-      const entry = parsed.querySelector('entry');
-      if (!entry) throw new Error('响应缺少版本信息');
-      const title = (entry.querySelector('title')?.textContent || '').trim();
-      const versionMatch = title.match(/v(\d+\.\d+\.\d+)/);
-      const latest = versionMatch ? versionMatch[1] : '';
-      const current = BHT_UI_VERSION;
-      if (!latest) throw new Error('响应缺少版本号');
-      const release = {
-        html_url: entry.querySelector('link[rel="alternate"]')?.getAttribute('href') || UPDATE_CHECK_RELEASE_PAGE,
-        published_at: entry.querySelector('updated')?.textContent || '',
-        body: (entry.querySelector('content')?.textContent || '').replace(/<[^>]+>/g, ' ')
-      };
-      renderUpdateStatus(statusEl, { latest, current, release });
-    } catch (e) {
-      if (statusEl) statusEl.textContent = '检查失败：' + String(e?.message || e) + '（请检查网络后重试）';
-    } finally {
-      btn.disabled = false;
-    }
-  });
-}
-
 function wireScheduleWindowButtons() {
   const container = $('deliveryScheduleWindows');
   if (!container || container.__bhtScheduleWired) return;
@@ -955,6 +851,11 @@ function updateDebugUi(settings = {}) {
 }
 
 function readSettingsPatch(base) {
+  const limits = {
+    taskMaxCommunicate: $('taskMaxCommunicate').value || DEFAULT_SETTINGS.taskMaxCommunicate,
+    dailyMaxCommunicate: $('dailyMaxCommunicate').value || DEFAULT_SETTINGS.dailyMaxCommunicate
+  };
+  validateCommunicationLimits(limits);
   return {
     ...base,
     theme: state.theme,
@@ -965,8 +866,8 @@ function readSettingsPatch(base) {
     nativeGreetingWaitMs: Number(base.nativeGreetingWaitMs || 2600),
     autoSendImageResume: $('autoSendImageResume').checked,
     resumeSendTiming: $('resumeSendTiming').value,
-    taskMaxCommunicate: Number($('taskMaxCommunicate').value || DEFAULT_SETTINGS.taskMaxCommunicate),
-    dailyMaxCommunicate: Number($('dailyMaxCommunicate').value || DEFAULT_SETTINGS.dailyMaxCommunicate),
+    taskMaxCommunicate: Number(limits.taskMaxCommunicate),
+    dailyMaxCommunicate: Number(limits.dailyMaxCommunicate),
     companyDailyMax: Number($('companyDailyMax').value || 3),
     bossCooldownDays: Number($('bossCooldownDays').value || 30),
     consecutiveFailPause: Number($('consecutiveFailPause').value || 3),
@@ -2458,14 +2359,14 @@ async function assertResumeStorageCapacity(resumes) {
         ' MB）。请减少图片数量/压缩图片后再保存'
       );
     }
-    if (globalThis.chrome?.storage?.local?.getBytesInUse) {
+    const unlimited = await globalThis.chrome?.permissions?.contains?.({ permissions: ['unlimitedStorage'] });
+    if (unlimited !== true && globalThis.chrome?.storage?.local?.getBytesInUse) {
       const totalUsed = await globalThis.chrome.storage.local.getBytesInUse(null);
       let oldResume = 0;
       try { oldResume = await chrome.storage.local.getBytesInUse('bht_resumes'); } catch (_) {}
       const projected = totalUsed - oldResume + resumeBytes;
       const quota = chrome.storage.local.QUOTA_BYTES || (10 * 1024 * 1024);
-      // 有 unlimitedStorage 时 QUOTA 可能很大；仍警告超大 projected
-      if (quota < 50 * 1024 * 1024 && projected > quota * 0.92) {
+      if (projected > quota * 0.92) {
         throw new Error(
           '扩展存储空间不足：简历约 ' + (resumeBytes / 1024 / 1024).toFixed(2) +
           ' MB，当前已用 ' + (totalUsed / 1024 / 1024).toFixed(2) +
@@ -3189,6 +3090,7 @@ function bindEvents() {
       if (data.cmd === 'suspend') state.hostSuspended = true;
       if (data.cmd === 'resume') {
         state.hostSuspended = false;
+        updateReminder?.maybeNotify();
         lastFullRefreshAt = Date.now();
         refresh({ soft: true }).catch(() => {});
       }
@@ -3942,10 +3844,16 @@ wireControlButtons();
 try { wireAutosave();
 try { wireResumeFilePreview(); } catch (_) {} } catch (_) {}
 try { wireScheduleWindowButtons(); } catch (_) {}
-try { wireUpdateCheck(); } catch (_) {}
+try {
+  updateReminder = initUpdateReminder({
+    currentVersion: BHT_UI_VERSION,
+    isSuspended: () => state.hostSuspended
+  });
+} catch (_) {}
 refresh().catch(() => {});
 setInterval(() => {
   if (state.hostSuspended) return;
+  updateReminder?.maybeNotify();
   refreshControlEnablement();
   if (state.config?.settings) updateDeliveryScheduleUi(state.config.settings);
   const runnerState = state.config?.runner || {};

@@ -11,7 +11,26 @@
     ...persistedStorage
   };
   const listeners = [];
+  const storageListeners = [];
   const calls = [];
+  const updateParams = new URLSearchParams(location.search);
+  const updateScope = updateParams.get("updateScope") || "default";
+  const updateMode = updateParams.get("updateFixture") || "current";
+
+  async function updateRequest(input) {
+    const response = await fetch("/__harness/update", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...input, scope: updateScope, mode: updateMode })
+    });
+    const result = await response.json();
+    if (result.state) {
+      const oldValue = clone(storage.bht_update_state);
+      storage.bht_update_state = clone(result.state);
+      persistStorage();
+      storageListeners.forEach((listener) => listener({ bht_update_state: { oldValue, newValue: clone(result.state) } }, "local"));
+    }
+    return result;
+  }
   const duplicateResumeFixture = new URLSearchParams(location.search).get("duplicateResume") === "1";
   const runnerFixture = new URLSearchParams(location.search).get("runner") || "";
   const runnerFixtureStartedAt = Date.now() - 5200;
@@ -200,6 +219,12 @@
     await recordCall(type, payload);
 
     if (type === "BHT_GET_STATE") return stateResponse();
+    if (type === "BHT_CHECK_UPDATE") return await updateRequest({ action: "check", force: payload?.force });
+    if (type === "BHT_CLAIM_UPDATE_REMINDER") return await updateRequest({
+      action: "claim", version: payload?.version, delay: Number(updateParams.get("updateClaimDelay") || 0)
+    });
+    if (type === "BHT_CONFIRM_UPDATE_REMINDER") return await updateRequest({ action: "confirm", claimId: payload?.claimId });
+    if (type === "BHT_CANCEL_UPDATE_REMINDER") return await updateRequest({ action: "cancel", claimId: payload?.claimId });
     if (type === "BHT_GET_RUNNER_STATE") {
       return { ok: true, runtimeVersion: "1.7.43", now: Date.now(), runner: clone(state.runner) };
     }
@@ -238,7 +263,10 @@
       return { ok: true, tabId: 202 };
     }
     if (type === "BHT_SAVE_SETTINGS") {
-      state.settings = { ...state.settings, ...(payload || {}) };
+      const { normalizeSettings } = await import("/shared/storage.js");
+      const { validateCommunicationLimits } = await import("/shared/constants.js");
+      validateCommunicationLimits(payload || {});
+      state.settings = normalizeSettings({ ...state.settings, ...(payload || {}) });
       storage.bht_settings = clone(state.settings);
       persistStorage();
       document.documentElement.dataset.harnessSavedTheme = state.settings.theme || "";
@@ -311,7 +339,16 @@
       return { ok: true };
     }
     if (type === "BHT_EXPORT_CONFIG") return { ok: true, data: clone(state) };
-    if (type === "BHT_IMPORT_CONFIG") return { ok: true };
+    if (type === "BHT_IMPORT_CONFIG") {
+      try {
+        const { importAll } = await import("/shared/storage.js");
+        const imported = await importAll(payload?.data || payload);
+        Object.assign(state, imported);
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, error: String(error?.message || error) };
+      }
+    }
     if (type === "BHT_PAUSE_TASK") updateTaskStatus("paused");
     if (type === "BHT_RESUME_TASK") updateTaskStatus("running", {
       pauseReason: "",
@@ -323,6 +360,10 @@
   }
 
   globalThis.chrome = {
+    tabs: {
+      async create({ url }) { document.documentElement.dataset.harnessOpenedUpdateUrl = url; return { id: 202, url }; }
+    },
+    permissions: { async contains({ permissions }) { return permissions.includes("unlimitedStorage"); } },
     runtime: {
       id: "boss-panel-harness",
       lastError: null,
@@ -330,15 +371,23 @@
       onMessage: { addListener(listener) { listeners.push(listener); } }
     },
     storage: {
+      onChanged: { addListener(listener) { storageListeners.push(listener); } },
       local: {
+        QUOTA_BYTES: 10 * 1024 * 1024,
+        async getBytesInUse(key) {
+          return new Blob([JSON.stringify(key == null ? storage : { [key]: storage[key] })]).size;
+        },
         async get(keys) {
+          if (keys === "bht_update_state") await updateRequest({ action: "read" });
           if (keys == null) return clone(storage);
           const list = Array.isArray(keys) ? keys : [keys];
           return Object.fromEntries(list.filter((key) => key in storage).map((key) => [key, clone(storage[key])]));
         },
         async set(values) {
+          const changes = Object.fromEntries(Object.entries(values).map(([key, newValue]) => [key, { oldValue: clone(storage[key]), newValue: clone(newValue) }]));
           Object.assign(storage, clone(values));
           persistStorage();
+          storageListeners.forEach((listener) => listener(changes, "local"));
         }
       }
     }

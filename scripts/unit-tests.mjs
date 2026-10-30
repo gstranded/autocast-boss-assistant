@@ -896,7 +896,10 @@ test("legacy filters migrate on read, save, import and export without changing O
       assert.equal(value[field].enabled.or, false);
       assert.equal(value[field].enabled.not, true);
     }
-    assert.deepEqual(value.location, original.location);
+    assert.deepEqual(value.location, {
+      ...original.location,
+      enabled: { include: true, exclude: true, ...original.location.enabled }
+    });
     assert.equal(value.salaryMin, original.salaryMin);
   };
   check(normalized);
@@ -959,9 +962,8 @@ test("export carries daily stats, idempotency and task; import sanitizes task", 
   assert.equal(sanitizeImportedTask(null), null);
   assert.equal(sanitizeImportedTask({ results: [] }), null);
   // 非法类型防护
-  const badShapes = importConfigPatch({ dailyStats: [1, 2], idempotency: "x" });
-  assert.deepEqual(badShapes[STORAGE_KEYS.DAILY_STATS], {}, "array dailyStats dropped to {}");
-  assert.deepEqual(badShapes[STORAGE_KEYS.IDEMPOTENCY], {}, "string idempotency dropped to {}");
+  assert.throws(() => importConfigPatch({ dailyStats: [1, 2], idempotency: "x" }), /dailyStats/);
+  assert.throws(() => importConfigPatch({ idempotency: "x" }), /idempotency/);
 });
 
 test("allowRepublishedJob escape also applies to idempotency book", () => {
@@ -1020,10 +1022,7 @@ test("checkLimits treats dailyMaxCommunicate 0 as unlimited", () => {
 });
 
 test("history import guards and unknown-status summary", () => {
-  const patch = importConfigPatch({ history: "not-array", dailyStats: [1], idempotency: "x" });
-  assert.deepEqual(patch[STORAGE_KEYS.HISTORY], [], "non-array history dropped to []");
-  assert.deepEqual(patch[STORAGE_KEYS.DAILY_STATS], {}, "non-object dailyStats dropped");
-  assert.deepEqual(patch[STORAGE_KEYS.IDEMPOTENCY], {}, "non-object idempotency dropped");
+  assert.throws(() => importConfigPatch({ history: "not-array", dailyStats: [1], idempotency: "x" }), /history/);
   const big = importConfigPatch({ history: new Array(6000).fill({ status: "success" }) });
   assert.equal(big[STORAGE_KEYS.HISTORY].length, 5000, "history capped to 5000");
   // unknown status 归类与列表一致（计跳过）
@@ -1395,8 +1394,10 @@ test("manifest version + hosts", () => {
   assert.equal(isolated?.js?.[4], "content/content-main.js");
   assert.ok(m.host_permissions.includes("https://github.com/*"), "update check needs github.com host permission");
   const app = fs.readFileSync("extension/sidepanel/app.js", "utf8");
-  assert.ok(app.includes("btnCheckUpdate"), "update check UI wired");
-  assert.ok(app.includes("releases.atom"), "update check fetches releases.atom feed");
+  const reminder = fs.readFileSync("extension/sidepanel/update-reminder.js", "utf8");
+  const policy = fs.readFileSync("extension/shared/update-policy.js", "utf8");
+  assert.ok(app.includes("initUpdateReminder") && reminder.includes("btnCheckUpdate"), "update check UI wired");
+  assert.ok(policy.includes("releases.atom"), "update check fetches releases.atom feed");
 });
 test("UI exposes themes, help tips and filter switches", () => {
   const html = fs.readFileSync("extension/sidepanel/index.html", "utf8");
@@ -1862,6 +1863,12 @@ try {
   };
   let displayWidth = 1920;
   globalThis.chrome = {
+    storage: { local: {
+      async get(key) {
+        return key === STORAGE_KEYS.UPDATE ? { [key]: { lastCheckedAt: Date.now(), lastAttemptAt: Date.now() } } : {};
+      },
+      async set() {}
+    } },
     runtime: {
       onInstalled: { addListener() {} },
       onMessage: { addListener() {} },

@@ -1,5 +1,6 @@
 import { REASON, reasonText } from './reason-codes.js';
 import { normalizeMatchText } from './text-utils.js';
+import { DEFAULT_SETTINGS, normalizeCommunicationLimit } from './constants.js';
 
 function daysBetween(ts, now = Date.now()) {
   return (now - ts) / (24 * 3600 * 1000);
@@ -101,19 +102,21 @@ export function checkDedup(job, ctx) {
 }
 
 export function checkLimits({ settings, taskSuccessCount, todayStats }) {
-  if (taskSuccessCount >= settings.taskMaxCommunicate) {
+  const taskMax = normalizeCommunicationLimit(settings.taskMaxCommunicate, DEFAULT_SETTINGS.taskMaxCommunicate);
+  const dailyMax = normalizeCommunicationLimit(settings.dailyMaxCommunicate, DEFAULT_SETTINGS.dailyMaxCommunicate, { allowZero: true });
+  if (taskSuccessCount >= taskMax) {
     return {
       ok: false,
       reasonCodes: [REASON.LIMIT_TASK_MAX],
-      reasonTexts: [reasonText(REASON.LIMIT_TASK_MAX, `${taskSuccessCount}/${settings.taskMaxCommunicate}`)]
+      reasonTexts: [reasonText(REASON.LIMIT_TASK_MAX, `${taskSuccessCount}/${taskMax}`)]
     };
   }
   // 0 = 未设每日上限（与界面显示「未设上限」一致；normalizeSettings 允许导入 0）
-  if (settings.dailyMaxCommunicate > 0 && (todayStats.communicate || 0) >= settings.dailyMaxCommunicate) {
+  if (dailyMax > 0 && (todayStats.communicate || 0) >= dailyMax) {
     return {
       ok: false,
       reasonCodes: [REASON.LIMIT_DAILY_MAX],
-      reasonTexts: [reasonText(REASON.LIMIT_DAILY_MAX, `${todayStats.communicate}/${settings.dailyMaxCommunicate}`)]
+      reasonTexts: [reasonText(REASON.LIMIT_DAILY_MAX, `${todayStats.communicate}/${dailyMax}`)]
     };
   }
   return { ok: true, reasonCodes: [], reasonTexts: [] };

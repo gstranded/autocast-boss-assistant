@@ -13,7 +13,8 @@ export const STORAGE_KEYS = {
   LOGS: 'bht_logs',
   DAILY_STATS: 'bht_daily_stats',
   ONBOARDING: 'bht_onboarding',
-  USAGE_NOTICE: 'bht_usage_notice'
+  USAGE_NOTICE: 'bht_usage_notice',
+  UPDATE: 'bht_update_state'
 };
 
 export const MESSAGE_MODES = {
@@ -89,6 +90,23 @@ export const DEFAULT_SETTINGS = {
   scheduledDeliveryWindows: [{ start: '09:00', end: '12:00' }, { start: '14:00', end: '17:00' }],
   whitelistOnly: false
 };
+
+export function normalizeCommunicationLimit(value, fallback = 150, { allowZero = false } = {}) {
+  if (value == null || String(value).trim() === '' || !['number', 'string'].includes(typeof value)) return fallback;
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric >= (allowZero ? 0 : 1) ? numeric : fallback;
+}
+
+export function validateCommunicationLimits(settings = {}) {
+  for (const key of ['taskMaxCommunicate', 'dailyMaxCommunicate']) {
+    const value = settings[key];
+    if (value == null || String(value).trim() === '') continue;
+    const min = key === 'dailyMaxCommunicate' ? 0 : 1;
+    if (!['number', 'string'].includes(typeof value) || !Number.isSafeInteger(Number(value)) || Number(value) < min) {
+      throw new Error(`${key === 'dailyMaxCommunicate' ? '每日最多沟通' : '本次最多沟通'}必须是${min === 0 ? '非负' : '正'}整数`);
+    }
+  }
+}
 
 export const DEFAULT_FILTERS = {
   title: {

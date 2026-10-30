@@ -70,6 +70,7 @@ import {
 } from '../shared/job-expect-context.js';
 import { resolveTargetSearchContinuation } from '../shared/target-search-scan.js';
 import { createOperationRegistry } from './operation-registry.js';
+import { createUpdateChecker, startUpdateChecks } from './update-checker.js';
 import { attachPageClock } from './page-clock.js';
 import { activateBackgroundTab, backgroundWorkspaceProblem, navigateBackgroundTab, prepareBackgroundWorkspace } from './execution-workspace.js';
 import {
@@ -103,6 +104,8 @@ const DELIVERY_SCHEDULE_ALARM = 'bht_delivery_schedule';
 // 防卡顿：连续投递多少岗后自动刷新一次消息页（BOSS 聊天页在长会话列表下会渲染卡顿）
 const MESSAGE_TAB_REFRESH_INTERVAL = 10;
 const BHT_RUNTIME_VERSION = String(chrome.runtime.getManifest?.().version || 'unknown');
+const updateChecker = createUpdateChecker({ storage: chrome.storage.local, currentVersion: BHT_RUNTIME_VERSION });
+startUpdateChecks(chrome, updateChecker);
 let backgroundExecution = null;
 chrome.runtime.onConnect?.addListener((port) => attachPageClock(port, {
   allowSender: (sender) => sender?.frameId === 0 && isBossTab(sender?.tab)
@@ -5324,6 +5327,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       };
     }
     switch (type) {
+      case MSG.CHECK_UPDATE:
+        return await updateChecker.check({ force: payload?.force === true });
+      case MSG.CLAIM_UPDATE_REMINDER:
+        return await updateChecker.claimReminder(payload?.version);
+      case MSG.CONFIRM_UPDATE_REMINDER:
+        return await updateChecker.confirmReminder(payload?.claimId);
+      case MSG.CANCEL_UPDATE_REMINDER:
+        return await updateChecker.cancelReminder(payload?.claimId);
       case MSG.GET_BOSS_GREETING: {
         const guard = await assertBossContext(sender);
         if (!guard.ok) return guard;
