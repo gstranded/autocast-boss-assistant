@@ -17,14 +17,14 @@ function updateFixture(scope, mode) {
   if (updateFixtures.has(scope)) return updateFixtures.get(scope);
   let state = normalizeUpdateState();
   const checker = createUpdateChecker({
-    currentVersion: "1.7.43",
+    currentVersion: "1.7.44",
     storage: {
       get: async (key) => ({ [key]: state }),
       set: async (patch) => { state = Object.values(patch)[0]; }
     },
     fetchFeed: async () => {
       if (mode === "error") return { ok: false, status: 503 };
-      const version = mode === "current" ? "1.7.43" : "1.7.44";
+      const version = mode === "current" ? "1.7.44" : "1.7.45";
       return { ok: true, text: async () => `<feed><entry>
         <link rel="alternate" href="${UPDATE_RELEASE_PAGE}/tag/v${version}"/>
         <updated>2026-10-30T12:00:00Z</updated>
