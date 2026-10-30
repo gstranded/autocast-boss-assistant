@@ -3298,6 +3298,59 @@ function firstEl(selectors, root = document) {
     return { ok: false };
   }
 
+  // BOSS 在接近每日上限时会先弹出提醒：
+  // 「您今天已与 120 位 BOSS 沟通，还剩 30 次沟通机会哦」，按钮只有「好」。
+  // 这不是硬上限，确认后仍可继续沟通；如果不关掉，后续补点会一直点在遮罩下。
+  function findBossCommunicationQuotaNotice() {
+    try {
+      const roots = Array.from(document.querySelectorAll(
+        ".greet-pop, .dialog-wrap, .dialog-container, .boss-dialog, [role='dialog'], [class*='modal']"
+      ));
+      for (const element of roots) {
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        if (style.display === "none" || style.visibility === "hidden" || rect.width < 80 || rect.height < 60) continue;
+        const text = String(element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+        if (!/今天已与\s*\d+\s*位BOSS沟通[\s\S]*还剩\s*\d+\s*次沟通机会/.test(text)) continue;
+        const confirm = Array.from(element.querySelectorAll(
+          ".btn-sure, button, a, [role='button'], .btn, span"
+        )).find((candidate) => {
+          const label = textOf(candidate);
+          return candidate.getAttribute?.("data-ka") === "dialog_confirm" || /^(好|知道了|确定)$/.test(label);
+        });
+        return { ok: true, element, confirm: confirm || null, text };
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function closeBossCommunicationQuotaNotice() {
+    const hit = findBossCommunicationQuotaNotice();
+    if (!hit) return { ok: false, detected: false };
+    if (!hit.confirm) return { ok: false, detected: true, closed: false, text: hit.text };
+    const clicked = clickLikeHuman(hit.confirm);
+    const result = {
+      ok: clicked !== false,
+      detected: true,
+      closed: clicked !== false,
+      text: hit.text,
+      button: describeDebugElement(hit.confirm)
+    };
+    debugTrace("boss_quota_warning_closed", result, result.closed ? "info" : "warn");
+    return result;
+  }
+
+  async function waitForBossCommunicationQuotaNotice(timeoutMs = 900) {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+    let result = { ok: false, detected: false };
+    do {
+      result = closeBossCommunicationQuotaNotice();
+      if (result.detected || Date.now() >= deadline) return result;
+      await sleep(50);
+    } while (Date.now() < deadline);
+    return result;
+  }
+
   function detectLoginModal() {
     // 避免频繁读 body.innerText（BOSS 大页极慢，会导致发消息循环卡死）
     const modalRoots = Array.from(
@@ -5176,6 +5229,14 @@ async function startChat(job, opts = {}) {
     });
     const existingBoss = skipExistingBossJobSwitch();
     if (existingBoss) return existingBoss;
+    // 详情页是批量投递的正式触发路径。平台上限弹窗必须在通用弹窗清理前识别，
+    // 否则 dismissCommonDialogs 可能先把它关掉，后面只剩下“点击无回执”的假象。
+    if (typeof detectBossDailyLimitModal === "function") {
+      const limitHit = detectBossDailyLimitModal();
+      if (limitHit.ok) {
+        return { ok: false, error: "BOSS_DAILY_LIMIT", message: limitHit.message, contentVersion: BHT_CONTENT_VERSION };
+      }
+    }
     dismissCommonDialogs();
     if (typeof detectLoginModal === "function") {
       const loginHit = detectLoginModal();
@@ -5358,6 +5419,12 @@ async function startChat(job, opts = {}) {
     if (subscribeReceipt?.closed) {
       debugTrace("worker_detail_subscribe_dialog_closed", subscribeReceipt, subscribeReceipt.available ? "info" : "warn");
     }
+    // 接近每日沟通上限时，BOSS 会在首个请求后弹出「还剩 N 次沟通机会」提醒。
+    // 该提醒不是硬上限，先确认「好」，再等待回执或进行一次安全补点。
+    const quotaNotice = closeBossCommunicationQuotaNotice();
+    if (quotaNotice?.closed) {
+      await sleep(120);
+    }
     dismissCommonDialogs();
     let nativeGreeting = clicked.already
       ? { available: false, showGreeting: null, text: "", source: "already-contacted" }
@@ -5365,9 +5432,38 @@ async function startChat(job, opts = {}) {
     if (!clicked.already && !nativeGreeting.available && subscribeReceipt?.available) {
       nativeGreeting = subscribeReceipt;
     }
+    if (!clicked.already && !nativeGreeting.available && quotaNotice?.closed) {
+      const actionAfterNotice = findConversationActionButton(scopeRoot) || findConversationActionButton(document);
+      if (/继续沟通/.test(textOf(actionAfterNotice))) {
+        nativeGreeting = { available: true, showGreeting: null, text: "", source: "quota-warning-closed" };
+      }
+    }
+
+    // 上限提示通常在点击后异步出现；等过首轮回执窗口后再检查一次，
+    // 将平台限流报告成明确的终止原因，避免落入连续“点击无效果”自动暂停。
+    if (typeof detectBossDailyLimitModal === "function") {
+      const limitHit = detectBossDailyLimitModal();
+      if (limitHit.ok) {
+        return { ok: false, error: "BOSS_DAILY_LIMIT", message: limitHit.message, contentVersion: BHT_CONTENT_VERSION };
+      }
+    }
 
     if (!clicked.already && !nativeGreeting.available) {
       // 无回执且页面既未跳转也未弹窗：BOSS 事件绑定可能晚于 DOM 出现，补点一次后仍无效果才快速失败
+      if (quotaNotice?.detected && !quotaNotice.closed) {
+        const blocked = {
+          ok: false,
+          error: "CONVERSATION_CREATE_NOT_CONFIRMED",
+          message: "BOSS 沟通次数提醒未能自动关闭，未再次点击「立即沟通」；请手动确认后重试",
+          buttonText: clicked.buttonText,
+          detailTitle: detailTitle || job.title || "",
+          href: location.href,
+          nativeGreeting,
+          contentVersion: BHT_CONTENT_VERSION
+        };
+        debugTrace("worker_detail_quota_warning_blocked", blocked, "error");
+        return blocked;
+      }
       const retryScope =
         firstEl(SELECTORS.detailRoot) ||
         document.querySelector(".job-detail, .job-detail-box, .job-detail-container") ||
@@ -5383,6 +5479,22 @@ async function startChat(job, opts = {}) {
           page: pageInfo()
         }, "warn");
         clickLikeHuman(retryBtn);
+        const retryQuotaNotice = await waitForBossCommunicationQuotaNotice(900);
+        if (retryQuotaNotice?.detected && !retryQuotaNotice.closed) {
+          const blocked = {
+            ok: false,
+            error: "CONVERSATION_CREATE_NOT_CONFIRMED",
+            message: "BOSS 沟通次数提醒未能自动关闭，未继续点击；请手动确认后重试",
+            buttonText: clicked.buttonText,
+            detailTitle: detailTitle || job.title || "",
+            href: location.href,
+            nativeGreeting,
+            contentVersion: BHT_CONTENT_VERSION
+          };
+          debugTrace("worker_detail_quota_warning_blocked", blocked, "error");
+          return blocked;
+        }
+        if (retryQuotaNotice?.closed) await sleep(120);
         // afterTs 与首次等待尾部重叠，避免回执恰好在两次等待之间到达被漏掉
         const retryGreeting = await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt + 2500, 4200);
         if (retryGreeting.available) {

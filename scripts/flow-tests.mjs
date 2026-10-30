@@ -1893,6 +1893,52 @@ test("left-list anomaly protection pauses instead of cascade-skipping", () => {
   assert.ok(content.includes("parseBossActiveLabel") && content.includes("无法归一化时保留原文"), "enrich normalizes active label like click path");
 });
 
+test("worker detail stops on a BOSS daily communication limit", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const workerDetail = extractFunctionSource(
+    content,
+    "async function triggerConversationOnWorkerDetail",
+    "async function triggerConversationOnList"
+  );
+  const clickIndex = workerDetail.indexOf("const clickOk = clickLikeHuman(btn)");
+  const detectorCalls = workerDetail.match(/detectBossDailyLimitModal\(\)/g) || [];
+  assert.ok(clickIndex >= 0, "worker detail click path is present");
+  assert.ok(detectorCalls.length >= 2, "worker detail checks the platform limit before and after clicking");
+  assert.ok(workerDetail.includes('error: "BOSS_DAILY_LIMIT"'), "worker detail returns the terminal platform-limit error");
+  assert.ok(workerDetail.indexOf("detectBossDailyLimitModal()") < clickIndex, "platform limit is checked before any click");
+  assert.ok(workerDetail.lastIndexOf("detectBossDailyLimitModal()") > clickIndex, "platform limit is checked after the click settles");
+});
+
+test("worker detail dismisses the near-limit warning before retrying", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const workerDetail = extractFunctionSource(
+    content,
+    "async function triggerConversationOnWorkerDetail",
+    "async function triggerConversationOnList"
+  );
+  const warningFinder = extractFunctionSource(
+    content,
+    "function findBossCommunicationQuotaNotice",
+    "function closeBossCommunicationQuotaNotice"
+  );
+  const warningCloser = extractFunctionSource(
+    content,
+    "function closeBossCommunicationQuotaNotice",
+    "async function waitForBossCommunicationQuotaNotice"
+  );
+  const retryIndex = workerDetail.indexOf("const retryBtn = findConversationActionButton");
+  const closeIndex = workerDetail.indexOf("closeBossCommunicationQuotaNotice");
+  assert.ok(warningFinder.includes("今天已与") && warningFinder.includes("还剩"), "near-limit warning text is recognized");
+  assert.ok(warningFinder.includes("dialog_confirm") && warningCloser.includes("clickLikeHuman"), "warning confirmation is clicked");
+  assert.ok(closeIndex >= 0 && closeIndex < retryIndex, "warning is dismissed before the no-effect retry");
+  assert.ok(workerDetail.includes("waitForBossCommunicationQuotaNotice"), "a warning raised by the retry is dismissed too");
+  assert.ok(workerDetail.includes("quotaNotice?.detected && !quotaNotice.closed"), "an undismissed warning blocks blind retries");
+  assert.ok(workerDetail.includes("沟通次数提醒未能自动关闭"), "blocked warning explains the manual recovery path");
+  const hardLimit = extractFunctionSource(content, "function detectBossDailyLimitModal", "function findBossCommunicationQuotaNotice");
+  assert.ok(hardLimit.includes("您已达到沟通上限"), "hard limit keeps its terminal detector");
+  assert.ok(!hardLimit.includes("还剩\\s*\\d+\\s*次沟通机会"), "near-limit warning is not treated as hard limit");
+});
+
 test("worker delivery inspects activity on the temporary detail tab only", () => {
   const background = fs.readFileSync("extension/background/service-worker.js", "utf8");
   const trigger = extractFunctionSource(
