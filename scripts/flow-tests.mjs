@@ -1919,11 +1919,11 @@ test("worker detail dismisses the near-limit warning before retrying", () => {
   const warningFinder = extractFunctionSource(
     content,
     "function findBossCommunicationQuotaNotice",
-    "function closeBossCommunicationQuotaNotice"
+    "async function closeBossCommunicationQuotaNotice"
   );
   const warningCloser = extractFunctionSource(
     content,
-    "function closeBossCommunicationQuotaNotice",
+    "async function closeBossCommunicationQuotaNotice",
     "async function waitForBossCommunicationQuotaNotice"
   );
   const retryIndex = workerDetail.indexOf("const retryBtn = findConversationActionButton");
@@ -1931,12 +1931,30 @@ test("worker detail dismisses the near-limit warning before retrying", () => {
   assert.ok(warningFinder.includes("今天已与") && warningFinder.includes("还剩"), "near-limit warning text is recognized");
   assert.ok(warningFinder.includes("dialog_confirm") && warningCloser.includes("clickLikeHuman"), "warning confirmation is clicked");
   assert.ok(closeIndex >= 0 && closeIndex < retryIndex, "warning is dismissed before the no-effect retry");
-  assert.ok(workerDetail.includes("waitForBossCommunicationQuotaNotice"), "a warning raised by the retry is dismissed too");
+  assert.ok((workerDetail.match(/handleQuotaWarning: true/g) || []).length >= 2, "a warning raised by the retry is dismissed too");
   assert.ok(workerDetail.includes("quotaNotice?.detected && !quotaNotice.closed"), "an undismissed warning blocks blind retries");
   assert.ok(workerDetail.includes("沟通次数提醒未能自动关闭"), "blocked warning explains the manual recovery path");
   const hardLimit = extractFunctionSource(content, "function detectBossDailyLimitModal", "function findBossCommunicationQuotaNotice");
   assert.ok(hardLimit.includes("您已达到沟通上限"), "hard limit keeps its terminal detector");
   assert.ok(!hardLimit.includes("还剩\\s*\\d+\\s*次沟通机会"), "near-limit warning is not treated as hard limit");
+});
+
+test("worker receipt wait handles a delayed quota warning and verifies dismissal", () => {
+  const content = fs.readFileSync("extension/content/content-main.js", "utf8");
+  const receiptWait = extractFunctionSource(
+    content,
+    "async function waitForNativeGreetingReceipt",
+    "function buildTriggerNavigationRecovery"
+  );
+  const warningCloser = extractFunctionSource(
+    content,
+    "async function closeBossCommunicationQuotaNotice",
+    "async function waitForBossCommunicationQuotaNotice"
+  );
+  assert.ok(receiptWait.includes("handleQuotaWarning"), "receipt wait exposes delayed warning handling");
+  assert.ok(receiptWait.includes("closeBossCommunicationQuotaNotice"), "receipt wait polls the quota warning");
+  assert.ok(receiptWait.includes("quotaNotice"), "receipt wait carries warning state to the caller");
+  assert.ok(warningCloser.includes("await sleep") && warningCloser.includes("findBossCommunicationQuotaNotice"), "closing waits until the warning is gone");
 });
 
 test("worker delivery inspects activity on the temporary detail tab only", () => {

@@ -1524,8 +1524,10 @@ const SELECTORS = {
     return rows.slice().reverse().find((row) => !row.jobId || !ids.length || ids.includes(row.jobId)) || null;
   }
 
-  async function waitForNativeGreetingReceipt(job = {}, afterTs = 0, timeoutMs = 1800) {
+  async function waitForNativeGreetingReceipt(job = {}, afterTs = 0, timeoutMs = 1800, options = {}) {
     const started = Date.now();
+    let quotaNotice = null;
+    const handleQuotaWarning = options?.handleQuotaWarning === true;
     while (Date.now() - started < timeoutMs) {
       const receipt = findNativeGreetingReceipt(job, afterTs);
       if (receipt) {
@@ -1534,12 +1536,22 @@ const SELECTORS = {
           showGreeting: receipt.hasShowGreeting ? receipt.showGreeting : null,
           text: receipt.greeting || "",
           source: "friend-add-response",
-          at: receipt.at
+          at: receipt.at,
+          quotaNotice
         };
+      }
+      if (handleQuotaWarning && typeof closeBossCommunicationQuotaNotice === "function") {
+        const warning = await closeBossCommunicationQuotaNotice({ verifyMs: 1200 });
+        if (warning?.detected) {
+          quotaNotice = warning;
+          if (!warning.closed) {
+            return { available: false, showGreeting: null, text: "", source: "quota-warning-blocked", quotaNotice };
+          }
+        }
       }
       await sleep(100);
     }
-    return { available: false, showGreeting: null, text: "", source: "no-friend-add-receipt" };
+    return { available: false, showGreeting: null, text: "", source: "no-friend-add-receipt", quotaNotice };
   }
 
   function buildTriggerNavigationRecovery(inflight = {}) {
@@ -3324,19 +3336,45 @@ function firstEl(selectors, root = document) {
     return null;
   }
 
-  function closeBossCommunicationQuotaNotice() {
+  async function closeBossCommunicationQuotaNotice({ verifyMs = 1200 } = {}) {
     const hit = findBossCommunicationQuotaNotice();
     if (!hit) return { ok: false, detected: false };
     if (!hit.confirm) return { ok: false, detected: true, closed: false, text: hit.text };
     const clicked = clickLikeHuman(hit.confirm);
+    if (clicked === false) {
+      const result = {
+        ok: false,
+        detected: true,
+        closed: false,
+        text: hit.text,
+        button: describeDebugElement(hit.confirm)
+      };
+      debugTrace("boss_quota_warning_closed", result, "warn");
+      return result;
+    }
+    const deadline = Date.now() + Math.max(50, Math.min(2000, Number(verifyMs) || 1200));
+    while (Date.now() < deadline) {
+      await sleep(50);
+      if (!findBossCommunicationQuotaNotice()) {
+        const result = {
+          ok: true,
+          detected: true,
+          closed: true,
+          text: hit.text,
+          button: describeDebugElement(hit.confirm)
+        };
+        debugTrace("boss_quota_warning_closed", result, "info");
+        return result;
+      }
+    }
     const result = {
-      ok: clicked !== false,
+      ok: false,
       detected: true,
-      closed: clicked !== false,
+      closed: false,
       text: hit.text,
       button: describeDebugElement(hit.confirm)
     };
-    debugTrace("boss_quota_warning_closed", result, result.closed ? "info" : "warn");
+    debugTrace("boss_quota_warning_closed", result, "warn");
     return result;
   }
 
@@ -3344,7 +3382,7 @@ function firstEl(selectors, root = document) {
     const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
     let result = { ok: false, detected: false };
     do {
-      result = closeBossCommunicationQuotaNotice();
+      result = await closeBossCommunicationQuotaNotice({ verifyMs: 1200 });
       if (result.detected || Date.now() >= deadline) return result;
       await sleep(50);
     } while (Date.now() < deadline);
@@ -5421,14 +5459,15 @@ async function startChat(job, opts = {}) {
     }
     // 接近每日沟通上限时，BOSS 会在首个请求后弹出「还剩 N 次沟通机会」提醒。
     // 该提醒不是硬上限，先确认「好」，再等待回执或进行一次安全补点。
-    const quotaNotice = closeBossCommunicationQuotaNotice();
+    let quotaNotice = await closeBossCommunicationQuotaNotice();
     if (quotaNotice?.closed) {
       await sleep(120);
     }
     dismissCommonDialogs();
     let nativeGreeting = clicked.already
       ? { available: false, showGreeting: null, text: "", source: "already-contacted" }
-      : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 3200);
+      : await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt, 3200, { handleQuotaWarning: true });
+    if (nativeGreeting?.quotaNotice?.detected) quotaNotice = nativeGreeting.quotaNotice;
     if (!clicked.already && !nativeGreeting.available && subscribeReceipt?.available) {
       nativeGreeting = subscribeReceipt;
     }
@@ -5479,8 +5518,15 @@ async function startChat(job, opts = {}) {
           page: pageInfo()
         }, "warn");
         clickLikeHuman(retryBtn);
-        const retryQuotaNotice = await waitForBossCommunicationQuotaNotice(900);
-        if (retryQuotaNotice?.detected && !retryQuotaNotice.closed) {
+        // afterTs 与首次等待尾部重叠，避免回执恰好在两次等待之间到达被漏掉
+        const retryGreeting = await waitForNativeGreetingReceipt(
+          job,
+          nativeReceiptStartedAt + 2500,
+          4200,
+          { handleQuotaWarning: true }
+        );
+        if (retryGreeting?.quotaNotice?.detected) quotaNotice = retryGreeting.quotaNotice;
+        if (retryGreeting?.quotaNotice?.detected && !retryGreeting.quotaNotice.closed) {
           const blocked = {
             ok: false,
             error: "CONVERSATION_CREATE_NOT_CONFIRMED",
@@ -5494,9 +5540,6 @@ async function startChat(job, opts = {}) {
           debugTrace("worker_detail_quota_warning_blocked", blocked, "error");
           return blocked;
         }
-        if (retryQuotaNotice?.closed) await sleep(120);
-        // afterTs 与首次等待尾部重叠，避免回执恰好在两次等待之间到达被漏掉
-        const retryGreeting = await waitForNativeGreetingReceipt(job, nativeReceiptStartedAt + 2500, 4200);
         if (retryGreeting.available) {
           nativeGreeting = retryGreeting;
         } else if (!stillOnDetail || isConversationNavigationStarted()) {
